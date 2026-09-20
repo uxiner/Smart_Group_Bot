@@ -272,7 +272,7 @@ class SkillService:
         self._register(RuleManageSkill())
         self._register(SendStickerSkill())
         self._register(MusicSearchSkill(settings))
-        self._register(WebSearchSkill())
+        self._register(WebSearchSkill(settings))
         self._register(WebFetchSkill())
         self._register(MihomoDocSkill())
         self._register(RouterOSDocSkill())
@@ -573,6 +573,107 @@ class SkillService:
             if call_id and name:
                 parsed.append({"id": call_id, "name": name, "arguments": arguments or "{}"})
         return parsed
+
+    @classmethod
+    def _salvage_text_tool_calls(
+        cls,
+        content: str,
+        *,
+        allowed_names: set[str],
+    ) -> list[dict[str, str]]:
+        """Recover tool calls that an upstream returned as prose instead of JSON.
+
+        Some OpenAI-compatible bridges (notably the Gemini web bridge) emit a
+        syntactically valid tool call inside the assistant text while leaving
+        ``tool_calls`` empty.  Without this, the loop sees "no tool call",
+        answers from the model's own prose, and never runs the tool.
+
+        Strict by construction: only a fenced/whole-body JSON object whose
+        ``tool_calls`` array names a registered skill is accepted, so ordinary
+        prose that merely mentions a tool name cannot trigger a call.
+        """
+
+        text = (content or "").strip()
+        if not text or "tool_calls" not in text:
+            return []
+        if len(text) > 20000:
+            return []
+
+        candidates: list[str] = []
+        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.S | re.I):
+            body = (match.group(1) or "").strip()
+            if body:
+                candidates.append(body)
+        if not candidates:
+            candidates.append(text)
+
+        decoder = json.JSONDecoder()
+        marker_token = '"tool_calls"'
+        for raw in candidates:
+            marker = raw.find(marker_token)
+            if marker < 0:
+                continue
+            raw_calls: Any = None
+            # Parse from the value itself rather than the envelope: the upstream
+            # frequently drops the envelope's closing brace or appends a schema
+            # fragment, which would invalidate a whole-object parse even though
+            # the tool-call array is intact.
+            for opener in ("[", "{"):
+                pos = raw.find(opener, marker + len(marker_token))
+                if pos < 0:
+                    continue
+                try:
+                    data, _consumed = decoder.raw_decode(raw[pos:])
+                except Exception:
+                    continue
+                if opener == "[" and isinstance(data, list):
+                    raw_calls = data
+                    break
+                if opener == "{" and isinstance(data, dict):
+                    inner = data.get("tool_calls")
+                    raw_calls = inner if isinstance(inner, (list, dict)) else [data]
+                    break
+            if isinstance(raw_calls, dict):
+                raw_calls = [raw_calls]
+            if not isinstance(raw_calls, list) or not raw_calls:
+                continue
+
+            parsed: list[dict[str, str]] = []
+            for index, call in enumerate(raw_calls):
+                if not isinstance(call, dict):
+                    parsed = []
+                    break
+                fn = call.get("function")
+                if isinstance(fn, dict):
+                    name = str(fn.get("name") or "").strip()
+                    raw_args = fn.get("arguments", "")
+                else:
+                    name = str(call.get("name") or "").strip()
+                    raw_args = call.get("arguments", call.get("parameters", ""))
+                if not name or name not in allowed_names:
+                    parsed = []
+                    break
+                if isinstance(raw_args, dict):
+                    arguments = json.dumps(raw_args, ensure_ascii=False)
+                else:
+                    arguments = str(raw_args or "").strip()
+                    if arguments:
+                        try:
+                            decoded = json.loads(arguments)
+                        except Exception:
+                            decoded = None
+                        if isinstance(decoded, dict):
+                            arguments = json.dumps(decoded, ensure_ascii=False)
+                parsed.append(
+                    {
+                        "id": str(call.get("id") or f"call_salvaged_{index}"),
+                        "name": name,
+                        "arguments": arguments or "{}",
+                    }
+                )
+            if parsed:
+                return parsed
+        return []
 
     @staticmethod
     def _parse_tool_arguments(raw: str) -> dict[str, Any]:
@@ -2493,6 +2594,17 @@ class SkillService:
             msg = resp.choices[0].message
             content = self._normalize_content_text(getattr(msg, "content", "")).strip()
             tool_calls = self._parse_tool_calls(msg)
+            if not tool_calls:
+                tool_calls = self._salvage_text_tool_calls(
+                    content, allowed_names=set(self.skills)
+                )
+                if tool_calls:
+                    log.info(
+                        "skill tool loop salvaged text tool_calls | step=%d count=%d names=%s",
+                        step,
+                        len(tool_calls),
+                        [call["name"] for call in tool_calls],
+                    )
 
             remaining_calls = self.max_total_tool_calls - total_tool_calls
             if remaining_calls <= 0:
@@ -2530,7 +2642,11 @@ class SkillService:
                     )
                 )
 
-            assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
+            salvaged = bool(tool_calls) and not self._parse_tool_calls(msg)
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "" if salvaged else content,
+            }
             if tool_calls:
                 assistant_message["tool_calls"] = [
                     {

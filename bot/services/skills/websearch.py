@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from functools import partial
 
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.services.skills.platform_common import run_search_thread
+from bot.services.skills.platform_common import request_json, run_search_thread
 from bot.utils.security import clean_text
 
 log = logging.getLogger(__name__)
@@ -225,6 +225,103 @@ class WebSearchSkill:
 
         return results
 
+
+    # ------------------------------------------------------------------
+    # Firecrawl backend
+    # ------------------------------------------------------------------
+    _FIRECRAWL_HOSTS = ("api.firecrawl.dev",)
+
+    def __init__(self, settings: object | None = None) -> None:
+        self._api_key = ""
+        self._base = "https://api.firecrawl.dev"
+        self._search_timeout = 18.0
+        if settings is not None:
+            self._api_key = clean_text(
+                str(getattr(settings, "firecrawl_api_key", "") or ""), max_len=512
+            )
+            base = clean_text(
+                str(getattr(settings, "firecrawl_api_base", "") or ""), max_len=2048
+            ).rstrip("/")
+            if base:
+                self._base = base
+            try:
+                self._search_timeout = float(
+                    getattr(settings, "firecrawl_search_timeout_sec", 18.0) or 18.0
+                )
+            except Exception:
+                self._search_timeout = 18.0
+
+    @property
+    def firecrawl_available(self) -> bool:
+        return bool(self._api_key)
+
+    @staticmethod
+    def _parse_firecrawl_rows(payload: object, *, max_results: int) -> list[dict]:
+        """Map a /v2/search response into the shared {title,url,snippet} shape."""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return []
+
+        rows: list[dict] = []
+        for source in ("web", "news", "images"):
+            bucket = data.get(source)
+            if not isinstance(bucket, list):
+                continue
+            for item in bucket:
+                if isinstance(item, dict):
+                    rows.append(item)
+            if rows:
+                # Prefer the highest-signal source that returned anything.
+                break
+
+        results: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            if len(results) >= max_results:
+                break
+            url = clean_text(
+                str(row.get("url") or row.get("link") or row.get("href") or ""),
+                max_len=300,
+            )
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = clean_text(
+                str(row.get("title") or row.get("headline") or url), max_len=200
+            )
+            snippet = clean_text(
+                str(
+                    row.get("description")
+                    or row.get("snippet")
+                    or row.get("content")
+                    or row.get("excerpt")
+                    or ""
+                ),
+                max_len=400,
+            )
+            results.append({"title": title or url, "url": url, "snippet": snippet})
+        return results
+
+    async def _firecrawl_search(self, query: str, *, max_results: int) -> list[dict]:
+        """One POST /v2/search call. Raises on transport/HTTP failure."""
+        url = f"{self._base}/v2/search"
+        status, payload, _final, error_text = await request_json(
+            url,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Accept": "application/json",
+            },
+            json_body={"query": query, "limit": max_results},
+            timeout_sec=self._search_timeout,
+            allowed_hosts=self._FIRECRAWL_HOSTS,
+        )
+        if status != 200:
+            raise RuntimeError(f"firecrawl_http_{status}:{clean_text(error_text, max_len=120)}")
+        if not isinstance(payload, dict) or not payload.get("success"):
+            raise RuntimeError("firecrawl_bad_payload")
+        return self._parse_firecrawl_rows(payload, max_results=max_results)
+
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         _ = context  # Unused for this skill.
         q = clean_text(str(arguments.get("query", "")), max_len=300)
@@ -247,6 +344,54 @@ class WebSearchSkill:
         last_error = "empty_result"
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 18.0
+
+        # Firecrawl is the primary backend; ddgs remains the fallback so a
+        # Firecrawl outage (or a missing key) degrades instead of breaking.
+        if self.firecrawl_available:
+            fc_attempts: list[str] = []
+            for candidate in candidates[:3]:
+                if candidate not in fc_attempts:
+                    fc_attempts.append(candidate)
+            for idx, candidate in enumerate(fc_attempts, start=1):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    last_error = "search_timeout"
+                    log.warning("firecrawl total timeout: query=%s", q)
+                    break
+                log.info(
+                    "firecrawl try=%d/%d query=%s",
+                    idx,
+                    len(fc_attempts),
+                    candidate,
+                )
+                try:
+                    results = await self._firecrawl_search(
+                        candidate, max_results=max_results
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = str(exc) or exc.__class__.__name__
+                    log.warning(
+                        "firecrawl attempt failed: query=%s error=%s", candidate, exc
+                    )
+                    continue
+                if results:
+                    return SkillRunResult(
+                        ok=True,
+                        skill=self.name,
+                        summary=f"找到 {len(results)} 条搜索结果",
+                        payload={
+                            "query": q,
+                            "effective_query": candidate,
+                            "search_kind": "firecrawl",
+                            "region": "auto",
+                            "results": results,
+                        },
+                    )
+            log.warning(
+                "firecrawl returned no results, falling back to ddgs: query=%s", q
+            )
 
         for idx, (kind, query, region, backend) in enumerate(attempts, start=1):
             remaining = deadline - loop.time()
