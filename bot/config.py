@@ -295,6 +295,12 @@ class Settings(BaseSettings):
     movie_info_imdb_aws_secret_access_key: str = ""
     movie_info_imdb_aws_session_token: str = ""
 
+    # Firecrawl-backed web search (websearch skill backend).
+    firecrawl_api_key: str = ""
+    firecrawl_api_base: str = "https://api.firecrawl.dev"
+    firecrawl_timeout_sec: float = 20.0
+    firecrawl_search_timeout_sec: float = 18.0
+
     av_enabled: bool = True
     av_http_timeout_sec: float = 15.0
     av_max_results: int = 18

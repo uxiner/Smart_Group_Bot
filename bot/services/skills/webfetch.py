@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.platform_common import (
@@ -18,7 +21,7 @@ log = logging.getLogger(__name__)
 
 class WebFetchSkill:
     name = "webfetch"
-    description = "抓取并提取指定 URL 的网页正文内容。"
+    description = "抓取并提取指定 URL 的网页正文内容（支持动态网页与 Markdown 深度抓取）。"
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -53,12 +56,63 @@ class WebFetchSkill:
         )
         return title, content
 
+    def _fetch_via_firecrawl(self, url: str, api_key: str) -> tuple[str, str] | None:
+        try:
+            req = Request(
+                "https://api.firecrawl.dev/v1/scrape",
+                data=json.dumps({"url": url, "formats": ["markdown"]}).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "SmartGroupBot/1.0",
+                },
+            )
+            with urlopen(req, timeout=20.0) as resp:
+                if resp.status != 200:
+                    return None
+                data = json.loads(resp.read().decode("utf-8"))
+                if not data.get("success", False):
+                    return None
+                doc = data.get("data", {})
+                meta = doc.get("metadata", {})
+                title = clean_text(meta.get("title") or meta.get("og:title") or "", max_len=200)
+                md = doc.get("markdown", "")
+                content = clean_multiline_text(md, max_len=8000)
+                return title, content
+        except Exception as e:
+            log.warning("Firecrawl scrape failed, falling back to basic fetch: %s", e)
+            return None
+
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         _ = context  # Unused for this skill.
         u = str(arguments.get("url", "")).strip()
         if not self._valid_url(u):
             return SkillRunResult(ok=False, skill=self.name, summary="URL 非法", error="invalid_url")
 
+        # 1. 优先尝试使用 Firecrawl 引擎提取网页（过反爬、JS渲染、输出清晰 Markdown）
+        firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+        if firecrawl_key:
+            import asyncio
+            result = await asyncio.to_thread(self._fetch_via_firecrawl, u, firecrawl_key)
+            if result and result[1]:
+                title, content = result
+                log.info("Successfully fetched %s via Firecrawl", u)
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary="网页抓取成功 (Firecrawl)",
+                    payload={
+                        "url": u,
+                        "final_url": u,
+                        "status": 200,
+                        "content_type": "text/markdown",
+                        "title": title or u,
+                        "content": content,
+                        "engine": "firecrawl",
+                    },
+                )
+
+        # 2. 原生 fetch 回退机制
         headers = {
             "User-Agent": "SmartGroupBot/1.0 (+https://example.local)",
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
@@ -110,6 +164,7 @@ class WebFetchSkill:
                     "content_type": ctype,
                     "title": title,
                     "content": content,
+                    "engine": "native",
                 },
             )
         except UnsafeUrlError as exc:
