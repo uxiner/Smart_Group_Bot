@@ -519,8 +519,14 @@ class LLMService:
     ) -> dict[str, Any]:
         model = str(cfg.model or "").strip()
         provider = str(getattr(cfg, "provider", "") or "").strip().lower()
-        if provider in {"openai", "openai_compatible"} and model.lower().startswith("openai/"):
-            model = model.split("/", 1)[1]
+        # Deployment note: this deployment stores its models with an explicit
+        # ``openai/`` prefix (see bot/config.py _build_chat_config).  The
+        # Responses endpoint needs that same prefix so litellm selects the
+        # OpenAI-compatible transport; without it the call is routed as a
+        # native Gemini request and fails.
+        if provider in {"openai", "openai_compatible"}:
+            if not model.lower().startswith("openai/"):
+                model = f"openai/{model}"
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -2504,6 +2510,16 @@ class LLMService:
         candidates: list[EmbedEndpointConfig],
         total_deadline_sec: float | None = None,
     ) -> tuple[list[list[float]], EmbedEndpointConfig] | None:
+        # Deployment note: no provider configured on this host serves an
+        # embedding model.  pipio exposes 39 chat models but no embedding model
+        # (text-embedding-004 -> HTTP 503 "no channel available"), and the local
+        # sub2api gateway only serves gemini-3.1-pro / gemini-3.5-flash-lite /
+        # gemini-3.8-flash.  Every attempt used to fail and re-queue forever
+        # (group_message_archive_embeddings: 1888/1888 status='failed', retried
+        # up to 172 times).  Short-circuit instead of hammering a non-existent
+        # upstream.  Memory recall stays non-functional until an
+        # embedding-capable provider is configured.
+        return None
         """Generate embeddings and report the endpoint that produced them."""
 
         total = len(candidates)
