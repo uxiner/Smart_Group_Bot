@@ -309,10 +309,22 @@ async def _initialize_runtime_services(
             "请在 /settings 的 Bot 行为中调高上下文预算。",
             settings.bot.max_context_tokens,
         )
-    vector_recall_provider = SQLiteArchiveVectorRecallProvider(
-        session_factory=session_factory,
-        llm=llm,
-        retention_days=settings.bot.memory_retention_days,
+    # Semantic archive recall is only useful when an embedding provider is
+    # actually configured.  This deployment has none (pipio exposes no
+    # embedding model and the local sub2api gateway only serves chat models),
+    # so the indexer could never succeed: every archived message queued an
+    # embedding job that failed and re-queued forever
+    # (group_message_archive_embeddings reached 1891/1891 status='failed',
+    # retried up to 173x).  Skip building the provider entirely when recall is
+    # disabled so no indexer task runs and the retry churn stops.
+    vector_recall_provider = (
+        SQLiteArchiveVectorRecallProvider(
+            session_factory=session_factory,
+            llm=llm,
+            retention_days=settings.bot.memory_retention_days,
+        )
+        if settings.bot.memory_recall_enabled
+        else None
     )
     memory = MemoryService(
         settings.bot,
