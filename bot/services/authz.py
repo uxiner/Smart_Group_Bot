@@ -34,11 +34,15 @@ async def _send_access_notice(
     # Keeping this import inside the send path preserves that dependency order.
     from bot.services.message_templates import render_action_notice
 
-    sent = await message.answer(
-        render_action_notice(title, action=action),
-        parse_mode="HTML",
-    )
-    await _schedule_auto_delete(sent, settings)
+    try:
+        sent = await message.answer(
+            render_action_notice(title, action=action),
+            parse_mode="HTML",
+        )
+        await _schedule_auto_delete(sent, settings)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Suppressed notice failure: {e}")
 
 
 def is_super_admin_user_id(user_id: int, settings: Settings) -> bool:
