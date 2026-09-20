@@ -9,6 +9,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./bot:/app/bot:ro
+      # Prompt templates are loaded from this directory at runtime and seeded
+      # into runtime_config on first boot.  Without the mount the container
+      # keeps the copy baked into the image, so prompt edits silently had no
+      # effect and the owner-policy migration kept re-applying the old text.
+      - ./prompt:/app/prompt:ro
       # Legacy one-time import only; ignored after runtime_config is created.
       - ./config.toml:/app/config.toml:ro
     ports:
