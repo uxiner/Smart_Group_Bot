@@ -824,7 +824,7 @@ async def _run_update_delivery_started(
     # true, so merely changing the model default is insufficient for deployed
     # databases. Backlog deletion must be a separate explicit operator action,
     # not part of the bot's automatic lifecycle.
-    polling_drop_pending_updates = True
+    polling_drop_pending_updates = False
     if settings.bot.drop_pending_updates:
         log.debug(
             "ignored deprecated drop_pending_updates=true; "
