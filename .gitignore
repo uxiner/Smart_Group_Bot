@@ -72,3 +72,11 @@ pnpm-debug.log*
 # Reproducible dependency graphs are release artifacts and must be committed.
 !uv.lock
 !requirements.lock
+
+# Local operational artifacts (manual backups, pre-migration snapshots).
+# The existing *.bak / data/ rules do not cover suffixed variants such as
+# config.py.bak-20260919_054025 or data.pre-migration-<ts>/, which left them
+# showing up as untracked noise in `git status`.
+backups/
+data.pre-migration-*/
+*.bak-*
