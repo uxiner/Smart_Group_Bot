@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -28,6 +29,14 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/rules", "/rules", "查看群规列表，支持翻页和删除", "用户想查看或删除群规", "核心入口"),
     CommandEntry("/av", "/av <番号/演员/关键词>", "搜索 AV 资源", "用户想搜片或查询 AV 详情", "核心入口"),
     CommandEntry("/voteban", "回复目标用户消息后发送 /voteban [举报理由]", "发起民主投票封禁，票数达标即封禁被回复用户；管理员可在投票消息上取消投票或直接封禁；与 AI 技能共用用户额度", "用户想集体投票封禁骚扰者", "核心入口"),
+    CommandEntry("/report", "回复要举报的消息后发送 /report [补充说明]", "举报被漏判的消息：机器人立刻让审核模型复核，并把结果与原文转交管理员", "群友看到广告/骚扰消息没有被处理", "核心入口"),
+    CommandEntry("/find", "/find <关键词>", "在本群保留期聊天记录里搜索消息", "群友想找回群里聊过的某条消息", "核心入口"),
+    CommandEntry("/checkin", "/checkin", "每日签到得积分：连续第 N 天得 N 分（最高 10 分），断签从 1 分重来", "群友想签到，或问签到怎么用", "核心入口"),
+    CommandEntry("/points", "/points", "查看可用积分、连续天数；广告质询时可花 2 分免除", "群友问自己有多少积分", "核心入口"),
+    CommandEntry("/rank", "/rank 或 /rank week", "查看本群积分榜 Top10；加 week 只看本周获得的积分", "群友想看积分排名，或想知道本周谁最活跃", "核心入口"),
+    CommandEntry("/me", "/me", "查看自己的积分、签到、违规与封禁状态", "群友想一次看清自己的积分和违规记录", "核心入口"),
+    CommandEntry("/health", "/health", "查看本群今日审核命中、待完成质询、归档量与当前模型通道", "管理员想快速了解机器人当前运行状况", "群审核管理"),
+    CommandEntry("/modstats", "/modstats [天数]", "审核质量报表：命中构成、边缘判定、误伤率（管理员）", "管理员想了解审核判得准不准、误伤多少", "管理工具"),
     CommandEntry("/warnings", "/warnings", "查看当前群警告/封禁名单", "管理员想查看审核处罚情况", "群审核管理"),
     CommandEntry("/clearwarnings", "回复用户后 /clearwarnings，或 /clearwarnings <用户ID>", "清空某用户的累计违规次数", "管理员要重置某用户的违规次数", "群审核管理"),
     CommandEntry("/ban", "回复用户后 /ban [原因]，或 /ban <用户ID> [原因]", "在当前群手动封禁；最高管理员可选择全局", "管理员要封禁某个用户", "群审核管理"),
@@ -35,7 +44,8 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/unban", "回复用户后 /unban，或 /unban <用户ID>", "解除当前群封禁；最高管理员可选择全局", "管理员要解封某个用户", "群审核管理"),
     CommandEntry("/raidguard", "/raidguard on [分钟]|off|status，或 /raidguard <分钟>", "手动开启、限时开启或解除爆破锁定", "管理员需要立即阻止新成员加入", "群审核管理"),
     CommandEntry("/aiexempt", "回复目标用户消息后发送 /aiexempt", "豁免某用户的 AI 审核", "管理员想让某用户跳过审核", "群审核管理"),
-    CommandEntry("/unaiexempt", "回复目标用户消息后发送 /unaiexempt", "取消某用户的 AI 审核豁免", "管理员想恢复某用户的审核", "群审核管理"),
+    CommandEntry("/unaiexempt", "回复目标用户消息后发送 /unaiexempt，或 /unaiexempt <用户ID>", "取消某用户的 AI 审核豁免", "管理员想恢复某用户的审核", "群审核管理"),
+    CommandEntry("/exemptlist", "/exemptlist（别名 /modlist）", "查看本群审核豁免与回复静默名单，支持翻页和一键取消", "管理员想查看哪些人被豁免审核或被静默回复，或直接点按钮移除", "群审核管理"),
     CommandEntry("/mute", "回复目标用户消息后发送 /mute", "忽略某用户后续消息回复", "管理员不想让 bot 再回复某用户", "群审核管理"),
     CommandEntry("/mute all", "/mute all", "全群仅审核不回复", "管理员希望 bot 暂时只做审核", "群审核管理"),
     CommandEntry("/unmute", "回复目标用户消息后发送 /unmute", "恢复某用户的消息回复", "管理员想重新允许 bot 回复某用户", "群审核管理"),
@@ -70,6 +80,12 @@ def build_help_text() -> str:
         "/rules：群规列表，支持翻页和删除\n"
         "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU + DMM + FC2\n"
         "/voteban：回复用户消息后发起民主投票封禁\n"
+        "/report：回复要举报的消息后转交管理员，机器人会先复核一遍\n"
+        "/find &lt;关键词&gt;：在本群保留期聊天记录里搜索消息\n"
+        "/checkin：每日签到得积分，连续第 N 天得 N 分（最高 10 分）；漏签一天重新从 1 分算\n"
+        "/points：查看可用积分、连续签到天数（消息被判定广告时可花 2 积分免除质询）\n"
+        "/rank：看本群积分榜（加 week 只看本周获得的积分）\n"
+        "/me：看自己的积分与违规记录\n"
         "@admin：呼叫全部群管理员（可附说明或回复被举报消息）\n\n"
         "<b>语义入口</b>\n"
         "主模型会自动调用 skill 处理：永久记忆新增/查看/修改、群规新增/查看。\n"
@@ -81,14 +97,17 @@ def build_help_text() -> str:
         "/spam：封禁垃圾用户、删除被回复消息并加入全局封禁名单\n"
         "/raidguard on [分钟]|off|status：手动控制爆破防护，数字单位为分钟\n"
         "/aiexempt：回复目标用户消息后豁免审核\n"
-        "/unaiexempt：回复目标用户消息后取消豁免\n"
+        "/unaiexempt：回复目标用户消息后取消豁免（也支持 /unaiexempt &lt;用户ID&gt;）\n"
+        "/exemptlist（或 /modlist）：查看审核豁免与回复静默名单，可点按钮取消\n"
         "/mute：回复目标用户消息后忽略其后续回复\n"
         "/mute all：本群仅做审核，不再回复\n"
         "/unmute：回复目标用户消息后恢复其回复\n"
         "/unmute all：恢复本群正常回复\n"
         "/proactive on|off|status：主动话题开关/状态\n"
         "/mimic：回复用户后学习其说话风格（status 查看 / off 停止）\n"
-        "/compact：立即压缩本群临时对话历史进背景摘要\n\n"
+        "/compact：立即压缩本群临时对话历史进背景摘要\n"
+        "/health：本群今日审核命中、待完成质询、归档量与当前模型通道\n\n"
+        "/modstats：审核质量报表（近 7 天命中数、边缘判定占比、被改判放行的误伤率，可加天数如 /modstats 30）\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup / unauthgroup / authlist\n"
         "/banlist：查看全局封禁名单\n"
@@ -97,6 +116,25 @@ def build_help_text() -> str:
         "/tts / tts enable|disable|always\n"
         "/av enable|disable"
     )
+
+
+def build_bot_commands() -> list[tuple[str, str]]:
+    """The Telegram "/" command menu, derived from the same catalog as /help.
+
+    Keeping one source means a new command shows up in the menu and in /help
+    together instead of being remembered by hand.  Only single-token names are
+    registrable: entries documenting an argument form ("/lm add", "/mute all")
+    are skipped so the menu never advertises a name Telegram would reject.
+    """
+    seen: set[str] = set()
+    commands: list[tuple[str, str]] = []
+    for item in _COMMANDS:
+        name = item.command.strip().lstrip("/")
+        if not name or " " in name or name in seen:
+            continue
+        seen.add(name)
+        commands.append((name, item.purpose[:250]))
+    return commands
 
 
 def build_command_guide_context() -> str:
@@ -115,3 +153,64 @@ def build_command_guide_context() -> str:
         lines.append(f"  purpose: {item.purpose}")
         lines.append(f"  suggest_when: {item.suggest_when}")
     return "\n".join(lines)
+
+
+# Sections whose commands exist for group operators.  "核心入口" entries are the
+# member-facing ones (/help, /av, /voteban, ...) and must keep working untouched.
+_MANAGEMENT_SECTIONS = frozenset({"群审核管理", "最高管理员命令"})
+_MEMBER_SECTIONS = frozenset({"核心入口"})
+
+_BARE_COMMAND_RE = re.compile(r"[@（(\s]")
+_ALIAS_RE = re.compile(r"（别名\s*([^）]+)）")
+
+
+def _declared_aliases(entry: CommandEntry) -> frozenset[str]:
+    """Extra command names an entry documents, e.g. ``（别名 /modlist）``.
+
+    The alias is documented in the *usage* text (``/exemptlist`` is the command,
+    ``/exemptlist（别名 /modlist）`` the usage), so both fields are scanned.
+    """
+    names: set[str] = set()
+    for group in _ALIAS_RE.findall(f"{entry.command} {entry.usage}"):
+        for part in re.split(r"[/\s、,，]+", group):
+            name = part.strip().lower()
+            if name:
+                names.add(name)
+    return frozenset(names)
+
+
+def bare_command(text: str) -> str:
+    """The plain command name in ``text`` (``/mute all`` -> ``mute``).
+
+    Handles the group form ``/mute@xatongxue_bot`` and the catalog's documented
+    argument forms (``/lm replace <...>``, ``/exemptlist（别名 /modlist）``).
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return ""
+    token = stripped.split(maxsplit=1)[0][1:]
+    # Cut anything that is not part of the name: "@bot", "（别名 /modlist）", "(...)".
+    token = _BARE_COMMAND_RE.split(token, maxsplit=1)[0]
+    return token.strip().lower()
+
+
+def management_command_names() -> frozenset[str]:
+    """Command names reserved for operators, for group-side command cleanup.
+
+    Derived from the catalog instead of a hand-kept list so a new operator
+    command is covered as soon as it is documented.  A name that is also
+    member-facing in another section is dropped: ``/av enable`` must not drag
+    the member command ``/av`` into the cleanup set.
+    """
+    member_names = {
+        bare_command(item.command)
+        for item in _COMMANDS
+        if item.section in _MEMBER_SECTIONS
+    }
+    names: set[str] = set()
+    for item in _COMMANDS:
+        if item.section not in _MANAGEMENT_SECTIONS:
+            continue
+        names.add(bare_command(item.command))
+        names.update(_declared_aliases(item))
+    return frozenset(name for name in names - member_names if name)

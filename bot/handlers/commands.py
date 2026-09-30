@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
+from datetime import timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -21,7 +23,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
+from bot.utils.timezone import now_shanghai_naive
 from bot.db.models import Admin, AuthorizedGroup, Group
+from bot.services.moderation_context import build_moderation_context
 from bot.services.authz import (
     ensure_group_admin_permission,
     ensure_group_authorized,
@@ -31,6 +35,15 @@ from bot.services.authz import (
     is_super_admin_user_id,
 )
 from bot.services import memory_holder
+from bot.services.checkin import (
+    CHALLENGE_SKIP_COST,
+    MemberProfile,
+    RankBoard,
+    build_rank_board,
+    member_profile,
+    record_checkin,
+    summarize,
+)
 from bot.services.av_search import (
     AVDetail,
     AVQuerySession,
@@ -59,6 +72,7 @@ from bot.utils.project_info import (
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
+    schedule_message_auto_delete_durable,
     is_group,
     preserve_delete_button,
     typing_action,
@@ -210,6 +224,29 @@ def _parse_int(value: str, *, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _moderation_llm(settings: Settings):
+    """LLMService for the moderation stage only.
+
+    Every role keyword is passed on purpose: a role left out silently collapses
+    onto `main` (see the platform notes), so an omitted `skill=` would make this
+    probe verify the wrong route.
+    """
+
+    from bot.services.llm import LLMService
+
+    bot_cfg = settings.bot
+    return LLMService(
+        bot_cfg.main_model,
+        bot_cfg.decision_model,
+        bot_cfg.compress_model,
+        moderation=bot_cfg.moderation_model,
+        vision=bot_cfg.vision_model,
+        embed=bot_cfg.embed_model,
+        skill=bot_cfg.skill_model,
+        max_context_tokens=bot_cfg.max_context_tokens,
+    )
 
 
 def _build_skill_service(settings: Settings) -> SkillService:
@@ -1503,3 +1540,550 @@ async def on_av_seed_paging(
         await callback.answer("更新失败，请重新 /av", show_alert=True)
         return
     await callback.answer()
+
+
+# --------------------------------------------------------- member self-service
+# Telegram command names are ASCII-only (the "/" menu and Command() both reject
+# non-latin), so these are /report, /find and /health rather than Chinese names.
+
+_REPORT_COOLDOWN_SECONDS = 90
+_report_cooldown: dict[tuple[int, int], float] = {}
+_REPORT_USAGE = (
+    "<b>/report 用法</b>\n"
+    "回复要举报的消息后发送 /report [补充说明]\n\n"
+    "机器人会先让审核模型立刻复核这条消息，再把复核结果和消息内容一起转给管理员。"
+)
+
+
+def _report_is_throttled(group_id: int, user_id: int) -> int:
+    """Seconds to wait before this member may report again (0 = allowed)."""
+
+    key = (int(group_id), int(user_id))
+    now = time.monotonic()
+    elapsed = now - _report_cooldown.get(key, 0.0)
+    remaining = _REPORT_COOLDOWN_SECONDS - elapsed
+    return int(remaining) + 1 if remaining > 0 else 0
+
+
+@router.message(Command("report"))
+async def cmd_report(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Report a message the moderation stage let through."""
+
+    from bot.services.call_admin import send_member_report_notice
+    from bot.services.moderation import ModerationService
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        await _answer(message, settings, _REPORT_USAGE)
+        return
+    reported = str(
+        getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+    ).strip()
+    if not reported:
+        await _answer(
+            message,
+            settings,
+            "这条消息没有可复核的文字。图片、贴纸或纯媒体请直接 @admin 请管理员查看。",
+        )
+        return
+
+    group_id = int(message.chat.id)
+    reporter_id = int(getattr(message.from_user, "id", 0) or 0)
+    reporter_name = " ".join(
+        part
+        for part in (
+            getattr(message.from_user, "first_name", "") or "",
+            getattr(message.from_user, "last_name", "") or "",
+        )
+        if part
+    ) or str(reporter_id)
+    reason = str(message.text or "").partition(" ")[2].strip()
+
+    wait = _report_is_throttled(group_id, reporter_id)
+    if wait:
+        await _answer(message, settings, f"刚举报过，请等 {wait} 秒后再发。")
+        return
+
+    group_row = await session.get(Group, group_id)
+    group_settings = dict(group_row.settings or {}) if group_row is not None else {}
+
+    # Force one fresh semantic check. The whole point of the report is that the
+    # pipeline already passed this message, so a cached "clean" verdict must not
+    # short-circuit it.
+    check_summary = ""
+    try:
+        # 举报的是"已经放过去"的消息：把它的上下文一起送审，避免只看一句就下结论
+        report_context, _block = await build_moderation_context(
+            session, group_id=group_id, anchor_text=reported, exclude_text=reported
+        )
+        moderation = ModerationService(settings.moderation, _moderation_llm(settings))
+        verdict = await moderation.evaluate(
+            session, group_id, reported, context="\n".join(report_context)
+        )
+        if verdict.violated:
+            confidence = (
+                f"，置信 {verdict.confidence:.2f}" if verdict.confidence else ""
+            )
+            check_summary = f"模型判定「违规」{confidence}｜{verdict.reason}"
+        elif verdict.conclusive:
+            check_summary = f"模型判定「未违规」｜{verdict.reason}"
+        else:
+            check_summary = "模型复核没有给出明确结论（可能漏判，请人工判断）"
+    except Exception:
+        log.warning("[%s] /report re-check failed", group_id, exc_info=True)
+        check_summary = "模型复核暂时不可用，请管理员人工判断"
+    await session.commit()
+
+    sent = await send_member_report_notice(
+        message.bot,
+        session,
+        settings,
+        group_id=group_id,
+        reporter_id=reporter_id,
+        reporter_name=reporter_name,
+        reported_text=reported,
+        reason=reason,
+        check_summary=check_summary,
+        group_settings=group_settings,
+    )
+    if sent:
+        _report_cooldown[(group_id, reporter_id)] = time.monotonic()
+        log.info(
+            "member report accepted | group=%s user=%s violated=%s",
+            group_id,
+            reporter_id,
+            check_summary,
+        )
+        await _answer(message, settings, "<b>已受理举报</b>\n已转交管理员复核，请等管理员处理。")
+        return
+    await _answer(
+        message,
+        settings,
+        "暂时没能通知到管理员，请直接 @admin 描述一下情况。",
+    )
+
+
+# 签到：群友发的那条命令 2 秒后清掉，回执 5 秒后消失（用户指定）。
+# 时长改动只动这两行。
+CHECKIN_COMMAND_DELETE_SECONDS = 2
+CHECKIN_RECEIPT_SECONDS = 5
+
+
+async def _schedule_checkin_command_cleanup(message: Message, group_id: int) -> None:
+    """删掉群友发的那条 /checkin 命令本身。
+
+    走 durable 调度器（写入 telegram_delete_jobs），所以重启不会把这条待删任务丢掉；
+    调度器不健康时只记日志——签到已经记上了，不能因为清理失败就报错给用户。
+    """
+
+    try:
+        accepted = await schedule_message_auto_delete_durable(
+            message, CHECKIN_COMMAND_DELETE_SECONDS
+        )
+    except Exception:
+        log.warning(
+            "[%s] checkin command cleanup scheduling failed", group_id, exc_info=True
+        )
+        return
+    if not accepted:
+        log.warning(
+            "[%s] checkin command cleanup rejected | message=%s",
+            group_id,
+            getattr(message, "message_id", "?"),
+        )
+
+
+@router.message(Command("checkin"))
+async def cmd_checkin(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """每日签到：一个成员在一个群里一天只能记一次分。
+
+    去重靠 member_checkins 的唯一索引（见 bot/services/checkin.py），所以重复点
+    不会多加分；回执文案把"今天签过了"和"签到成功"分开说清楚。
+    """
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    user = getattr(message, "from_user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return
+
+    group_id = int(message.chat.id)
+    outcome = await record_checkin(
+        session,
+        group_id=group_id,
+        user_id=int(user.id),
+        display_name=str(getattr(user, "full_name", "") or ""),
+    )
+    await session.commit()
+    if outcome.already:
+        log.info("checkin repeated | group=%s user=%s", group_id, user.id)
+        await _schedule_checkin_command_cleanup(message, group_id)
+        await _answer(
+            message,
+            settings,
+            "<b>今天已经签过了</b>\n"
+            f"可用 <b>{outcome.available_points}</b> 分｜连续 {outcome.streak} 天"
+            f"｜共签到 {outcome.total_days} 天\n"
+            f"明天 0 点后再来，可得 +{outcome.next_award} 分。",
+            auto_delete_seconds=CHECKIN_RECEIPT_SECONDS,
+        )
+        return
+    log.info(
+        "checkin recorded | group=%s user=%s total=%s streak=%s",
+        group_id,
+        user.id,
+        outcome.total_points,
+        outcome.streak,
+    )
+    await _schedule_checkin_command_cleanup(message, group_id)
+    await _answer(
+        message,
+        settings,
+        f"<b>签到成功 · 第 {outcome.streak} 天 +{outcome.points_awarded} 分</b>\n"
+        f"可用 <b>{outcome.available_points}</b> 分｜连续 {outcome.streak} 天"
+        f"｜共签到 {outcome.total_days} 天\n"
+        + (
+            "已连续 10 天以上，每天都是满额 +10 分。"
+            if outcome.capped
+            else f"明天签到可得 +{outcome.next_award} 分。"
+        ),
+        auto_delete_seconds=CHECKIN_RECEIPT_SECONDS,
+    )
+
+
+@router.message(Command("points"))
+async def cmd_points(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """查看自己的签到积分（只读，不签到）。"""
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return
+
+    outcome = await summarize(
+        session, group_id=int(message.chat.id), user_id=int(user.id)
+    )
+    await session.commit()
+    today_line = (
+        f"今日已签到（连续 {outcome.streak} 天，下次可得 +{outcome.next_award} 分）"
+        if outcome.already
+        else f"今日未签到，发送 /checkin 可得 +{outcome.next_award} 分"
+    )
+    spent_line = (
+        f"｜累计获得 {outcome.total_points} 分，已消耗 {outcome.spent_points} 分"
+        if outcome.spent_points
+        else ""
+    )
+    await _answer(
+        message,
+        settings,
+        "<b>我的积分</b>\n"
+        f"可用 <b>{outcome.available_points}</b> 分{spent_line}\n"
+        f"连续 {outcome.streak} 天｜共签到 {outcome.total_days} 天\n"
+        f"{today_line}\n"
+        f"广告质询时可用 {CHALLENGE_SKIP_COST} 积分直接免除。",
+    )
+
+
+_RANK_MEDALS = ("🥇", "🥈", "🥉")
+
+
+def _rank_wants_week(message: Message) -> bool:
+    """``/rank week`` 看本周榜；其它参数（含 ``/rank@bot week``）只看有没有 week。"""
+
+    text = str(getattr(message, "text", "") or "")
+    argument = text.partition(" ")[2].strip().lower()
+    return bool(argument) and argument.split()[0] == "week"
+
+
+def _render_rank_board(board: RankBoard) -> str:
+    """积分榜文案：前三名挂奖牌，末尾一行总是自己的名次（不在榜内也显示）。"""
+
+    if board.mode == "week":
+        title = "本周积分榜"
+        empty = "本群本周还没有人签到，发送 /checkin 抢第一。"
+    else:
+        title = "本群积分榜"
+        empty = "本群还没有人签到，发送 /checkin 抢第一。"
+
+    if not board.has_data:
+        return f"<b>{title}</b>\n{empty}"
+
+    lines = [f"<b>{title}</b>"]
+    for index, entry in enumerate(board.entries):
+        medal = _RANK_MEDALS[index] if index < len(_RANK_MEDALS) else f"{index + 1}."
+        lines.append(f"{medal} {html.escape(entry.display_name)} · {entry.points} 分")
+
+    mine = f"你：第 {board.caller_rank} 名 · 可用 {board.caller_available} 分"
+    if board.mode == "week":
+        mine += f"（本周 +{board.caller_points} 分）"
+    lines.append(mine)
+    return "\n".join(lines)
+
+
+def _render_member_profile(profile: MemberProfile) -> str:
+    """个人档案文案：积分、签到、违规、封禁一次说清；被封禁时加粗提醒。"""
+
+    spent = (
+        f"（累计获得 {profile.total_points} 分，已消耗 {profile.spent_points} 分）"
+        if profile.spent_points
+        else ""
+    )
+    today_line = (
+        f"今日已签到，明天可得 +{profile.next_award} 分。"
+        if profile.signed_today
+        else f"今日还没签到，发送 /checkin 可得 +{profile.next_award} 分。"
+    )
+    lines = [
+        "<b>我的档案</b>",
+        f"可用积分：<b>{profile.available_points}</b> 分{spent}",
+        f"连续签到：{profile.streak} 天｜累计签到：{profile.total_days} 天",
+        today_line,
+        f"违规记录：累计 {profile.warning_count} 次"
+        f"｜近 {profile.window_days} 天被审核命中 {profile.recent_violations} 次",
+    ]
+    if profile.banned:
+        lines.append("<b>你目前在封禁名单里，请联系管理员处理。</b>")
+    return "\n".join(lines)
+
+
+@router.message(Command("rank"))
+async def cmd_rank(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """本群积分榜 Top10（只读）：默认按可用积分，``/rank week`` 按本周获得积分。"""
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return
+
+    board = await build_rank_board(
+        session,
+        group_id=int(message.chat.id),
+        user_id=int(user.id),
+        week=_rank_wants_week(message),
+    )
+    await session.commit()
+    await _answer(message, settings, _render_rank_board(board))
+
+
+@router.message(Command("me"))
+async def cmd_me(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """个人档案（只读）：积分、签到、违规与封禁状态。"""
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return
+
+    profile = await member_profile(
+        session, group_id=int(message.chat.id), user_id=int(user.id)
+    )
+    await session.commit()
+    await _answer(message, settings, _render_member_profile(profile))
+
+
+@router.message(Command("find"))
+async def cmd_find(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Search this group's retained archive (the same recall the bot uses)."""
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    query = str(message.text or "").partition(" ")[2].strip()
+    if len(query) < 2:
+        await _answer(
+            message,
+            settings,
+            "<b>/find 用法</b>\n/find &lt;关键词&gt;\n\n"
+            "在当前群的保留期聊天记录里找你需要的消息（默认 5 条）。",
+        )
+        return
+
+    memory = memory_holder.get_optional()
+    if memory is None:
+        await _answer(message, settings, "记忆服务还没就绪，稍后再试。")
+        return
+    await session.commit()
+    try:
+        hits = await memory.recall_archive(
+            int(message.chat.id), query=query, limit=5
+        )
+    except Exception:
+        log.warning("[%s] /find recall failed", message.chat.id, exc_info=True)
+        await _answer(message, settings, "搜索暂时不可用，稍后再试。")
+        return
+
+    if not hits:
+        await _answer(
+            message,
+            settings,
+            f"没找到与「{html.escape(query)}」匹配的消息（只搜当前群、保留期内的记录）。",
+        )
+        return
+
+    lines = [f"<b>群内搜索</b> · 「{html.escape(query)}」"]
+    for index, row in enumerate(hits, start=1):
+        content = " ".join(
+            str(
+                row.get("content") or row.get("raw_text") or row.get("derived_text") or ""
+            ).split()
+        )
+        if not content:
+            content = f"[{row.get('message_type') or '非文本消息'}]"
+        body = content if len(content) <= 90 else content[:89] + "…"
+        when = str(row.get("sent_at") or "")[5:16]
+        who = str(
+            row.get("sender_name")
+            or row.get("sender_display_name")
+            or row.get("sender_username")
+            or "未知"
+        )
+        lines.append(f"{index}. <code>{when}</code> {html.escape(who)}：{html.escape(body)}")
+    lines.append("\n<i>最多列出 5 条，按相关度排序。</i>")
+    await _answer(message, settings, "\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("health"))
+async def cmd_health(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """One-command operations snapshot for this group (admins)."""
+
+    from sqlalchemy import text
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+    group_id = int(message.chat.id)
+    await session.commit()
+
+    # violations.created_at is UTC while the archive's sent_at is Shanghai
+    # local: window each on its own clock instead of feeding both one boundary.
+    utc_cutoff = now_shanghai_naive().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - timedelta(hours=8)
+    try:
+        rule_rows = (
+            await session.execute(
+                text(
+                    "select rule_id, count(*) from violations "
+                    "where group_id = :gid and created_at >= :cutoff "
+                    "group by rule_id order by rule_id"
+                ),
+                {"gid": group_id, "cutoff": utc_cutoff},
+            )
+        ).all()
+        pending_rows = (
+            await session.execute(
+                text(
+                    "select kind, count(*) from join_verifications "
+                    "where group_id = :gid and status = 'pending' group by kind"
+                ),
+                {"gid": group_id},
+            )
+        ).all()
+        archive_rows = (
+            await session.execute(
+                text(
+                    "select count(*) from group_message_archive where group_id = :gid"
+                ),
+                {"gid": group_id},
+            )
+        ).scalar_one()
+        today_senders = (
+            await session.execute(
+                text(
+                    "select count(distinct sender_id) from group_message_archive "
+                    "where group_id = :gid and sent_at >= :since"
+                ),
+                {"gid": group_id, "since": utc_cutoff + timedelta(hours=8)},
+            )
+        ).scalar_one()
+    except Exception:
+        log.warning("[%s] /health query failed", group_id, exc_info=True)
+        await _answer(message, settings, "统计暂时不可用，稍后再试。")
+        return
+    await session.commit()
+
+    rule_map = {1: "语义审核", 4: "本地正则"}
+    hits = "、".join(
+        f"{rule_map.get(int(rid), '规则' + str(rid))} {int(count)} 次"
+        for rid, count in rule_rows
+    ) or "0 次"
+    pending = "、".join(f"{kind} {int(count)}" for kind, count in pending_rows) or "无"
+    memory_ready = "正常" if memory_holder.get_optional() is not None else "未就绪"
+    routing = "、".join(
+        f"{stage}={getattr(getattr(settings.bot, attr), 'model', '?')}"
+        for stage, attr in (
+            ("闲聊", "main_model"),
+            ("决策", "decision_model"),
+            ("审核", "moderation_model"),
+            ("技能", "skill_model"),
+            ("看图", "vision_model"),
+            ("压缩", "compress_model"),
+        )
+    )
+    await _answer(
+        message,
+        settings,
+        "<b>运行状态</b>\n"
+        f"今日审核命中：{hits}\n"
+        f"待完成质询：{pending}\n"
+        f"今日活跃成员：{int(today_senders)} 人\n"
+        f"归档消息：{int(archive_rows)} 条\n"
+        f"记忆服务：{memory_ready}\n"
+        f"<i>{html.escape(routing)}</i>",
+        auto_delete_seconds=0,
+    )

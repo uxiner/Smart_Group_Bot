@@ -11,12 +11,24 @@ from types import SimpleNamespace
 
 from aiogram import F, Router
 from aiogram.filters import IS_NOT_MEMBER, IS_MEMBER, ChatMemberUpdatedFilter
-from aiogram.types import CallbackQuery, ChatMemberUpdated, Update
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import AuthorizedGroup, Group, JoinVerification, UserWarning
+from bot.db.models import (
+    AuthorizedGroup,
+    Group,
+    JoinVerification,
+    UserWarning,
+    Violation,
+)
 from bot.services.admin_status import invalidate_admin_status_cache
 from bot.services.authz import (
     is_group_authorized,
@@ -34,13 +46,20 @@ from bot.services.join_screening import (
     profile_screen_signature,
     screen_member_profile_verbose,
 )
+from bot.services.checkin import (
+    CHALLENGE_SKIP_COST,
+    SPEND_REASON_CHALLENGE,
+    spend_points,
+)
 from bot.services.join_verification import (
     PATROL_VERIFY_CALLBACK_DATA,
     RAID_VERIFY_CALLBACK_DATA,
     TERMINAL_LEASE_SECONDS,
+    VERIFICATION_CALLBACK_APPEAL,
     VERIFICATION_CALLBACK_APPROVE,
     VERIFICATION_CALLBACK_PREFIX,
     VERIFICATION_CALLBACK_REJECT,
+    VERIFICATION_CALLBACK_SPEND,
     VERIFICATION_CALLBACK_START,
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
@@ -56,6 +75,7 @@ from bot.services.join_verification import (
     ban_member_result,
     build_profile_screening_ban_notice,
     build_group_prompt_keyboard,
+    build_verification_callback_data,
     build_group_prompt_text,
     build_verification_progress_text,
     build_private_deep_link,
@@ -103,6 +123,8 @@ from bot.services.message_templates import (
     card_field,
     render_progress_notice,
 )
+from bot.services.ban_audit import record_ban_event
+from bot.services.moderation_context import build_moderation_context
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.services.raid_guard import (
@@ -1558,6 +1580,299 @@ async def _handle_verification_start_callback(
     )
 
 
+async def _moderation_appeal_context(
+    session: AsyncSession, group_id: int, user_id: int
+) -> tuple[str, bool]:
+    """(最近一次被判违规的原文, 今天是否还有其他命中)。
+
+    命中文本存在 violations 表里，是复核唯一可靠的输入：触发时那条群消息
+    已经被流水线删掉了。同一天内多次命中的账号不自动放行，避免"发广告→申诉→
+    模型偶尔看走眼→原地复活"被反复利用。
+    """
+
+    rows = (
+        (
+            await session.execute(
+                select(Violation)
+                .where(
+                    Violation.group_id == int(group_id),
+                    Violation.user_id == int(user_id),
+                )
+                .order_by(Violation.id.desc())
+                .limit(6)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return "", False
+    original = str(rows[0].message_text or "").strip()
+    # violations.created_at 是 UTC，本地时间要减 8 小时再比
+    utc_cutoff = now_shanghai_naive() - timedelta(hours=8 + 24)
+    repeats = any(
+        row.created_at is not None and row.created_at >= utc_cutoff
+        for row in rows[1:]
+    )
+    return original, repeats
+
+
+async def _latest_violation_id(
+    session: AsyncSession, group_id: int, user_id: int
+) -> int | None:
+    """该成员在本群最近一次审核命中的记录号（用作审计事件的引用）。"""
+
+    result = await session.execute(
+        select(Violation.id)
+        .where(
+            Violation.group_id == int(group_id),
+            Violation.user_id == int(user_id),
+        )
+        .order_by(Violation.id.desc())
+        .limit(1)
+    )
+    row_id = result.scalar_one_or_none()
+    return int(row_id) if row_id is not None else None
+
+
+async def _record_moderation_cleared(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    source: str,
+    reason: str = "",
+    actor_user_id: int = 0,
+    actor_display: str = "",
+) -> None:
+    """记一条"审核命中最终被判为误伤/放行"的审计事实。
+
+    误伤率报表靠这张账本，而不是靠日志——日志会滚，报表要长期能算。
+    写失败只记日志，绝不影响放行本身。
+    """
+
+    try:
+        reference_id = await _latest_violation_id(session, group_id, user_id)
+        await record_ban_event(
+            session,
+            group_id=int(group_id),
+            target_user_id=int(user_id),
+            action="clear",
+            source=str(source or "unknown")[:64],
+            outcome="cleared",
+            reason=str(reason or "")[:200],
+            actor_user_id=int(actor_user_id or 0),
+            actor_display=str(actor_display or "")[:255],
+            reference_type="violation",
+            reference_id=int(reference_id or 0),
+        )
+    except Exception:
+        log.warning(
+            "moderation clear audit failed | group=%s user=%s source=%s",
+            group_id,
+            user_id,
+            source,
+            exc_info=True,
+        )
+
+
+async def _review_moderation_appeal(
+    session: AsyncSession, settings: Settings, group_id: int, text: str
+) -> tuple[object, str]:
+    """用审核模型对被申诉的原文再判一次，返回 (verdict, 给人看的结论)。"""
+
+    if not text.strip():
+        return None, "找不到原始消息文本，无法自动复核"
+    from bot.services.moderation import ModerationService
+
+    # 复核的是历史消息：按这条消息在归档里的位置取它之前的对话，
+    # 免得模型又只看这一句、重复第一次的误判。
+    context_lines, _block = await build_moderation_context(
+        session, group_id=int(group_id), anchor_text=text, exclude_text=text
+    )
+    try:
+        moderation = ModerationService(settings.moderation, _build_llm(settings))
+        verdict = await moderation.evaluate(
+            session, int(group_id), text, context="\n".join(context_lines)
+        )
+    except Exception:
+        log.warning("moderation appeal recheck failed | group=%s", group_id, exc_info=True)
+        return None, "模型复核暂时不可用，请管理员人工判断"
+    if verdict.violated:
+        confidence = f"，置信 {verdict.confidence:.2f}" if verdict.confidence else ""
+        return verdict, f"模型二次复核仍判「违规」{confidence}｜{verdict.reason}"
+    if verdict.conclusive:
+        return verdict, f"模型二次复核判「未违规」｜{verdict.reason}"
+    # 空回复/不可解析时 conclusive=False：绝不能当成"没问题"直接放人
+    return verdict, "模型二次复核没有给出明确结论，请管理员人工判断"
+
+
+async def _handle_verification_spend_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    target_user_id: int,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """「消耗 N 积分免除质询」：先扣分，再走放行链路。
+
+    扣分带幂等键 ``challenge:<质询ID>``（唯一索引），连点两次按钮只会扣一次。
+    余额在点按钮的这一刻再查一遍：卡片是几分钟前发的，这期间分可能已经花掉。
+    """
+
+    operator = callback.from_user
+    if operator is None or int(operator.id) != target_user_id:
+        await _ack_security_callback(
+            callback, "仅被质询的成员本人可以点击", show_alert=True
+        )
+        return
+
+    record = await _verification_callback_record(callback, session, target_user_id)
+    if record is None:
+        return
+    if str(record.kind or "") != VERIFICATION_KIND_MODERATION:
+        await _ack_security_callback(callback, "该验证不支持积分免除", show_alert=True)
+        return
+
+    group_id = int(record.group_id)
+    cost = CHALLENGE_SKIP_COST
+    charged = await spend_points(
+        session,
+        group_id=group_id,
+        user_id=target_user_id,
+        points=cost,
+        reason=SPEND_REASON_CHALLENGE,
+        ref=f"challenge:{int(record.id)}",
+    )
+    await session.commit()
+    if not charged:
+        log.info(
+            "moderation challenge skip refused | group=%s user=%s cost=%s",
+            group_id,
+            target_user_id,
+            cost,
+        )
+        await _ack_security_callback(
+            callback,
+            f"积分不足 {cost} 分，请完成人机验证",
+            show_alert=True,
+        )
+        return
+
+    log.info(
+        "moderation challenge skipped with points | group=%s user=%s cost=%s",
+        group_id,
+        target_user_id,
+        cost,
+    )
+    # 扣分和放行共用管理员"通过"那条链路：lease、恢复权限、终态落库、补偿重试都在那一处
+    await _handle_verification_admin_callback(
+        callback,
+        session,
+        settings,
+        action=VERIFICATION_CALLBACK_APPROVE,
+        target_user_id=target_user_id,
+        session_factory=session_factory,
+        system_override=True,
+        system_points=cost,
+    )
+
+
+async def _handle_verification_appeal_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    target_user_id: int,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """「复核 / 开始验证」：先让审核模型重判一次，再决定放行还是继续质询。
+
+    判定为正常（模型明确说未违规、且该成员当天没有别的命中）→ 直接恢复发言，
+    不打扰管理员；其余情况（仍判违规、结论不明确、一天内多次命中、找不到原文）
+    一律走原有质询流程——送本人去做人机验证，超时照旧封禁。管理员那条路
+    （管理员通过 / 管理员拒绝）不受影响，两条路谁先到算谁。
+    """
+
+    operator = callback.from_user
+    if operator is None or int(operator.id) != target_user_id:
+        await _ack_security_callback(
+            callback, "仅被质询的成员本人可以点击", show_alert=True
+        )
+        return
+
+    record = await _verification_callback_record(callback, session, target_user_id)
+    if record is None:
+        return
+    if str(record.kind or "") != VERIFICATION_KIND_MODERATION:
+        await _ack_security_callback(callback, "该验证不支持复核", show_alert=True)
+        return
+
+    group_id = int(record.group_id)
+    original_text, repeats = await _moderation_appeal_context(
+        session, group_id, target_user_id
+    )
+    await session.commit()
+
+    verdict, check_summary = await _review_moderation_appeal(
+        session, settings, group_id, original_text
+    )
+    await session.commit()
+
+    if (
+        verdict is not None
+        and not verdict.violated
+        and verdict.conclusive
+        and not repeats
+        and original_text
+    ):
+        log.info(
+            "moderation recheck cleared the member | group=%s user=%s | %s",
+            group_id,
+            target_user_id,
+            check_summary,
+        )
+        await _record_moderation_cleared(
+            session,
+            group_id=group_id,
+            user_id=target_user_id,
+            source="appeal_recheck",
+            reason=check_summary,
+            actor_user_id=int(getattr(callback.from_user, "id", 0) or 0),
+        )
+        await session.commit()
+        await _handle_verification_admin_callback(
+            callback,
+            session,
+            settings,
+            action=VERIFICATION_CALLBACK_APPROVE,
+            target_user_id=target_user_id,
+            session_factory=session_factory,
+            system_override=True,
+        )
+        return
+
+    # Still a violation, or the model would not commit: keep the challenge and
+    # send the member into the ordinary human verification.
+    log.info(
+        "moderation recheck kept the challenge | group=%s user=%s | repeats=%s | %s",
+        group_id,
+        target_user_id,
+        repeats,
+        check_summary,
+    )
+    username = await _callback_bot_username(callback)
+    if not username:
+        await _ack_security_callback(
+            callback, "验证入口暂时不可用，请稍后重试", show_alert=True
+        )
+        return
+    await callback.answer(
+        url=build_private_deep_link(username, group_id),
+    )
+
+
 async def _handle_verification_admin_callback(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -1566,7 +1881,17 @@ async def _handle_verification_admin_callback(
     action: str,
     target_user_id: int,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    system_override: bool = False,
+    system_points: int = 0,
 ) -> None:
+    """Apply one admin decision to a pending verification.
+
+    ``system_override`` marks the caller as the bot itself (the false-positive
+    appeal path already authenticated the member): the operator-permission gate
+    is skipped, and the card/ack wording says the re-check cleared them instead
+    of naming an administrator. Everything else — leasing, permission restore,
+    terminal completion, compensation — stays on this one implementation.
+    """
     message = callback.message
     chat = getattr(message, "chat", None)
     operator = callback.from_user
@@ -1583,7 +1908,7 @@ async def _handle_verification_admin_callback(
     if not authorized:
         await _ack_security_callback(callback, "当前群组未授权", show_alert=True)
         return
-    if not await is_group_admin_or_higher(
+    if not system_override and not await is_group_admin_or_higher(
         bot=callback.bot,
         session=session,
         settings=settings,
@@ -1780,29 +2105,72 @@ async def _handle_verification_admin_callback(
                 show_alert=True,
             )
             return
-        approved_text = build_verification_progress_text(
-            kind=kind,
-            status="已通过",
-            completed="已由管理员确认",
-            current="发言权限已恢复",
-            action=(
-                f"<b>{shown}</b> 已由管理员直接通过消息审查验证。"
-                if kind == VERIFICATION_KIND_MODERATION
-                else f"<b>{shown}</b> 已由管理员直接通过入群验证。"
-            ),
-            details=(
-                None
-                if kind == VERIFICATION_KIND_MODERATION
-                else "欢迎加入。"
-            ),
-        )
+        # 放行就等于"这次命中是误伤"：记进审计账本，撑起误伤率报表。
+        # 花积分免除不算误伤（那是当事人自己选择的权益）。
+        if system_points <= 0:
+            operator = callback.from_user
+            await _record_moderation_cleared(
+                session,
+                group_id=int(getattr(record, "group_id", 0) or 0),
+                user_id=target_user_id,
+                source="appeal_recheck" if system_override else "admin_review",
+                reason="复核判为正常消息" if system_override else "管理员判定放行",
+                actor_user_id=int(getattr(operator, "id", 0) or 0),
+                actor_display=str(getattr(operator, "full_name", "") or ""),
+            )
+        if system_override:
+            # system_points>0：这是"花积分免除质询"，文案要说清分被扣了、质询结束了
+            if system_points > 0:
+                completed_label = f"已消耗 {system_points} 积分免除质询"
+                action_line = (
+                    f"<b>{shown}</b> 消耗 {system_points} 积分免除了本次质询，"
+                    "发言权限已恢复。"
+                )
+            else:
+                completed_label = "复核为正常消息"
+                action_line = (
+                    f"<b>{shown}</b> 的消息经机器人复核为正常消息，已恢复发言权限。"
+                )
+            approved_text = build_verification_progress_text(
+                kind=kind,
+                status="已通过",
+                completed=completed_label,
+                current="发言权限已恢复",
+                action=action_line,
+                details="管理员无需再处理。",
+            )
+        else:
+            approved_text = build_verification_progress_text(
+                kind=kind,
+                status="已通过",
+                completed="已由管理员确认",
+                current="发言权限已恢复",
+                action=(
+                    f"<b>{shown}</b> 已由管理员直接通过消息审查验证。"
+                    if kind == VERIFICATION_KIND_MODERATION
+                    else f"<b>{shown}</b> 已由管理员直接通过入群验证。"
+                ),
+                details=(
+                    None
+                    if kind == VERIFICATION_KIND_MODERATION
+                    else "欢迎加入。"
+                ),
+            )
         await _edit_verification_prompt(callback, settings, text=approved_text)
         await close_private_challenge_message(
             callback.bot,
             target_user_id,
             int(snapshot.get("private_message_id") or 0),
         )
-        await _ack_security_callback(callback, "已直接通过验证")
+        if system_override:
+            ack_line = (
+                f"已消耗 {system_points} 积分，质询已免除"
+                if system_points > 0
+                else "复核为正常消息，已恢复发言权限"
+            )
+        else:
+            ack_line = "已直接通过验证"
+        await _ack_security_callback(callback, ack_line)
         if kind == VERIFICATION_KIND_JOIN:
             await send_group_welcome(
                 callback.bot,
@@ -1941,6 +2309,28 @@ async def on_verification_callback(
     action, target_user_id = parsed
     if action == VERIFICATION_CALLBACK_START:
         await _handle_verification_start_callback(callback, session, target_user_id)
+        return
+    if action == VERIFICATION_CALLBACK_SPEND:
+        # Answered by the challenged member, not an admin: this branch must sit
+        # before the administrator authorization gate below.
+        await _handle_verification_spend_callback(
+            callback,
+            session,
+            settings,
+            target_user_id,
+            session_factory=session_factory,
+        )
+        return
+    if action == VERIFICATION_CALLBACK_APPEAL:
+        # Answered by the challenged member, not an admin: this branch must sit
+        # before the administrator authorization gate below.
+        await _handle_verification_appeal_callback(
+            callback,
+            session,
+            settings,
+            target_user_id,
+            session_factory=session_factory,
+        )
         return
     if session_factory is None:
         await _handle_verification_admin_callback(

@@ -350,6 +350,18 @@ async def _sqlite_migrate_violation_rule_fk(conn) -> bool:
         "notice_sent_at",
         "notice_sent_at DATETIME",
     )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "confidence",
+        "confidence FLOAT",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "verdict_reason",
+        "verdict_reason VARCHAR(120) DEFAULT ''",
+    )
     columns = await _sqlite_table_columns(conn, "violations")
 
     orphan_result = await conn.execute(

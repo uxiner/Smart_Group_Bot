@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -413,6 +414,14 @@ class Violation(Base):
     # Count captured by the atomic warning transaction for this event.  It lets
     # retries render the original warning state without incrementing again.
     warning_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 判定细节：置信度与模型给的理由。误伤率报表要能回答"这次命中到底有多确定"，
+    # 靠日志不够（日志会滚），必须落库。历史行是 NULL（这一列是后加的）。
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # server_default 不能省：老代码/迁移测试会用裸 SQL 插入 violations，
+    # NOT NULL 而没有库级默认值会直接撞约束。
+    verdict_reason: Mapped[str] = mapped_column(
+        String(120), default="", server_default=""
+    )
     # NULL means a threshold/sender-chat ban has not completed its Telegram +
     # audit persistence stage.  False is an attempted but unconfirmed ban.
     ban_enforced: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
@@ -1032,3 +1041,62 @@ class StickerLibraryRecord(Base):
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (Index("ix_sticker_group_file", "group_id", "file_id", unique=True),)
+
+class MemberCheckin(Base):
+    """每日签到：一行 = 一个成员在一个本地自然日的一次签到。
+
+    "一天只能签一次"靠表上的唯一索引保证，不靠"先查到再插入"这种有竞态的写法：
+    并发点两次只有一条能落库，另一条撞 IntegrityError，我们把它翻译成"今天签过了"。
+    积分就是这张表的聚合（COUNT/SUM），没有会跟真实记录飘掉的计数器。
+    """
+
+    __tablename__ = "member_checkins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    # 本地（Asia/Shanghai）自然日 YYYY-MM-DD。用 UTC 会让 00:00-08:00 的签到
+    # 落到前一天，跨天判断直接错。
+    checkin_date: Mapped[str] = mapped_column(String(10))
+    # 预留：以后要做连续奖励/管理员补分，改这里即可，不用动表结构。
+    points: Mapped[int] = mapped_column(Integer, default=1)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_member_checkins_day",
+            "group_id",
+            "user_id",
+            "checkin_date",
+            unique=True,
+        ),
+    )
+
+class MemberPointSpend(Base):
+    """积分消费台账：一行 = 一次扣分（目前只有"消耗积分免除质询"）。
+
+    和 member_checkins 一样是 append-only：可用积分 = 签到的 SUM(points) 减去
+    这张表的 SUM(points)。不设"余额"列，避免余额和流水对不上。
+    """
+
+    __tablename__ = "member_point_spends"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    points: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    # 幂等键：同一次质询只能扣一次（重复点按钮时唯一索引会挡住第二条）
+    ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_member_point_spends_ref",
+            "group_id",
+            "user_id",
+            "ref",
+            unique=True,
+        ),
+    )
