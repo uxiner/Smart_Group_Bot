@@ -123,6 +123,7 @@ from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.member_identity import member_display_name
 from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
+from bot.services.moderation_context import build_moderation_context
 from bot.services.moderation import ModerationVerdict
 from bot.services.notification_pins import unpin_notification_message
 from bot.services.reply_mode import ReplyModeService
@@ -165,8 +166,10 @@ from bot.utils.telegram import (
 
 router = Router()
 log = logging.getLogger(__name__)
+_OWNER_ADDRESS_TERMS = ("亲爱的", "主人")
 _OWNER_SALUTATION_RE = re.compile(
-    r"^\s*(?:(?:好(?:的)?|嗯|嗨|嘿|哈喽|收到|明白|行|是的|当然|ok)\s*)?主人(?:[，,：:!！。\s]|$)+",
+    r"^\s*(?:(?:好(?:的)?|嗯|嗨|嘿|哈喽|收到|明白|行|是的|当然|ok)\s*)?"
+    r"(?:亲爱的|主人)(?:[，,：:!！。\s]|$)+",
     re.IGNORECASE,
 )
 _SILENT_REPLY_MARKERS = {
@@ -726,10 +729,12 @@ def _build_warn_target(
 
 
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
-    """Avoid misaddressing non-owner users as '主人'."""
+    """Avoid misaddressing non-owner users as '亲爱的' (retired '主人' included)."""
     if sender_is_owner:
         return reply
-    if "主人" not in reply:
+    # Both terms must be able to reach the stripper: the early return used to
+    # check only '主人', so a reply opening with '亲爱的' kept the salutation.
+    if not any(term in reply for term in _OWNER_ADDRESS_TERMS):
         return reply
 
     cleaned = _OWNER_SALUTATION_RE.sub("", reply, count=1).lstrip()
@@ -1058,6 +1063,8 @@ async def _screen_bot_sender_message(
                 "bot_ban",
                 rule,
                 source_message_id=_source_message_id(message),
+                confidence=_verdict_confidence(verdict),
+                verdict_reason=_verdict_reason(verdict),
             )
             await session.flush()
             prior_ban_result = _violation_nullable_bool(
@@ -1278,6 +1285,8 @@ async def _screen_bot_sender_message(
                 rule_action,
                 rule,
                 source_message_id=_source_message_id(message),
+                confidence=_verdict_confidence(verdict),
+                verdict_reason=_verdict_reason(verdict),
             )
             await session.flush()
             await session.commit()
@@ -1508,6 +1517,8 @@ async def _apply_counted_moderation_ban(
                 input_text,
                 "ban_applied" if should_ban else "ban_warning",
                 rule,
+                confidence=_verdict_confidence(verdict),
+                verdict_reason=_verdict_reason(verdict),
             )
             violation.warning_count = int(count)
             violation.action_taken = "ban_applied" if should_ban else "ban_warning"
@@ -1532,6 +1543,8 @@ async def _apply_counted_moderation_ban(
                 "ban_warning",
                 rule,
                 source_message_id=source_message_id,
+                confidence=_verdict_confidence(verdict),
+                verdict_reason=_verdict_reason(verdict),
             )
             created = _violation_event_created(violation)
             stored_count = getattr(violation, "warning_count", None)
@@ -5872,6 +5885,36 @@ async def flush_pending_inbound_batches() -> None:
     | F.video_note
     | F.contact
 )
+
+def _verdict_confidence(verdict: object) -> float | None:
+    """置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。"""
+
+    value = getattr(verdict, "confidence", None)
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _verdict_reason(verdict: object) -> str:
+    """判定理由（同样容忍 verdict 为 None）。"""
+
+    return str(getattr(verdict, "reason", "") or "")
+
+
+def _moderation_reply_text(message: Message) -> str | None:
+    """被回复消息的正文（回复对象人是谁不重要，重要的是他在说什么）。"""
+
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        return None
+    for attr in ("text", "caption"):
+        value = getattr(reply, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
 async def on_group_message(
     message: Message,
     session: AsyncSession,
@@ -6128,7 +6171,22 @@ async def on_group_message(
         # patrol; ordinary messages are moderated on their content alone.
 
         if not auto_exempt_moderation and not manual_exempt:
-            verdict = await mod.evaluate(session, group_id, input_text)
+            # 孤立地看一条消息，群里的日常话题词很容易被读成引流。把这条之前的群内对话
+            # （以及它回复的那条消息）一起送审，模型才能分清"群友在聊天"和"有人在推销"。
+            moderation_context, _block = await build_moderation_context(
+                session,
+                group_id=group_id,
+                exclude_message_id=getattr(message, "message_id", None),
+                exclude_text=text,
+                reply_to=_moderation_reply_text(message),
+            )
+            moderation_context_text = "\n".join(moderation_context)
+            context_kwargs = (
+                {"context": moderation_context_text} if moderation_context_text else {}
+            )
+            verdict = await mod.evaluate(
+                session, group_id, input_text, **context_kwargs
+            )
             violated = verdict.violated
             reason = verdict.reason
             rule = verdict.rule
@@ -6149,7 +6207,53 @@ async def on_group_message(
 
                 message_deleted = False
                 high_confidence = mod.is_high_confidence(verdict)
-                if not high_confidence:
+                if action == "ban" and not high_confidence:
+                    # A marginal verdict is close to a coin flip: the model
+                    # returned violated=True with a confidence below the
+                    # high-confidence threshold, and re-reading the *same*
+                    # payload often flips it (measured: a client-screenshot
+                    # description scored 0.70 and passed twice on identical
+                    # re-runs).  A ban-rule hit costs the sender their speaking
+                    # rights, so ask once more and act only when the second
+                    # verdict agrees.  High-confidence hits (regex rules at 1.00,
+                    # confident semantic ads) are unaffected and never pay the
+                    # extra call.
+                    confirmation = await mod.evaluate(
+                        session, group_id, input_text, **context_kwargs
+                    )
+                    if not (confirmation.violated and confirmation.conclusive):
+                        log.info(
+                            "[%s]【流程】审核 | 边缘判定复核未确认，不处理 | user=%s | "
+                            "首次=%.2f 复核=%.2f 复核违规=%s | %s | 耗时=%dms",
+                            group_id,
+                            user_id,
+                            verdict.confidence,
+                            confirmation.confidence,
+                            confirmation.violated,
+                            (confirmation.reason or "")[:60],
+                            int((time.perf_counter() - moderation_started) * 1000),
+                        )
+                        return
+                    log.info(
+                        "[%s]【流程】审核 | 边缘判定经复核确认 | user=%s | 首次=%.2f 复核=%.2f",
+                        group_id,
+                        user_id,
+                        verdict.confidence,
+                        confirmation.confidence,
+                    )
+                # A `ban` rule hit from a real user always takes the
+                # mute+challenge path immediately: the offending message is
+                # deleted, the sender is restricted to read-only, and the Mini
+                # App challenge decides whether the restriction is lifted or the
+                # account is banned at the deadline.  Confidence no longer
+                # changes the outcome, only whether the verdict is usable, so a
+                # single advertisement costs the sender their speaking rights.
+                challenge_first = (
+                    action == "ban"
+                    and not sender_identity.is_chat
+                    and moderation_challenge_ready(settings)
+                )
+                if not high_confidence or challenge_first:
                     if not verdict.conclusive:
                         log.warning(
                             "[%s] inconclusive moderation confidence; no direct action | user=%s",
@@ -6175,6 +6279,8 @@ async def on_group_message(
                                     "challenge",
                                     rule,
                                     source_message_id=_source_message_id(message),
+                                    confidence=_verdict_confidence(verdict),
+                                    verdict_reason=_verdict_reason(verdict),
                                 )
                                 await session.flush()
                                 await session.commit()
@@ -6279,6 +6385,8 @@ async def on_group_message(
                             "ban_applied",
                             rule,
                             source_message_id=source_message_id,
+                            confidence=_verdict_confidence(verdict),
+                            verdict_reason=_verdict_reason(verdict),
                         )
                         flush = getattr(session, "flush", None)
                         if callable(flush):
@@ -6370,6 +6478,8 @@ async def on_group_message(
                             "warn",
                             rule,
                             source_message_id=_source_message_id(message),
+                            confidence=_verdict_confidence(verdict),
+                            verdict_reason=_verdict_reason(verdict),
                         )
                         await session.flush()
                         violation_id = int(violation.id)
@@ -6419,6 +6529,8 @@ async def on_group_message(
                             "delete",
                             rule,
                             source_message_id=_source_message_id(message),
+                            confidence=_verdict_confidence(verdict),
+                            verdict_reason=_verdict_reason(verdict),
                         )
                         await session.flush()
                         await session.commit()

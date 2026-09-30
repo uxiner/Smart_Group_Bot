@@ -217,26 +217,35 @@ class ModerationService:
         return result.scalar_one_or_none() is not None
 
     async def check_rules(
-        self, session: AsyncSession, group_id: int, text: str
+        self, session: AsyncSession, group_id: int, text: str, *, context: str = ""
     ) -> tuple[bool, str, ModerationRule | None]:
         """使用 LLM 基于群规则判定，返回(是否违规, 原因, 命中规则)。"""
-        verdict = await self.evaluate(session, group_id, text)
+        verdict = await self.evaluate(session, group_id, text, context=context)
         return verdict.violated, verdict.reason, verdict.rule
 
     async def check_rules_verbose(
-        self, session: AsyncSession, group_id: int, text: str
+        self, session: AsyncSession, group_id: int, text: str, *, context: str = ""
     ) -> tuple[bool, str, ModerationRule | None, bool]:
         """同 check_rules，但额外返回判定是否可信（conclusive）。"""
-        verdict = await self.evaluate(session, group_id, text)
+        verdict = await self.evaluate(session, group_id, text, context=context)
         return verdict.violated, verdict.reason, verdict.rule, verdict.conclusive
 
     async def evaluate(
-        self, session: AsyncSession, group_id: int, text: str
+        self,
+        session: AsyncSession,
+        group_id: int,
+        text: str,
+        *,
+        context: str = "",
     ) -> ModerationVerdict:
         """Evaluate deterministic rules locally and semantic rules with the LLM.
 
         审核模型输出不可解析时按不违规处理，但 conclusive=False，
-        调用方不应据此写入"已审查通过"类缓存。"""
+        调用方不应据此写入"已审查通过"类缓存。
+
+        ``context`` 是这条消息之前的群内对话（见 ``bot.services.moderation_context``）。
+        本地正则只匹配消息本身，上下文只交给语义规则——否则上下文里的广告词会算到别人头上。
+        """
         stmt = select(ModerationRule).where(
             ModerationRule.group_id == group_id,
             ModerationRule.enabled == True,
@@ -393,7 +402,17 @@ class ModerationService:
         system_prompt = build_defended_system(
             get_prompt("moderation").format(rules_json=rules_json)
         )
-        user_input = wrap_untrusted("待审核消息", clean_text(text, max_len=1200), max_len=1200)
+        clean_context = clean_text(context or "", max_len=1200)
+        if clean_context:
+            # 上下文同样是群成员写的，按不可信内容包裹，防止它夹带指令
+            user_input = (
+                f"{wrap_untrusted('群内上下文', clean_context, max_len=1200)}\n\n"
+                f"{wrap_untrusted('待审核消息', clean_text(text, max_len=1200), max_len=1200)}"
+            )
+        else:
+            user_input = wrap_untrusted(
+                "待审核消息", clean_text(text, max_len=1200), max_len=1200
+            )
         try:
             llm_raw = await self.llm.moderation(system_prompt, user_input)
         except Exception:
@@ -492,6 +511,8 @@ class ModerationService:
         rule: ModerationRule | None = None,
         *,
         source_message_id: int | None = None,
+        confidence: float | None = None,
+        verdict_reason: str = "",
     ) -> Violation:
         values = {
             "group_id": int(group_id),
@@ -499,6 +520,8 @@ class ModerationService:
             "rule_id": int(rule.id) if rule is not None and rule.id is not None else None,
             "message_text": str(text or "")[:500],
             "action_taken": str(action or "warn")[:32],
+            "confidence": None if confidence is None else round(float(confidence), 3),
+            "verdict_reason": str(verdict_reason or "")[:120],
         }
         normalized_source = int(source_message_id or 0)
         if normalized_source <= 0:

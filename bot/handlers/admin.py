@@ -25,12 +25,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import (
+    BotScreening,
     Group,
+    GroupMember,
     ModerationExemption,
     ModerationRule,
     ReplyMute,
     UserWarning,
 )
+from bot.services.quality_report import render_group_quality
 from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabled
 from bot.services.bot_screening import remove_bot_whitelist
 from bot.services.ban_audit import record_ban_event
@@ -112,6 +115,7 @@ from bot.utils.telegram import (
     configured_auto_delete_seconds,
     is_group,
     preserve_delete_button,
+    schedule_message_auto_delete_durable,
 )
 
 router = Router()
@@ -119,6 +123,9 @@ log = logging.getLogger(__name__)
 
 _MUTE_ALL_REPLIES_KEY = "mute_all_replies"
 _LIST_PAGE_SIZE = 5
+# `/exemptlist` in a group delivers the card to the operator's DM and leaves only
+# this one-line receipt behind; it removes itself so the group stays clean.
+_ROSTER_NOTICE_AUTO_DELETE_SECONDS = 5
 _LEGACY_ACTION_RESPONSE_RE = re.compile(
     r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
 )
@@ -670,6 +677,49 @@ def _build_rule_list_page(
         ),
         InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
     )
+
+
+async def _callback_user_can_manage_group(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    group_id: int,
+) -> bool:
+    """Authorize a roster callback against an explicit group id.
+
+    Roster cards are delivered to private chats, where `msg.chat.id` is the
+    operator's own user id and says nothing about the group being managed.
+    The target group therefore travels in the callback payload and every check
+    runs against it, exactly as `_callback_user_can_manage_rules` does for the
+    in-group lists.
+    """
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return False
+    if group_id == 0:
+        await callback.answer("参数错误", show_alert=True)
+        return False
+
+    authorized = await is_group_authorized(session, group_id)
+    await session.commit()
+    if not authorized:
+        await callback.answer("当前群组未授权", show_alert=True)
+        return False
+
+    user = callback.from_user
+    if user and is_super_admin_user_id(user.id, settings):
+        return True
+    if not user:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return False
+    locally_authorized = await is_group_admin_authorized(session, group_id, user.id)
+    await session.commit()
+    if locally_authorized:
+        return True
+
+    await callback.answer("仅群管理可操作该列表", show_alert=True)
+    return False
 
 
 async def _callback_user_can_manage_rules(
@@ -3862,6 +3912,42 @@ async def on_warnings_paging(
     await callback.answer()
 
 
+@router.message(Command("modstats"))
+async def cmd_modstats(
+    message: Message, session: AsyncSession, settings: Settings
+) -> None:
+    """审核质量报表：命中构成、边缘判定、被改判放行的（误伤）条数。
+
+    用法：``/modstats``（近 7 天）或 ``/modstats 30``（近 30 天）。
+    """
+
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    days = 7
+    parts = str(message.text or "").split()
+    if len(parts) > 1:
+        try:
+            days = max(1, min(90, int(parts[1])))
+        except ValueError:
+            days = 7
+    try:
+        text = await render_group_quality(
+            session, group_id=int(message.chat.id), days=days
+        )
+    except Exception:
+        log.warning(
+            "[%s] /modstats failed | days=%s", getattr(message.chat, "id", "?"), days,
+            exc_info=True,
+        )
+        await _answer(message, settings, "<b>报表生成失败</b>\n请稍后重试。")
+        return
+    await _commit_settings(session)
+    await _answer(message, settings, text)
+
+
 @router.message(Command("mute"))
 async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
@@ -4420,3 +4506,542 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
         f"<b>用户</b>: {_safe_user_label(target_id, target_name)}\n"
         f"<b>状态</b>: {'；'.join(status_lines)}"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ModerationRosterEntry:
+    kind: Literal["exempt", "bot", "mute"]
+    user_id: int
+    display_name: str
+    username: str
+    created_by: int
+    created_at_text: str
+
+
+def _roster_kind_label(kind: str) -> str:
+    return {
+        "exempt": "审核豁免",
+        "bot": "Bot 白名单",
+        "mute": "回复静默",
+    }.get(kind, kind)
+
+
+def _roster_button_label(entry: _ModerationRosterEntry) -> str:
+    prefix = {
+        "exempt": "取消豁免",
+        "bot": "撤销Bot白名单",
+        "mute": "解除静默",
+    }.get(entry.kind, "移除")
+    label = _truncate_text(entry.display_name or entry.username or "", 14)
+    if label:
+        return f"{prefix}: {label} ({entry.user_id})"
+    return f"{prefix}: {entry.user_id}"
+
+
+def _format_roster_time(value: object) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    text = str(value).strip()
+    return text[:16] if len(text) > 16 else text
+
+
+async def _load_moderation_roster(
+    session: AsyncSession,
+    group_id: int,
+) -> tuple[list[_ModerationRosterEntry], bool]:
+    exempt_rows = list(
+        (
+            await session.execute(
+                select(ModerationExemption)
+                .where(ModerationExemption.group_id == group_id)
+                .order_by(ModerationExemption.id.asc())
+            )
+        ).scalars().all()
+    )
+    bot_rows = list(
+        (
+            await session.execute(
+                select(BotScreening)
+                .where(
+                    BotScreening.group_id == group_id,
+                    BotScreening.whitelisted.is_(True),
+                )
+                .order_by(BotScreening.id.asc())
+            )
+        ).scalars().all()
+    )
+    mute_rows = list(
+        (
+            await session.execute(
+                select(ReplyMute)
+                .where(ReplyMute.group_id == group_id)
+                .order_by(ReplyMute.id.asc())
+            )
+        ).scalars().all()
+    )
+    group_row = await session.get(Group, group_id)
+    mute_all = bool((group_row.settings or {}).get(_MUTE_ALL_REPLIES_KEY, False)) if group_row else False
+
+    user_ids: set[int] = set()
+    for row in exempt_rows:
+        user_ids.add(int(row.user_id))
+    for row in bot_rows:
+        user_ids.add(int(row.bot_id))
+    for row in mute_rows:
+        user_ids.add(int(row.user_id))
+
+    profiles: dict[int, tuple[str, str]] = {}
+    if user_ids:
+        member_rows = list(
+            (
+                await session.execute(
+                    select(GroupMember).where(
+                        GroupMember.group_id == group_id,
+                        GroupMember.user_id.in_(sorted(user_ids)),
+                    )
+                )
+            ).scalars().all()
+        )
+        for member in member_rows:
+            profiles[int(member.user_id)] = (
+                (member.full_name or "").strip(),
+                (member.username or "").strip(),
+            )
+
+    entries: list[_ModerationRosterEntry] = []
+    for row in exempt_rows:
+        uid = int(row.user_id)
+        full_name, username = profiles.get(uid, ("", ""))
+        entries.append(
+            _ModerationRosterEntry(
+                kind="exempt",
+                user_id=uid,
+                display_name=full_name,
+                username=username,
+                created_by=int(getattr(row, "created_by", 0) or 0),
+                created_at_text=_format_roster_time(getattr(row, "created_at", None)),
+            )
+        )
+    for row in bot_rows:
+        uid = int(row.bot_id)
+        full_name, username = profiles.get(uid, ("", ""))
+        entries.append(
+            _ModerationRosterEntry(
+                kind="bot",
+                user_id=uid,
+                display_name=full_name,
+                username=username,
+                created_by=0,
+                created_at_text=_format_roster_time(getattr(row, "created_at", None)),
+            )
+        )
+    for row in mute_rows:
+        uid = int(row.user_id)
+        full_name, username = profiles.get(uid, ("", ""))
+        entries.append(
+            _ModerationRosterEntry(
+                kind="mute",
+                user_id=uid,
+                display_name=full_name,
+                username=username,
+                created_by=int(getattr(row, "created_by", 0) or 0),
+                created_at_text=_format_roster_time(getattr(row, "created_at", None)),
+            )
+        )
+    return entries, mute_all
+
+
+def _build_moderation_roster_page(
+    entries: list[_ModerationRosterEntry],
+    *,
+    mute_all: bool = False,
+    page: int,
+    group_id: int,
+    group_title: str = "",
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = len(entries)
+    exempt_count = sum(1 for item in entries if item.kind in ("exempt", "bot"))
+    mute_count = sum(1 for item in entries if item.kind == "mute")
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    start = page * _LIST_PAGE_SIZE
+    end = min(start + _LIST_PAGE_SIZE, total)
+
+    metadata: dict[str, str] = {}
+    # A card delivered to a private chat has no chat context of its own, so the
+    # group it describes has to be printed on it.  Buttons carry the group id
+    # for the same reason: a DM callback cannot infer it from the chat.
+    if group_title or group_id:
+        metadata["群组"] = (
+            f"{html.escape(group_title)}　<code>{group_id}</code>"
+            if group_title
+            else f"<code>{group_id}</code>"
+        )
+    metadata["审核豁免"] = f"<code>{exempt_count}</code> 人"
+    metadata["回复静默"] = f"<code>{mute_count}</code> 人"
+    if mute_all:
+        metadata["全群静默"] = "已开启（<code>/unmute all</code> 恢复）"
+    if total > 0:
+        metadata["页码"] = f"<code>{page + 1} / {total_pages}</code>"
+
+    if total == 0:
+        return (
+            render_data_brief(
+                "审核与静默名单",
+                metadata=metadata,
+                empty="当前没有被豁免审核或被静默回复的成员。",
+                footer="回复目标消息发送 <code>/aiexempt</code>（豁免审核）或 <code>/mute</code>（静默回复）可加入名单。",
+            ),
+            None,
+        )
+
+    lines: list[str] = []
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for idx, entry in enumerate(entries[start:end], start=start + 1):
+        name_part = html.escape(entry.display_name) if entry.display_name else "（未记录昵称）"
+        handle_part = f" @{html.escape(entry.username)}" if entry.username else ""
+        detail_parts = [f"类型　{_roster_kind_label(entry.kind)}"]
+        if entry.created_at_text:
+            detail_parts.append(f"时间　<code>{html.escape(entry.created_at_text)}</code>")
+        lines.extend(
+            [
+                f"<b>{idx}.</b> {name_part}{handle_part}　<code>{entry.user_id}</code>",
+                "　".join(detail_parts),
+                "",
+            ]
+        )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=_roster_button_label(entry),
+                    callback_data=f"exd:{entry.kind}:{entry.user_id}:{page}:{group_id}",
+                )
+            ]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="上一页",
+                callback_data=f"exl:{page - 1}:{group_id}",
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="下一页",
+                callback_data=f"exl:{page + 1}:{group_id}",
+            )
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+
+    return (
+        render_data_brief(
+            "审核与静默名单",
+            metadata=metadata,
+            items=lines,
+            footer="点击下方按钮可直接取消豁免或解除静默。",
+        ),
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None,
+    )
+
+
+def _roster_message_group_id(message: Message) -> int:
+    """The group a roster card describes (0 when the chat is not a group)."""
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", "") not in ("group", "supergroup"):
+        return 0
+    return int(chat.id)
+
+
+async def send_roster_card_private(
+    bot: object,
+    user_id: int,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None,
+) -> bool:
+    """Deliver a roster card to the operator's private chat.
+
+    Returns False when Telegram refuses the DM (bot never started by that user,
+    or blocked), so the caller can fall back to posting it in the group instead
+    of leaving the operator with a command that appears to do nothing.
+    """
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest) as exc:
+        log.warning("roster DM delivery failed user=%s: %s", user_id, exc)
+        return False
+
+
+@router.message(Command("exemptlist", "modlist"))
+async def cmd_exemptlist(message: Message, session: AsyncSession, settings: Settings) -> None:
+    chat_id = int(message.chat.id)
+    private_request = _roster_message_group_id(message) == 0
+
+    if private_request:
+        # Running it in a DM has no group of its own: accept an explicit group
+        # id for the super admin, otherwise point at the in-group command.
+        args = (message.text or "").partition(" ")[2].strip()
+        target = _parse_int(args.split()[0], default=0) if args else 0
+        if not message.from_user or not is_super_admin_user_id(message.from_user.id, settings):
+            await _answer(
+                message,
+                settings,
+                "<b>命令用法</b>\n请在本群内发送 <code>/exemptlist</code>，名单会发送到你的私聊。",
+            )
+            return
+        if target == 0:
+            await _answer(
+                message,
+                settings,
+                "<b>命令用法</b>\n私聊可用 <code>/exemptlist &lt;群ID&gt;</code>，或直接在目标群内发送 <code>/exemptlist</code>。",
+            )
+            return
+        group_id = target
+        group_title = ""
+    else:
+        if not await ensure_group_authorized(message, session, settings):
+            return
+        if not await ensure_group_admin_permission(message, session, settings):
+            return
+        group_id = chat_id
+        group_title = message.chat.title or ""
+
+    if not await is_group_authorized(session, group_id):
+        await session.commit()
+        await _answer(message, settings, "当前群组未授权。")
+        return
+
+    # The invoker's own command line is removed by
+    # ManagementCommandCleanupMiddleware, so only the receipt below is scheduled
+    # here.
+
+    entries, mute_all = await _load_moderation_roster(session, group_id)
+    group_row = await session.get(Group, group_id)
+    await session.commit()
+    if not group_title and group_row is not None:
+        group_title = group_row.title or ""
+
+    text, keyboard = _build_moderation_roster_page(
+        entries,
+        mute_all=mute_all,
+        page=0,
+        group_id=group_id,
+        group_title=group_title,
+    )
+
+    operator_id = int(message.from_user.id) if message.from_user else 0
+    if private_request:
+        delivered = await send_roster_card_private(
+            message.bot, operator_id, text, keyboard
+        )
+        if not delivered:
+            await _answer(
+                message,
+                settings,
+                "<b>审核与静默名单</b>\n无法发送私聊：请先私聊 bot 发送 <code>/start</code> 后再试。",
+            )
+        else:
+            await _answer(message, settings, "审核名单已发送到你的私聊。")
+        return
+
+    if operator_id and await send_roster_card_private(
+        message.bot, operator_id, text, keyboard
+    ):
+        # Keep the group clean: the card lives in the DM, and this one-line
+        # receipt removes itself shortly after.  Schedule the deletion from here
+        # rather than through answer_with_auto_delete so the outcome is logged:
+        # that helper treats "nothing to do" as success silently, which makes a
+        # receipt that never disappears impossible to diagnose after the fact.
+        receipt = await message.answer(
+            "审核名单已发送到你的私聊。",
+            disable_web_page_preview=True,
+        )
+        accepted = await schedule_message_auto_delete_durable(
+            receipt,
+            _ROSTER_NOTICE_AUTO_DELETE_SECONDS,
+        )
+        log.info(
+            "roster receipt posted | chat=%s message=%s auto_delete=%ss scheduled=%s",
+            message.chat.id,
+            getattr(receipt, "message_id", None),
+            _ROSTER_NOTICE_AUTO_DELETE_SECONDS,
+            accepted,
+        )
+        return
+
+    # DM refused (never started the bot, or blocked it) - post it here instead.
+    await _answer(
+        message,
+        settings,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("exl:"))
+async def on_exemptlist_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /exemptlist", show_alert=True)
+        return
+
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    # "exl:<page>" (cards posted before DM delivery) or "exl:<page>:<group_id>".
+    if len(parts) not in (2, 3):
+        await callback.answer("参数错误", show_alert=True)
+        return
+    page = _parse_int(parts[1], default=0)
+    group_id = _parse_int(parts[2], default=0) if len(parts) == 3 else int(msg.chat.id)
+    if not await _callback_user_can_manage_group(callback, session, settings, group_id):
+        return
+
+    group_row = await session.get(Group, group_id)
+    entries, mute_all = await _load_moderation_roster(session, group_id)
+    await session.commit()
+    text, keyboard = _build_moderation_roster_page(
+        entries,
+        mute_all=mute_all,
+        page=page,
+        group_id=group_id,
+        group_title=(group_row.title or "") if group_row is not None else "",
+    )
+    try:
+        await msg.edit_text(
+            text,
+            reply_markup=preserve_delete_button(msg, keyboard),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("列表刷新失败，请重试 /exemptlist", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("列表刷新失败，请重试 /exemptlist", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("exd:"))
+async def on_exemptlist_delete(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /exemptlist", show_alert=True)
+        return
+
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    # "exd:<kind>:<uid>:<page>" (cards posted before DM delivery) or
+    # "exd:<kind>:<uid>:<page>:<group_id>".
+    if len(parts) not in (4, 5):
+        await callback.answer("参数错误", show_alert=True)
+        return
+    kind = parts[1]
+    target_id = _parse_int(parts[2], default=0)
+    page_hint = _parse_int(parts[3], default=0)
+    group_id = _parse_int(parts[4], default=0) if len(parts) == 5 else int(msg.chat.id)
+    if kind not in ("exempt", "bot", "mute") or target_id == 0:
+        await callback.answer("参数错误", show_alert=True)
+        return
+    if not await _callback_user_can_manage_group(callback, session, settings, group_id):
+        return
+
+    removed = False
+    if kind == "exempt":
+        row = (
+            await session.execute(
+                select(ModerationExemption).where(
+                    ModerationExemption.group_id == group_id,
+                    ModerationExemption.user_id == target_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            await session.delete(row)
+            removed = True
+    elif kind == "bot":
+        removed = await remove_bot_whitelist(session, group_id, target_id)
+    elif kind == "mute":
+        row = (
+            await session.execute(
+                select(ReplyMute).where(
+                    ReplyMute.group_id == group_id,
+                    ReplyMute.user_id == target_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is not None:
+            await session.delete(row)
+            removed = True
+    await session.commit()
+
+    if not removed:
+        await callback.answer("该条目已不在名单中", show_alert=True)
+        return
+
+    entries, mute_all = await _load_moderation_roster(session, group_id)
+    group_row = await session.get(Group, group_id)
+    await session.commit()
+    total_pages = max(1, (len(entries) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page_hint, 0), total_pages - 1)
+    text, keyboard = _build_moderation_roster_page(
+        entries,
+        mute_all=mute_all,
+        page=page,
+        group_id=group_id,
+        group_title=(group_row.title or "") if group_row is not None else "",
+    )
+    try:
+        await msg.edit_text(
+            text,
+            reply_markup=preserve_delete_button(msg, keyboard),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("已移除，但列表刷新失败，请重试 /exemptlist", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("已移除，但列表刷新失败，请重试 /exemptlist", show_alert=True)
+        return
+    action_done = {
+        "exempt": f"已取消豁免: {target_id}",
+        "bot": f"已撤销 Bot 白名单: {target_id}",
+        "mute": f"已解除静默: {target_id}",
+    }[kind]
+    await callback.answer(action_done)

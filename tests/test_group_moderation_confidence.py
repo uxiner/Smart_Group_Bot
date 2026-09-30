@@ -144,6 +144,13 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
                 "bot.handlers.group.ModerationService",
                 return_value=moderation_service,
             ),
+            # Default: no Mini App challenge is available, so a ban-rule hit
+            # falls back to the counted-warning path.  Challenge tests override
+            # this by patching the same target through extra_patches.
+            patch(
+                "bot.handlers.group.moderation_challenge_ready",
+                return_value=False,
+            ),
         ]
         patches.extend(extra_patches.values())
         with ExitStack() as stack:
@@ -197,6 +204,151 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             moderation.record_violation.await_args.kwargs["source_message_id"],
             777,
         )
+
+    async def test_high_confidence_ban_rule_also_deletes_and_challenges(self) -> None:
+        """A confident ad hit must mute+challenge on the first message.
+
+        Confidence only decides whether the verdict is usable; it must not turn
+        a first-offence advertisement into a silent warning.
+        """
+        rule = SimpleNamespace(
+            id=17,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="发布广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.97,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=330, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+
+        message = await self._run(
+            moderation,
+            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=True),
+            begin=patch("bot.handlers.group.begin_moderation_challenge", new=begin),
+        )
+
+        message.delete.assert_awaited_once()
+        begin.assert_awaited_once()
+        self.assertEqual(begin.await_args.kwargs["user_id"], 42)
+        self.assertEqual(begin.await_args.kwargs["rule_action"], "ban")
+        moderation.record_violation.assert_awaited_once()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "challenge")
+
+    async def test_marginal_verdict_not_confirmed_leaves_message_alone(self) -> None:
+        """A flaky low-confidence hit must not cost the sender their rights.
+
+        The same payload can score violated=0.70 once and pass on the next read
+        (measured on a client-screenshot description), so a marginal ban-rule hit
+        is re-read once and acted on only when the second verdict agrees.
+        """
+        rule = SimpleNamespace(id=18, action="ban", rule_type="llm", pattern="禁止广告")
+        marginal = ModerationVerdict(
+            violated=True,
+            reason="疑似推广",
+            rule=rule,
+            conclusive=True,
+            confidence=0.7,
+        )
+        clean = ModerationVerdict(
+            violated=False,
+            reason="",
+            rule=None,
+            conclusive=True,
+            confidence=0.0,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(side_effect=[marginal, clean]),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=340, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        message = await self._run(
+            moderation,
+            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=True),
+            begin=patch("bot.handlers.group.begin_moderation_challenge", new=begin),
+        )
+        self.assertEqual(moderation.evaluate.await_count, 2)
+        message.delete.assert_not_awaited()
+        begin.assert_not_awaited()
+        moderation.record_violation.assert_not_awaited()
+
+    async def test_marginal_verdict_confirmed_twice_still_challenges(self) -> None:
+        """Two agreeing verdicts are conclusive enough to act on."""
+        rule = SimpleNamespace(id=19, action="ban", rule_type="llm", pattern="禁止广告")
+        marginal = ModerationVerdict(
+            violated=True,
+            reason="疑似推广",
+            rule=rule,
+            conclusive=True,
+            confidence=0.7,
+        )
+        confirmed = ModerationVerdict(
+            violated=True,
+            reason="确认推销",
+            rule=rule,
+            conclusive=True,
+            confidence=0.88,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(side_effect=[marginal, confirmed]),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=341, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        message = await self._run(
+            moderation,
+            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=True),
+            begin=patch("bot.handlers.group.begin_moderation_challenge", new=begin),
+        )
+        self.assertEqual(moderation.evaluate.await_count, 2)
+        message.delete.assert_awaited_once()
+        begin.assert_awaited_once()
+
+    async def test_high_confidence_hit_is_not_re_read(self) -> None:
+        """Only marginal verdicts pay for the confirmation call."""
+        rule = SimpleNamespace(id=20, action="ban", rule_type="regex", pattern="禁止广告")
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="命中正则规则",
+            rule=rule,
+            conclusive=True,
+            confidence=1.0,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=342, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        await self._run(
+            moderation,
+            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=True),
+            begin=patch("bot.handlers.group.begin_moderation_challenge", new=begin),
+        )
+        self.assertEqual(moderation.evaluate.await_count, 1)
+        begin.assert_awaited_once()
 
     async def test_failed_challenge_releases_source_key_for_ban_fallback(self) -> None:
         rule = SimpleNamespace(
@@ -731,7 +883,9 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reset_update_completion(token)
 
-        self.assertEqual(message._test_session.execute.await_count, 0)
+        # 审核现在会为"群内上下文"读一次归档（只读，见 bot/services/moderation_context.py）；
+        # 真正的不变量是下面这条：边缘判定不会多写一次持久化策略。
+        self.assertEqual(message._test_session.execute.await_count, 1)
         self.assertEqual(message._test_session.commit.await_count, 4)
         message.bot.ban_chat_member.assert_awaited_once_with(
             -10001,
