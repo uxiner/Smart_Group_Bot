@@ -76,6 +76,7 @@ from bot.services.join_verification import (
     prepare_join_verification,
     reconcile_moderation_ban_after_lost_lease,
     reconcile_stale_verification_restriction,
+    restore_member_permissions,
     renew_prepared_join_verification,
     renew_join_verification_lease,
     shield_abort_prepared_join_verification,
@@ -2741,7 +2742,46 @@ class RaidGuardService:
                     group_id,
                     prepared.user_id,
                 )
-                return False
+                if not restore_permissions:
+                    return False
+                # The compensation raised before it could lift the restriction.
+                # The reconciler alone is not evidence: when the stored record is
+                # already gone it reports success without touching Telegram, which
+                # would leave the member muted.  So clear the restriction directly
+                # as well - aborting a challenge is exactly the case where members
+                # are meant to get their speaking rights back.
+                try:
+                    await reconcile_stale_verification_restriction(
+                        self.bot,
+                        self.session_factory,
+                        group_id,
+                        prepared.user_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "[%s] raid mute reconcile fallback failed | user=%s",
+                        group_id,
+                        prepared.user_id,
+                    )
+                try:
+                    return bool(
+                        await restore_member_permissions(
+                            self.bot,
+                            group_id,
+                            prepared.user_id,
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "[%s] raid mute restore fallback failed | user=%s",
+                        group_id,
+                        prepared.user_id,
+                    )
+                    return False
 
         async def abort_many(
             pairs: list[tuple[RaidSuspect, PreparedVerification]],
@@ -2920,6 +2960,17 @@ class RaidGuardService:
                                 await reconcile_stale_verification_restriction(
                                     self.bot,
                                     self.session_factory,
+                                    group_id,
+                                    suspect.user_id,
+                                )
+                                # Losing the lease after a successful mute means
+                                # nothing else will compensate this member: only the
+                                # pairs recorded as muted are restored on abort.  The
+                                # reconciler reports success without touching
+                                # Telegram once the record is gone, so clear the
+                                # restriction directly to avoid stranding them muted.
+                                await restore_member_permissions(
+                                    self.bot,
                                     group_id,
                                     suspect.user_id,
                                 )

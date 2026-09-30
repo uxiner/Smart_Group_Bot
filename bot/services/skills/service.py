@@ -540,7 +540,7 @@ class SkillService:
             messages=messages,
             tools=tools,
             label="skill",
-            cfg=self.llm.main,
+            cfg=self.llm.skill_config,
             preview_limit=80,
         )
 

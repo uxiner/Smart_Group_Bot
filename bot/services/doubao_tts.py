@@ -42,6 +42,11 @@ _SEGMENT_SPLIT_RE = re.compile(r"(?<=[\u3002\uff01\uff1f!?；;…\n])")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SEMICOLON_RE = re.compile(r"[；;]+")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", flags=re.IGNORECASE)
+
+# Edge TTS voice names look like `zh-TW-HsiaoChenNeural`.  They are used as the
+# voice selector when no Doubao credentials are configured, so the same
+# `tts.speaker` field switches provider without new config keys.
+_EDGE_VOICE_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]+)+Neural$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _FENCED_CODE_RE = re.compile(r"```(?:[\w+-]+)?\s*([\s\S]*?)```")
@@ -293,9 +298,23 @@ class DoubaoTTSService:
         self.silence_duration_ms = int(getattr(settings, "doubao_tts_silence_duration_ms", 0) or 0)
         self.http_timeout_sec = float(getattr(settings, "doubao_tts_http_timeout_sec", 20.0) or 20.0)
         self.max_text_length = int(getattr(settings, "doubao_tts_max_text_length", 500) or 500)
+        self.edge_voice = self._resolve_edge_voice()
+
+    def _resolve_edge_voice(self) -> str:
+        """Return the Edge TTS voice to use, or "" when Doubao should be used.
+
+        Doubao credentials always win; Edge is the fallback provider and is
+        selected purely by putting an Edge voice name in `tts.speaker`.
+        """
+        if self.app_id and self.access_key:
+            return ""
+        speaker = (self.speaker or "").strip()
+        return speaker if _EDGE_VOICE_RE.match(speaker) else ""
 
     @property
     def available(self) -> bool:
+        if self.edge_voice:
+            return bool(self.enabled)
         return bool(
             self.enabled and self.api_base and self.app_id and self.access_key and self.resource_id and self.speaker
         )
@@ -736,6 +755,14 @@ class DoubaoTTSService:
             auto_style=_auto_style,
         )
 
+        if self.edge_voice:
+            return await self._synthesize_edge(
+                normalized,
+                speech_rate=style.speech_rate,
+                loudness_rate=style.loudness_rate,
+                audio_format=audio_format,
+            )
+
         request_id = str(uuid.uuid4())
         timeout = aiohttp.ClientTimeout(
             total=min(
@@ -863,6 +890,71 @@ class DoubaoTTSService:
         except Exception as exc:
             log.exception("doubao tts request failed")
             return TTSSynthesisResult(ok=False, text=normalized, error=str(exc))
+
+    async def _synthesize_edge(
+        self,
+        text: str,
+        *,
+        speech_rate: int | None = None,
+        loudness_rate: int | None = None,
+        audio_format: str | None = None,
+    ) -> TTSSynthesisResult:
+        """Synthesize through Microsoft Edge's read-aloud endpoint (free, no key).
+
+        Returns mp3 bytes when the caller asks for mp3, otherwise the same
+        ogg/opus payload Doubao callers expect, so every caller stays agnostic.
+        """
+        try:
+            import edge_tts
+        except Exception as exc:  # pragma: no cover - depends on image contents
+            log.error("edge tts import failed: %s", exc)
+            return TTSSynthesisResult(ok=False, text=text, error="edge_tts_unavailable")
+
+        def _pct(value: int | None) -> str:
+            raw = max(-50, min(100, int(value or 0)))
+            return f"{raw:+d}%"
+
+        try:
+            communicate = edge_tts.Communicate(
+                text,
+                self.edge_voice,
+                rate=_pct(speech_rate),
+                volume=_pct(loudness_rate),
+            )
+            parts: list[bytes] = []
+            total = 0
+            timeout = max(5.0, float(self.http_timeout_sec or 20.0))
+            async with asyncio.timeout(timeout):
+                async for chunk in communicate.stream():
+                    if str(chunk.get("type", "")) != "audio":
+                        continue
+                    data = chunk.get("data") or b""
+                    total += len(data)
+                    if total > _TTS_MAX_AUDIO_BYTES:
+                        return TTSSynthesisResult(ok=False, text=text, error="audio_too_large")
+                    parts.append(data)
+        except Exception as exc:
+            log.warning("edge tts request failed | voice=%s error=%s", self.edge_voice, exc)
+            return TTSSynthesisResult(ok=False, text=text, error=f"edge_tts_error:{exc}")
+
+        if not parts:
+            return TTSSynthesisResult(ok=False, text=text, error="empty_audio")
+
+        mp3_bytes = b"".join(parts)
+        wanted = (audio_format or self.audio_format or "").strip() or self.audio_format
+        if wanted == "mp3":
+            return TTSSynthesisResult(ok=True, text=text, audio_bytes=mp3_bytes, audio_format="mp3")
+        try:
+            ogg_bytes = await self._convert_mp3_to_ogg_opus(mp3_bytes)
+        except Exception as exc:
+            log.exception("tts ffmpeg transcode failed (edge)")
+            return TTSSynthesisResult(ok=False, text=text, error=str(exc))
+        return TTSSynthesisResult(
+            ok=True,
+            text=text,
+            audio_bytes=ogg_bytes,
+            audio_format="ogg_opus",
+        )
 
     @staticmethod
     async def _convert_mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes:

@@ -19,17 +19,35 @@ class DecisionPromptTests(unittest.TestCase):
             self.assertIn(block, DECISION_SYSTEM)
 
     def test_decision_prompt_is_active_but_rate_limited(self) -> None:
-        self.assertIn("warm but restrained group member", DECISION_SYSTEM)
-        self.assertIn("Prefer replying less often over jumping into every topic", DECISION_SYSTEM)
-        self.assertIn("raise the bar for another reply", DECISION_SYSTEM)
-        self.assertIn("Prefer quality over frequency.", DECISION_SYSTEM)
+        self.assertIn(
+            "the bot is a group member who speaks when it has something worth saying",
+            DECISION_SYSTEM,
+        )
+        self.assertIn("Every reply must carry substance", DECISION_SYSTEM)
+        self.assertIn(
+            "shows the bot has already posted within the last few messages and "
+            "nobody has addressed it since",
+            DECISION_SYSTEM,
+        )
 
     def test_decision_prompt_mentions_bot_frequency_signals(self) -> None:
         self.assertIn("role=assistant", DECISION_SYSTEM)
         self.assertIn("sender_id=BOT", DECISION_SYSTEM)
-        self.assertIn("replied recently or multiple times already", DECISION_SYSTEM)
-        self.assertIn("the bot has already spoken recently", DECISION_SYSTEM)
+        self.assertIn(
+            "a recent-bot-messages section for reply-frequency judgment",
+            DECISION_SYSTEM,
+        )
+        self.assertIn(
+            "has already posted within the last few messages",
+            DECISION_SYSTEM,
+        )
 
     def test_decision_prompt_defaults_to_skip_when_not_needed(self) -> None:
-        self.assertIn("When unsure, default to `skip`.", DECISION_SYSTEM)
-        self.assertIn("stay quiet when a reply would be redundant, intrusive, or too frequent", DECISION_SYSTEM)
+        self.assertIn(
+            "When unsure about a message that is NOT a question, output `skip`.",
+            DECISION_SYSTEM,
+        )
+        self.assertIn(
+            "stays out of banter, jokes, greetings, and back-channel chatter",
+            DECISION_SYSTEM,
+        )

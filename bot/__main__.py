@@ -12,6 +12,7 @@ from bot.config import load_bootstrap_settings, validate_bootstrap_settings
 from bot.db.engine import init_db
 from bot.handlers import admin, commands, group, membership
 from bot.loader import create_bot, dp
+from bot.middlewares.command_cleanup import ManagementCommandCleanupMiddleware
 from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.logging_mw import LoggingMiddleware
@@ -58,6 +59,7 @@ from bot.services.update_delivery import (
     run_update_delivery,
 )
 from bot.utils.bot_identity import set_bot_identity
+from bot.utils.command_catalog import build_bot_commands
 from bot.utils.logging_setup import configure_logging
 from bot.utils.telegram import (
     configure_telegram_cleanup_scheduler,
@@ -322,6 +324,13 @@ async def _initialize_runtime_services(
             session_factory=session_factory,
             llm=llm,
             retention_days=settings.bot.memory_retention_days,
+            # The local llama.cpp embedding server shares two CPU cores with the
+            # archive indexer, so a recall query that lands behind an indexing
+            # batch can wait several seconds.  The built-in 2.5s query deadline
+            # silently returned zero hits; 8s keeps recall reliable while the
+            # indexer is busy, and smaller batches keep each wait short.
+            query_timeout_seconds=8.0,
+            batch_size=8,
         )
         if settings.bot.memory_recall_enabled
         else None
@@ -353,6 +362,9 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     )
     # Roster tracking feeds the profile patrol; outer so every sender is seen.
     dispatcher.message.outer_middleware(MemberRosterMiddleware(session_factory))
+    # Operators' own command lines are noise once served: drop them from the
+    # group a few seconds later.  Outer so a rejected update is still cleaned.
+    dispatcher.message.outer_middleware(ManagementCommandCleanupMiddleware())
     dispatcher.message.middleware(LoggingMiddleware())
     # No throttle middleware: it silently drops rapid consecutive messages,
     # which breaks inbound batch merging and lets a fast second violating
@@ -365,6 +377,29 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     dispatcher.callback_query.middleware(DbSessionMiddleware(session_factory))
     dispatcher.chat_member.middleware(DbSessionMiddleware(session_factory))
     dispatcher.my_chat_member.middleware(DbSessionMiddleware(session_factory))
+
+
+async def _publish_bot_command_menu(bot: object) -> None:
+    """Mirror the /help catalog into Telegram's "/" menu.
+
+    The menu was maintained by hand and had drifted empty, which is how a rarely
+    used command like /exemptlist gets forgotten.  Publishing from the catalog
+    keeps both surfaces in step.  A failure here must never block startup - the
+    bot works fine without a menu.
+    """
+    from aiogram.types import BotCommand
+
+    try:
+        commands = [
+            BotCommand(command=name, description=description)
+            for name, description in build_bot_commands()
+        ]
+        if not commands:
+            return
+        await bot.set_my_commands(commands)  # type: ignore[attr-defined]
+        log.info("Telegram command menu published: %d entries", len(commands))
+    except Exception as exc:
+        log.warning("Telegram command menu publish failed: %s", exc)
 
 
 async def main() -> None:
@@ -415,6 +450,7 @@ async def main() -> None:
             display_name=me.full_name or me.first_name or "",
         )
         log.info("Bot identity resolved: @%s (%s)", me.username, me.full_name)
+        await _publish_bot_command_menu(bot)
         telegram_cleanup = TelegramCleanupScheduler(
             bot=bot,
             session_factory=session_factory,
@@ -502,6 +538,7 @@ async def main() -> None:
                 settings.bot.main_model,
                 settings.bot.decision_model,
                 settings.bot.compress_model,
+                skill=settings.bot.skill_model,
                 moderation=settings.bot.moderation_model,
                 vision=settings.bot.vision_model,
                 embed=settings.bot.embed_model,

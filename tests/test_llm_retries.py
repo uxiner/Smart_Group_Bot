@@ -778,7 +778,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "ok")
         mock_responses.assert_awaited_once()
-        self.assertEqual(mock_responses.call_args.kwargs["model"], "gpt-4.1")
+        self.assertEqual(mock_responses.call_args.kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_responses.call_args.kwargs["input"][0]["role"], "system")
         self.assertEqual(mock_completion.await_count, 0)
 
@@ -846,7 +846,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(resp)
         self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["name"], "websearch")
         mock_responses.assert_awaited_once()
-        self.assertEqual(mock_responses.call_args.kwargs["model"], "gpt-4.1")
+        self.assertEqual(mock_responses.call_args.kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_responses.call_args.kwargs["api_base"], "https://gateway.example/v1")
         self.assertEqual(len(mock_responses.call_args.kwargs["tools"]), 1)
 

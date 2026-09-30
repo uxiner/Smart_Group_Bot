@@ -1786,7 +1786,7 @@ class MemoryService:
                         "0.0, 0.0, 2.4, 3.0, 1.8, 0.9, 0.7, 1.2) "
                         "AS bm25_score "
                         "FROM group_message_archive_fts "
-                        "JOIN group_message_archive AS archive "
+                        "CROSS JOIN group_message_archive AS archive "
                         "ON archive.id = group_message_archive_fts.rowid "
                         "WHERE group_message_archive_fts MATCH :match_query "
                         "AND archive.group_id = :group_id "

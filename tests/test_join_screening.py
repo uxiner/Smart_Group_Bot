@@ -1165,7 +1165,7 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await is_globally_banned(session, 777))
             message.bot.ban_chat_member.assert_not_awaited()
             message.answer.assert_awaited_once()
-            self.assertIn("请选择封禁范围", message.answer.await_args.args[0])
+            self.assertIn("选择封禁范围", message.answer.await_args.args[0])
             self.assertEqual(
                 len(message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0]),
                 2,
@@ -1197,7 +1197,7 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(warning_result.scalar_one_or_none())
             message.bot.unban_chat_member.assert_not_awaited()
-            self.assertIn("请选择解封范围", message.answer.await_args.args[0])
+            self.assertIn("选择解封范围", message.answer.await_args.args[0])
             answer_mock.assert_not_awaited()
 
     async def test_clearwarnings_command_clears_count_by_user_id(self) -> None:
@@ -1386,6 +1386,11 @@ class GlobalBanMiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
         event = self._event(user_id=667, text="ordinary message")
         event.bot.ban_chat_member.side_effect = [False, True]
+        # A bare `False` from banChatMember is an *unconfirmed* ban, so the
+        # membership probe must not report the target as already kicked:
+        # ban_member_result reads that as a confirmed ban and the update would
+        # never be retried.  The member is still present while it is unconfirmed.
+        event.bot.get_chat_member.return_value = SimpleNamespace(status="member")
 
         failed_receipt = UpdateCompletionReceipt()
         token = bind_update_completion(failed_receipt)
