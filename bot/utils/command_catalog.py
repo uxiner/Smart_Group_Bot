@@ -37,6 +37,7 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/me", "/me", "查看自己的积分、签到、违规与封禁状态", "群友想一次看清自己的积分和违规记录", "核心入口"),
     CommandEntry("/health", "/health", "查看本群今日审核命中、待完成质询、归档量与当前模型通道", "管理员想快速了解机器人当前运行状况", "群审核管理"),
     CommandEntry("/modstats", "/modstats [天数]", "审核质量报表：命中构成、边缘判定、误伤率（管理员）", "管理员想了解审核判得准不准、误伤多少", "管理工具"),
+    CommandEntry("/cost", "/cost [天数]", "成本与健康报表：token 用量、缓存命中、超时与空响应（管理员）", "管理员想看这几天花了多少 token、缓存有没有生效", "管理工具"),
     CommandEntry("/warnings", "/warnings", "查看当前群警告/封禁名单", "管理员想查看审核处罚情况", "群审核管理"),
     CommandEntry("/clearwarnings", "回复用户后 /clearwarnings，或 /clearwarnings <用户ID>", "清空某用户的累计违规次数", "管理员要重置某用户的违规次数", "群审核管理"),
     CommandEntry("/ban", "回复用户后 /ban [原因]，或 /ban <用户ID> [原因]", "在当前群手动封禁；最高管理员可选择全局", "管理员要封禁某个用户", "群审核管理"),
@@ -108,6 +109,7 @@ def build_help_text() -> str:
         "/compact：立即压缩本群临时对话历史进背景摘要\n"
         "/health：本群今日审核命中、待完成质询、归档量与当前模型通道\n\n"
         "/modstats：审核质量报表（近 7 天命中数、边缘判定占比、被改判放行的误伤率，可加天数如 /modstats 30）\n"
+        "/cost：成本与健康报表（token 用量、缓存命中率、超时/空响应，可加天数如 /cost 30）\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup / unauthgroup / authlist\n"
         "/banlist：查看全局封禁名单\n"

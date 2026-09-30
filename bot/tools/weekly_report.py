@@ -5,6 +5,10 @@
     docker exec smart_group_bot-bot-1 python -m bot.tools.weekly_report [天数] [--dry-run]
 
 由定时任务调用。发不出去只打印错误，不影响机器人本体。
+
+发送之前先做**上周活跃激励结算**（``settle_weekly_activity``）：算分、发奖、把
+"上周活跃榜"拼进周报正文。结算按 (用户, ISO 周) 幂等，重复跑不会重复加分；
+``--dry-run`` 连积分也不动，只验证文案。
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from aiogram import Bot
 
 from bot.config import Settings
 from bot.db.engine import init_db
+from bot.services.activity import render_activity_lines, settle_weekly_activity
+from bot.services.cost_report import render_cost_digest
 from bot.services.quality_report import authorized_group_ids, render_group_quality
 log = logging.getLogger(__name__)
 
@@ -35,10 +41,29 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
     try:
         async with session_factory() as session:
             group_ids = await authorized_group_ids(session)
-            texts = {
-                group_id: await render_group_quality(session, group_id=group_id, days=days)
-                for group_id in group_ids
-            }
+            texts: dict[int, str] = {}
+            boards: dict[int, list[str]] = {}
+            for group_id in group_ids:
+                # 结算与发奖必须发生在渲染之前：榜单要显示本周实际到账的分。
+                # --dry-run 只渲染不发（连积分也不动），验证文案时不会改任何人的钱包。
+                try:
+                    result = await settle_weekly_activity(
+                        session, group_id=group_id, award=not dry_run
+                    )
+                    if not dry_run:
+                        await session.commit()
+                    boards[group_id] = render_activity_lines(result)
+                except Exception:  # 单群结算失败不影响其它群，也不影响内容块
+                    await session.rollback()
+                    log.exception("weekly activity settle failed | group=%s", group_id)
+                    boards[group_id] = []
+                texts[group_id] = await render_group_quality(
+                    session,
+                    group_id=group_id,
+                    days=days,
+                    activity_lines=boards[group_id],
+                )
+            cost_text = await render_cost_digest(session, days=days)
         if not group_ids:
             print("没有授权群，跳过")
             return 0
@@ -47,6 +72,8 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
             for group_id in group_ids:
                 print(f"---- dry-run | group={group_id} ----")
                 print(texts[group_id].replace("审核质量 · 近", "群健康周报 · 近", 1))
+            print("---- dry-run | 成本摘要（私发超管）----")
+            print(cost_text)
             return 0
         bot = Bot(token)
         try:
@@ -61,6 +88,16 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
                 except Exception as exc:  # 单个群失败不影响其它群
                     log.warning("weekly report send failed | group=%s | %s", group_id, exc)
                     print(f"发送失败 | group={group_id} | {exc}")
+            admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
+            if admin_id > 0:
+                try:
+                    await bot.send_message(admin_id, cost_text)
+                    print(f"已私发成本摘要 | admin={admin_id}")
+                except Exception as exc:
+                    log.warning("weekly cost digest failed | admin=%s | %s", admin_id, exc)
+                    print(f"成本摘要私发失败 | {exc}")
+            else:
+                print("未配置最高管理员，跳过成本摘要")
         finally:
             await bot.session.close()
     finally:

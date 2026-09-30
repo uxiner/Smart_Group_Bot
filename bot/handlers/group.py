@@ -34,7 +34,7 @@ from bot.db.models import (
     VoteBanSession,
 )
 from bot.db.sqlite_session import is_database_locked_error
-from bot.services import memory_holder
+from bot.services import activity, memory_holder
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.at_reply import is_at_reply_enabled
 from bot.services.authz import (
@@ -5865,6 +5865,9 @@ async def flush_pending_inbound_batches() -> None:
             await asyncio.wait(pending_activity, timeout=1.0)
     _GROUP_ACTIVITY_PENDING.clear()
 
+    # 活跃激励的日累计：关机前尽量把已经在排队的写入落完（少一条就少一条）
+    await activity.drain_activity_tasks()
+
     orphan_tasks = {task for task in _PENDING_REPLY_ORPHAN_TASKS if not task.done()}
     for task in orphan_tasks:
         task.cancel()
@@ -6079,6 +6082,43 @@ async def on_group_message(
         f"is_owner:{owner_flag} is_tg_admin:{tg_admin_flag} trusted_source:{trusted_source} "
         f"name:{history_display_name}"
     )
+
+    # 每周活跃激励的日累计：只记合格发言（正文、非命令、非机器人/频道、非管理员）。
+    # 生产走后台任务落库，绝不阻塞后面的回复流程；统计失败也只记日志。
+    # 先做一次纯函数预筛，命令/媒体连任务都不用建（服务层还会再判一次）。
+    reply_to_message = getattr(message, "reply_to_message", None)
+    reply_to_user = getattr(reply_to_message, "from_user", None)
+    reply_to_user_id = (
+        int(getattr(reply_to_user, "id", 0) or 0)
+        if reply_to_user is not None and not getattr(reply_to_user, "is_bot", False)
+        else 0
+    )
+    is_bot_sender = bool(user and user.is_bot)
+    if activity.is_countable_message(
+        text=text,
+        message_type=msg_type,
+        is_bot=is_bot_sender,
+        is_channel=sender_identity.is_chat,
+        is_admin=sender_is_owner or sender_is_tg_admin,
+    ):
+        incentive_kwargs: dict[str, Any] = {
+            "group_id": group_id,
+            "user_id": user_id,
+            "text": text,
+            "message_type": msg_type,
+            "display_name": display_name,
+            "is_bot": is_bot_sender,
+            "is_channel": sender_identity.is_chat,
+            "is_admin": sender_is_owner or sender_is_tg_admin,
+            "reply_to_user_id": reply_to_user_id,
+        }
+        if session_factory is None:
+            # 兼容孤立调用（测试）：没有后台工厂就直接用当前 session，让结果可见
+            await activity.record_message_activity_safe(session, **incentive_kwargs)
+        else:
+            activity.schedule_activity_record(
+                session_factory=session_factory, **incentive_kwargs
+            )
 
     llm = LLMService(
         settings.bot.main_model,

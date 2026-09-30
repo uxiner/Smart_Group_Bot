@@ -883,9 +883,11 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reset_update_completion(token)
 
-        # 审核现在会为"群内上下文"读一次归档（只读，见 bot/services/moderation_context.py）；
+        # 审核现在会为"群内上下文"读一次归档（只读，见 bot/services/moderation_context.py），
+        # 再加上每周活跃激励的日累计一次 UPSERT（bot/services/activity.py：这条消息是
+        # 合格发言，且本用例没给 session_factory，走的是"直接用当前 session"的兼容分支）。
         # 真正的不变量是下面这条：边缘判定不会多写一次持久化策略。
-        self.assertEqual(message._test_session.execute.await_count, 1)
+        self.assertEqual(message._test_session.execute.await_count, 2)
         self.assertEqual(message._test_session.commit.await_count, 4)
         message.bot.ban_chat_member.assert_awaited_once_with(
             -10001,

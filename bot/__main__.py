@@ -19,7 +19,7 @@ from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
-from bot.services import memory_holder
+from bot.services import llm_metrics, memory_holder
 from bot.services.archive_vector import SQLiteArchiveVectorRecallProvider
 from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
@@ -281,6 +281,10 @@ async def _initialize_runtime_services(
     settings: Any,
     session_factory: Any,
 ) -> tuple[RuntimeConfigManager, LLMService, MemoryService]:
+    # 成本看板的记数器只累加在内存里，这里给它会话工厂，
+    # 由它自己按 60 秒的节奏落盘（回复路径上不做任何数据库写入）。
+    llm_metrics.configure(session_factory)
+
     runtime_config = RuntimeConfigManager(
         session_factory=session_factory,
         settings=settings,
