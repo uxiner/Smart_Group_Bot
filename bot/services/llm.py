@@ -25,6 +25,7 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
+from bot.services import llm_metrics
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -1071,10 +1072,39 @@ class LLMService:
 
         if not prompt_tokens and not completion_tokens and not total_tokens:
             return None
+
+        # 缓存与思考 token：网关的字段名有 OpenAI / Anthropic / DeepSeek 三套写法，
+        # 逐个兜底取（取到非 0 就用）。成本看板靠这几个字段判断"有没有吃到缓存"
+        # 和"关思考到底生效没有"，所以宁可多试几个键名。
+        def pick(*names: str) -> int:
+            for name in names:
+                value = cls._coerce_int(cls._get_value(usage, name, 0))
+                if value:
+                    return value
+            return 0
+
+        nested_cache = cls._coerce_int(
+            cls._get_value(cls._get_value(usage, "prompt_tokens_details", {}) or {}, "cached_tokens", 0)
+        )
+        nested_reasoning = cls._coerce_int(
+            cls._get_value(cls._get_value(usage, "completion_tokens_details", {}) or {}, "reasoning_tokens", 0)
+        )
+        cached_tokens = max(
+            pick("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"),
+            nested_cache,
+        )
+        cache_write_tokens = pick("cache_creation_input_tokens", "cache_write_tokens")
+        thinking_tokens = max(
+            pick("completion_thinking_tokens", "thinking_tokens", "reasoning_tokens"),
+            nested_reasoning,
+        )
         return SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            thinking_tokens=thinking_tokens,
         )
 
     @classmethod
@@ -2288,6 +2318,7 @@ class LLMService:
                 tool_calls = getattr(message, "tool_calls", None)
                 if not content.strip() and not tool_calls:
                     if attempt < total_attempts:
+                        llm_metrics.record(label, empty_responses=1)
                         log.warning(
                             "LLM empty response | stage=%s | model=%s | attempt=%d/%d | retrying_same_model",
                             label_cn,
@@ -2299,6 +2330,7 @@ class LLMService:
                         if backoff > 0:
                             await asyncio.sleep(backoff)
                         continue
+                    llm_metrics.record(label, empty_responses=1)
                     self._record_circuit_failure(cfg, stage=label)
                     return None
 
@@ -2323,10 +2355,14 @@ class LLMService:
                     truncated,
                     preview,
                 )
+                llm_metrics.record_usage(
+                    label, usage, prompt_tokens=tokens_in, output_tokens=tokens_out
+                )
                 self._record_circuit_success(cfg, stage=label)
                 return resp
             except asyncio.TimeoutError:
                 if attempt < total_attempts:
+                    llm_metrics.record(label, timeouts=1)
                     log.warning(
                         "LLM timeout | stage=%s | model=%s | attempt=%d/%d | timeout=%.1fs | retrying_same_model",
                         label_cn,
@@ -2339,6 +2375,7 @@ class LLMService:
                     if backoff > 0:
                         await asyncio.sleep(backoff)
                     continue
+                llm_metrics.record(label, timeouts=1)
                 log.warning(
                     "LLM timeout | stage=%s | model=%s | attempt=%d/%d | timeout=%.1fs | fallback_next",
                     label_cn,
@@ -2360,6 +2397,7 @@ class LLMService:
                     )
                     continue
                 if attempt < total_attempts:
+                    llm_metrics.record(label, failures=1)
                     log.warning(
                         "LLM failure | stage=%s | model=%s | attempt=%d/%d | error=%s | retrying_same_model",
                         label_cn,
@@ -2372,6 +2410,7 @@ class LLMService:
                     if backoff > 0:
                         await asyncio.sleep(backoff)
                     continue
+                llm_metrics.record(label, failures=1)
                 log.warning(
                     "LLM failure | stage=%s | model=%s | attempt=%d/%d | error=%s | fallback_next",
                     label_cn,

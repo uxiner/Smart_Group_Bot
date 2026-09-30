@@ -1,10 +1,12 @@
 """每日签到与积分：连续签到递增（1→10 封顶），断签从 1 分重来；积分可消费。
 
-两条不变量：
+三条不变量：
 
 - “一天只能签一次”靠 ``member_checkins`` 上 (群, 用户, 本地自然日) 的唯一索引；
-- **可用积分 = 签到流水 SUM(points) − 消费流水 SUM(points)**。两张表都是 append-only，
-  没有“余额”列，所以不会出现余额和流水对不上的情况（要审计某人的分怎么没的，查流水即可）。
+- **可用积分 = 签到流水 SUM + 奖励流水 SUM − 消费流水 SUM**。三张表都是 append-only，
+  没有“余额”列，所以不会出现余额和流水对不上的情况（要审计某人的分怎么没的，查流水即可）；
+- 奖励（``member_point_awards``，如每周活跃激励）走独立流水，**不写进 member_checkins**：
+  连续签到天数是把签到日期倒着数出来的，伪造签到行会把连击算错。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db.models import (
     GlobalBan,
     MemberCheckin,
+    MemberPointAward,
     MemberPointSpend,
     UserWarning,
     Violation,
@@ -32,6 +35,16 @@ MAX_DAILY_POINTS = 10
 SPEND_REASON_CHALLENGE = "moderation_challenge"
 # 免除一次审核质询的价钱
 CHALLENGE_SKIP_COST = 2
+
+
+def available_from_ledgers(*, earned: int, awarded: int, spent: int) -> int:
+    """可用积分的**唯一**定义：签到所得 + 奖励所得 − 已消费。
+
+    其它地方（包括 /rank 的默认榜）要算可用余额都必须走这里，免得哪天加了新的
+    积分来源，只有一部分页面跟着变。
+    """
+
+    return int(earned) + int(awarded) - int(spent)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,8 +106,10 @@ def _streak(days: set[str], today: date) -> int:
     return streak
 
 
-async def _sums(session: AsyncSession, group_id: int, user_id: int) -> tuple[int, int, int]:
-    """(累计获得, 累计消耗, 签到天数)"""
+async def _sums(
+    session: AsyncSession, group_id: int, user_id: int
+) -> tuple[int, int, int, int]:
+    """(累计签到所得, 累计奖励所得, 累计消耗, 签到天数)"""
 
     earned_row = (
         await session.execute(
@@ -106,6 +121,16 @@ async def _sums(session: AsyncSession, group_id: int, user_id: int) -> tuple[int
             )
         )
     ).one()
+    awarded = (
+        await session.execute(
+            select(func.coalesce(func.sum(MemberPointAward.points), 0))
+            .select_from(MemberPointAward)
+            .where(
+                MemberPointAward.group_id == int(group_id),
+                MemberPointAward.user_id == int(user_id),
+            )
+        )
+    ).scalar()
     spent = (
         await session.execute(
             select(func.coalesce(func.sum(MemberPointSpend.points), 0))
@@ -116,7 +141,12 @@ async def _sums(session: AsyncSession, group_id: int, user_id: int) -> tuple[int
             )
         )
     ).scalar()
-    return int(earned_row[0] or 0), int(spent or 0), int(earned_row[1] or 0)
+    return (
+        int(earned_row[0] or 0),
+        int(awarded or 0),
+        int(spent or 0),
+        int(earned_row[1] or 0),
+    )
 
 
 async def summarize(
@@ -130,14 +160,18 @@ async def summarize(
 
     today = local_today(now)
     days = await _dates(session, group_id, user_id)
-    earned, spent, total_days = await _sums(session, group_id, user_id)
+    earned, awarded, spent, total_days = await _sums(session, group_id, user_id)
     streak = _streak(days, today)
+    # 累计获得 = 签到 + 奖励（不含消费），可用 = 累计获得 − 消费，两行对得上
+    total = earned + awarded
     return CheckinOutcome(
         already=today.isoformat() in days,
         points_awarded=0,
-        total_points=earned,
+        total_points=total,
         spent_points=spent,
-        available_points=earned - spent,
+        available_points=available_from_ledgers(
+            earned=earned, awarded=awarded, spent=spent
+        ),
         total_days=total_days,
         streak=streak,
         next_award=award_for_streak(streak + 1) if streak else 1,
@@ -150,8 +184,8 @@ async def available_points(
 ) -> int:
     """当前可用积分（质询卡决定要不要显示"消耗积分免除"时用）。"""
 
-    earned, spent, _days = await _sums(session, group_id, user_id)
-    return earned - spent
+    earned, awarded, spent, _days = await _sums(session, group_id, user_id)
+    return available_from_ledgers(earned=earned, awarded=awarded, spent=spent)
 
 
 async def record_checkin(
@@ -351,6 +385,28 @@ async def _spent_by_user(session: AsyncSession, group_id: int) -> dict[int, int]
     return {int(user_id): int(points or 0) for user_id, points in rows.all()}
 
 
+async def _awards_by_user(
+    session: AsyncSession,
+    group_id: int,
+    *,
+    since: datetime | None = None,
+) -> dict[int, int]:
+    """按成员聚合奖励所得（每周活跃激励之类）；``since`` 非空时只看该时刻之后。"""
+
+    stmt = (
+        select(
+            MemberPointAward.user_id,
+            func.coalesce(func.sum(MemberPointAward.points), 0),
+        )
+        .where(MemberPointAward.group_id == int(group_id))
+        .group_by(MemberPointAward.user_id)
+    )
+    if since is not None:
+        stmt = stmt.where(MemberPointAward.created_at >= since)
+    rows = await session.execute(stmt)
+    return {int(user_id): int(points or 0) for user_id, points in rows.all()}
+
+
 async def _display_names(session: AsyncSession, group_id: int) -> dict[int, str]:
     """每个成员最近一条签到记录的昵称（签到时填的展示名）。"""
 
@@ -393,29 +449,44 @@ async def build_rank_board(
 ) -> RankBoard:
     """排本群积分榜，并算出调用者自己的名次。
 
-    默认榜按**可用积分**（签到流水 − 消费流水）；``week=True`` 只累加本周一
-    （Asia/Shanghai）以来**获得**的积分。并列时签到天数多的在前，再按 user_id
-    稳定排序。调用者即使不在榜内也会拿到名次：没有任何记录时排在所有有效记录
-    之后（榜里不会出现这条合成记录，它只出现在"你：第 X 名"那行）。
+    默认榜按**可用积分**（签到流水 + 奖励流水 − 消费流水）；``week=True`` 只累加
+    本周一（Asia/Shanghai）以来**获得**的积分（含本周到账的奖励）。并列时签到天数
+    多的在前，再按 user_id 稳定排序。调用者即使不在榜内也会拿到名次：没有任何记录
+    时排在所有有效记录之后（榜里不会出现这条合成记录，它只出现在"你：第 X 名"那行）。
     """
 
     gid, uid = int(group_id), int(user_id)
     overall = await _earned_by_user(session, gid)
+    awarded = await _awards_by_user(session, gid)
     spent = await _spent_by_user(session, gid)
     available = {
-        member: points - spent.get(member, 0)
-        for member, (points, _days) in overall.items()
+        member: available_from_ledgers(
+            earned=overall.get(member, (0, 0))[0],
+            awarded=awarded.get(member, 0),
+            spent=spent.get(member, 0),
+        )
+        # 只靠奖励拿分（没签到过）的人也要出现在榜上
+        for member in set(overall) | set(awarded)
     }
 
     if week:
-        since = _week_start(local_today(now)).isoformat()
-        weekly = await _earned_by_user(session, gid, since=since)
-        scored = {member: (points, days) for member, (points, days) in weekly.items()}
+        week_monday = _week_start(local_today(now))
+        weekly = await _earned_by_user(session, gid, since=week_monday.isoformat())
+        week_awards = await _awards_by_user(
+            session, gid, since=datetime.combine(week_monday, time.min)
+        )
+        scored = {
+            member: (
+                weekly.get(member, (0, 0))[0] + week_awards.get(member, 0),
+                weekly.get(member, (0, 0))[1],
+            )
+            for member in set(weekly) | set(week_awards)
+        }
         mode = "week"
     else:
         scored = {
-            member: (available[member], days)
-            for member, (_points, days) in overall.items()
+            member: (available[member], overall.get(member, (0, 0))[1])
+            for member in available
         }
         mode = "all"
 

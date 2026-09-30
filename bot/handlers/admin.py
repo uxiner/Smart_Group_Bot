@@ -33,6 +33,7 @@ from bot.db.models import (
     ReplyMute,
     UserWarning,
 )
+from bot.services.cost_report import render_group_cost
 from bot.services.quality_report import render_group_quality
 from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabled
 from bot.services.bot_screening import remove_bot_whitelist
@@ -3940,6 +3941,41 @@ async def cmd_modstats(
     except Exception:
         log.warning(
             "[%s] /modstats failed | days=%s", getattr(message.chat, "id", "?"), days,
+            exc_info=True,
+        )
+        await _answer(message, settings, "<b>报表生成失败</b>\n请稍后重试。")
+        return
+    await _commit_settings(session)
+    await _answer(message, settings, text)
+
+
+@router.message(Command("cost"))
+async def cmd_cost(
+    message: Message, session: AsyncSession, settings: Settings
+) -> None:
+    """成本与健康报表：token 用量、缓存命中、超时与空响应。
+
+    用法：``/cost``（近 7 天）或 ``/cost 30``（近 30 天）。
+
+    只给最高管理员看：token 花销是运营成本，没必要让群里每个管理员都看到。
+    数据来自 ``llm_usage_daily``（见 ``bot.services.llm_metrics`` 的累加与落盘）。
+    """
+
+    if not await ensure_super_admin(message, settings):
+        return
+
+    days = 7
+    parts = str(message.text or "").split()
+    if len(parts) > 1:
+        try:
+            days = max(1, min(90, int(parts[1])))
+        except ValueError:
+            days = 7
+    try:
+        text = await render_group_cost(session, days=days)
+    except Exception:
+        log.warning(
+            "[%s] /cost failed | days=%s", getattr(message.chat, "id", "?"), days,
             exc_info=True,
         )
         await _answer(message, settings, "<b>报表生成失败</b>\n请稍后重试。")

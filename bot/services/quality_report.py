@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -358,9 +359,16 @@ def _blockquote(title: str, lines: list[str]) -> str:
 
 
 def render_quality_report(
-    quality: ModerationQuality, activity: ActivitySummary | None = None
+    quality: ModerationQuality,
+    activity: ActivitySummary | None = None,
+    *,
+    activity_lines: Sequence[str] | None = None,
 ) -> str:
-    """审核质量报表（Telegram HTML；标题 + 可展开明细）。"""
+    """审核质量报表（Telegram HTML；标题 + 可展开明细）。
+
+    ``activity_lines`` 是外部（每周活跃激励结算）算好的"上周活跃榜"文案行，
+    这里只负责排版，不重复统计也不发奖。
+    """
 
     title = f"审核质量 · 近 {quality.days} 天"
     lines: list[str] = []
@@ -422,17 +430,24 @@ def render_quality_report(
                 for index, (name, points) in enumerate(activity.top_members)
             )
             lines.append(f"本周积分榜：{board}")
+    if activity_lines:
+        lines.append("")
+        lines.extend(str(line) for line in activity_lines if str(line).strip())
     return _blockquote(title, lines)
 
 
 async def render_group_quality(
-    session: AsyncSession, *, group_id: int, days: int = 7
+    session: AsyncSession,
+    *,
+    group_id: int,
+    days: int = 7,
+    activity_lines: Sequence[str] | None = None,
 ) -> str:
     """一次取齐并渲染（命令与周报共用）。"""
 
     quality = await collect_quality(session, group_id=group_id, days=days)
     activity = await collect_activity(session, group_id=group_id, days=days)
-    return render_quality_report(quality, activity)
+    return render_quality_report(quality, activity, activity_lines=activity_lines)
 
 
 async def authorized_group_ids(session: AsyncSession) -> list[int]:

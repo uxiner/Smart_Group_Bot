@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ModerationConfig
 from bot.db.models import ModerationExemption, ModerationRule, UserWarning, Violation
+from bot.services import llm_metrics
 from bot.services.llm import LLMService
 from bot.utils.prompts import get_prompt
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
@@ -431,6 +432,9 @@ class ModerationService:
             preview_limit = 500
             preview_truncated = len(escaped) > preview_limit
             preview = escaped[:preview_limit]
+            # 统计口径：模型"有输出但不是合法 JSON"。这和"空响应"是两回事，
+            # 成本看板里分开计，才能看出是模型被截断还是根本没出声。
+            llm_metrics.record("moderation", parse_errors=1)
             log.warning(
                 "审核模型输出不可解析，按不违规处理: response_len=%d preview_truncated=%s preview=%s",
                 len(raw_text),

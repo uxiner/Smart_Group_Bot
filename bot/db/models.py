@@ -1100,3 +1100,141 @@ class MemberPointSpend(Base):
             unique=True,
         ),
     )
+
+
+class LlmUsageDaily(Base):
+    """按天、按阶段的 LLM 用量台账：token、缓存、超时、空响应、解析失败。
+
+    写入路径见 ``bot.services.llm_metrics``：主路径只在内存里加整数，
+    60 秒的惰性定时器把批次并进这张表（累加式 upsert），所以回复延迟不受影响。
+    ``usage_date`` 是 Asia/Shanghai 的自然日，和 ``member_checkins.checkin_date``
+    同口径——否则日报 / 周报会对不上。
+    """
+
+    __tablename__ = "llm_usage_daily"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    usage_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    stage: Mapped[str] = mapped_column(String(24), default="", nullable=False)
+
+    calls: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    prompt_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    #: 命中前缀缓存的 token（网关的 cached_tokens / cache_read_input_tokens）
+    cached_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    #: 写进缓存的 token（cache_creation_input_tokens）
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    #: 思考 token（completion_thinking_tokens）；关掉思考时应恒为 0
+    thinking_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+    empty_responses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    timeouts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: 模型有输出但不是合法 JSON（审核用），与空响应分开计
+    parse_errors: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ux_llm_usage_daily_day_stage", "usage_date", "stage", unique=True),
+    )
+
+
+class MemberActivityDaily(Base):
+    """每周活跃激励的日累计：一行 = 一个成员在一个本地自然日（Asia/Shanghai）。
+
+    为什么按天滚动累计而不是等周末再算：群里消息不重放，周末再统计要么扫
+    ``group_message_archive``（只留 7 天，覆盖不了完整自然周），要么什么都没了。
+    所以每条合格消息落到这里做一次 UPSERT。
+
+    ``messages`` 在**写入时**就按 ``MAX_DAILY_MESSAGES``（20）封顶：防刷屏的要求
+    落在数据层，之后不管怎么聚合都不会把刷屏算成贡献。``activity_date`` 与
+    ``member_checkins.checkin_date`` 同口径（本地自然日 ``YYYY-MM-DD``）。
+    """
+
+    __tablename__ = "member_activity_daily"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    activity_date: Mapped[str] = mapped_column(String(10))
+    # 当天有效消息条数（写入时已按 20 封顶）
+    messages: Mapped[int] = mapped_column(Integer, default=0)
+    # 当天"别人回复我"的次数
+    replies_received: Mapped[int] = mapped_column(Integer, default=0)
+    # 最近一次发言时的展示名：榜单要显示昵称，不能指望每个人都签到过
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        onupdate=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # UPSERT 的冲突目标；也是"一个人一天一行"的唯一保证
+        Index(
+            "ix_member_activity_daily_day",
+            "group_id",
+            "user_id",
+            "activity_date",
+            unique=True,
+        ),
+        # 周结算按 (群, 日期区间) 聚合
+        Index(
+            "ix_member_activity_daily_group_date",
+            "group_id",
+            "activity_date",
+            "user_id",
+        ),
+    )
+
+
+class MemberPointAward(Base):
+    """积分奖励流水：一行 = 一次发放（目前只有"每周活跃激励"）。
+
+    **为什么不用 member_checkins 发奖**：连续签到天数是从签到日期集合里倒着推的，
+    塞一行假的签到会直接把连击算错（用户能看见自己的连续天数）。奖励是另一条
+    独立流水，和签到互不影响。
+
+    ``ref`` 是幂等键（``weekly-activity:2026-W40:<user_id>``）：同一周同一个人
+    只会有一行，重复结算靠唯一索引 + ON CONFLICT DO NOTHING 挡住，不抛异常。
+    """
+
+    __tablename__ = "member_point_awards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    points: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_member_point_awards_ref",
+            "group_id",
+            "user_id",
+            "ref",
+            unique=True,
+        ),
+        # 审计"这周发了多少分"用
+        Index(
+            "ix_member_point_awards_group_created",
+            "group_id",
+            "created_at",
+            "user_id",
+        ),
+    )
