@@ -38,12 +38,20 @@ from bot.services.authz import (
 from bot.services import memory_holder
 from bot.services.checkin import (
     CHALLENGE_SKIP_COST,
+    CHECKIN_CALLBACK_DATA,
     MemberProfile,
     RankBoard,
     build_rank_board,
     member_profile,
     record_checkin,
+    render_checkin_receipt,
+    render_checkin_toast,
     summarize,
+)
+from bot.services.checkin_reminder import (
+    count_checkins_today,
+    find_reminder_slot,
+    render_checkin_reminder,
 )
 from bot.services.av_search import (
     AVDetail,
@@ -1746,10 +1754,7 @@ async def cmd_checkin(
         await _answer(
             message,
             settings,
-            "<b>今天已经签过了</b>\n"
-            f"可用 <b>{outcome.available_points}</b> 分｜连续 {outcome.streak} 天"
-            f"｜共签到 {outcome.total_days} 天\n"
-            f"明天 0 点后再来，可得 +{outcome.next_award} 分。",
+            render_checkin_receipt(outcome),
             auto_delete_seconds=CHECKIN_RECEIPT_SECONDS,
         )
         return
@@ -1764,16 +1769,100 @@ async def cmd_checkin(
     await _answer(
         message,
         settings,
-        f"<b>签到成功 · 第 {outcome.streak} 天 +{outcome.points_awarded} 分</b>\n"
-        f"可用 <b>{outcome.available_points}</b> 分｜连续 {outcome.streak} 天"
-        f"｜共签到 {outcome.total_days} 天\n"
-        + (
-            "已连续 10 天以上，每天都是满额 +10 分。"
-            if outcome.capped
-            else f"明天签到可得 +{outcome.next_award} 分。"
-        ),
+        render_checkin_receipt(outcome),
         auto_delete_seconds=CHECKIN_RECEIPT_SECONDS,
     )
+
+
+async def _refresh_checkin_reminder_count(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    *,
+    group_id: int,
+) -> None:
+    """把提醒里的「今日已签到 N 人」刷成最新人数（best-effort）。
+
+    只改**这条提醒自己**：靠 ``checkin_reminder_posts`` 按 (群, 消息) 反查它属于
+    哪个时段，再用同一个渲染函数重算文案。找不到台账（不是提醒消息、或老消息）
+    就直接跳过。任何失败只记日志、不重试——签到已经落库了，编辑失败不能反过来
+    影响签到，也不许往群里补发消息。
+    """
+
+    message = getattr(callback, "message", None)
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    if message is None or message_id <= 0:
+        return
+    try:
+        slot = await find_reminder_slot(
+            session, group_id=group_id, message_id=message_id
+        )
+        if slot is None:
+            return
+        checked_in = await count_checkins_today(session, group_id=group_id)
+        await message.edit_text(
+            render_checkin_reminder(slot=slot, checked_in=checked_in),
+            parse_mode="HTML",
+            reply_markup=getattr(message, "reply_markup", None),
+        )
+    except Exception:
+        log.warning(
+            "[%s] checkin reminder count refresh failed | message=%s",
+            group_id,
+            message_id,
+            exc_info=True,
+        )
+
+
+@router.callback_query(F.data == CHECKIN_CALLBACK_DATA)
+async def on_checkin_button(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    """「✅ 一键签到」按钮：走与 /checkin 完全相同的签到逻辑。
+
+    点击者身份**只**取自 ``callback.from_user``——callback_data 是固定常量，
+    消息作者也不能当成点击者，否则任何人都能替别人签到。
+    回执只用 answer_callback_query 的轻提示，不再往群里发消息（避免刷屏）。
+    """
+
+    if session is None:
+        await callback.answer("会话未就绪，请稍后再试")
+        return
+    clicked = getattr(callback, "from_user", None)
+    if clicked is None or bool(getattr(clicked, "is_bot", False)):
+        await callback.answer("请由群成员本人点击签到")
+        return
+    chat = getattr(getattr(callback, "message", None), "chat", None)
+    if chat is None or str(getattr(chat, "type", "")) not in ("group", "supergroup"):
+        await callback.answer("一键签到只能在群里使用")
+        return
+
+    group_id = int(chat.id)
+    if not await is_group_authorized(session, group_id):
+        await callback.answer("本群尚未授权，暂时无法签到")
+        return
+
+    outcome = await record_checkin(
+        session,
+        group_id=group_id,
+        user_id=int(clicked.id),
+        display_name=str(getattr(clicked, "full_name", "") or ""),
+    )
+    await session.commit()
+    # 先给 toast 回执，再 best-effort 刷新提醒上的人数：先回执用户才不会等编辑结果
+    await callback.answer(render_checkin_toast(outcome))
+    if outcome.already:
+        log.info("checkin button repeated | group=%s user=%s", group_id, clicked.id)
+        return
+    log.info(
+        "checkin button recorded | group=%s user=%s total=%s streak=%s",
+        group_id,
+        clicked.id,
+        outcome.total_points,
+        outcome.streak,
+    )
+    await _refresh_checkin_reminder_count(callback, session, group_id=group_id)
 
 
 @router.message(Command("points"))

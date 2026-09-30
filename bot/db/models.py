@@ -1286,3 +1286,46 @@ class MemberPointAward(Base):
             "user_id",
         ),
     )
+
+
+class CheckinReminderPost(Base):
+    """签到提醒的发送台账：一行 = 一个群在一个时段发出去的那条提醒。
+
+    ``slot_key`` 形如 ``2026-10-01:9``（**本地**自然日 + 本地时段），
+    ``(group_id, slot_key)`` 上的唯一索引就是"同一时段只发一条"的幂等键：
+    定时任务重试、运维手动重跑、cron 重复触发都靠它挡住第二条。
+
+    先占位再发送：占位成功才发消息，发失败就把占位删掉（见
+    ``bot.services.checkin_reminder.release_reminder_slot``），这样"没发出去"
+    不会被记成"已发过"。``message_id`` 在发送成功后才回填，供审计与按钮回调
+    反查"这条提醒是哪个时段发的"。
+    """
+
+    __tablename__ = "checkin_reminder_posts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # "YYYY-MM-DD:slot"（本地自然日 + 本地时段 9/12/15/18）
+    slot_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 发送成功前为 0；发送成功后回填 Telegram message_id
+    message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_checkin_reminder_posts_slot",
+            "group_id",
+            "slot_key",
+            unique=True,
+        ),
+        # 按钮回调按 (群, 消息) 反查这条提醒是哪个时段发的（更新"今日已签到 N 人"用）
+        Index(
+            "ix_checkin_reminder_posts_message",
+            "group_id",
+            "message_id",
+        ),
+    )

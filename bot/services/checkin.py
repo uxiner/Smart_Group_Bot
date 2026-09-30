@@ -244,6 +244,98 @@ async def record_checkin(
     )
 
 
+# ---------------------------------------------------------------------------
+# 回执文案：`/checkin` 命令与「✅ 一键签到」按钮**共用同一个渲染函数**
+#
+# 为什么抽出来：两条入口各写一份文案，改口径时必然有一边忘了改，用户就会在命令
+# 和按钮里看到两份不一致的回执。这里只留一个"结果 → 文案"的出口：
+# ``checkin_receipt()`` 取数，``render_checkin_receipt()`` 出 HTML 卡片（命令用），
+# ``render_checkin_toast()`` 出按钮的轻提示（toast 有长度限制，是压缩版）。
+# 注意：抽取只是搬家，`/checkin` 的文案逐字未变（tests/test_checkin.py 会盯着）。
+# ---------------------------------------------------------------------------
+
+# 「✅ 一键签到」按钮的固定 callback_data。**绝不能**把用户 ID 编进来：
+# 点击者身份只由 callback_query.from_user 决定；一旦把 ID 写进按钮，
+# 谁点的按钮谁就可能被算成别人签到。
+CHECKIN_CALLBACK_DATA = "checkin:v1"
+
+CHECKIN_BUTTON_TEXT = "✅ 一键签到"
+
+# answer_callback_query 的 toast 上限：Telegram 限制 200 字符，这里留余量。
+CHECKIN_TOAST_MAX_CHARS = 180
+
+
+@dataclass(frozen=True, slots=True)
+class CheckinReceipt:
+    """回执的字段视图：命令与按钮两条入口都从这里取数字。"""
+
+    already: bool      # 今天是否已经签过
+    day: int           # 本次签到是连续第几天
+    awarded: int       # 本次获得的分
+    available: int     # 当前可用分
+    streak: int        # 当前连续天数
+    total_days: int    # 累计签到天数
+    next_award: int    # 下一次可得几分
+    capped: bool       # 是否已到每日封顶
+
+
+def checkin_receipt(outcome: CheckinOutcome) -> CheckinReceipt:
+    """把一次签到结果收敛成回执字段（**唯一**的取数出口）。"""
+
+    return CheckinReceipt(
+        already=bool(outcome.already),
+        day=int(outcome.streak),
+        awarded=int(outcome.points_awarded),
+        available=int(outcome.available_points),
+        streak=int(outcome.streak),
+        total_days=int(outcome.total_days),
+        next_award=int(outcome.next_award),
+        capped=bool(outcome.capped),
+    )
+
+
+def render_checkin_receipt(outcome: CheckinOutcome) -> str:
+    """`/checkin` 的完整回执（HTML）。抽取前后逐字一致。"""
+
+    receipt = checkin_receipt(outcome)
+    if receipt.already:
+        return (
+            "<b>今天已经签过了</b>\n"
+            f"可用 <b>{receipt.available}</b> 分｜连续 {receipt.streak} 天"
+            f"｜共签到 {receipt.total_days} 天\n"
+            f"明天 0 点后再来，可得 +{receipt.next_award} 分。"
+        )
+    return (
+        f"<b>签到成功 · 第 {receipt.day} 天 +{receipt.awarded} 分</b>\n"
+        f"可用 <b>{receipt.available}</b> 分｜连续 {receipt.streak} 天"
+        f"｜共签到 {receipt.total_days} 天\n"
+        + (
+            "已连续 10 天以上，每天都是满额 +10 分。"
+            if receipt.capped
+            else f"明天签到可得 +{receipt.next_award} 分。"
+        )
+    )
+
+
+def render_checkin_toast(outcome: CheckinOutcome) -> str:
+    """「一键签到」按钮的回执轻提示（纯文本一行，不再往群里发消息）。
+
+    与 `/checkin` 的卡片同源（都走 ``checkin_receipt``），只是压成一行：
+    toast 太长会被 Telegram 截断，而群里再补一条回执就是刷屏。
+    """
+
+    receipt = checkin_receipt(outcome)
+    if receipt.already:
+        return (
+            f"今天已经签过了｜可用 {receipt.available} 分"
+            f"｜连续 {receipt.streak} 天｜明天可得 +{receipt.next_award} 分"
+        )
+    return (
+        f"签到成功 · 第 {receipt.day} 天 +{receipt.awarded} 分"
+        f"｜可用 {receipt.available} 分｜连续 {receipt.streak} 天"
+    )
+
+
 async def spend_points(
     session: AsyncSession,
     *,
