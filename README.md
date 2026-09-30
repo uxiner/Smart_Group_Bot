@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/aiogram-3.x-0066CC.svg" alt="aiogram">
-  <img src="https://img.shields.io/badge/tests-1993%20passed-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-2037%20passed-brightgreen.svg" alt="Tests">
 </p>
 
 > **本仓库是 [Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot) 的个人部署分支**，
@@ -38,6 +38,12 @@
   **可用积分只有一个定义**：`available_from_ledgers()` = 签到 + 奖励 − 消费，任何页面都走它。
 - **奖励绝不伪装成签到行**：连续签到天数是从签到日期集合倒推出来的，伪造一行就会把用户的连击算坏。
 - 所有加减分都由 `ref` 唯一索引保证幂等，重试/重复执行不会重复记账。
+- **签到提醒**（`bot/tools/checkin_reminder.py`）：每天 **9:00 / 12:00 / 15:00 / 18:00** 在群里发一条提醒
+  （文案按时段称呼不同），带一个「✅ 一键签到」按钮，**10 分钟后自动删除**（走持久删除队列，重启不丢任务）。
+  按钮的回调数据是固定常量、**不带用户 ID**——点击者身份只由 `callback.from_user` 决定，所以没法替别人签到；
+  签到成功/已签过都用轻提示（toast）回执，不在群里另发消息；提醒里的「今日已签到 N 人」会随点击刷新。
+  **同一时段只发一条**（`(群, 时段)` 唯一键先占位再发送，发送失败会释放占位以便重试）。
+  命令与按钮共用同一个回执渲染函数，不会出现两边文案不一致。
 
 ### 2️⃣ 周活跃激励（全新）
 
@@ -90,7 +96,7 @@
 ### 6️⃣ 运维与工程质量（在原版之上加固）
 
 - **管理命令自动清理**：`ManagementCommandCleanupMiddleware` 在 5 秒后删掉群里的 `/ban`、`/mute` 等管理命令行（只碰管理命令，不动成员命令），避免群里堆一屏命令噪声；走持久队列，重启也不漏删
-- **测试规模**：上游 100 个测试文件 → 本分支 **111 个文件、1993 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
+- **测试规模**：上游 100 个测试文件 → 本分支 **112 个文件、2037 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
 - **路由完整性回归测试**：`tests/test_router_route_integrity.py`——防止「helper 函数插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 
@@ -140,6 +146,8 @@ APP_UID="$(id -u)" APP_GID="$(id -g)" docker compose up -d --build
 - 生产机上的代码更新走「备份 → 拷贝已测产物 → 逐文件哈希核对 → 重启 → 验活」，不是 `git pull`
 - 周报与活跃榜发奖是定时任务（`python -m bot.tools.weekly_report`），由宿主机 cron 触发
 - 积分商店到期清理也是定时任务（`python -m bot.tools.shop_expire`，幂等、可加 `--dry-run` 自检），建议每 5–10 分钟跑一次
+- 签到提醒由宿主 cron 在本地 9/12/15/18 点触发（`python -m bot.tools.checkin_reminder --slot <时段>`），
+  工具不判断当前几点：要不要发由 cron 决定，重复触发由时段占位挡住
 
 ## 许可
 
