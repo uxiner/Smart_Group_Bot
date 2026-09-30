@@ -4,12 +4,12 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/aiogram-3.x-0066CC.svg" alt="aiogram">
-  <img src="https://img.shields.io/badge/tests-1917%20passed-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-1993%20passed-brightgreen.svg" alt="Tests">
 </p>
 
 > **本仓库是 [Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot) 的个人部署分支**，
 > 服务一个真实运营的私有 Telegram 大群。`main` = 上游 `main` + 一批自研功能：
-> **成员积分与自助**、**审核质量与成本看板**、**周活跃激励**。
+> **成员积分与自助**、**审核质量与成本看板**、**周活跃激励**、**积分商店**。
 > 上游原版说明（完整功能、架构、部署细节）保存在 [`docs/README.upstream.md`](docs/README.upstream.md)。
 
 **上游项目是什么**：一个由大模型驱动的 Telegram 群聊智能管理机器人，把「聊天陪伴」和「群组治理」合并进同一条消息管线——既能自然参与群聊、调用技能查资料，也能完成内容审核、入群验证、爆破防护和民主投票封禁；全部运行配置在 Telegram Mini App 内可视化完成。
@@ -48,7 +48,30 @@
 - 前 10 名发 **25 / 12 / 4 分**（每周共 77 分），结果随周报发进群里；`bot/tools/activity_award.py` 支持手动补跑与 `--dry-run`
 - 采集与结算都在后台任务里跑（独立 session），**不阻塞群消息的回复路径**
 
-### 3️⃣ 审核增强（在原版审核之上改）
+### 3️⃣ 积分商店（全新）
+
+用积分换三样东西（价格与时长固定；`/shop` 会显示价目表和用法）：
+
+| 商品 | 价格 | 时长 |
+|---|---|---|
+| 自定义头衔（Telegram 原生 member tag） | 30 分 | 7 天 |
+| 同上 · 长租 | 80 分 | 30 天 |
+| 置顶自己的求助 | 20 分 | 6 小时 |
+| 抽奖一次 | 5 分 | 即时开奖 |
+
+- **头衔**：`/tag 文字`（加 `30天` 买长租）。1–16 个字、不能带表情、不能与他人重名，
+  也不能出现「管理员/官方/客服」这类容易冒充的词；**只卖给普通成员**——管理员/群主的头衔归群设置管，
+  实测对管理员调用 Telegram 接口会返回成功但**不会真的挂上**，所以干脆不卖、不扣分。
+  **续费是往后顺延**（还没到期就再买，从原到期时间接着加），到期由定时任务自动清除。
+- **置顶**：回复自己的一条消息后发 `/top`，静默置顶 6 小时（不弹全群通知），到时自动取消；每人同时最多 1 条。
+- **抽奖**：`/draw`，5 分一次、每天最多 10 次；中奖概率 60% 谢谢参与 / 25% 3 分 / 10% 12 分 / 4% 40 分 / 1% 120 分
+  （长期期望约 **4.75 分**/次，作为积分回收口防止通胀），随机数用 `secrets`。
+- **失败自动退款**：扣分先入消费流水，Telegram 侧失败就写一笔退款流水（`shop-refund:<原ref>`，幂等），
+  **不会出现「钱扣了东西没拿到」**；退款本身失败会记日志报警。
+- **到期清理**：`bot/tools/shop_expire.py`（幂等、支持 `--dry-run`），由宿主 cron 定时跑。
+- 权益状态记在 `member_entitlements`（`kind='tag'|'pin'`，一行 = 一个人在一个群里的一件在租商品）。
+
+### 4️⃣ 审核增强（在原版审核之上改）
 
 | 能力 | 说明 |
 |---|---|
@@ -58,16 +81,16 @@
 | 质量报表 | `/modstats`：命中构成、边缘判定、**误伤率**；`/health`：今日命中、待完成质询、归档量、当前模型通道 |
 | 名单管理 | `/exemptlist`（豁免 / 回复静默名单，可翻页、一键移除）、`/unaiexempt`（取消某用户的 AI 审核豁免） |
 
-### 4️⃣ 运营看板与周报（全新）
+### 5️⃣ 运营看板与周报（全新）
 
 - `/cost [天数]`：token 用量、**缓存命中率**、思考 token、超时 / 空响应 / 解析失败，并按阶段（审核 / 决策 / 技能 / 视觉）拆分
 - `bot/services/llm_metrics.py`：进程内用量累加器，60 秒惰性落盘；主回复路径**不写库、不抛异常**
 - `bot/tools/weekly_report.py`：每周把「群健康 + 活跃榜」发进各授权群；**成本摘要只私发给最高管理员**（不在群里晒运营花销）
 
-### 5️⃣ 运维与工程质量（在原版之上加固）
+### 6️⃣ 运维与工程质量（在原版之上加固）
 
 - **管理命令自动清理**：`ManagementCommandCleanupMiddleware` 在 5 秒后删掉群里的 `/ban`、`/mute` 等管理命令行（只碰管理命令，不动成员命令），避免群里堆一屏命令噪声；走持久队列，重启也不漏删
-- **测试规模**：上游 100 个测试文件 → 本分支 **110 个文件、1917 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
+- **测试规模**：上游 100 个测试文件 → 本分支 **111 个文件、1993 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
 - **路由完整性回归测试**：`tests/test_router_route_integrity.py`——防止「helper 函数插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 
@@ -83,13 +106,17 @@
 | `/rank`、`/rank week` | 本群积分榜 Top10（总榜 / 本周） | 所有人 |
 | `/find <关键词>` | 搜索群内保留期消息 | 所有人 |
 | `/report` | 回复漏判消息后举报，触发模型复核 | 所有人 |
+| `/shop` | 积分商店：价目表与每件商品怎么用 | 所有人 |
+| `/tag <文字>`、`/tag <文字> 30天` | 用积分给自己挂群内头衔（30 分 7 天 / 80 分 30 天） | 所有人 |
+| `/top` | 回复自己的一条消息后发送，花 20 分置顶 6 小时 | 所有人 |
+| `/draw` | 花 5 分抽奖一次（每天最多 10 次） | 所有人 |
 | `/health` | 本群今日审核命中、待质询、归档量、模型通道 | 管理员 |
 | `/modstats [天数]` | 审核质量报表（命中构成、误伤率） | 管理员 |
 | `/cost [天数]` | 成本与健康看板（token / 缓存 / 异常） | 管理员 |
 | `/exemptlist` | 审核豁免与静默名单（翻页 / 移除） | 管理员 |
 | `/unaiexempt` | 取消某用户的 AI 审核豁免 | 管理员 |
 
-新增数据表：`member_checkins`、`member_point_spends`、`member_point_awards`、`member_activity_daily`、`llm_usage_daily`。
+新增数据表：`member_checkins`、`member_point_spends`、`member_point_awards`、`member_activity_daily`、`member_entitlements`、`llm_usage_daily`。
 
 ---
 
@@ -112,6 +139,7 @@ APP_UID="$(id -u)" APP_GID="$(id -g)" docker compose up -d --build
 - 数据库是 SQLite（**WAL 模式**）：备份请用 SQLite 在线备份 API（`VACUUM INTO` / `sqlite3.backup()`），**不要直接 `cp` 数据文件**
 - 生产机上的代码更新走「备份 → 拷贝已测产物 → 逐文件哈希核对 → 重启 → 验活」，不是 `git pull`
 - 周报与活跃榜发奖是定时任务（`python -m bot.tools.weekly_report`），由宿主机 cron 触发
+- 积分商店到期清理也是定时任务（`python -m bot.tools.shop_expire`，幂等、可加 `--dry-run` 自检），建议每 5–10 分钟跑一次
 
 ## 许可
 
