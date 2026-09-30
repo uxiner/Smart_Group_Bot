@@ -5872,20 +5872,6 @@ async def flush_pending_inbound_batches() -> None:
         await asyncio.wait(orphan_tasks, timeout=1.0)
 
 
-@router.message(
-    F.text
-    | F.caption
-    | F.sticker
-    | F.voice
-    | F.photo
-    | F.video
-    | F.animation
-    | F.document
-    | F.audio
-    | F.video_note
-    | F.contact
-)
-
 def _verdict_confidence(verdict: object) -> float | None:
     """置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。"""
 
@@ -5915,6 +5901,19 @@ def _moderation_reply_text(message: Message) -> str | None:
     return None
 
 
+@router.message(
+    F.text
+    | F.caption
+    | F.sticker
+    | F.voice
+    | F.photo
+    | F.video
+    | F.animation
+    | F.document
+    | F.audio
+    | F.video_note
+    | F.contact
+)
 async def on_group_message(
     message: Message,
     session: AsyncSession,
