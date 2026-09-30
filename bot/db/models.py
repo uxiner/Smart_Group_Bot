@@ -1197,6 +1197,54 @@ class MemberActivityDaily(Base):
     )
 
 
+class MemberEntitlement(Base):
+    """积分商店里"生效中"的权益：一行 = 一个人在一个群里的一件在租商品。
+
+    目前有两种：``kind='tag'``（自定义头衔，``payload`` 是头衔文字）和
+    ``kind='pin'``（置顶求助，``payload`` 是被置顶的消息 ID 字符串）。
+
+    - ``(group_id, user_id, kind)`` 上的唯一索引保证"一人一项"：同一个人、同一个群里
+      只能有一个生效中的头衔和一个生效中的置顶，续费是把这一行往后延，不是再插一行。
+    - ``expires_at`` 上有索引：``bot.tools.shop_expire`` 每次只扫到期的行。
+    - 到期处理完就把这一行删掉，所以表里只有"现在还有效"的权益——查重复头衔、
+      查"我是不是已经有置顶"都只看这张表，不需要再按时间过滤。
+
+    时间一律是本地（Asia/Shanghai）朴素时间，和 ``member_checkins.checkin_date``、
+    ``member_activity_daily.activity_date`` 同口径。
+    """
+
+    __tablename__ = "member_entitlements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: 'tag' | 'pin'
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 头衔文字，或置顶消息的 message_id（字符串）
+    payload: Mapped[str] = mapped_column(String(255), default="")
+    #: 买下这件商品时那条消费流水的 ref，退款/审计时对得上
+    ref: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (
+        # "一人一项"：续费走 UPDATE，不是再插一行
+        Index(
+            "ix_member_entitlements_slot",
+            "group_id",
+            "user_id",
+            "kind",
+            unique=True,
+        ),
+        # 到期扫描的驱动索引
+        Index("ix_member_entitlements_expires", "expires_at"),
+    )
+
+
 class MemberPointAward(Base):
     """积分奖励流水：一行 = 一次发放（目前只有"每周活跃激励"）。
 
