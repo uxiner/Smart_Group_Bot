@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -59,6 +60,14 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.message_templates import render_action_notice, render_data_brief
+from bot.services.point_shop import (
+    buy_member_tag,
+    buy_pin,
+    play_lottery,
+    render_balance,
+    render_shop_menu,
+    resolve_pin_target,
+)
 from bot.services.skills import SkillService
 from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
@@ -2086,4 +2095,212 @@ async def cmd_health(
         f"记忆服务：{memory_ready}\n"
         f"<i>{html.escape(routing)}</i>",
         auto_delete_seconds=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 积分商店（/shop、/tag、/top、/draw）
+#
+# 设计约束：这里只做"取参数 → 调服务 → 发回执"，扣分/退款/幂等/到期清理全在
+# bot.services.point_shop 里（那套逻辑 CLI 也要用）。商店里任何异常都只影响这一条
+# 请求，所以每个处理器都自己兜住异常，绝不让它冒泡去影响审核/回复/签到。
+# ---------------------------------------------------------------------------
+
+#: 「我的积分」按钮的 callback_data（只有这一个按钮，点了真的会返回余额）
+SHOP_BALANCE_CALLBACK = "shop:points"
+
+_SHOP_MENU_BUTTON = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="我的积分", callback_data=SHOP_BALANCE_CALLBACK)]
+    ]
+)
+
+_SHOP_UNAVAILABLE_TEXT = "商店暂时不可用，请稍后再试（这次没有扣分）。"
+
+
+def _shop_command_argument(message: Message) -> str:
+    """命令后面的全部参数：``/tag 摸鱼冠军`` → ``摸鱼冠军``（``/tag@bot 文字`` 同理）。"""
+
+    text = str(getattr(message, "text", "") or "")
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _shop_caller(message: Message) -> object | None:
+    """发命令的人；机器人/匿名身份返回 None（不参与商店）。"""
+
+    user = getattr(message, "from_user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return None
+    return user
+
+
+async def _shop_ready(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> object | None:
+    """群内 + 已授权 + 真人发言，三条都满足才返回调用者。"""
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return None
+    if not await ensure_group_authorized(message, session, settings):
+        return None
+    return _shop_caller(message)
+
+
+@router.message(Command("shop"))
+async def cmd_shop(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """积分商店：价目表 + 每件商品的确切用法 + 「我的积分」按钮。"""
+
+    user = await _shop_ready(message, session, settings)
+    if user is None:
+        return
+    group_id = int(message.chat.id)
+    try:
+        outcome = await summarize(
+            session, group_id=group_id, user_id=int(user.id)
+        )
+        await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] shop menu failed | user=%s", group_id, user.id)
+        await _answer(message, settings, _SHOP_UNAVAILABLE_TEXT)
+        return
+    await _answer(
+        message,
+        settings,
+        render_shop_menu(available=outcome.available_points),
+        reply_markup=_SHOP_MENU_BUTTON,
+    )
+
+
+@router.message(Command("tag"))
+async def cmd_tag(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """自定义头衔：``/tag 文字``（30 分 7 天）、``/tag 文字 30天``（80 分 30 天）。"""
+
+    user = await _shop_ready(message, session, settings)
+    if user is None:
+        return
+    group_id = int(message.chat.id)
+    try:
+        reply = await buy_member_tag(
+            session,
+            bot=getattr(message, "bot", None),
+            group_id=group_id,
+            user_id=int(user.id),
+            raw_text=_shop_command_argument(message),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] shop tag failed | user=%s", group_id, user.id)
+        await _answer(message, settings, _SHOP_UNAVAILABLE_TEXT)
+        return
+    await _answer(message, settings, reply.text)
+
+
+@router.message(Command("top"))
+async def cmd_top(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """置顶自己的求助：回复自己的一条消息再发 /top（20 分 6 小时）。"""
+
+    user = await _shop_ready(message, session, settings)
+    if user is None:
+        return
+    group_id = int(message.chat.id)
+    try:
+        reply = await buy_pin(
+            session,
+            bot=getattr(message, "bot", None),
+            group_id=group_id,
+            user_id=int(user.id),
+            target=resolve_pin_target(message),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] shop pin failed | user=%s", group_id, user.id)
+        await _answer(message, settings, _SHOP_UNAVAILABLE_TEXT)
+        return
+    await _answer(message, settings, reply.text)
+
+
+@router.message(Command("draw"))
+async def cmd_draw(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """抽奖：5 分一次，每人每天最多 10 次（本地自然日）。"""
+
+    user = await _shop_ready(message, session, settings)
+    if user is None:
+        return
+    group_id = int(message.chat.id)
+    try:
+        reply = await play_lottery(
+            session,
+            group_id=group_id,
+            user_id=int(user.id),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] shop draw failed | user=%s", group_id, user.id)
+        await _answer(message, settings, _SHOP_UNAVAILABLE_TEXT)
+        return
+    await _answer(message, settings, reply.text)
+
+
+@router.callback_query(F.data == SHOP_BALANCE_CALLBACK)
+async def on_shop_balance(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    """「我的积分」按钮：真的查一次余额再弹出来。"""
+
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    if session is None or chat is None:
+        await callback.answer("会话未就绪，请重新发送 /shop", show_alert=True)
+        return
+    if str(getattr(chat, "type", "") or "") not in ("group", "supergroup"):
+        await callback.answer("该按钮仅在群内可用", show_alert=True)
+        return
+    if not await is_group_authorized(session, int(chat.id)):
+        await callback.answer("当前群未授权，请联系最高管理员。", show_alert=True)
+        return
+    user = callback.from_user
+    if user is None or bool(getattr(user, "is_bot", False)):
+        await callback.answer()
+        return
+    try:
+        outcome = await summarize(
+            session, group_id=int(chat.id), user_id=int(user.id)
+        )
+        await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] shop balance failed | user=%s", chat.id, user.id)
+        await callback.answer("查询失败，请稍后再试", show_alert=True)
+        return
+    await callback.answer(
+        render_balance(available=outcome.available_points, streak=outcome.streak),
+        show_alert=True,
     )

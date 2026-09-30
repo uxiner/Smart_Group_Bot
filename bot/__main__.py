@@ -36,6 +36,7 @@ from bot.services.group_permissions import (
 from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_tasks
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
+from bot.services.point_shop import ShopExpiryService
 from bot.services.raid_guard import RaidGuardService, init_raid_guard_service
 from bot.services.proactive import ProactiveTopicService
 from bot.services.privileged_tasks import flush_privileged_tasks
@@ -513,6 +514,12 @@ async def main() -> None:
             session_factory=session_factory,
         )
         init_group_permission_service(group_permissions)
+        # 积分商店买来的头衔/置顶到期后要自动撤掉：常驻循环跑同一套逻辑，
+        # 运维也可以随时用 python -m bot.tools.shop_expire 手动补一次。
+        shop_expiry = ShopExpiryService(
+            bot=bot,
+            session_factory=session_factory,
+        )
         # Event-driven (no background loop): joins feed the detector from the
         # membership handler; challenge deadlines ride the shared sweeper.
         raid_guard = RaidGuardService(
@@ -675,6 +682,10 @@ async def main() -> None:
             asyncio.create_task(
                 group_permissions.run_forever(),
                 name="group-permission-runner",
+            ),
+            asyncio.create_task(
+                shop_expiry.run_forever(),
+                name="shop-expiry-runner",
             ),
             asyncio.create_task(
                 run_resource_watchdog(),
