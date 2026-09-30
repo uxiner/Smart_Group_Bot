@@ -11,6 +11,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from inspect import isawaitable
 from types import SimpleNamespace
 from typing import Any
@@ -24,7 +25,11 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
-from bot.services.request_priority import ReservedCapacityGate
+from bot.services.request_priority import (
+    ExecutionPriority,
+    ReservedCapacityGate,
+    execution_priority_scope,
+)
 from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
@@ -42,16 +47,23 @@ class EmbeddingBatchResult:
 # Keep slow/upstream-broken providers from consuming every Telegram update
 # worker at once.  The semaphore is process-wide because LLMService instances
 # are intentionally short lived (one is built for each pending reply batch).
-_LLM_REQUEST_CAPACITY = 4
+_LLM_REQUEST_CAPACITY = 8
 _LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(_LLM_REQUEST_CAPACITY)
 _LLM_PRIORITY_GATE = ReservedCapacityGate(
     total_capacity=_LLM_REQUEST_CAPACITY,
-    noncritical_capacity=3,
-    # Ordinary replies may use at most two slots. One additional slot remains
-    # available to HIGH join/raid screening and the final slot is reserved for
-    # CRITICAL permission controls.
-    normal_capacity=2,
+    noncritical_capacity=7,
+    # Ordinary replies may use at most half of the slots. The rest stays
+    # available to HIGH join/raid screening and moderation, and the final
+    # slot is reserved for CRITICAL permission controls. 8 total keeps a 3x
+    # margin below the gateway's measured concurrency knee (~24 in flight;
+    # beyond that it answers 503 no_healthy_account).
+    normal_capacity=4,
 )
+# Moderation is safety critical: a missed audit is worse than a late reply,
+# so audits are admitted at HIGH priority (one slot beyond the two NORMAL
+# reply slots).  Ordinary replies keep the default NORMAL priority and can
+# no longer push an audit past its stage deadline during a burst.
+_MODERATION_EXECUTION_PRIORITY = ExecutionPriority.HIGH
 _LLM_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
 _LLM_ORPHAN_STARTED: dict[asyncio.Future[Any], float] = {}
 _LLM_CLEANUP_TASKS: set[asyncio.Future[Any]] = set()
@@ -72,6 +84,75 @@ _LLM_STAGE_DEADLINES = {
 }
 _LLM_CIRCUIT_FAILURE_THRESHOLD = 3
 _LLM_CIRCUIT_COOLDOWN_SECONDS = 30.0
+
+# A tool-capable stage is useless when the model answers with an apology string
+# instead of a tool call: the local web bridge does exactly that whenever it
+# receives a `tools` array.  Such a response used to be returned as the final
+# answer, which silently disabled every search/website skill and could leak the
+# apology into the group.  Recognise the phrasing and keep walking the fallback
+# chain so a tool-capable endpoint gets a turn.
+_TOOL_UNUSABLE_CONTENT_RE = re.compile(
+    r"(?:"
+    r"something went wrong"
+    r"|encounter(?:ing|ed)?\s+an?\s+(?:unknown\s+)?error"
+    r"|having a hard time fulfilling"
+    r"|try (?:your request|that) again"
+    r"|could you try again"
+    r"|服务(?:器)?(?:出现)?异常"
+    r"|出错了[，,]?\s*请(?:稍后)?重试"
+    r")",
+    re.IGNORECASE,
+)
+# Only short replies are treated as failure notices; a long, substantive answer
+# that happens to contain one of these phrases must stay usable.
+_TOOL_UNUSABLE_MAX_CHARS = 240
+_TOOL_UNUSABLE_TTL_SECONDS = 300.0
+# A tool-capable fallback must not be starved by a primary endpoint that hangs:
+# cap a non-final candidate's call so the rest of the stage budget survives.
+_TOOL_CANDIDATE_CAP_SECONDS = 40.0
+# The same bridge degrades *chat* turns too: it answers HTTP 200 whose body is
+# Google's own failure notice ("Sorry, something went wrong...") or a
+# "I am only a language model" refusal template.  The chat path has no tool
+# contract to check, so such a string used to be posted to the group verbatim
+# as if it were an answer.  Treat it as an unusable turn and keep walking the
+# fallback chain -- the free bridge still gets the first try, a working
+# endpoint only answers once it fails.
+_CHAT_DEGRADED_CONTENT_RE = re.compile(
+    r"(?:"
+    # Google web failure notices (mirrors _TOOL_UNUSABLE_CONTENT_RE)
+    r"something went wrong"
+    r"|encounter(?:ing|ed)?\s+an?\s+(?:unknown\s+)?error"
+    r"|having a hard time fulfilling"
+    r"|try (?:your request|that) again"
+    r"|could you try again"
+    r"|服务(?:器)?(?:出现)?异常"
+    r"|出错了[，,]?\s*请(?:稍后)?重试"
+    # "I am only a text model" refusal templates seen from the bridge
+    r"|我只是(?:一个|个)?(?:语言模型|文本\s*AI|AI)"
+    r"|(?:身为|作为)(?:一个|个)?(?:语言模型|文本\s*AI|AI)"
+    r"|我是一个(?:语言模型|文本\s*AI)"
+    r"|我(?:只|仅)会生成(?:文字|文本)"
+    r"|爱莫能助"
+    r"|超出了我的(?:程序逻辑范畴|能力范围|设计用途|能力|设计)"
+    r"|程序代码的局限"
+    r"|不具备这方面的信息或能力"
+    r"|(?:没法|无法|不能)(?:帮(?:到|上|得了)你|办到|提供这方面的(?:帮助|信息|内容))"
+    r")",
+    re.IGNORECASE,
+)
+# Only short replies are treated as degraded; a long, substantive answer that
+# happens to quote one of these phrases must stay usable.
+_CHAT_DEGRADED_MAX_CHARS = 260
+# A degraded bridge stays degraded for hours (an upstream protocol change, not a
+# blip), so one wasted attempt every 30s would make every group reply feel slow.
+# Trip the circuit for longer than the default cooldown.
+_CHAT_DEGRADED_COOLDOWN_SECONDS = 300.0
+# Identifies the bridge-shaped endpoints the check above is designed for: the
+# degraded notice only ever comes from the free in-house Gemini web bridge,
+# which is reached over a docker service name or a loopback address.  A public
+# provider answering with the same words is a genuine reply and stays usable.
+# (``provider`` holds the wire protocol here, not the configured provider name,
+# so the address is the only reliable signal.)
 _LLM_TOKENIZER_THREAD_CAPACITY = 2
 _LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS = 1.0
 _LLM_TOKENIZER_STALE_SECONDS = 30.0
@@ -401,6 +482,7 @@ class LLMService:
         *,
         moderation: ModelConfig | None = None,
         vision: ModelConfig | None = None,
+        skill: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
     ) -> None:
@@ -409,8 +491,18 @@ class LLMService:
         self.decision_config = decision
         self.moderation_config = moderation or decision
         self.compress_config = compress or main
+        # Tool-calling (skills) endpoints; falls back to ``main``.
+        self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
+        # Endpoint -> monotonic deadline until which it is known to answer the
+        # tool stage with an apology string instead of a tool call.
+        self._tool_incapable: dict[tuple[str, str, str], float] = {}
+        # Chat endpoints that just answered HTTP 200 with a failure notice, keyed
+        # like ``_tool_incapable`` and stamped with a loop deadline.  A degraded
+        # bridge is skipped while the stamp lasts so it cannot add its full
+        # latency to every single reply.
+        self._chat_degraded_until: dict[tuple[str, str, str], float] = {}
 
     def reconfigure(
         self,
@@ -420,6 +512,7 @@ class LLMService:
         *,
         moderation: ModelConfig | None = None,
         vision: ModelConfig | None = None,
+        skill: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
     ) -> None:
@@ -429,6 +522,7 @@ class LLMService:
         self.decision_config = decision
         self.moderation_config = moderation or decision
         self.compress_config = compress or main
+        self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
 
@@ -2299,6 +2393,19 @@ class LLMService:
     ) -> str:
         total = len(candidates)
         loop = asyncio.get_running_loop()
+        # Skip endpoints that just answered with a failure notice, as long as a
+        # usable candidate remains: with a persistently degraded bridge every
+        # reply would otherwise pay the bridge's full timeout before the working
+        # endpoint gets its turn.
+        now = loop.time()
+        fresh = [
+            c
+            for c in candidates
+            if self._chat_degraded_until.get(self._tool_endpoint_key(c), 0.0) <= now
+        ]
+        if fresh:
+            candidates = fresh
+            total = len(candidates)
         deadline_sec = self._stage_deadline_seconds(
             label,
             candidates[0] if candidates else None,
@@ -2325,7 +2432,33 @@ class LLMService:
                 )
                 return ""
             if resp is not None:
-                return self._normalize_content_text(resp.choices[0].message.content)
+                text = self._normalize_content_text(resp.choices[0].message.content)
+                if not self._chat_response_degraded(text, cfg):
+                    return text
+                # The endpoint answered HTTP 200 with a failure notice: mark it so
+                # a persistently degraded bridge is skipped for a while instead
+                # of adding its latency to every single reply.
+                self._chat_degraded_until[self._tool_endpoint_key(cfg)] = (
+                    loop.time() + _CHAT_DEGRADED_COOLDOWN_SECONDS
+                )
+                if idx < total:
+                    log.warning(
+                        "LLM degraded reply, walking fallback | stage=%s | "
+                        "model=%s | next=%s | text=%r",
+                        self._label_cn(label),
+                        cfg.model,
+                        candidates[idx].model,
+                        text[:120],
+                    )
+                    continue
+                log.error(
+                    "LLM degraded reply on last candidate, suppressed | "
+                    "stage=%s | model=%s | text=%r",
+                    self._label_cn(label),
+                    cfg.model,
+                    text[:120],
+                )
+                return ""
             if idx < total:
                 continue
             log.error(
@@ -2336,6 +2469,105 @@ class LLMService:
             return ""
         return ""
 
+    @staticmethod
+    def _chat_response_degraded(text: str, cfg: ChatEndpointConfig) -> bool:
+        """True when a chat turn returned a failure notice instead of an answer.
+
+        The free Gemini web bridge answers HTTP 200 whose body is Google's own
+        error notice or a refusal template whenever its upstream session is
+        throttled; the chat path has no tool contract to inspect, so such a
+        string used to reach the group verbatim.  Only bridge-shaped endpoints
+        are judged, and only short replies count, so a long substantive answer
+        quoting one of these phrases stays usable.
+        """
+        stripped = " ".join((text or "").split())
+        if not stripped or len(stripped) > _CHAT_DEGRADED_MAX_CHARS:
+            return False
+        if not LLMService._is_local_bridge_endpoint(cfg):
+            return False
+        return _CHAT_DEGRADED_CONTENT_RE.search(stripped) is not None
+
+    @staticmethod
+    def _is_local_bridge_endpoint(cfg: ChatEndpointConfig) -> bool:
+        """True when the endpoint is a self-hosted bridge, not a public provider.
+
+        Only the in-house Gemini web bridge can return a degraded notice, and it
+        is always reached over a docker service name or a loopback address; a
+        public gateway saying the same words is answering for real and must be
+        left alone.
+        """
+        api_base = str(getattr(cfg, "api_base", "") or "").strip().lower()
+        if not api_base:
+            return False
+        host = api_base.split("//", 1)[-1].split("/", 1)[0].rsplit("@", 1)[-1]
+        host = host.split(":", 1)[0].strip("[]")
+        if not host:
+            return False
+        if host in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}:
+            return True
+        # A bare hostname (no dot) is a container/service name on a private
+        # network, not something reachable on the public internet.
+        if "." not in host or host.endswith(".local"):
+            return True
+        # A private-range address is a self-hosted service too (NAS/LAN bridge).
+        return bool(re.match(r"^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)", host))
+
+    @staticmethod
+    def _tool_endpoint_key(cfg: ChatEndpointConfig) -> tuple[str, str, str]:
+        return (
+            str(getattr(cfg, "provider", "") or ""),
+            str(getattr(cfg, "model", "") or ""),
+            str(getattr(cfg, "api_base", "") or ""),
+        )
+
+    @staticmethod
+    def _tool_response_usable(resp: Any) -> bool:
+        """False when a tool turn produced neither a tool call nor usable text.
+
+        Covers the two failure shapes seen from the Gemini web bridge: an
+        apology/error string returned instead of a tool call, and an empty
+        body.  A text-encoded tool call (recovered later by
+        ``_salvage_text_tool_calls``) stays usable because it is ordinary
+        content that does not match the failure phrasing.
+        """
+        if resp is None:
+            return False
+        message: Any = resp
+        choices = getattr(resp, "choices", None)
+        if not choices and isinstance(resp, dict):
+            choices = resp.get("choices")
+        if choices:
+            first = choices[0]
+            message = getattr(first, "message", None)
+            if message is None and isinstance(first, dict):
+                message = first.get("message")
+            if message is None:
+                message = first
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls is None and isinstance(message, dict):
+            tool_calls = message.get("tool_calls")
+        if tool_calls:
+            return True
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = " ".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+            ).strip()
+        else:
+            text = ""
+        if not text:
+            return False
+        if len(text) <= _TOOL_UNUSABLE_MAX_CHARS:
+            if _TOOL_UNUSABLE_CONTENT_RE.search(text):
+                return False
+        return True
+
     async def complete_with_tools(
         self,
         *,
@@ -2345,9 +2577,29 @@ class LLMService:
         cfg: ModelConfig | None = None,
         preview_limit: int = 80,
     ) -> Any | None:
-        candidates = self._chat_candidates(cfg or self.main)
-        total = len(candidates)
+        candidates = self._chat_candidates(cfg or self.skill_config)
         loop = asyncio.get_running_loop()
+        now = loop.time()
+        # 2026-09-29: the CONFIGURED primary always keeps slot #1.  The skill
+        # route's contract is "home gateway first, free bridge only as a
+        # fallback"; the previous shape dropped the primary whenever it had just
+        # failed the tool contract, which promoted the *fallback* above it - so
+        # a single gateway hiccup made the following 5 minutes of skill calls
+        # wait on the degraded free bridge and then escalate back.  The mark now
+        # only skips fallbacks that just failed the same contract; if every
+        # fallback is marked the marks are cleared, so the chain still gets a
+        # chance instead of answering from a known-bad primary alone.
+        head, tail = candidates[:1], candidates[1:]
+        fresh_tail = [
+            c
+            for c in tail
+            if self._tool_incapable.get(self._tool_endpoint_key(c), 0.0) <= now
+        ]
+        if tail and not fresh_tail:
+            self._tool_incapable.clear()
+            fresh_tail = tail
+        candidates = head + fresh_tail
+        total = len(candidates)
         deadline_sec = self._stage_deadline_seconds(
             label,
             candidates[0] if candidates else None,
@@ -2357,8 +2609,12 @@ class LLMService:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return None
+            call_timeout = remaining
+            if idx < total:
+                # Leave the rest of the stage budget for a tool-capable fallback.
+                call_timeout = min(remaining, _TOOL_CANDIDATE_CAP_SECONDS)
             try:
-                async with asyncio.timeout(remaining):
+                async with asyncio.timeout(call_timeout):
                     resp = await self._chat_completion_response_with_retries(
                         messages=messages,
                         cfg=candidate,
@@ -2368,6 +2624,20 @@ class LLMService:
                         tool_choice="auto",
                     )
             except TimeoutError:
+                self._tool_incapable[self._tool_endpoint_key(candidate)] = (
+                    loop.time() + _TOOL_UNUSABLE_TTL_SECONDS
+                )
+                if idx < total:
+                    log.warning(
+                        "LLM tool candidate timed out | stage=%s | model=%s | "
+                        "attempt=%d/%d | waited=%.1fs | escalating_to_fallback",
+                        self._label_cn(label),
+                        candidate.model,
+                        idx,
+                        total,
+                        call_timeout,
+                    )
+                    continue
                 log.error(
                     "LLM tool total deadline exceeded | stage=%s deadline=%.1fs",
                     self._label_cn(label),
@@ -2375,7 +2645,20 @@ class LLMService:
                 )
                 return None
             if resp is not None:
-                return resp
+                if self._tool_response_usable(resp) or idx >= total:
+                    return resp
+                self._tool_incapable[self._tool_endpoint_key(candidate)] = (
+                    loop.time() + _TOOL_UNUSABLE_TTL_SECONDS
+                )
+                log.warning(
+                    "LLM tool response unusable | stage=%s | model=%s | "
+                    "attempt=%d/%d | escalating_to_fallback",
+                    self._label_cn(label),
+                    candidate.model,
+                    idx,
+                    total,
+                )
+                continue
             if idx < total:
                 continue
             log.error(
@@ -2403,12 +2686,18 @@ class LLMService:
             cfg = self.main
             label = "main"
 
-        return await self._chat_with_fallbacks(
-            messages=messages,
-            candidates=self._chat_candidates(cfg),
-            label=label,
-            preview_limit=(120 if label == "moderation" else 80),
+        scope = (
+            execution_priority_scope(_MODERATION_EXECUTION_PRIORITY)
+            if label == "moderation"
+            else nullcontext()
         )
+        with scope:
+            return await self._chat_with_fallbacks(
+                messages=messages,
+                candidates=self._chat_candidates(cfg),
+                label=label,
+                preview_limit=(120 if label == "moderation" else 80),
+            )
 
     async def decision(self, system: str, user_text: str) -> str:
         """Fast decision call (uses decision model)."""
@@ -2510,16 +2799,15 @@ class LLMService:
         candidates: list[EmbedEndpointConfig],
         total_deadline_sec: float | None = None,
     ) -> tuple[list[list[float]], EmbedEndpointConfig] | None:
-        # Deployment note: no provider configured on this host serves an
-        # embedding model.  pipio exposes 39 chat models but no embedding model
-        # (text-embedding-004 -> HTTP 503 "no channel available"), and the local
-        # sub2api gateway only serves gemini-3.1-pro / gemini-3.5-flash-lite /
-        # gemini-3.8-flash.  Every attempt used to fail and re-queue forever
-        # (group_message_archive_embeddings: 1888/1888 status='failed', retried
-        # up to 172 times).  Short-circuit instead of hammering a non-existent
-        # upstream.  Memory recall stays non-functional until an
-        # embedding-capable provider is configured.
-        return None
+        # Deployment note: embeddings are served locally by the smart_embed
+        # container (llama.cpp + bge-m3 at http://smart_embed:8788/v1 on this
+        # host's bot docker network).  pipio exposes no embedding model and the
+        # local sub2api gateway serves chat models only, so this stage used to
+        # fail and re-queue forever (group_message_archive_embeddings:
+        # 1888/1888 status='failed', retried up to 172 times) and was
+        # short-circuited with `return None`.  Do not reintroduce that
+        # short-circuit: with models.embed pointed at the local endpoint the
+        # archive queue drains and memory recall works again.
         """Generate embeddings and report the endpoint that produced them."""
 
         total = len(candidates)

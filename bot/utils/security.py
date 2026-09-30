@@ -194,7 +194,7 @@ def build_history_message_record(
     )
     # Owner is authoritative only from the system-set flag / system-prepended
     # tag, never from the user-controlled body. Non-owner lines carry no owner
-    # marker at all so the model can positively bind 主人 to the immutable
+    # marker at all so the model can positively bind the owner to the immutable
     # sender_id instead of guessing from spoofable display names.
     is_owner = ""
     raw_owner = msg.get("is_owner", "")

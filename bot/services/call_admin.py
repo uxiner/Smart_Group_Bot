@@ -421,6 +421,136 @@ async def _await_pin_owner_task(task: asyncio.Task[None]) -> None:
         raise cancellation
 
 
+def build_member_report_text(
+    mentions: list[str],
+    *,
+    reporter_id: int,
+    reporter_name: str,
+    reported_text: str,
+    reason: str = "",
+    check_summary: str = "",
+) -> str:
+    """Card for a member-reported message, carrying the bot's own re-check."""
+
+    shown = html.escape(str(reporter_name or "").strip() or str(reporter_id))
+    details = []
+    if str(reason or "").strip():
+        details.append(
+            card_field("补充说明", html.escape(_break_user_mentions(reason.strip()[:200])))
+        )
+    details.append(
+        card_field("被举报消息", html.escape(_break_user_mentions(reported_text.strip()[:300])))
+    )
+    if str(check_summary or "").strip():
+        details.append(
+            card_field("审核复核", html.escape(_break_user_mentions(check_summary.strip()[:200])))
+        )
+    return render_summary_notice(
+        "成员举报 · 请管理员查看",
+        " ".join(mentions),
+        context=card_field(
+            "发起人", f'<a href="tg://user?id={int(reporter_id)}">{shown}</a>'
+        ),
+        details=details,
+    )
+
+
+async def send_member_report_notice(
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    group_id: int,
+    reporter_id: int,
+    reporter_name: str,
+    reported_text: str,
+    reason: str = "",
+    check_summary: str = "",
+    group_settings: dict | None = None,
+) -> bool:
+    """Summon the admins about a message the pipeline let through.
+
+    Like the appeal notice this is not gated by the @admin policy: a report is
+    the group's only way to recover from a missed detection.
+    """
+
+    try:
+        mentions = await _resolve_admin_mentions(
+            bot, session, group_id, call_admin_targets(group_settings)
+        )
+    except Exception:
+        log.warning("[%s] member report admin lookup failed", group_id, exc_info=True)
+        return False
+    if not mentions:
+        log.info("[%s] member report skipped: no admins to mention", group_id)
+        return False
+
+    text = build_member_report_text(
+        mentions,
+        reporter_id=reporter_id,
+        reporter_name=reporter_name,
+        reported_text=reported_text,
+        reason=reason,
+        check_summary=check_summary,
+    )
+    return await _send_admin_notice(
+        bot,
+        settings,
+        group_id=group_id,
+        text=text,
+        group_settings=group_settings,
+        log_label="member report",
+        task_prefix="member-report-pin",
+    )
+
+
+async def _send_admin_notice(
+    bot: Bot,
+    settings: Settings,
+    *,
+    group_id: int,
+    text: str,
+    group_settings: dict | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    log_label: str,
+    task_prefix: str,
+) -> bool:
+    """Send one admin-addressed notice, honoring the group's pin/cleanup prefs."""
+
+    cleanup_seconds = configured_auto_delete_seconds(settings, "call_admin")
+    pin_message = notification_pin_enabled(settings, group_settings, "call_admin")
+    initial_markup = reply_markup
+    if cleanup_seconds == AUTO_DELETE_BUTTON_SENTINEL:
+        # A delete-only control removes the pin too, so any admin controls are
+        # dropped in this mode and admins act with their own tools.
+        initial_markup = build_delete_button_markup()
+    try:
+        sent = await bot.send_message(
+            group_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=initial_markup,
+        )
+    except Exception:
+        log.warning("[%s] %s send failed", group_id, log_label, exc_info=True)
+        return False
+    if cleanup_seconds != AUTO_DELETE_BUTTON_SENTINEL:
+        await schedule_message_auto_delete_durable(sent, cleanup_seconds)
+    if pin_message:
+        message_id = int(getattr(sent, "message_id", 0) or 0)
+        pin_owner = asyncio.create_task(
+            _establish_call_admin_pin(
+                bot,
+                chat_id=group_id,
+                message_id=message_id,
+                initial_markup=initial_markup,
+            ),
+            name=f"{task_prefix}:{group_id}:{message_id}",
+        )
+        await _await_pin_owner_task(pin_owner)
+    return True
+
+
 async def handle_call_admin(
     message,
     session: AsyncSession,
@@ -430,7 +560,6 @@ async def handle_call_admin(
     caller_id: int,
     caller_name: str,
 ) -> bool:
-    """Send the admin summon for one "@admin" message; False if not sent."""
     group_id = int(message.chat.id)
     if not call_admin_policy(settings, group_settings):
         return False

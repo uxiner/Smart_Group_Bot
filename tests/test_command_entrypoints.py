@@ -5,7 +5,7 @@ from unittest.mock import ANY, AsyncMock, patch
 from bot.config import Settings
 from bot.handlers import admin, commands
 from bot.services.skills.base import SkillRunResult
-from bot.utils.command_catalog import build_command_guide_context
+from bot.utils.command_catalog import build_bot_commands, build_command_guide_context
 
 
 def _settings() -> Settings:
@@ -1185,6 +1185,320 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             session_factory,
         )
         self.assertIn("规则添加成功", publish.await_args.args[1])
+
+    def test_exemptlist_command_and_callbacks_are_registered(self) -> None:
+        msg_callbacks = [h.callback for h in admin.router.message.handlers]
+        cb_callbacks = [h.callback for h in admin.router.callback_query.handlers]
+        self.assertIn(admin.cmd_exemptlist, msg_callbacks)
+        self.assertIn(admin.on_exemptlist_paging, cb_callbacks)
+        self.assertIn(admin.on_exemptlist_delete, cb_callbacks)
+        guide = build_command_guide_context()
+        self.assertIn("command: /exemptlist", guide)
+        self.assertIn("查看本群审核豁免与回复静默名单", guide)
+
+    def test_moderation_roster_page_renders_combined_list_and_buttons(self) -> None:
+        empty_text, empty_kb = admin._build_moderation_roster_page(
+            [], mute_all=True, page=0, group_id=-10001
+        )
+        self.assertIn("<b>审核与静默名单</b>", empty_text)
+        self.assertIn("当前没有被豁免审核或被静默回复的成员", empty_text)
+        self.assertIn("全群静默", empty_text)
+        self.assertIn("<code>-10001</code>", empty_text)
+        self.assertIsNone(empty_kb)
+
+        entries = [
+            admin._ModerationRosterEntry(
+                kind="exempt",
+                user_id=101,
+                display_name="张三",
+                username="zhangsan",
+                created_by=999,
+                created_at_text="2026-09-28 21:00",
+            ),
+            admin._ModerationRosterEntry(
+                kind="bot",
+                user_id=202,
+                display_name="通知机器人",
+                username="notify_bot",
+                created_by=0,
+                created_at_text="2026-09-20 12:00",
+            ),
+            admin._ModerationRosterEntry(
+                kind="mute",
+                user_id=303,
+                display_name="",
+                username="",
+                created_by=999,
+                created_at_text="2026-09-28 22:00",
+            ),
+        ]
+        text, kb = admin._build_moderation_roster_page(
+            entries, mute_all=False, page=0, group_id=-10001, group_title="测试群"
+        )
+        self.assertIn("<b>审核豁免</b>　<code>2</code> 人", text)
+        self.assertIn("<b>回复静默</b>　<code>1</code> 人", text)
+        self.assertIn("张三 @zhangsan　<code>101</code>", text)
+        self.assertIn("类型　审核豁免", text)
+        self.assertIn("类型　Bot 白名单", text)
+        self.assertIn("（未记录昵称）　<code>303</code>", text)
+        self.assertIn("类型　回复静默", text)
+        self.assertIn("测试群", text)
+        self.assertIsNotNone(kb)
+        cb_data = [row[0].callback_data for row in kb.inline_keyboard]
+        # Every button carries the group: a card delivered to a DM cannot infer
+        # it from the chat it is clicked in.
+        self.assertEqual(
+            cb_data,
+            [
+                "exd:exempt:101:0:-10001",
+                "exd:bot:202:0:-10001",
+                "exd:mute:303:0:-10001",
+            ],
+        )
+
+    def test_help_catalog_drives_the_telegram_command_menu(self) -> None:
+        menu = dict(build_bot_commands())
+        self.assertIn("exemptlist", menu)
+        self.assertIn("取消", menu["exemptlist"])
+        # Argument forms and duplicate base names must not reach Telegram.
+        self.assertNotIn("lm add", menu)
+        self.assertNotIn("mute all", menu)
+        self.assertEqual(len(menu), len(build_bot_commands()))
+        for name in menu:
+            self.assertNotIn(" ", name)
+            self.assertLessEqual(len(menu[name]), 256)
+
+    async def test_exemptlist_in_group_delivers_card_to_private_chat(self) -> None:
+        receipt_message = SimpleNamespace(message_id=777)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="测试群"),
+            from_user=SimpleNamespace(id=123, username="admin", full_name="管理员"),
+            text="/exemptlist",
+            message_id=9001,
+            bot=SimpleNamespace(),
+            answer=AsyncMock(return_value=receipt_message),
+        )
+        session = SimpleNamespace(
+            commit=AsyncMock(),
+            get=AsyncMock(return_value=None),
+        )
+        entries = [
+            admin._ModerationRosterEntry(
+                kind="exempt",
+                user_id=101,
+                display_name="张三",
+                username="zhangsan",
+                created_by=999,
+                created_at_text="2026-09-28 21:00",
+            )
+        ]
+        with (
+            patch(
+                "bot.handlers.admin.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.ensure_group_admin_permission",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._load_moderation_roster",
+                new=AsyncMock(return_value=(entries, False)),
+            ),
+            patch(
+                "bot.handlers.admin.send_roster_card_private",
+                new=AsyncMock(return_value=True),
+            ) as deliver,
+            patch(
+                "bot.handlers.admin.schedule_message_auto_delete_durable",
+                new=AsyncMock(return_value=True),
+            ) as schedule_delete,
+        ):
+            await admin.cmd_exemptlist(message, session=session, settings=_settings())
+
+        # The card goes to the operator's DM; the group only sees a receipt that
+        # removes itself, so a long roster never clutters the chat.
+        self.assertEqual(deliver.await_args.args[1], 123)
+        self.assertIn("张三 @zhangsan", deliver.await_args.args[2])
+        self.assertIn("-10001", deliver.await_args.args[2])
+        message.answer.assert_awaited_once()
+        # Only the receipt is scheduled here: the operator's own command line is
+        # removed centrally by ManagementCommandCleanupMiddleware.
+        schedule_delete.assert_awaited_once()
+        self.assertIs(schedule_delete.await_args.args[0], receipt_message)
+        self.assertEqual(
+            schedule_delete.await_args.args[1],
+            admin._ROSTER_NOTICE_AUTO_DELETE_SECONDS,
+        )
+
+    async def test_exemptlist_falls_back_to_group_when_dm_is_refused(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="测试群"),
+            from_user=SimpleNamespace(id=123, username="admin", full_name="管理员"),
+            text="/exemptlist",
+            message_id=9001,
+            bot=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock(), get=AsyncMock(return_value=None))
+        with (
+            patch(
+                "bot.handlers.admin.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.ensure_group_admin_permission",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._load_moderation_roster",
+                new=AsyncMock(return_value=([], False)),
+            ),
+            patch(
+                "bot.handlers.admin.send_roster_card_private",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.admin._answer",
+                new=AsyncMock(),
+            ) as answer_mock,
+            patch(
+                "bot.handlers.admin.schedule_message_auto_delete_durable",
+                new=AsyncMock(return_value=True),
+            ) as schedule_delete,
+        ):
+            await admin.cmd_exemptlist(message, session=session, settings=_settings())
+
+        # A refused DM must not leave the operator with a command that appears
+        # to do nothing: the card is posted in the group instead and nothing is
+        # scheduled for deletion here (the middleware handles the command line).
+        schedule_delete.assert_not_awaited()
+        self.assertIn("审核与静默名单", answer_mock.await_args.args[2])
+
+    async def test_private_roster_callback_authorizes_against_payload_group(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123, type="private"),  # operator's own DM
+            edit_text=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            data="exd:exempt:101:0:-10001",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        row = SimpleNamespace(id=1, group_id=-10001, user_id=101)
+        result = SimpleNamespace(scalar_one_or_none=lambda: row)
+        session = SimpleNamespace(
+            execute=AsyncMock(return_value=result),
+            delete=AsyncMock(),
+            commit=AsyncMock(),
+            get=AsyncMock(return_value=None),
+        )
+        with (
+            patch(
+                "bot.handlers.admin.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ) as authorized,
+            patch(
+                "bot.handlers.admin.is_group_admin_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._load_moderation_roster",
+                new=AsyncMock(return_value=([], False)),
+            ),
+        ):
+            await admin.on_exemptlist_delete(
+                callback, settings=_settings(), session=session
+            )
+
+        # -10001 comes from the button, not from the DM chat id, and the
+        # permission checks run against it.
+        self.assertEqual(authorized.await_args.args[1], -10001)
+        session.delete.assert_awaited_once_with(row)
+        message.edit_text.assert_awaited_once()
+        callback.answer.assert_awaited_once_with("已取消豁免: 101")
+
+    async def test_private_roster_callback_rejects_unauthorized_operator(self) -> None:
+        message = SimpleNamespace(chat=SimpleNamespace(id=123, type="private"))
+        callback = SimpleNamespace(
+            data="exd:exempt:101:0:-10001",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        with (
+            patch(
+                "bot.handlers.admin.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.is_group_admin_authorized",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await admin.on_exemptlist_delete(
+                callback, settings=_settings(), session=session
+            )
+        callback.answer.assert_awaited_once_with("仅群管理可操作该列表", show_alert=True)
+
+    async def test_exemptlist_delete_callback_removes_entry_and_refreshes(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            reply_markup=None,
+            edit_text=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            data="exd:exempt:101:0",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        row = SimpleNamespace(id=1, group_id=-10001, user_id=101)
+        result = SimpleNamespace(scalar_one_or_none=lambda: row)
+        session = SimpleNamespace(
+            execute=AsyncMock(return_value=result),
+            delete=AsyncMock(),
+            commit=AsyncMock(),
+            get=AsyncMock(return_value=None),
+        )
+        remaining = [
+            admin._ModerationRosterEntry(
+                kind="mute",
+                user_id=303,
+                display_name="李四",
+                username="lisi",
+                created_by=999,
+                created_at_text="2026-09-28 22:00",
+            )
+        ]
+        with (
+            patch(
+                "bot.handlers.admin._callback_user_can_manage_group",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._load_moderation_roster",
+                new=AsyncMock(return_value=(remaining, False)),
+            ),
+        ):
+            await admin.on_exemptlist_delete(
+                callback, settings=_settings(), session=session
+            )
+        session.delete.assert_awaited_once_with(row)
+        message.edit_text.assert_awaited_once()
+        edited_text = message.edit_text.await_args.args[0]
+        self.assertIn("李四 @lisi", edited_text)
+        callback.answer.assert_awaited_once_with("已取消豁免: 101")
 
 
 if __name__ == "__main__":

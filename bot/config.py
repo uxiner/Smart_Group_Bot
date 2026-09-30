@@ -138,6 +138,8 @@ class BotConfig(BaseModel):
         max_tokens=1024,
         timeout_sec=12.0,
     )
+    # Tool-calling (skills) stage route; ``None`` = reuse ``main_model``.
+    skill_model: ModelConfig | None = None
     embed_model: EmbedConfig = EmbedConfig()
     max_context_tokens: int = 256000
     max_output_tokens: int = 2048

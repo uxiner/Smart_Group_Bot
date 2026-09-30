@@ -138,7 +138,10 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             await group.on_group_message(message, session=session, settings=settings)
 
         moderation_service.is_user_exempt.assert_awaited_once_with(session, -10001, -1009876543210)
-        moderation_service.evaluate.assert_awaited_once_with(session, -10001, "bad text")
+        # The first verdict is a low-confidence ban, so the handler asks once
+        # more before acting; the channel sender is still not exempt.
+        moderation_service.evaluate.assert_awaited_with(session, -10001, "bad text")
+        self.assertEqual(moderation_service.evaluate.await_count, 2)
         message.chat.ban_sender_chat.assert_awaited_once_with(-1009876543210)
         message.delete.assert_awaited_once()
         moderation_service.record_violation.assert_awaited_once()

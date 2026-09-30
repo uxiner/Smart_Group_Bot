@@ -2664,7 +2664,11 @@ class ModerationChallengeTests(_DbTestCase):
         self.assertIn("疑似发布广告", prompt_call.args[1])
         self.assertEqual(prompt_call.kwargs["parse_mode"], "HTML")
         keyboard = prompt_call.kwargs["reply_markup"]
-        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "jv:v:918")
+        # Moderation cards lead with the combined "re-check, then verify" button
+        # (the old plain 开始验证 is still used by the join/patrol/raid cards).
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "复核 / 开始验证")
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "jv:p:918")
+        self.assertEqual(len(keyboard.inline_keyboard), 2)
         self.assertEqual(keyboard.inline_keyboard[1][0].callback_data, "jv:a:918")
         self.assertEqual(keyboard.inline_keyboard[1][1].callback_data, "jv:r:918")
 

@@ -219,6 +219,10 @@ class ModelSettingsConfig(StrictModel):
             timeout_sec=12.0,
         )
     )
+    # Tool-calling (skills) stage.  ``None`` keeps the legacy behaviour of
+    # reusing ``main``; pointing it at a tool-capable provider stops the
+    # stage from burning budget on an endpoint that cannot call tools.
+    skill: ChatRoleConfig | None = None
     embed: EmbedRoleConfig = Field(default_factory=EmbedRoleConfig)
     retry_attempts: int = Field(default=2, ge=1, le=10)
     retry_backoff_sec: float = Field(default=0.8, ge=0.0, le=60.0, allow_inf_nan=False)
@@ -778,6 +782,8 @@ class RuntimeConfig(StrictModel):
             parent=moderation_parent,
         )
         compress_provider, compress_model = effective_chat(models.compress, parent=main)
+        skill_role = models.skill or main
+        skill_provider, skill_model = effective_chat(skill_role, parent=main)
         embed_provider = models.embed.provider or main.provider
 
         common_retry = {
@@ -848,6 +854,19 @@ class RuntimeConfig(StrictModel):
             fallback_spec=self._fallback_spec(models.compress.fallbacks),
             request_params=models.compress.request_params,
             fallback_request_params=self._fallback_request_params(models.compress.fallbacks),
+            **common_retry,
+        )
+        settings.bot.skill_model = _build_chat_config(
+            profiles=profiles,
+            provider_name=skill_provider,
+            model_name=skill_model,
+            temperature=skill_role.temperature,
+            max_tokens=skill_role.max_tokens,
+            timeout_sec=skill_role.timeout_sec,
+            total_deadline_sec=skill_role.total_deadline_sec,
+            fallback_spec=self._fallback_spec(skill_role.fallbacks),
+            request_params=skill_role.request_params,
+            fallback_request_params=self._fallback_request_params(skill_role.fallbacks),
             **common_retry,
         )
         settings.bot.embed_model = _build_embed_config(

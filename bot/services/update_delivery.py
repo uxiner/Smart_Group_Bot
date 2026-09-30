@@ -97,6 +97,9 @@ _PRIVILEGED_COMMANDS = frozenset(
         "warnings",
         "aiexempt",
         "unaiexempt",
+        "exemptlist",
+        "modlist",
+        "health",
         # The settings entry point performs permission checks and is the
         # recovery surface for incorrectly configured enforcement policies.
         "settings",
@@ -117,6 +120,8 @@ _ADMIN_CALLBACK_PREFIXES = (
     "atl:",  # authorized-group pages
     "adl:",  # delegated-admin pages
     "wpl:",  # warning pages
+    "exl:",  # moderation-roster pages
+    "exd:",  # moderation-roster entry removal
 )
 _ADMIN_CALLBACK_EXACT = frozenset(
     {

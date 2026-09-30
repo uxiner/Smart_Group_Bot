@@ -182,6 +182,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 display_name="member",
                 bot_username="bot",
                 reason="test",
+                rule_action="ban",
             )
 
         self.assertTrue(started)
@@ -243,6 +244,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 display_name="member",
                 bot_username="bot",
                 reason="test",
+                rule_action="ban",
             )
 
         self.assertTrue(handled)
@@ -309,6 +311,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 display_name="member",
                 bot_username="bot",
                 reason="test",
+                rule_action="ban",
             )
 
         self.assertTrue(handled)
@@ -388,6 +391,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 display_name="member",
                 bot_username="bot",
                 reason="test",
+                rule_action="ban",
             )
 
         self.assertTrue(handled)

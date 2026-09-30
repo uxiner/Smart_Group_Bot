@@ -726,14 +726,30 @@ class DetectionTests(_DbTestCase):
         )
 
         self.assertEqual(enforced, [])
-        # The chunk is intentionally muted concurrently.  Both requests may
-        # already be in flight when the first one observes deauthorization;
-        # every member that was muted must then receive a compensating restore.
-        self.assertEqual(bot.restrict_chat_member.await_count, 4)
-        self.assertCountEqual(
-            [item.args[1] for item in bot.restrict_chat_member.await_args_list],
-            [92, 92, 93, 93],
+        # The chunk is muted concurrently, so how many requests were already in
+        # flight when the first one observed deauthorization is a scheduling
+        # detail, not a contract: suspect 93 may be stopped before it is muted
+        # at all (2 calls) or have its own mute compensated (4 calls).  Assert
+        # the invariant instead of an exact count - every member that WAS muted
+        # must end up restored, and nobody else may be touched.
+        muted_users = {
+            int(call.args[1])
+            for call in bot.restrict_chat_member.await_args_list
+            if getattr(call.kwargs.get("permissions"), "can_send_messages", None) is False
+        }
+        restored_users = {
+            int(call.args[1])
+            for call in bot.restrict_chat_member.await_args_list
+            if call.kwargs.get("use_independent_chat_permissions") is True
+        }
+        self.assertTrue(muted_users, "expected at least the first suspect to be muted")
+        self.assertLessEqual(muted_users, {92, 93}, "no unrelated member may be muted")
+        self.assertTrue(
+            restored_users >= muted_users,
+            f"muted users {sorted(muted_users)} were not all restored "
+            f"(restored: {sorted(restored_users)})",
         )
+        self.assertLessEqual(restored_users, muted_users, "restored a member that was never muted")
         bot.send_message.assert_not_awaited()
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 92))
@@ -1697,6 +1713,24 @@ class DetectionTests(_DbTestCase):
         for user_id in (1, 2, 3):
             await self._join(service, user_id)
         bot.unban_chat_member.side_effect = Exception("flood wait")
+        # A bare unban failure is an *unconfirmed* unban, so the membership probe
+        # must keep reporting the temporary ban as still in place: reporting
+        # "kicked" would be read as a completed kick and the join would be
+        # consumed.  `chat_member_is_present` runs before the ban and still sees
+        # a plain member.
+        banned = {"applied": False}
+
+        async def _ban_chat_member(*_args, **_kwargs):
+            banned["applied"] = True
+            return True
+
+        async def _get_chat_member(chat_id, user_id, *_args, **_kwargs):
+            if int(user_id) == 99 and banned["applied"]:
+                return SimpleNamespace(status="kicked")
+            return SimpleNamespace(status="member")
+
+        bot.ban_chat_member.side_effect = _ban_chat_member
+        bot.get_chat_member.side_effect = _get_chat_member
         # Kick failed: the join must fall through to the normal pipeline.
         self.assertFalse(await self._join(service, 99))
         bot.ban_chat_member.assert_awaited_once_with(
@@ -1883,8 +1917,8 @@ class DetectionTests(_DbTestCase):
         service, bot = self._service(_settings(raid_guard_join_threshold=20))
         for user_id in range(1, 21):
             await self._join(service, user_id)
-        # 1 lockdown notice + ceil(20/15)=2 challenge chunks.
-        self.assertEqual(bot.send_message.await_count, 3)
+        # 1 lockdown notice + ceil(20/RAID_MENTIONS_PER_MESSAGE(=8))=3 chunk notices.
+        self.assertEqual(bot.send_message.await_count, 4)
         async with self.session_factory() as session:
             for user_id in range(1, 21):
                 self.assertIsNotNone(
@@ -2244,7 +2278,7 @@ class TimeoutTests(_DbTestCase):
         bot.edit_message_text.assert_not_awaited()
         bot.send_message.assert_awaited_once()
         notice = bot.send_message.await_args.args[1]
-        self.assertIn("爆破防护质询超时", notice)
+        self.assertIn("爆破防护质询 · 已超时", notice)
         self.assertIn("已移出群聊", notice)
 
     async def test_raid_timeout_notice_honors_moderation_auto_delete(self) -> None:

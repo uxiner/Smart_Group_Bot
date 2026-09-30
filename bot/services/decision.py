@@ -135,7 +135,7 @@ class DecisionService:
         if contains_prompt_injection(normalized):
             log.warning("decision input may contain prompt injection")
 
-        result = await self._llm_decide(
+        decision_args = (
             normalized,
             is_mentioned,
             is_reply,
@@ -147,9 +147,23 @@ class DecisionService:
             user_tag,
             msg_type,
             history,
-            merged_count=max(1, int(merged_count or 1)),
-            merged_context=clean_text(merged_context, max_len=1800),
         )
+        decision_kwargs = {
+            "merged_count": max(1, int(merged_count or 1)),
+            "merged_context": clean_text(merged_context, max_len=1800),
+        }
+        result = await self._llm_decide(*decision_args, **decision_kwargs)
+        if result not in ("skip", "casual", "question"):
+            # An empty verdict - in practice the stage deadline was hit and the
+            # provider never answered - used to be silently downgraded to skip,
+            # which looked exactly like a deliberate "do not speak". Surface it
+            # (reason=empty_output) and ask once more before giving up.
+            log.warning(
+                "decision retry reason=%s actual=%r",
+                "empty_output" if not result else "invalid_output",
+                result,
+            )
+            result = await self._llm_decide(*decision_args, **decision_kwargs)
 
         if result == "question":
             result = "casual"

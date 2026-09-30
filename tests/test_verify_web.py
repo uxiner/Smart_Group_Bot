@@ -569,7 +569,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         notice = self.bot.edit_message_text.await_args.kwargs
         self.assertEqual(notice["chat_id"], -100)
         self.assertEqual(notice["message_id"], 777)
-        self.assertIn("已通过消息审查验证", notice["text"])
+        self.assertIn("消息审查验证 · 已通过", notice["text"])
         self.assertNotIn("欢迎加入", notice["text"])
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 109))
@@ -639,7 +639,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await resp.json())["ok"])
         self.bot.edit_message_text.assert_not_awaited()
         self.bot.send_message.assert_awaited_once()
-        self.assertIn("已通过爆破防护质询", self.bot.send_message.await_args.args[1])
+        self.assertIn("爆破防护质询 · 已通过", self.bot.send_message.await_args.args[1])
         schedule_mock.assert_awaited_once()
         self.assertEqual(schedule_mock.call_args.args[1], 25)
 
