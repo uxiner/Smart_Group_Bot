@@ -93,6 +93,10 @@ from bot.utils.telegram import (
     schedule_message_auto_delete_durable,
 )
 from bot.utils.timezone import now_shanghai_naive
+from bot.services.checkin import (
+    CHALLENGE_SKIP_COST,
+    available_points,
+)
 
 log = logging.getLogger(__name__)
 
@@ -470,11 +474,19 @@ VERIFICATION_CALLBACK_PREFIX = "jv"
 VERIFICATION_CALLBACK_START = "v"
 VERIFICATION_CALLBACK_APPROVE = "a"
 VERIFICATION_CALLBACK_REJECT = "r"
+# Raised by the challenged member themselves (not an admin): re-check the
+# flagged message, releasing them when the second verdict is clean.
+VERIFICATION_CALLBACK_APPEAL = "p"
+# Also member-facing, and only offered when they can afford it: spend points to
+# end the moderation challenge outright instead of verifying.
+VERIFICATION_CALLBACK_SPEND = "s"
 VERIFICATION_CALLBACK_ACTIONS = frozenset(
     {
         VERIFICATION_CALLBACK_START,
         VERIFICATION_CALLBACK_APPROVE,
         VERIFICATION_CALLBACK_REJECT,
+        VERIFICATION_CALLBACK_APPEAL,
+        VERIFICATION_CALLBACK_SPEND,
     }
 )
 # The patrol warning message is shared by many violators, so its button has no
@@ -1338,36 +1350,80 @@ def parse_verification_callback_data(value: str) -> tuple[str, int] | None:
     return (action, user_id) if user_id > 0 else None
 
 
-def build_group_prompt_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def build_group_prompt_keyboard(
+    user_id: int, *, appeal: bool = False, spend_points: int = 0
+) -> InlineKeyboardMarkup:
+    """Group-side challenge controls.
+
+    Two rows, always: the member's own action on the first row, the two
+    administrator decisions on the second.
+
+    ``spend_points`` > 0 prepends the member's "spend points to skip this
+    challenge" row (only offered when they can actually afford it).
+
+    `appeal=True` (moderation challenges only) turns the first row into a single
+    "re-check, then verify" button: clicking it makes the bot judge the flagged
+    message once more, releasing the member outright when the second verdict is
+    clean and falling back to the normal verification otherwise. Only moderation
+    challenges get it — a false positive there is both possible and costly (the
+    member is muted, then banned on timeout), while the join, patrol and raid
+    challenges have no such ambiguity.
+    """
+
+    if appeal:
+        first_row = [
+            InlineKeyboardButton(
+                text="复核 / 开始验证",
+                callback_data=build_verification_callback_data(
+                    VERIFICATION_CALLBACK_APPEAL,
+                    user_id,
+                ),
+            )
+        ]
+    else:
+        first_row = [
+            InlineKeyboardButton(
+                text="开始验证",
+                callback_data=build_verification_callback_data(
+                    VERIFICATION_CALLBACK_START,
+                    user_id,
+                ),
+            )
+        ]
+    rows: list[list[InlineKeyboardButton]] = []
+    if spend_points > 0:
+        # 有余分的人多一条"花分免验"的路：这是他们签到攒来的权益
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="开始验证",
+                    text=f"消耗 {int(spend_points)} 积分免除质询",
                     callback_data=build_verification_callback_data(
-                        VERIFICATION_CALLBACK_START,
+                        VERIFICATION_CALLBACK_SPEND,
                         user_id,
                     ),
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="管理员通过",
-                    callback_data=build_verification_callback_data(
-                        VERIFICATION_CALLBACK_APPROVE,
-                        user_id,
-                    ),
+            ]
+        )
+    rows += [
+        first_row,
+        [
+            InlineKeyboardButton(
+                text="管理员通过",
+                callback_data=build_verification_callback_data(
+                    VERIFICATION_CALLBACK_APPROVE,
+                    user_id,
                 ),
-                InlineKeyboardButton(
-                    text="管理员拒绝",
-                    callback_data=build_verification_callback_data(
-                        VERIFICATION_CALLBACK_REJECT,
-                        user_id,
-                    ),
+            ),
+            InlineKeyboardButton(
+                text="管理员拒绝",
+                callback_data=build_verification_callback_data(
+                    VERIFICATION_CALLBACK_REJECT,
+                    user_id,
                 ),
-            ],
-        ]
-    )
+            ),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_moderation_prompt_text(
@@ -1376,6 +1432,7 @@ def build_moderation_prompt_text(
     display_name: str,
     reason: str,
     timeout_seconds: int,
+    spend_points: int = 0,
 ) -> str:
     shown = html.escape((display_name or "").strip() or str(user_id))
     safe_reason = html.escape((reason or "疑似命中群规").strip())
@@ -1387,11 +1444,17 @@ def build_moderation_prompt_text(
         next_step="恢复发言权限",
         action=(
             f'<a href="tg://user?id={user_id}">{shown}</a>，请在 '
-            f"{_format_timeout(timeout_seconds)} 内点击下方「开始验证」。"
+            f"{_format_timeout(timeout_seconds)} 内点击下方「复核 / 开始验证」。"
         ),
         details=[
             card_field("待核验原因", safe_reason),
             "验证通过后会自动恢复发言权限；超时将被封禁。",
+            "点「复核 / 开始验证」：机器人会重新判定这条消息，判定为正常会立即恢复发言；仍判定为广告则需完成人机验证。",
+            (
+                f"也可以消耗 {int(spend_points)} 积分直接免除本次质询（签到攒的积分）。"
+                if spend_points > 0
+                else None
+            ),
         ],
     )
 
@@ -4410,6 +4473,20 @@ async def _begin_moderation_challenge_locked(
                     user_id,
                 )
             return True
+        # 有余分的人可以花分免除这次质询：余额在这里查一次，按钮文案与卡片一致
+        try:
+            affordable = await available_points(
+                session, group_id=group_id, user_id=user_id
+            )
+        except Exception:
+            log.warning(
+                "moderation challenge points lookup failed | group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+            affordable = 0
+        skip_cost = CHALLENGE_SKIP_COST if affordable >= CHALLENGE_SKIP_COST else 0
         sent = await bot.send_message(
             group_id,
             build_moderation_prompt_text(
@@ -4417,9 +4494,12 @@ async def _begin_moderation_challenge_locked(
                 display_name=display_name,
                 reason=reason,
                 timeout_seconds=timeout_seconds,
+                spend_points=skip_cost,
             ),
             parse_mode="HTML",
-            reply_markup=build_group_prompt_keyboard(user_id),
+            reply_markup=build_group_prompt_keyboard(
+                user_id, appeal=True, spend_points=skip_cost
+            ),
         )
         prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
 
