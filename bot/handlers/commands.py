@@ -9,7 +9,7 @@ from datetime import timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -742,9 +742,24 @@ async def _edit_av_detail_in_place(
     message: Message,
     detail: AVDetail,
     keyboard: InlineKeyboardMarkup | None,
+    allow_media: bool = True,
+    text: str | None = None,
 ) -> bool:
     caption = _build_av_detail_caption(detail)
-    detail_text = _build_av_detail_text(detail)
+    detail_text = text if text is not None else _build_av_detail_text(detail)
+
+    # 群内（allow_media=False）只允许文字：绝不把封面编辑回群里。
+    if not allow_media:
+        try:
+            await message.edit_text(
+                detail_text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return True
+        except Exception:
+            log.exception("failed to edit message as group text detail")
+            return False
 
     # If current message is photo, edit caption first to keep same media message.
     if getattr(message, "photo", None):
@@ -786,7 +801,8 @@ async def _edit_av_seed_in_place(
     keyboard: InlineKeyboardMarkup | None,
 ) -> bool:
     # Keep seed browsing in the same message.
-    if getattr(message, "photo", None):
+    # 群内不出现任何照片：历史的图片消息也一律改回文字（不新增私聊分支）。
+    if not _av_message_is_group(message) and getattr(message, "photo", None):
         try:
             await message.edit_caption(caption=text, reply_markup=keyboard)
             return True
@@ -811,6 +827,177 @@ async def _edit_av_seed_in_place(
         return False
 
 
+# ---------------------------------------------------------------------------
+# /av 封面走私聊：群里只留文字
+#
+# 为什么：群是社区群，封面属于 NSFW，不能在群里出现；标题/番号/详情这类文字没问题，
+# 所以群内路径照旧发文字 + 按钮，封面单独发给发起者的私聊。Telegram 不允许机器人
+# 主动私聊没跟它说过话的人，那种情况下群里换成 t.me/<bot>?start=av 深链按钮，
+# 由用户自己点开私聊按「开始」后再回群里重新查询 —— 绝不把图发回群里兜底。
+# ---------------------------------------------------------------------------
+
+#: 私聊封面发送结果（只用来决定群里那一行提示怎么写）。
+_AV_COVER_NO_COVER = "no_cover"
+_AV_COVER_SENT = "sent"
+_AV_COVER_PRIVATE_BLOCKED = "private_blocked"
+_AV_COVER_FAILED = "failed"
+
+_AV_COVER_SENT_HINT = "封面已私聊发给你。"
+_AV_COVER_PRIVATE_BLOCKED_HINT = (
+    "封面需要先打开与机器人的私聊并按「开始」，再回群里重新查询；"
+    "文本结果照旧留在群里。"
+)
+_AV_COVER_FAILED_HINT = "封面这次没能发出去；文本结果照旧留在群里。"
+
+#: 「打开私聊」深链按钮的文案。
+_AV_PRIVATE_OPEN_BUTTON_TEXT = "打开私聊"
+
+
+def _av_message_is_group(message: Message) -> bool:
+    """这条消息是不是群消息（群内路径一律不许出现照片）。"""
+
+    chat = getattr(message, "chat", None)
+    return bool(chat is not None and getattr(chat, "type", "") in ("group", "supergroup"))
+
+
+def _build_av_cover_caption(detail: AVDetail) -> str:
+    """私聊封面的说明：只要番号/作品名，不带按钮也不带分页。"""
+
+    code = (detail.code or "").strip()
+    title = _truncate_text((detail.title or "").strip(), 120)
+    if code and title:
+        return f"{code} · {title}"
+    return code or title or "AV 封面"
+
+
+async def _resolve_bot_username(bot: object) -> str:
+    """运行时取 bot 用户名（私聊深链用）。取不到就返回空串，调用方退化成纯文字提示。"""
+
+    try:
+        me = await bot.get_me()
+    except Exception:
+        log.exception("failed to resolve bot username for the AV private-chat deep link")
+        return ""
+    return str(getattr(me, "username", "") or "").strip().lstrip("@")
+
+
+def _av_detail_keyboard_with_private_link(
+    keyboard: InlineKeyboardMarkup | None,
+    *,
+    bot_username: str,
+) -> InlineKeyboardMarkup | None:
+    """在详情键盘末尾补一行「打开私聊」URL 按钮；取不到用户名时保持原样。"""
+
+    username = (bot_username or "").strip().lstrip("@")
+    if not username:
+        return keyboard
+    rows = list(keyboard.inline_keyboard) if keyboard is not None else []
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=_AV_PRIVATE_OPEN_BUTTON_TEXT,
+                url=f"https://t.me/{username}?start=av",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_av_cover_to_sender_dm(
+    *,
+    bot: object,
+    sender_user_id: int,
+    detail: AVDetail,
+) -> str:
+    """把封面私聊发给发起者，返回 ``_AV_COVER_*`` 结果码。
+
+    顺序沿用原来的「先试 URL、失败再上传字节」；任何失败都只记日志，
+    绝不把图发回群里兜底。
+    """
+
+    cover_url = (detail.cover_url or "").strip()
+    if not cover_url or sender_user_id <= 0:
+        return _AV_COVER_NO_COVER
+
+    caption = _build_av_cover_caption(detail)
+    try:
+        await bot.send_photo(chat_id=sender_user_id, photo=cover_url, caption=caption)
+        return _AV_COVER_SENT
+    except TelegramForbiddenError:
+        # 对方从没跟 bot 说过话 / 拉黑了 bot：只能请他自己点开私聊。
+        log.info("av cover dm blocked | user=%s", sender_user_id)
+        return _AV_COVER_PRIVATE_BLOCKED
+    except TelegramBadRequest as exc:
+        # 有些来源的图片 Telegram 拉不到，退回上传字节。
+        log.warning("av cover dm by url failed: %s", exc)
+    except Exception:
+        log.exception("failed to send av cover to dm | user=%s", sender_user_id)
+
+    file_obj = await _download_cover_input_file(cover_url, referer=detail.url)
+    if file_obj is not None:
+        try:
+            await bot.send_photo(chat_id=sender_user_id, photo=file_obj, caption=caption)
+            return _AV_COVER_SENT
+        except TelegramForbiddenError:
+            log.info("av cover dm blocked on upload | user=%s", sender_user_id)
+            return _AV_COVER_PRIVATE_BLOCKED
+        except Exception:
+            log.exception("failed to send av cover to dm by upload | user=%s", sender_user_id)
+
+    return _AV_COVER_FAILED
+
+
+async def _send_av_detail_in_group(
+    *,
+    message: Message,
+    session: AVQuerySession,
+    detail: AVDetail,
+    detail_text: str,
+    keyboard: InlineKeyboardMarkup | None,
+    in_place: bool,
+) -> bool:
+    """群内详情：只发文字 + 按钮，封面走私聊，提示并进详情文本末尾。"""
+
+    sender_user_id = int(session.owner_user_id or 0)
+    if sender_user_id <= 0 and message.from_user is not None:
+        sender_user_id = int(message.from_user.id)
+
+    outcome = await _send_av_cover_to_sender_dm(
+        bot=message.bot,
+        sender_user_id=sender_user_id,
+        detail=detail,
+    )
+
+    reply_markup = keyboard
+    text = detail_text
+    if outcome == _AV_COVER_SENT:
+        text = f"{detail_text}\n\n<i>{_AV_COVER_SENT_HINT}</i>"
+    elif outcome == _AV_COVER_PRIVATE_BLOCKED:
+        text = f"{detail_text}\n\n<i>{_AV_COVER_PRIVATE_BLOCKED_HINT}</i>"
+        reply_markup = _av_detail_keyboard_with_private_link(
+            keyboard,
+            bot_username=await _resolve_bot_username(message.bot),
+        )
+    elif outcome == _AV_COVER_FAILED:
+        text = f"{detail_text}\n\n<i>{_AV_COVER_FAILED_HINT}</i>"
+
+    if in_place:
+        return await _edit_av_detail_in_place(
+            message=message,
+            detail=detail,
+            keyboard=reply_markup,
+            allow_media=False,
+            text=text,
+        )
+
+    try:
+        await message.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
+        return True
+    except Exception:
+        log.exception("failed to send av detail text in group")
+        return False
+
+
 async def _send_av_detail(
     *,
     message: Message,
@@ -823,9 +1010,21 @@ async def _send_av_detail(
     detail_text = _build_av_detail_text(detail)
     keyboard = _build_av_detail_keyboard(session=session, result_idx=result_idx, detail=detail)
 
+    # 群内路径：文字与按钮照旧留群里，封面只走私聊（group path never sends media）。
+    if _av_message_is_group(message):
+        return await _send_av_detail_in_group(
+            message=message,
+            session=session,
+            detail=detail,
+            detail_text=detail_text,
+            keyboard=keyboard,
+            in_place=in_place,
+        )
+
     if in_place:
         return await _edit_av_detail_in_place(message=message, detail=detail, keyboard=keyboard)
 
+    # 以下带图路径只剩私聊（最高管理员的诊断入口）：私聊 chat 就是发起者本人。
     sent_photo: Message | None = None
     if detail.cover_url:
         try:
