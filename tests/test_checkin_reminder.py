@@ -48,6 +48,7 @@ from bot.services.checkin import (
 from bot.services.checkin_reminder import (
     REMINDER_AUTO_DELETE_SECONDS,
     REMINDER_SLOTS,
+    SHOP_BUTTON_TEXT,
     SLOT_GREETINGS,
     build_checkin_reminder_keyboard,
     claim_reminder_slot,
@@ -81,13 +82,26 @@ def _outcome(**overrides) -> CheckinOutcome:
 class _FakeBot:
     """假 Bot：只记调用，不发网络请求。"""
 
-    def __init__(self, send=None) -> None:
+    def __init__(
+        self,
+        send=None,
+        *,
+        username: str | None = "TestShopBot",
+        get_me_side_effect=None,
+    ) -> None:
         self.token = "123456:TEST-TOKEN"
         self.session = SimpleNamespace(close=AsyncMock())
         self.sent: list[int] = []
         self.returned: list[object] = []
         self.send_message = AsyncMock(
             side_effect=self._send if send is None else send
+        )
+        # 商店按钮的深链要 @username：这里模拟 get_me（可以被改成抛异常/没用户名）
+        self.get_me = AsyncMock(
+            side_effect=get_me_side_effect,
+            return_value=SimpleNamespace(
+                id=123456, is_bot=True, username=username
+            ),
         )
 
     async def _send(self, chat_id, text, **kwargs):
@@ -162,18 +176,62 @@ class ReminderCopyTests(unittest.TestCase):
 
 
 class ReminderKeyboardTests(unittest.TestCase):
-    def test_button_is_present_with_a_fixed_callback_data(self) -> None:
-        keyboard = build_checkin_reminder_keyboard()
-        buttons = [button for row in keyboard.inline_keyboard for button in row]
-        self.assertEqual(len(buttons), 1)
+    def test_shop_button_is_a_private_deep_link_next_to_the_checkin_button(self) -> None:
+        """一行两个按钮：签到走 callback，商店走私聊深链（URL 而不是 callback）。
+
+        设计变更：商店菜单从"群里再发一条"改成"私聊里发"，所以按钮从 callback
+        换成了 ``t.me/<bot>?start=shop_<群号>``；原来的两条断言
+        （只有 1 个按钮 / 两个 callback 常量）按新契约改写成下面这两条。
+        """
+
+        keyboard = build_checkin_reminder_keyboard(
+            bot_username="TestShopBot", group_id=-100123
+        )
+
+        self.assertEqual(len(keyboard.inline_keyboard), 1, "两个按钮必须在同一行")
+        buttons = keyboard.inline_keyboard[0]
+        self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0].text, CHECKIN_BUTTON_TEXT)
         self.assertEqual(buttons[0].callback_data, "checkin:v1")
         self.assertEqual(buttons[0].callback_data, CHECKIN_CALLBACK_DATA)
+        self.assertEqual(buttons[1].text, SHOP_BUTTON_TEXT)
+        self.assertIsNone(buttons[1].callback_data, "商店按钮不能是 callback")
+        self.assertEqual(
+            buttons[1].url, "https://t.me/TestShopBot?start=shop_-100123"
+        )
+
+    def test_shop_deep_link_strips_a_leading_at(self) -> None:
+        keyboard = build_checkin_reminder_keyboard(
+            bot_username="@TestShopBot", group_id=-100
+        )
+
+        self.assertEqual(
+            keyboard.inline_keyboard[0][1].url,
+            "https://t.me/TestShopBot?start=shop_-100",
+        )
+
+    def test_shop_button_is_dropped_without_a_bot_username(self) -> None:
+        """取不到 @username 就退化成「只有一个签到按钮」，不能让提醒发不出去。"""
+
+        for username in ("", "   ", "@"):
+            keyboard = build_checkin_reminder_keyboard(
+                bot_username=username, group_id=-100
+            )
+            buttons = keyboard.inline_keyboard[0]
+            self.assertEqual(
+                [button.text for button in buttons],
+                [CHECKIN_BUTTON_TEXT],
+                f"{username!r} 时不该有商店按钮",
+            )
+            self.assertEqual(buttons[0].callback_data, CHECKIN_CALLBACK_DATA)
 
     def test_callback_data_never_encodes_a_user_id(self) -> None:
-        button = build_checkin_reminder_keyboard().inline_keyboard[0][0]
-        for user_id in (7, 123456789, 999999999):
-            self.assertNotIn(str(user_id), button.callback_data or "")
+        keyboard = build_checkin_reminder_keyboard(
+            bot_username="TestShopBot", group_id=-100
+        )
+        for button in keyboard.inline_keyboard[0]:
+            for user_id in (7, 123456789, 999999999):
+                self.assertNotIn(str(user_id), button.callback_data or "")
 
     def test_button_handler_is_registered_on_the_commands_router(self) -> None:
         names = [
@@ -314,8 +372,14 @@ class CheckinReminderToolTests(_DbTestCase):
         dry_run: bool = False,
         send=None,
         stdout: io.StringIO | None = None,
+        username: str | None = "TestShopBot",
+        get_me_side_effect=None,
     ):
-        bot = _FakeBot(send=send)
+        bot = _FakeBot(
+            send=send,
+            username=username,
+            get_me_side_effect=get_me_side_effect,
+        )
         cleaner = AsyncMock(return_value=True)
         buffer = stdout if stdout is not None else io.StringIO()
         _FakeCleanupScheduler.instances = []
@@ -383,6 +447,110 @@ class CheckinReminderToolTests(_DbTestCase):
         for call, message in zip(cleaner.await_args_list, bot.returned):
             self.assertEqual(call.args[0], message, "删的必须就是刚发出去的那条")
             self.assertEqual(call.args[1], 600)
+
+    async def test_reminder_still_has_two_buttons_and_a_600s_durable_delete(self) -> None:
+        """商店按钮换成深链之后：仍然一行两个按钮、600 秒删除、同时段重跑只发一条。"""
+
+        await self._authorize(-200)
+
+        _code1, bot1, cleaner1, _out1 = await self._run_tool(12)
+        code2, bot2, cleaner2, out2 = await self._run_tool(12)
+
+        self.assertEqual(bot1.send_message.await_count, 2)
+        for call in bot1.send_message.await_args_list:
+            group_id = int(call.args[0])
+            keyboard = call.kwargs["reply_markup"]
+            self.assertEqual(len(keyboard.inline_keyboard), 1, "两个按钮必须在同一行")
+            checkin_button, shop_button = keyboard.inline_keyboard[0]
+            self.assertEqual(checkin_button.callback_data, CHECKIN_CALLBACK_DATA)
+            self.assertIsNone(shop_button.callback_data, "商店按钮不能是 callback")
+            self.assertEqual(
+                shop_button.url,
+                f"https://t.me/TestShopBot?start=shop_{group_id}",
+                "深链必须带机器人用户名和这个群的群号",
+            )
+        self.assertEqual(REMINDER_AUTO_DELETE_SECONDS, 600)
+        self.assertEqual(cleaner1.await_count, 2)
+        for call, message in zip(cleaner1.await_args_list, bot1.returned):
+            self.assertEqual(call.args[0], message)
+            self.assertEqual(call.args[1], 600)
+        self.assertEqual(bot2.send_message.await_count, 0, "同时段重跑不能重复发")
+        self.assertEqual(cleaner2.await_count, 0)
+        self.assertEqual(code2, 0)
+        self.assertIn("已发过，跳过", out2)
+
+    async def test_get_me_failure_degrades_to_a_single_button(self) -> None:
+        """get_me 抛异常 / 没有 username：提醒照样发，只是少一个商店按钮。"""
+
+        await self._authorize(-200)
+        # 两个时段各跑一次：同一个时段第二次会被幂等占位挡住，发不出去
+        for slot, kwargs in (
+            (9, {"username": None}),
+            (12, {"get_me_side_effect": RuntimeError("getMe timed out")}),
+        ):
+            _code, bot, cleaner, _out = await self._run_tool(slot, **kwargs)
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertEqual(cleaner.await_count, 2)
+            for call in bot.send_message.await_args_list:
+                keyboard = call.kwargs["reply_markup"]
+                self.assertEqual(
+                    [button.text for button in keyboard.inline_keyboard[0]],
+                    [CHECKIN_BUTTON_TEXT],
+                    f"{kwargs} 时必须退化成只有一个签到按钮",
+                )
+
+    async def test_get_me_lookup_is_not_cached_into_a_hardcoded_username(self) -> None:
+        """用户名是运行时取的：换一个机器人用户名，深链跟着变。"""
+
+        _code, bot, _cleaner, _out = await self._run_tool(
+            9, username="AnotherBot"
+        )
+
+        shop_button = bot.send_message.await_args_list[0].kwargs[
+            "reply_markup"
+        ].inline_keyboard[0][1]
+        self.assertEqual(
+            shop_button.url, "https://t.me/AnotherBot?start=shop_-100"
+        )
+
+    async def test_reminder_carries_the_roster_in_checkin_order(self) -> None:
+        """正文里「今日已签到 N 人」后面跟着当天的名单（最早签到的在前）。"""
+
+        await self._authorize(-200)
+        async with self.session_factory() as session:
+            await record_checkin(
+                session, group_id=-200, user_id=7, display_name="ming Li"
+            )
+            await record_checkin(
+                session, group_id=-200, user_id=8, display_name="职业法师刘海柱"
+            )
+            await session.commit()
+
+        _code, bot, _cleaner, _output = await self._run_tool(9)
+
+        self.assertEqual(bot.send_message.await_count, 2)
+        by_chat = {
+            int(call.args[0]): call.args[1]
+            for call in bot.send_message.await_args_list
+        }
+        self.assertIn("今日已签到 <b>2</b> 人", by_chat[-200])
+        self.assertIn("已签到（2）：ming Li、职业法师刘海柱", by_chat[-200])
+        self.assertIn("今日已签到 <b>0</b> 人", by_chat[-100])
+        self.assertIn("还没有人签到，来抢第一个 ☝️", by_chat[-100])
+
+    async def test_dry_run_prints_the_roster_too(self) -> None:
+        async with self.session_factory() as session:
+            await record_checkin(
+                session, group_id=-100, user_id=7, display_name="<script>"
+            )
+            await session.commit()
+
+        code, bot, cleaner, output = await self._run_tool(9, dry_run=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(bot.send_message.await_count, 0)
+        self.assertEqual(cleaner.await_count, 0)
+        self.assertIn("已签到（1）：&lt;script&gt;", output, "dry-run 也要能看到名单")
 
     async def test_cleanup_scheduler_is_started_and_torn_down(self) -> None:
         _code, _bot, _cleaner, _output = await self._run_tool(9)

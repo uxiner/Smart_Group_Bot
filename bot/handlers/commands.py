@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.utils.timezone import now_shanghai_naive
-from bot.db.models import Admin, AuthorizedGroup, Group
+from bot.db.models import Admin, AuthorizedGroup, Group, GroupMember
 from bot.services.moderation_context import build_moderation_context
 from bot.services.authz import (
     ensure_group_admin_permission,
@@ -49,9 +49,10 @@ from bot.services.checkin import (
     summarize,
 )
 from bot.services.checkin_reminder import (
-    count_checkins_today,
     find_reminder_slot,
+    parse_shop_start_payload,
     render_checkin_reminder,
+    today_checkin_roster,
 )
 from bot.services.av_search import (
     AVDetail,
@@ -864,6 +865,110 @@ async def _send_av_detail(
 
 
 
+# ---------------------------------------------------------------------------
+# 私聊商店入口（签到提醒上的「🛒 积分商店」深链）
+#
+# 为什么走私聊：菜单发在群里会把群刷乱（老板反馈）。Telegram 又不允许机器人主动
+# 私聊没跟它说过话的人，所以群里只放一个 URL 深链按钮（``t.me/<bot>?start=shop_<群>``），
+# 点一下等于那个人自己给机器人发了 /start —— 这是唯一对所有人都可用的做法。
+#
+# payload 用独立的 ``shop_`` 前缀（见 checkin_reminder.parse_shop_start_payload），
+# 与入群验证的 ``verify…`` 前缀不重叠：``/start verify…`` 的既有行为一个字都不动。
+# ---------------------------------------------------------------------------
+
+#: 私聊菜单末尾的说明：这三个动作需要群上下文，仍然在群里用。
+_PRIVATE_SHOP_FOOTER = (
+    "\n\n"
+    "<i>头衔 /tag、置顶 /top、抽奖 /draw 仍然在群里发：这些操作需要群上下文，"
+    "它们在群里的回执本来就会自动删除，不会占屏。</i>"
+)
+
+_PRIVATE_SHOP_UNAVAILABLE_TEXT = "积分商店暂时不可用，请稍后再试（这次没有扣分）。"
+
+
+async def _user_is_group_member(
+    session: AsyncSession, *, group_id: int, user_id: int
+) -> bool:
+    """成员表里有没有这个人的**在群**记录（``left`` 的不算）。
+
+    Bot API 列不出群成员，所以成员名单就是 ``group_members`` 这张现成的表。
+    """
+
+    row = (
+        await session.execute(
+            select(GroupMember.id)
+            .where(
+                GroupMember.group_id == int(group_id),
+                GroupMember.user_id == int(user_id),
+                GroupMember.left.is_not(True),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+async def _handle_private_shop_start(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    payload: str,
+) -> bool:
+    """私聊 ``/start shop_<群号>``：在**私聊**里回商店菜单。
+
+    - 返回 True = 这个 payload 是商店的（已经给出答复，调用方不要再走欢迎文案）；
+      返回 False = 不是商店 payload（调用方继续走原来的入群验证 / 欢迎文案）。
+      所以这个分支不可能截胡 ``/start verify…``；
+    - 菜单正文与群里的 ``/shop`` 同源（``render_shop_menu``），可用积分取
+      「这个人**在那个群**的可用积分」（只读，不扣分；积分不够也能看）；
+    - payload 解析失败、群没授权、查不到这个人在群里：都只在私聊友好提示，
+      **不发菜单、不扣分**；
+    - 任何异常只记日志 + 提示失败：``/start`` 是入口，绝不能抛出去。
+    """
+
+    group_id = parse_shop_start_payload(payload)
+    if group_id is None:
+        return False
+    user = getattr(message, "from_user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return True
+    try:
+        if not await is_group_authorized(session, group_id):
+            await _answer(
+                message,
+                settings,
+                "这个群还没有授权使用积分商店，请联系群管理员。",
+            )
+            return True
+        if not await _user_is_group_member(
+            session, group_id=group_id, user_id=int(user.id)
+        ):
+            await _answer(
+                message,
+                settings,
+                "没有查到你是这个群的成员：请先在群里说句话，再点一次商店按钮。",
+            )
+            return True
+        outcome = await summarize(
+            session, group_id=group_id, user_id=int(user.id)
+        )
+        await session.commit()
+        await _answer(
+            message,
+            settings,
+            render_shop_menu(available=outcome.available_points)
+            + _PRIVATE_SHOP_FOOTER,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "[%s] private shop menu failed | user=%s", group_id, user.id
+        )
+        await _answer(message, settings, _PRIVATE_SHOP_UNAVAILABLE_TEXT)
+    return True
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
@@ -873,6 +978,9 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
     if message.chat and message.chat.type == "private":
         command_parts = str(message.text or "").split(maxsplit=1)
         payload = command_parts[1] if len(command_parts) == 2 else ""
+        # 商店深链先认（shop_ 前缀与 verify… 不重叠，认不出来就返回 False 继续往下）
+        if await _handle_private_shop_start(message, session, settings, payload):
+            return
         if await maybe_send_private_verification(
             message,
             session,
@@ -1774,18 +1882,18 @@ async def cmd_checkin(
     )
 
 
-async def _refresh_checkin_reminder_count(
+async def _refresh_checkin_reminder_roster(
     callback: CallbackQuery,
     session: AsyncSession,
     *,
     group_id: int,
 ) -> None:
-    """把提醒里的「今日已签到 N 人」刷成最新人数（best-effort）。
+    """把提醒里的「今日已签到 N 人 + 已签到名单」刷成最新（best-effort）。
 
     只改**这条提醒自己**：靠 ``checkin_reminder_posts`` 按 (群, 消息) 反查它属于
-    哪个时段，再用同一个渲染函数重算文案。找不到台账（不是提醒消息、或老消息）
-    就直接跳过。任何失败只记日志、不重试——签到已经落库了，编辑失败不能反过来
-    影响签到，也不许往群里补发消息。
+    哪个时段，再用同一个渲染函数重算文案（人数与名单一次查全，绝不只刷新一半）。
+    找不到台账（不是提醒消息、或老消息）就直接跳过。任何失败只记日志、不重试——
+    签到已经落库了，编辑失败不能反过来影响签到，也不许往群里补发消息。
     """
 
     message = getattr(callback, "message", None)
@@ -1798,15 +1906,17 @@ async def _refresh_checkin_reminder_count(
         )
         if slot is None:
             return
-        checked_in = await count_checkins_today(session, group_id=group_id)
+        roster = await today_checkin_roster(session, group_id=group_id)
         await message.edit_text(
-            render_checkin_reminder(slot=slot, checked_in=checked_in),
+            render_checkin_reminder(
+                slot=slot, checked_in=roster.count, names=roster.names
+            ),
             parse_mode="HTML",
             reply_markup=getattr(message, "reply_markup", None),
         )
     except Exception:
         log.warning(
-            "[%s] checkin reminder count refresh failed | message=%s",
+            "[%s] checkin reminder roster refresh failed | message=%s",
             group_id,
             message_id,
             exc_info=True,
@@ -1862,7 +1972,7 @@ async def on_checkin_button(
         outcome.total_points,
         outcome.streak,
     )
-    await _refresh_checkin_reminder_count(callback, session, group_id=group_id)
+    await _refresh_checkin_reminder_roster(callback, session, group_id=group_id)
 
 
 @router.message(Command("points"))

@@ -1,4 +1,10 @@
-"""签到提醒：按 ``--slot`` 给每个授权群发一条带「✅ 一键签到」按钮的提醒。
+"""签到提醒：按 ``--slot`` 给每个授权群发一条带按钮的提醒。
+
+按钮一行两个：「✅ 一键签到」（callback，固定常量 ``checkin:v1``）｜
+「🛒 积分商店」（**URL 深链** ``https://t.me/<bot>?start=shop_<群号>``，把商店菜单引到
+私聊，不在群里刷屏；``<bot>`` 运行时用 ``get_me()`` 取，取不到就只留签到按钮）。
+正文里带「今日已签到 N 人」和按签到先后排好的已签到名单（最多 20 个昵称，
+超出折成「…等 N 人」）。
 
 用法（容器内）：
 
@@ -51,12 +57,13 @@ from bot.services.checkin_reminder import (
     REMINDER_SLOTS,
     build_checkin_reminder_keyboard,
     claim_reminder_slot,
-    count_checkins_today,
     mark_reminder_sent,
     normalize_slot,
     release_reminder_slot,
     render_checkin_reminder,
+    shop_start_payload,
     slot_key,
+    today_checkin_roster,
 )
 from bot.services.quality_report import authorized_group_ids
 from bot.services.telegram_cleanup import TelegramCleanupScheduler
@@ -72,6 +79,25 @@ _USAGE = (
     + "|".join(str(slot) for slot in REMINDER_SLOTS)
     + " [--dry-run]"
 )
+
+
+async def _bot_username(bot: object) -> str:
+    """机器人的 @username（商店深链要用）；取不到就返回空串。
+
+    失败只记日志、不抛：少一个商店按钮是小事，让整条签到提醒发不出去是大事。
+    """
+
+    getter = getattr(bot, "get_me", None)
+    if not callable(getter):
+        return ""
+    try:
+        me = await getter()
+    except Exception:
+        log.warning(
+            "checkin reminder get_me failed; shop button omitted", exc_info=True
+        )
+        return ""
+    return str(getattr(me, "username", "") or "").strip().lstrip("@")
 
 
 async def _post(slot: int, *, dry_run: bool = False) -> int:
@@ -91,14 +117,18 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
             if dry_run:
                 # 只渲染不发送、不占位：验证文案/目标群时用它，别拿真群当试验场
                 for group_id in group_ids:
-                    checked_in = await count_checkins_today(
-                        session, group_id=group_id
-                    )
+                    roster = await today_checkin_roster(session, group_id=group_id)
                     print(
                         f"---- dry-run | group={group_id} | slot={slot} | {key} ----"
                     )
                     print(
-                        render_checkin_reminder(slot=slot, checked_in=checked_in)
+                        render_checkin_reminder(
+                            slot=slot, checked_in=roster.count, names=roster.names
+                        )
+                    )
+                    print(
+                        f"（商店按钮深链 payload：{shop_start_payload(group_id)}；"
+                        "运行时用 get_me() 的 @username 拼成 t.me 链接）"
                     )
                 return 0
 
@@ -110,6 +140,12 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                 return 1
 
             bot = Bot(token)
+            # 「🛒 积分商店」按钮是私聊深链，需要机器人的 @username。**运行时取**
+            # （不硬编码）：取不到（网络抖动 / 机器人没设 username）就退化成只有
+            # 一个签到按钮，绝不因为少个用户名让整条提醒发不出去。
+            bot_username = await _bot_username(bot)
+            if not bot_username:
+                print("取不到机器人用户名，本次提醒不含商店按钮")
             # 本进程是一次性的（cron 拉起、发完就退出），而"10 分钟后删除"必须是
             # **持久任务**：删除调度器是进程内的，不装它 schedule_message_auto_
             # delete_durable 只会记一条 critical 日志、什么都不写。所以这里起一个
@@ -137,14 +173,20 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                         if not claimed:
                             print(f"本时段已发过，跳过 | group={group_id} | {key}")
                             continue
-                        checked_in = await count_checkins_today(
+                        roster = await today_checkin_roster(
                             session, group_id=group_id
                         )
                         sent_message = await bot.send_message(
                             group_id,
-                            render_checkin_reminder(slot=slot, checked_in=checked_in),
+                            render_checkin_reminder(
+                                slot=slot,
+                                checked_in=roster.count,
+                                names=roster.names,
+                            ),
                             parse_mode="HTML",
-                            reply_markup=build_checkin_reminder_keyboard(),
+                            reply_markup=build_checkin_reminder_keyboard(
+                                bot_username=bot_username, group_id=group_id
+                            ),
                         )
                         delivered = True
                         await mark_reminder_sent(
@@ -168,7 +210,7 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                         sent += 1
                         print(
                             f"已发送提醒 | group={group_id} | {key}"
-                            f" | 今日已签到 {checked_in} 人"
+                            f" | 今日已签到 {roster.count} 人"
                         )
                     except Exception as exc:  # 单群失败不影响其它群
                         await session.rollback()
