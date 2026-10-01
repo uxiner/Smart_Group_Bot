@@ -11,7 +11,11 @@ from datetime import timedelta
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -106,6 +110,7 @@ from bot.utils.project_info import (
     PROJECT_REPOSITORY_URL,
 )
 from bot.utils.telegram import (
+    _track_telegram_background_task,
     answer_with_auto_delete,
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -799,8 +804,20 @@ def _build_av_seed_page(
     )
 
 
-async def _download_cover_input_file(cover_url: str, referer: str = "") -> BufferedInputFile | None:
-    url = (cover_url or "").strip()
+async def _download_av_image_input_file(
+    image_url: str,
+    referer: str = "",
+    *,
+    filename_prefix: str = "av_cover",
+) -> BufferedInputFile | None:
+    """下载一张外部图片成 ``BufferedInputFile``（封面与样例图共用这一条路径）。
+
+    「一律下载字节后上传」是有意的：外部 URL 交给 Telegram 去抓时，有些来源会被拒
+    （见 ``_edit_message_as_photo`` 的 BadRequest 兜底）。单张上限沿用现有下载上限
+    （15MB / 15 秒），不引入重试循环。
+    """
+
+    url = (image_url or "").strip()
     if not url.startswith("http"):
         return None
 
@@ -830,10 +847,16 @@ async def _download_cover_input_file(cover_url: str, referer: str = "") -> Buffe
             ext = ".png"
         elif "webp" in ctype:
             ext = ".webp"
-        return BufferedInputFile(raw, filename=f"av_cover{ext}")
+        return BufferedInputFile(raw, filename=f"{filename_prefix}{ext}")
     except Exception:
-        log.exception("failed to download cover: %s", url)
+        log.exception("failed to download av image: %s", url)
         return None
+
+
+async def _download_cover_input_file(cover_url: str, referer: str = "") -> BufferedInputFile | None:
+    return await _download_av_image_input_file(
+        cover_url, referer=referer, filename_prefix="av_cover"
+    )
 
 
 async def _edit_message_as_photo(
@@ -985,6 +1008,67 @@ _AV_COVER_FAILED_HINT = "封面这次没能发出去；文本结果照旧留在�
 #: 「打开私聊」深链按钮的文案。
 _AV_PRIVATE_OPEN_BUTTON_TEXT = "打开私聊"
 
+# ---------------------------------------------------------------------------
+# 私聊附带「番号的其他图片」（封面之外再发几张样例图）
+#
+# 来源是详情页 ``class="sample-box"`` 的链接（优先 dmm CDN）。这些图**只走私聊**：
+# 群内永远只有文字（见 _send_av_detail_in_group），而且必须在群内文字之后放进
+# **受控后台任务**里发——群内看到文字的时间不得因为这几张图变慢。
+# 第三方图可能缺失 / 失效 / 被限流，所以「有几张发几张」，绝不用别的图凑数。
+# ---------------------------------------------------------------------------
+
+#: 私聊附带样例图的默认张数。
+AV_DM_SAMPLE_DEFAULT = 4
+#: 硬上限：不管怎么配，一次最多就发这么多张。
+AV_DM_SAMPLE_HARD_CAP = 5
+#: 样例图后台任务的并发上限（保护后台任务集合，不引入任何重试循环）。
+_AV_SAMPLE_DM_TASK_LIMIT = 16
+#: 后台任务登记表：测试与优雅退出时可以等它们自然结束。
+_AV_SAMPLE_DM_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _av_dm_sample_limit(settings: Settings | None) -> int:
+    """这次可以补发几张样例图：默认 :data:`AV_DM_SAMPLE_DEFAULT`、0=关闭、硬上限 5。"""
+
+    raw = AV_DM_SAMPLE_DEFAULT
+    if settings is not None:
+        raw = getattr(settings, "av_dm_sample_count", AV_DM_SAMPLE_DEFAULT)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return AV_DM_SAMPLE_DEFAULT
+    if value <= 0:
+        return 0
+    return min(value, AV_DM_SAMPLE_HARD_CAP)
+
+
+def _av_dm_sample_urls(detail: AVDetail, limit: int) -> list[str]:
+    """按 ``detail.sample_urls`` 的顺序取前 ``limit`` 条可用 URL（去重保序的兜底）。"""
+
+    if limit <= 0:
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in getattr(detail, "sample_urls", None) or []:
+        url = str(raw or "").strip()
+        if not url.startswith("http"):
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def _build_av_sample_caption(detail: AVDetail) -> str:
+    """第一张样例图的说明：只要有番号，别让几张图变成无主照片。"""
+
+    code = (detail.code or "").strip()
+    return f"{code} · 其他图片" if code else "其他图片"
+
 
 def _av_message_is_group(message: Message) -> bool:
     """这条消息是不是群消息（群内路径一律不许出现照片）。"""
@@ -1080,6 +1164,166 @@ async def _send_av_cover_to_sender_dm(
     return _AV_COVER_FAILED
 
 
+async def _send_av_samples_to_sender_dm(
+    *,
+    bot: object,
+    sender_user_id: int,
+    detail: AVDetail,
+    limit: int,
+) -> int:
+    """封面之后，把番号的样例图补发到**私聊**，返回成功张数。
+
+    - 只在私聊：``sender_user_id <= 0`` 或 ``limit <= 0`` 直接返回 0（0=关闭）；
+    - 一律**下载字节后上传**（``Referer`` 用详情页），不把外部 URL 交给 Telegram 去抓；
+    - 逐张 best-effort：某张下载/发送失败只记日志、继续下一张；全失败也只是 0 张，
+      **绝不**改变调用方的结果码（``sent`` / ``private_blocked`` 的语义不变）；
+    - 私聊被拒（``TelegramForbiddenError``）→ 立刻停手，剩下的不再尝试；
+    - 被 Telegram 限流（``TelegramRetryAfter``）→ 同样立刻停手，不硬顶着把剩下的张数
+      全撞成 429；
+    - 群里永远不会有照片：本函数只会 ``send_photo(chat_id=sender_user_id)``，
+      而且这个 chat_id 必须是正数（用户私聊 id），负数（群/频道）一律拒绝。
+    """
+
+    if sender_user_id <= 0 or limit <= 0:
+        return 0
+    urls = _av_dm_sample_urls(detail, limit)
+    if not urls:
+        return 0
+
+    total = len(urls)
+    sent = 0
+    for index, url in enumerate(urls, start=1):
+        file_obj = await _download_av_image_input_file(
+            url,
+            referer=detail.url,
+            filename_prefix=f"av_sample_{index}",
+        )
+        if file_obj is None:
+            log.warning(
+                "【AV 样例图】下载失败，跳过 | user=%s | %d/%d | url=%s",
+                sender_user_id,
+                index,
+                total,
+                url,
+            )
+            continue
+        caption = _build_av_sample_caption(detail) if index == 1 else None
+        try:
+            await bot.send_photo(
+                chat_id=sender_user_id,
+                photo=file_obj,
+                caption=caption,
+            )
+            sent += 1
+        except TelegramForbiddenError:
+            log.info("【AV 样例图】私聊被拒，停止补发 | user=%s", sender_user_id)
+            break
+        except TelegramRetryAfter as exc:
+            # 被限流时不硬顶着继续发（否则只会把剩下的张数全撞成 429）。
+            log.warning(
+                "【AV 样例图】被 Telegram 限流，停止补发 | user=%s | retry_after=%s",
+                sender_user_id,
+                getattr(exc, "retry_after", "?"),
+            )
+            break
+        except Exception:
+            log.exception(
+                "【AV 样例图】发送失败，继续下一张 | user=%s | %d/%d",
+                sender_user_id,
+                index,
+                total,
+            )
+            continue
+    log.info("【AV 样例图】补发完成 | user=%s | sent=%d/%d", sender_user_id, sent, total)
+    return sent
+
+
+async def _send_av_samples_dm_guarded(
+    *,
+    bot: object,
+    sender_user_id: int,
+    detail: AVDetail,
+    limit: int,
+) -> None:
+    """后台任务体：任何异常都只记日志（样例图是纯附加项，绝不影响已有结果）。"""
+
+    try:
+        await _send_av_samples_to_sender_dm(
+            bot=bot,
+            sender_user_id=sender_user_id,
+            detail=detail,
+            limit=limit,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("【AV 样例图】后台补发失败 | user=%s", sender_user_id)
+
+
+def _forget_av_sample_dm_task(task: asyncio.Task[object]) -> None:
+    _AV_SAMPLE_DM_TASKS.discard(task)
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _schedule_av_samples_dm(
+    *,
+    bot: object,
+    sender_user_id: int,
+    detail: AVDetail,
+    settings: Settings | None,
+) -> bool:
+    """把样例图补发放进受控后台任务（返回是否真的排上了）。
+
+    调用方必须已经在**群内/私聊正文之后**才调这里：这几张图不许拖慢文字结果。
+    """
+
+    limit = _av_dm_sample_limit(settings)
+    if limit <= 0 or sender_user_id <= 0:
+        return False
+    if not _av_dm_sample_urls(detail, limit):
+        return False
+    if len(_AV_SAMPLE_DM_TASKS) >= _AV_SAMPLE_DM_TASK_LIMIT:
+        log.warning(
+            "【AV 样例图】后台任务已达上限，本次跳过 | user=%s | active=%d",
+            sender_user_id,
+            len(_AV_SAMPLE_DM_TASKS),
+        )
+        return False
+    try:
+        task = asyncio.create_task(
+            _send_av_samples_dm_guarded(
+                bot=bot,
+                sender_user_id=sender_user_id,
+                detail=detail,
+                limit=limit,
+            ),
+            name="av-dm-samples",
+        )
+    except RuntimeError:
+        log.warning("【AV 样例图】没有可用事件循环，本次跳过 | user=%s", sender_user_id)
+        return False
+    _AV_SAMPLE_DM_TASKS.add(task)
+    task.add_done_callback(_forget_av_sample_dm_task)
+    # 同时登记到全局 Telegram 后台任务表：健康快照看得见它，退出时也会被清理。
+    _track_telegram_background_task(task)
+    log.info(
+        "【AV 样例图】已排入后台任务 | user=%s | limit=%d", sender_user_id, limit
+    )
+    return True
+
+
+async def flush_av_sample_dm_tasks(*, timeout_seconds: float = 5.0) -> None:
+    """等样例图后台任务自然结束（测试与优雅退出用；异常已在任务体内被吞掉）。"""
+
+    tasks = {task for task in _AV_SAMPLE_DM_TASKS if not task.done()}
+    if not tasks:
+        return
+    await asyncio.wait(tasks, timeout=max(0.0, float(timeout_seconds)))
+
+
 async def _send_av_detail_in_group(
     *,
     message: Message,
@@ -1088,8 +1332,13 @@ async def _send_av_detail_in_group(
     detail_text: str,
     keyboard: InlineKeyboardMarkup | None,
     in_place: bool,
+    settings: Settings | None = None,
 ) -> bool:
-    """群内详情：只发文字 + 按钮，封面走私聊，提示并进详情文本末尾。"""
+    """群内详情：只发文字 + 按钮，封面走私聊，提示并进详情文本末尾。
+
+    样例图（封面之外的几张）排在**群内文字之后**的受控后台任务里发：群里看到文字的
+    时间不受影响，且私聊被拒（``private_blocked``）时一张都不发。
+    """
 
     sender_user_id = int(session.owner_user_id or 0)
     if sender_user_id <= 0 and message.from_user is not None:
@@ -1115,20 +1364,31 @@ async def _send_av_detail_in_group(
         text = f"{detail_text}\n\n<i>{_AV_COVER_FAILED_HINT}</i>"
 
     if in_place:
-        return await _edit_av_detail_in_place(
+        sent_ok = await _edit_av_detail_in_place(
             message=message,
             detail=detail,
             keyboard=reply_markup,
             allow_media=False,
             text=text,
         )
+    else:
+        try:
+            await message.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
+            sent_ok = True
+        except Exception:
+            log.exception("failed to send av detail text in group")
+            return False
 
-    try:
-        await message.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
-        return True
-    except Exception:
-        log.exception("failed to send av detail text in group")
-        return False
+    # 群内文字已经出去了，才轮到样例图（后台任务，失败只记日志）。
+    # 私聊被拒 / 没封面可发 时一张都不发：结果码与群内文案保持不变。
+    if sent_ok and outcome in (_AV_COVER_SENT, _AV_COVER_FAILED):
+        _schedule_av_samples_dm(
+            bot=message.bot,
+            sender_user_id=sender_user_id,
+            detail=detail,
+            settings=settings,
+        )
+    return sent_ok
 
 
 async def _send_av_detail(
@@ -1139,6 +1399,7 @@ async def _send_av_detail(
     detail: AVDetail,
     in_place: bool = False,
     header: str = "",
+    settings: Settings | None = None,
 ) -> bool:
     caption = _build_av_detail_caption(detail)
     detail_text = _build_av_detail_text(detail)
@@ -1157,12 +1418,27 @@ async def _send_av_detail(
             detail_text=detail_text,
             keyboard=keyboard,
             in_place=in_place,
+            settings=settings,
+        )
+
+    # 以下带图路径只剩私聊（最高管理员的诊断入口）：私聊 chat 就是发起者本人。
+    # 样例图补发走与群内**同一个**函数，同样放进后台任务（私聊也不必多等）。
+    sender_user_id = _av_private_sender_user_id(message)
+
+    def _schedule_samples() -> None:
+        _schedule_av_samples_dm(
+            bot=message.bot,
+            sender_user_id=sender_user_id,
+            detail=detail,
+            settings=settings,
         )
 
     if in_place:
-        return await _edit_av_detail_in_place(message=message, detail=detail, keyboard=keyboard)
+        ok = await _edit_av_detail_in_place(message=message, detail=detail, keyboard=keyboard)
+        if ok:
+            _schedule_samples()
+        return ok
 
-    # 以下带图路径只剩私聊（最高管理员的诊断入口）：私聊 chat 就是发起者本人。
     sent_photo: Message | None = None
     if detail.cover_url:
         try:
@@ -1171,6 +1447,7 @@ async def _send_av_detail(
                 caption=caption,
                 reply_markup=keyboard,
             )
+            _schedule_samples()
             return True
         except TelegramBadRequest as exc:
             # Some source URLs are blocked for Telegram fetch or return non-image content.
@@ -1187,6 +1464,7 @@ async def _send_av_detail(
                     caption=caption,
                     reply_markup=keyboard,
                 )
+                _schedule_samples()
                 return True
             except Exception:
                 log.exception("failed to send av cover photo by upload")
@@ -1197,8 +1475,25 @@ async def _send_av_detail(
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
+        _schedule_samples()
         return True
     return False
+
+
+def _av_private_sender_user_id(message: Message) -> int:
+    """私聊里「发起者」的 user id（私聊 chat id 就是用户 id，负数一律当 0）。"""
+
+    candidates: list[int] = []
+    chat = getattr(message, "chat", None)
+    if chat is not None:
+        candidates.append(int(getattr(chat, "id", 0) or 0))
+    user = getattr(message, "from_user", None)
+    if user is not None:
+        candidates.append(int(getattr(user, "id", 0) or 0))
+    for value in candidates:
+        if value > 0:
+            return value
+    return 0
 
 
 
@@ -1716,6 +2011,7 @@ async def _send_av_query_result(
                 result_idx=0,
                 detail=detail,
                 header=header,
+                settings=settings,
             )
             if not sent_ok:
                 await _answer(
@@ -2331,6 +2627,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                     session=av_session,
                     result_idx=0,
                     detail=detail,
+                    settings=settings,
                 )
                 if not sent_ok:
                     await _answer(
@@ -2472,6 +2769,7 @@ async def on_av_detail_select(
         result_idx=idx,
         detail=detail,
         in_place=True,
+        settings=settings,
     )
     if not ok:
         await callback.answer("详情更新失败，请重试", show_alert=True)

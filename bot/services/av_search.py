@@ -212,6 +212,76 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
     return out
 
 
+def _dedupe_urls_keep_order(urls: list[str]) -> list[str]:
+    """URL 去重保序（**不**复用 :func:`_dedupe_keep_order`：那个会按 80 字截断）。"""
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        value = html.unescape((raw or "").strip())
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _is_sample_thumbnail_url(url: str) -> bool:
+    """站内 ``pics/sample/`` 那档缩略图（实测只有 4KB，太糊，不发给用户）。"""
+
+    path = urlparse(url or "").path or ""
+    return "/pics/sample/" in path.lower()
+
+
+def _is_preferred_sample_url(url: str) -> bool:
+    """优先 dmm CDN（``pics.dmm.co.jp``）：实测 88~109KB 真 JPEG 且可下载。"""
+
+    host = (urlparse(url or "").netloc or "").lower()
+    return host == "pics.dmm.co.jp" or host.endswith(".pics.dmm.co.jp")
+
+
+#: 详情页里「番号的其他图片」的容器 class（实测每页 10 条）。
+_AV_SAMPLE_BOX_CLASS = "sample-box"
+_ANCHOR_TAG_RE = re.compile(r"(?is)<a\b[^>]*>")
+
+
+def _extract_sample_urls(content: str, page_url: str = "") -> list[str]:
+    """从详情页取「番号的其他图片」（``class="sample-box"`` 的那些链接）。
+
+    实测（线上容器、同一套 UA/Referer）：javbus 详情页里 ``class="sample-box"`` 的链接
+    有 10 条，形如 ``https://pics.dmm.co.jp/digital/video/sone00342/sone00342jp-1.jpg``。
+    同一页还有 ``https://www.javbus.com/pics/sample/<id>_N.jpg`` 的本地缩略图（4KB，太糊），
+    这里**丢弃**。
+
+    规则：只认 ``sample-box`` 的 ``href``（属性顺序随便）→ ``_abs_url`` 补全 → 丢掉
+    ``pics/sample/`` 缩略图 → dmm CDN 那档排在前面（其余保序）→ 去重保序。
+    解析不到就是空列表：**绝不**因为样例图缺失让整次查询失败。
+    """
+
+    if not content:
+        return []
+
+    candidates: list[str] = []
+    for match in _ANCHOR_TAG_RE.finditer(content):
+        tag = match.group(0)
+        if _AV_SAMPLE_BOX_CLASS not in tag.lower():
+            continue
+        href = _extract_first(r'href\s*=\s*["\'](.*?)["\']', tag)
+        url = _abs_url(page_url, href)
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if _is_sample_thumbnail_url(url):
+            continue
+        candidates.append(url)
+
+    preferred = [url for url in candidates if _is_preferred_sample_url(url)]
+    others = [url for url in candidates if not _is_preferred_sample_url(url)]
+    return _dedupe_urls_keep_order([*preferred, *others])
+
+
 def _looks_like_person_name(text: str) -> bool:
     v = _clean_text(text, max_len=80)
     if not v:
@@ -365,6 +435,9 @@ class AVDetail:
     series: str = ""
     summary: str = ""
     seeds: list[AVSeed] = field(default_factory=list)
+    #: 番号的其他图片（详情页 ``class="sample-box"``，优先 dmm CDN 那档）。
+    #: 只在私聊里补发；解析不到就是空列表（不影响其余字段）。
+    sample_urls: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -1145,6 +1218,8 @@ class AVSearchService:
 
         summary = _clean_text(_extract_meta(content, "description"), max_len=420)
         seeds = self._parse_magnets(content)
+        # 样例图是纯附加项：解析不到就是空列表，绝不影响上面任何字段与整次查询。
+        sample_urls = _extract_sample_urls(content, page_url)
 
         return AVDetail(
             source="javbus",
@@ -1163,6 +1238,7 @@ class AVSearchService:
             series=_clean_text(series, max_len=80),
             summary=summary,
             seeds=seeds,
+            sample_urls=sample_urls,
         )
 
     def _extract_javbus_actors(self, content: str) -> list[str]:
@@ -1766,6 +1842,9 @@ class AVSearchService:
             return detail
         if jav_detail.seeds:
             detail.seeds = jav_detail.seeds
+        if not detail.sample_urls:
+            # dmm / madouqu 详情页没有 sample-box，靠 javbus 详情页补样例图。
+            detail.sample_urls = jav_detail.sample_urls
         if not detail.cover_url:
             detail.cover_url = jav_detail.cover_url
         if not detail.actors:
