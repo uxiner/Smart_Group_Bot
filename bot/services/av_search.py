@@ -1,3 +1,19 @@
+"""AV 检索与详情抓取（javbus 主源 + madouqu / DMM / FC2 备选）。
+
+来源范围（实测结论，别再重复摸索）：
+
+- 主源仍是 javbus（详情页 + ``ajax/uncledatoolsbyajax.php`` 的磁力表）；
+  磁力 / 大小 / 日期都来自这里，私聊内联「下载地址」用的就是这批 ``AVSeed``。
+- **ed2k 拿不到**：javbus / javdb / DMM / FC2 / madouqu 实测都只给 ``magnet:?``，
+  绝不凭空拼接或伪造 ed2k 链接。
+- **官方剧情拿不到**：javbus 的 meta description 只是标题重复，javdb 详情页没有
+  剧情块，DMM 在年龄门后面。所以 /av 的 AI 概述只按题材 / 看点写，并明确标注
+  「AI 概述，非官方剧情」。
+- **价格也不做**：DMM 价格在年龄门后，madouqu 的「pt」是仿站积分，不是真价。
+- TODO(可选第二源)：javdb.com 可直连、无 Cloudflare，将来若要补搜索结果可以把它
+  作为**可选第二源**接进来（本次不实现，避免多一个站点的抓取与解析面）。
+"""
+
 from __future__ import annotations
 
 import asyncio

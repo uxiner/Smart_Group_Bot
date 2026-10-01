@@ -312,6 +312,10 @@ class Settings(BaseSettings):
     av_max_results: int = 18
     #: 私聊里封面之后补发的样例图张数（默认 4、硬上限 5、0=关闭）。
     av_dm_sample_count: int = 4
+    #: 私聊详情里内联的下载地址条数（默认 3、硬上限 5、0=关闭该块）。
+    av_inline_seed_count: int = 3
+    #: 私聊详情里的 AI「题材与看点概述」；默认关（开启会调用一次 LLM）。
+    av_ai_synopsis_enabled: bool = False
     av_javbus_base_url: str = "https://www.javbus.com"
     av_madouqu_base_url: str = "https://madouqu.com"
     av_dmm_base_url: str = "https://www.dmm.co.jp"

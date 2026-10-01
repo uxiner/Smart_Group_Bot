@@ -82,6 +82,8 @@ _LLM_STAGE_DEADLINES = {
     "vision": 90.0,
     "main": 120.0,
     "skill": 120.0,
+    # /av 的可选 AI 题材概述：附加项，宁可拿不到也不能拖住查询。
+    "synopsis": 20.0,
 }
 _LLM_CIRCUIT_FAILURE_THRESHOLD = 3
 _LLM_CIRCUIT_COOLDOWN_SECONDS = 30.0
@@ -2713,8 +2715,15 @@ class LLMService:
         *,
         use_decision: bool = False,
         use_moderation: bool = False,
+        stage: str | None = None,
     ) -> str:
-        """Send chat completion request and return assistant text."""
+        """Send chat completion request and return assistant text.
+
+        ``stage`` only relabels an ordinary ``main`` call for usage metrics,
+        log lines, and the stage deadline (e.g. ``synopsis`` for the optional
+        /av AI overview).  It never changes which model configuration is used,
+        so no new provider or endpoint is introduced.
+        """
         if use_moderation:
             cfg = self.moderation_config
             label = "moderation"
@@ -2724,10 +2733,15 @@ class LLMService:
         else:
             cfg = self.main
             label = "main"
+        if stage:
+            label = str(stage).strip() or label
+            preview_limit = 80
+        else:
+            preview_limit = 120 if label == "moderation" else 80
 
         scope = (
             execution_priority_scope(_MODERATION_EXECUTION_PRIORITY)
-            if label == "moderation"
+            if use_moderation
             else nullcontext()
         )
         with scope:
@@ -2735,7 +2749,7 @@ class LLMService:
                 messages=messages,
                 candidates=self._chat_candidates(cfg),
                 label=label,
-                preview_limit=(120 if label == "moderation" else 80),
+                preview_limit=preview_limit,
             )
 
     async def decision(self, system: str, user_text: str) -> str:

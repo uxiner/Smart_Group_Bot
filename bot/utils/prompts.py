@@ -20,6 +20,7 @@ _PROMPT_FILES = {
     "persona": "persona.md",
     "proactive_topic": "proactive_topic.md",
     "style_distill": "style_distill.md",
+    "av_synopsis": "av_synopsis.md",
 }
 
 
