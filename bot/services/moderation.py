@@ -58,6 +58,30 @@ MATCH_SOURCE_OWN = "own"
 MATCH_SOURCE_QUOTE = SCAN_SCOPE_QUOTE
 MATCH_SOURCE_VISION = SCAN_SCOPE_VISION
 MATCH_SOURCE_SEMANTIC = "semantic"
+#: 引用/图片描述带来的命中，如果用户本人在**反对/警示**（骗子、别信、举报…），
+#: 就不追究——与语义规则 ④(c) 的豁免一致。典型场景：有人引用一条招嫖广告提醒大家
+#: "这是骗子别信"，硬正则只看到引文，会把提醒的人当成发广告的。
+_OBJECTION_PATTERN = (
+    r"(骗[子人]|别信|不要信|勿信|别上[当好]|假(的|货)|诈骗|举报|小心|注意(风险|安全)|"
+    r"有风险|坑人|钓鱼|别加|避雷|假的吧)"
+)
+
+
+def _own_text_objects(candidates: tuple[str, ...]) -> bool:
+    """用户自己写的正文里，有没有"提示这是骗子/广告"这类反对信号。"""
+
+    for candidate in candidates:
+        try:
+            if safe_regex.search(
+                _OBJECTION_PATTERN,
+                candidate,
+                flags=safe_regex.IGNORECASE,
+                timeout=0.02,
+            ) is not None:
+                return True
+        except (safe_regex.error, TimeoutError):
+            continue
+    return False
 _SCAN_SCOPE_ORDER = (SCAN_SCOPE_MESSAGE, SCAN_SCOPE_QUOTE, SCAN_SCOPE_VISION)
 _SCAN_SCOPE_ALIASES = {
     "message": SCAN_SCOPE_MESSAGE,
@@ -532,6 +556,9 @@ class ModerationService:
                 return _moderation_match_candidates(segments.vision)
             return own_candidates
 
+        # 用户本人是不是在警示骗子/反对广告（引用/图片描述命中时用来豁免）。
+        own_objects = _own_text_objects(own_candidates)
+
         regex_deadline = time.perf_counter() + 0.1
 
         def regex_hits(pattern: str, candidates: tuple[str, ...]) -> bool:
@@ -615,15 +642,23 @@ class ModerationService:
                         include_vision=include_vision,
                         keyword_folded=folded_pattern,
                     )
-                    log.info(
-                        "审核命中本地关键词: group=%s rule_id=%s source=%s",
-                        group_id,
-                        rule.id,
-                        source,
-                    )
-                    return make_verdict(
-                        violated=True,
-                        reason="命中关键词规则",
+                    if source != MATCH_SOURCE_OWN and own_objects:
+                        log.info(
+                            "审核豁免 (命中来自 %s，但本人在警示): group=%s rule_id=%s",
+                            source,
+                            group_id,
+                            rule.id,
+                        )
+                    else:
+                        log.info(
+                            "审核命中本地关键词: group=%s rule_id=%s source=%s",
+                            group_id,
+                            rule.id,
+                            source,
+                        )
+                        return make_verdict(
+                            violated=True,
+                            reason="命中关键词规则",
                         rule=rule,
                         conclusive=True,
                         confidence=1.0,
@@ -675,6 +710,15 @@ class ModerationService:
                             include_quote=include_quote,
                             include_vision=include_vision,
                         )
+                        if source != MATCH_SOURCE_OWN and own_objects:
+                            log.info(
+                                "审核豁免 (命中来自 %s，但本人在警示): group=%s rule_id=%s",
+                                source,
+                                group_id,
+                                rule.id,
+                            )
+                            # 跳出候选循环，继续下一条规则（这条不追究）。
+                            break
                         log.info(
                             "审核命中本地正则: group=%s rule_id=%s source=%s",
                             group_id,
