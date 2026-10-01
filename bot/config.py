@@ -170,6 +170,16 @@ class ModerationConfig(BaseModel):
     # 判定复用审核链路本来就有的那次视觉调用（不新增模型调用）；默认开启。
     # 关闭后不做判定（提示词里也不加 NSFW 要求）也不做任何处置。
     nsfw_image_guard_enabled: bool = True
+    # 广告经「引用/转发」再次传播时，被引用那条消息的原作者同样按规则处置
+    # （删除其消息 + 记违规 + 既有质询/禁言流程）。默认开启；关闭后行为与旧版完全一致。
+    punish_quoted_author_enabled: bool = True
+    # 被引用消息超过该时长（秒）就不再追溯原作者，只记日志。默认 7 天。
+    quoted_author_max_age_seconds: int = 7 * 24 * 60 * 60
+    # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 + 记违规，
+    # 不质询/不封禁/不禁言/不累计警告。默认开启；关闭即回到"整段跳过"的旧行为。
+    admin_moderation_enabled: bool = True
+    # 管理员命中违规时，私聊最高管理员一份完整证据（best-effort，不刷屏）。默认开启。
+    admin_alert_super_admin_enabled: bool = True
 
 
 class Settings(BaseSettings):
@@ -821,6 +831,18 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.moderation.bot_screening_message_count = min(
         100, max(1, int(settings.moderation.bot_screening_message_count))
+    )
+    settings.moderation.punish_quoted_author_enabled = bool(
+        settings.moderation.punish_quoted_author_enabled
+    )
+    settings.moderation.quoted_author_max_age_seconds = max(
+        0, int(settings.moderation.quoted_author_max_age_seconds)
+    )
+    settings.moderation.admin_moderation_enabled = bool(
+        settings.moderation.admin_moderation_enabled
+    )
+    settings.moderation.admin_alert_super_admin_enabled = bool(
+        settings.moderation.admin_alert_super_admin_enabled
     )
 
     settings.bot.token = settings.bot_token

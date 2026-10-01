@@ -249,7 +249,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.chat.ban_sender_chat.await_count, 2)
         self.assertTrue(violation.ban_enforced)
 
-    async def test_anonymous_sender_using_current_group_identity_is_auto_exempt(self) -> None:
+    async def test_anonymous_sender_is_auto_exempt_when_admin_moderation_disabled(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
             from_user=SimpleNamespace(
@@ -276,7 +276,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
                 embed_model="",
                 max_context_tokens=0,
             ),
-            moderation=SimpleNamespace(enabled=True),
+            moderation=SimpleNamespace(enabled=True, admin_moderation_enabled=False),
             skill_sticker_file_ids="",
         )
         moderation_service = SimpleNamespace(
@@ -305,8 +305,103 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
         ):
             await group.on_group_message(message, session=session, settings=settings)
 
+        # D 节行为变更：只有显式关闭 moderation.admin_moderation_enabled 时，
+        # 匿名管理员（以本群身份发言）才回到"整段跳过"的旧行为。
         moderation_service.is_user_exempt.assert_not_awaited()
         moderation_service.evaluate.assert_not_awaited()
+
+    async def test_anonymous_sender_is_moderated_as_admin_by_default(self) -> None:
+        """D 节：匿名管理员默认不再豁免——删 + 群内警示 + 记违规，不质询。"""
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            from_user=SimpleNamespace(
+                id=1087968824,
+                is_bot=True,
+                username="GroupAnonymousBot",
+                full_name="Group",
+            ),
+            sender_chat=SimpleNamespace(id=-10001, username=None, title="test"),
+            text="admin announcement",
+            date=None,
+            delete=AsyncMock(),
+            bot=SimpleNamespace(
+                me=AsyncMock(return_value=SimpleNamespace(username="selfbot", id=1))
+            ),
+        )
+        group_row = SimpleNamespace(settings={"mute_all_replies": True})
+        session = SimpleNamespace(
+            flush=AsyncMock(),
+            commit=AsyncMock(),
+            rollback=AsyncMock(),
+            delete=AsyncMock(),
+            execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)),
+        )
+        settings = SimpleNamespace(
+            bot=SimpleNamespace(
+                main_model="",
+                decision_model="",
+                compress_model="",
+                moderation_model="",
+                vision_model="",
+                embed_model="",
+                max_context_tokens=0,
+            ),
+            moderation=SimpleNamespace(enabled=True),
+            skill_sticker_file_ids="",
+        )
+        rule = SimpleNamespace(id=5, action="delete", rule_type="regex", pattern="公告")
+        moderation_service = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(
+                return_value=ModerationVerdict(
+                    violated=True,
+                    reason="命中正则规则",
+                    rule=rule,
+                    conclusive=True,
+                    confidence=1.0,
+                )
+            ),
+            is_high_confidence=lambda _verdict: True,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=1, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        notice = AsyncMock(return_value=True)
+
+        with (
+            patch("bot.handlers.group.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch(
+                "bot.handlers.group._fresh_group_authorized_for_moderation",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._record_group_activity_cas",
+                new=AsyncMock(return_value=group_row.settings),
+            ),
+            patch("bot.handlers.group.extract_message_text", return_value=("admin announcement", "text")),
+            patch("bot.handlers.group._append_image_context", new=AsyncMock(return_value=("admin announcement", ""))),
+            patch("bot.handlers.group._build_reply_context_for_llm", new=AsyncMock(return_value="")),
+            patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
+            patch("bot.handlers.group._is_user_admin_cached", new=AsyncMock(return_value=False)),
+            patch("bot.handlers.group.LLMService", return_value=object()),
+            patch("bot.handlers.group.SkillService", return_value=object()),
+            patch("bot.handlers.group.ModerationService", return_value=moderation_service),
+            patch("bot.handlers.group.answer_with_auto_delete", new=notice),
+            patch("bot.handlers.group.begin_moderation_challenge", new=begin),
+        ):
+            await group.on_group_message(message, session=session, settings=settings)
+
+        message.delete.assert_awaited_once()
+        notice.assert_awaited_once()
+        moderation_service.record_violation.assert_awaited_once()
+        self.assertEqual(moderation_service.record_violation.await_args.args[4], "delete")
+        begin.assert_not_awaited()
 
 
 if __name__ == "__main__":

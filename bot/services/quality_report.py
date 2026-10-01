@@ -41,6 +41,28 @@ from bot.utils.timezone import now_shanghai_naive
 MARGINAL_CONFIDENCE = 0.9
 LOCAL_UTC_OFFSET_HOURS = 8
 
+# 置信度分档：调 moderation.high_confidence_threshold 之前，先看命中实际落在哪一档。
+# 键是稳定的机器名（报表/测试都用它），值是给人看的区间标签。
+CONFIDENCE_BANDS: tuple[tuple[str, str], ...] = (
+    ("lt_0_5", "&lt;0.5"),
+    ("0_5_0_7", "0.5–0.7"),
+    ("0_7_0_9", "0.7–0.9"),
+    ("ge_0_9", "≥0.9"),
+)
+
+
+def confidence_band(value: float) -> str:
+    """把 0–1 的置信度归到 ``CONFIDENCE_BANDS`` 的某一档。"""
+
+    numeric = float(value)
+    if numeric < 0.5:
+        return "lt_0_5"
+    if numeric < 0.7:
+        return "0_5_0_7"
+    if numeric < 0.9:
+        return "0_7_0_9"
+    return "ge_0_9"
+
 
 def _utc_since(days: int) -> datetime:
     return now_shanghai_naive() - timedelta(hours=LOCAL_UTC_OFFSET_HOURS) - timedelta(days=max(1, int(days)))
@@ -71,6 +93,11 @@ class ModerationQuality:
     join_bans: int = 0
     bans_by_source: dict[str, int] = field(default_factory=dict)
     pending_challenges: int = 0
+    # 有置信度的命中按 CONFIDENCE_BANDS 分档计数（无置信度的不进任何档）
+    confidence_bands: dict[str, int] = field(default_factory=dict)
+    # 落在 moderation.high_confidence_threshold 之上的命中数（默认 0.9）
+    high_confidence_hits: int = 0
+    high_confidence_threshold: float = MARGINAL_CONFIDENCE
 
     @property
     def cleared(self) -> int:
@@ -83,6 +110,18 @@ class ModerationQuality:
         if self.total <= 0:
             return None
         return self.cleared / self.total
+
+    @property
+    def high_confidence_ratio(self) -> float | None:
+        """高置信命中占窗口内全部命中的比例。
+
+        分母是全部命中（含没有置信度的历史行）——那正是运营要回答的问题：
+        "把阈值调到多少，才不会让大部分命中都落进不可用的区间"。
+        """
+
+        if self.total <= 0:
+            return None
+        return self.high_confidence_hits / self.total
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +149,23 @@ async def _rule_labels(session: AsyncSession, group_id: int) -> dict[int, str]:
 
 
 async def collect_quality(
-    session: AsyncSession, *, group_id: int, days: int = 7
+    session: AsyncSession,
+    *,
+    group_id: int,
+    days: int = 7,
+    high_threshold: float | None = None,
 ) -> ModerationQuality:
-    """窗口内的审核质量：命中构成、边缘判定、放行（误伤）数。"""
+    """窗口内的审核质量：命中构成、边缘判定、放行（误伤）数。
+
+    ``high_threshold`` 是运行时配置的 ``moderation.high_confidence_threshold``；
+    不传就按默认 0.9 统计"高置信占比"。
+    """
 
     gid = int(group_id)
     window = max(1, int(days))
+    confidence_threshold = (
+        MARGINAL_CONFIDENCE if high_threshold is None else float(high_threshold)
+    )
     utc_since = _utc_since(window)
 
     total = (
@@ -147,10 +197,17 @@ async def collect_quality(
         )
     )
     marginal = confident = no_confidence = 0
+    bands = {key: 0 for key, _label in CONFIDENCE_BANDS}
+    high_hits = 0
     for (value,) in confidence_rows.all():
         if value is None:
             no_confidence += 1
-        elif float(value) < MARGINAL_CONFIDENCE:
+            continue
+        numeric = float(value)
+        bands[confidence_band(numeric)] += 1
+        if numeric >= confidence_threshold:
+            high_hits += 1
+        if numeric < MARGINAL_CONFIDENCE:
             marginal += 1
         else:
             confident += 1
@@ -241,6 +298,9 @@ async def collect_quality(
         join_bans=int(join_bans),
         bans_by_source=ban_by_source,
         pending_challenges=int(pending),
+        confidence_bands=bands,
+        high_confidence_hits=int(high_hits),
+        high_confidence_threshold=confidence_threshold,
     )
 
 
@@ -386,10 +446,23 @@ def render_quality_report(
             f"边缘判定（置信 &lt; {MARGINAL_CONFIDENCE:g}）<b>{quality.marginal}</b> 条"
             f"，高置信 {quality.confident} 条"
         )
+        if any(quality.confidence_bands.values()):
+            band_text = "｜".join(
+                f"{label} {quality.confidence_bands.get(key, 0)}"
+                for key, label in CONFIDENCE_BANDS
+            )
+            lines.append(f"置信度分档：{band_text}")
+            ratio = quality.high_confidence_ratio
+            if ratio is not None:
+                lines.append(
+                    f"高于高置信阈值（{quality.high_confidence_threshold:g}）："
+                    f"<b>{quality.high_confidence_hits}</b> 条，"
+                    f"占全部命中 {ratio * 100:.0f}%"
+                )
         if quality.no_confidence:
             lines.append(
-                f"（另有 {quality.no_confidence} 条历史命中没有置信度记录，"
-                "该字段是本次上线后才开始落的）"
+                f"（另有 {quality.no_confidence} 条命中没有模型置信度："
+                "本地正则/关键词命中、图片守卫，或置信度字段上线前的历史行）"
             )
         lines.append(
             f"被放行/判定误伤：<b>{quality.cleared}</b> 条"
@@ -442,10 +515,16 @@ async def render_group_quality(
     group_id: int,
     days: int = 7,
     activity_lines: Sequence[str] | None = None,
+    high_threshold: float | None = None,
 ) -> str:
     """一次取齐并渲染（命令与周报共用）。"""
 
-    quality = await collect_quality(session, group_id=group_id, days=days)
+    quality = await collect_quality(
+        session,
+        group_id=group_id,
+        days=days,
+        high_threshold=high_threshold,
+    )
     activity = await collect_activity(session, group_id=group_id, days=days)
     return render_quality_report(quality, activity, activity_lines=activity_lines)
 
@@ -464,11 +543,13 @@ async def authorized_group_ids(session: AsyncSession) -> list[int]:
 
 __all__ = [
     "ActivitySummary",
+    "CONFIDENCE_BANDS",
     "MARGINAL_CONFIDENCE",
     "ModerationQuality",
     "authorized_group_ids",
     "collect_activity",
     "collect_quality",
+    "confidence_band",
     "render_group_quality",
     "render_quality_report",
 ]
