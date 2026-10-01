@@ -106,6 +106,7 @@
     persona: "角色人格",
     proactive_topic: "主动话题",
     style_distill: "风格提炼",
+    av_synopsis: "AV 题材概述",
   };
 
   const GROUP_EDITABLE_KEYS = new Set([
@@ -1086,6 +1087,8 @@
             ${field("av.http_timeout_sec", "请求超时（秒）", { type: "number", min: 1, max: 300, step: 0.1, required: true })}
             ${field("av.max_results", "最大结果数", { type: "number", min: 1, max: 100, step: 1, required: true })}
             ${field("av.dm_sample_count", "私聊样例图张数（0=关闭）", { type: "number", min: 0, max: 5, step: 1, required: true })}
+            ${field("av.inline_seed_count", "私聊内联下载地址条数（0=关闭该块）", { type: "number", min: 0, max: 5, step: 1, required: true, hint: "硬上限 5 条；群内文案不受影响" })}
+            ${toggle("av.ai_synopsis_enabled", "私聊 AI 题材概述（默认关）", "开启后每次私聊查询多一次模型调用，输出会标注「AI 概述，非官方剧情」")}
             ${field("av.javbus_base_url", "JavBus 地址", { type: "url", maxlength: 1000 })}
             ${field("av.madouqu_base_url", "Madouqu 地址", { type: "url", maxlength: 1000 })}
             ${field("av.dmm_base_url", "DMM 地址", { type: "url", maxlength: 1000 })}

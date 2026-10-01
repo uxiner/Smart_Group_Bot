@@ -90,7 +90,11 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.member_identity import member_display_name
 from bot.services.group_settings import acquire_group_settings_write_intent
-from bot.services.message_templates import render_action_notice, render_data_brief
+from bot.services.message_templates import (
+    card_field,
+    render_action_notice,
+    render_data_brief,
+)
 from bot.services.point_shop import (
     buy_member_tag,
     buy_pin,
@@ -102,6 +106,7 @@ from bot.services.point_shop import (
 from bot.services.skills import SkillService
 from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
+from bot.utils.prompts import get_prompt
 from bot.utils.project_info import (
     PROJECT_DEVELOPER,
     PROJECT_DEVELOPER_CONTACT,
@@ -630,6 +635,160 @@ def _build_av_search_page(
     )
 
 
+# ---------------------------------------------------------------------------
+# /av 私聊结果：内联「下载地址」+ 独立「制作信息」块 + 可选 AI 题材概述
+#
+# 磁力、大小、日期全部来自**详情抓取时已经拿到的** ``AVDetail.seeds``
+# （javbus 详情页 ajax/uncledatoolsbyajax.php，见 av_search._fetch_javbus_ajax_magnets），
+# 这里只负责排版，不发任何新请求：不再新增一次外部查询。
+#
+# 排版只在私聊生效（``private_view=True``）：群内文案保持原样
+#（仍是「种子 N 条（点下方按钮浏览）」+ 按钮），由回归测试逐字守住。
+# ---------------------------------------------------------------------------
+
+#: 私聊内联下载地址的默认条数。
+AV_INLINE_SEED_DEFAULT = 3
+#: 硬上限：不管怎么配，一次最多内联这么多条（10 会被夹到 5）。
+AV_INLINE_SEED_HARD_CAP = 5
+#: 单条消息的安全长度。Telegram 上限 4096；这里留出 HTML 实体消耗的余量，
+#: 超了就按 N→N-1→…→1 减条数。**磁力链本身绝不截断**：截断过的磁力是坏链，
+#: 宁可不显示这一条，也不能给一个看起来能用、实际打不开的地址。
+_AV_INLINE_SEED_BUDGET = 3500
+#: 内联标题的截断长度（远端标题可以很长，含「中文字幕」这类标注）。
+_AV_INLINE_SEED_TITLE_LEN = 40
+#: AI 概述块标题；这行字必须原样出现在正文里（规格硬要求）。
+_AV_SYNOPSIS_LABEL = "AI 概述，非官方剧情"
+#: AI 概述输出长度上限（1~3 句，超长就截断）。
+_AV_SYNOPSIS_MAX_CHARS = 220
+#: AI 概述的兜底总预算（秒）。LLM 层还有 synopsis 阶段时限（见 llm.LLMService）。
+_AV_SYNOPSIS_TIMEOUT_SEC = 25.0
+
+
+def _av_inline_seed_limit(settings: Settings | None) -> int:
+    """这次私聊内联几条下载地址：默认 :data:`AV_INLINE_SEED_DEFAULT`、0=关闭、硬上限 5。"""
+
+    raw = AV_INLINE_SEED_DEFAULT
+    if settings is not None:
+        raw = getattr(settings, "av_inline_seed_count", AV_INLINE_SEED_DEFAULT)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return AV_INLINE_SEED_DEFAULT
+    if value <= 0:
+        return 0
+    return min(value, AV_INLINE_SEED_HARD_CAP)
+
+
+def _av_ai_synopsis_enabled(settings: Settings | None) -> bool:
+    """AI 概述默认关；``settings is None`` 时也当关（拿不到配置就不烧模型）。"""
+
+    if settings is None:
+        return False
+    raw = getattr(settings, "av_ai_synopsis_enabled", False)
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return bool(raw)
+
+
+def _render_av_inline_seed_lines(seeds: object, limit: int) -> list[str]:
+    """把前 ``limit`` 条种子渲染成两行一组：``大小 · 日期 · 标题`` + ``<code>磁力</code>``。
+
+    - 空的大小/日期/标题只是省掉分隔符，不补占位符；
+    - 没有磁力串的条目整条跳过（宁可少一条，也不给空地址）；
+    - 标题与磁力串都过 ``html.escape``：磁力里的 ``&`` 必须转成 ``&amp;``，
+      否则 Telegram 的 HTML 解析会直接报错，整条消息发不出去。
+    """
+
+    if limit <= 0:
+        return []
+    lines: list[str] = []
+    for seed in list(seeds or [])[:limit]:
+        magnet = str(getattr(seed, "magnet", "") or "").strip()
+        if not magnet:
+            continue
+        parts: list[str] = []
+        size = _truncate_text(str(getattr(seed, "size", "") or ""), 24)
+        date = _truncate_text(str(getattr(seed, "date", "") or ""), 24)
+        title = _truncate_text(
+            str(getattr(seed, "title", "") or ""), _AV_INLINE_SEED_TITLE_LEN
+        )
+        if size:
+            parts.append(html.escape(size))
+        if date:
+            parts.append(html.escape(date))
+        parts.append(html.escape(title or "Magnet"))
+        lines.append(" · ".join(parts))
+        lines.append(f"<code>{html.escape(magnet)}</code>")
+    return lines
+
+
+def _build_av_private_detail_text(
+    detail: AVDetail,
+    *,
+    seed_limit: int,
+    ai_synopsis: str,
+) -> str:
+    """私聊详情正文：基本信息 / 标题 + 简介 / 下载地址 / 制作信息 / AI 概述。"""
+
+    basic: dict[str, object] = {
+        "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
+        "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
+    }
+    if detail.date:
+        basic["发行日期"] = f"<code>{html.escape(detail.date)}</code>"
+    if detail.score:
+        basic["评分"] = f"<code>{html.escape(detail.score)}</code>"
+    if detail.seeds:
+        basic["种子"] = f"<code>{len(detail.seeds)}</code> 条（点下方按钮浏览）"
+    else:
+        basic["种子"] = "无"
+    if detail.url:
+        basic["详情页"] = f'<a href="{html.escape(detail.url, quote=True)}">打开详情页</a>'
+
+    # 制作信息单独成块（片商/发行商/导演/系列/演员/时长/类型），字段一个不少。
+    making: dict[str, object] = {}
+    if detail.studio:
+        making["制作商"] = html.escape(detail.studio)
+    if detail.publisher:
+        making["发行商"] = html.escape(detail.publisher)
+    if detail.director:
+        making["导演"] = html.escape(detail.director)
+    if detail.series:
+        making["系列"] = html.escape(detail.series)
+    if detail.actors:
+        making["演员"] = html.escape(" / ".join(detail.actors))
+    if detail.runtime:
+        making["时长"] = html.escape(detail.runtime)
+    if detail.genres:
+        making["类型"] = html.escape(" / ".join(detail.genres))
+
+    item_lines: list[str] = [f"<b>{html.escape(detail.title or '-')}</b>"]
+    if detail.summary:
+        item_lines.extend(["", html.escape(_truncate_text(detail.summary, 360))])
+
+    seed_lines = _render_av_inline_seed_lines(detail.seeds, seed_limit)
+    if seed_lines:
+        item_lines.extend(
+            ["", "<b>下载地址</b>", "<blockquote>" + "\n".join(seed_lines) + "</blockquote>"]
+        )
+
+    if making:
+        rows = "\n".join(card_field(label, value) for label, value in making.items())
+        item_lines.extend(["", "<b>制作信息</b>", f"<blockquote>{rows}</blockquote>"])
+
+    synopsis = (ai_synopsis or "").strip()
+    if synopsis:
+        item_lines.extend(
+            [
+                "",
+                f"<b>{_AV_SYNOPSIS_LABEL}</b>",
+                f"<blockquote>{html.escape(synopsis)}</blockquote>",
+            ]
+        )
+
+    return render_data_brief("影片详情", metadata=basic, items=item_lines)
+
+
 def _build_av_detail_caption(detail: AVDetail) -> str:
     metadata: dict[str, object] = {
         "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
@@ -666,45 +825,158 @@ def _build_av_detail_caption(detail: AVDetail) -> str:
     )
 
 
-def _build_av_detail_text(detail: AVDetail) -> str:
-    metadata: dict[str, object] = {
-        "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
-        "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
-    }
+def _build_av_detail_text(
+    detail: AVDetail,
+    *,
+    private_view: bool = False,
+    inline_seed_count: int | None = None,
+    ai_synopsis: str = "",
+) -> str:
+    """详情正文（Telegram HTML）。
 
-    if detail.date:
-        metadata["发行日期"] = f"<code>{html.escape(detail.date)}</code>"
-    if detail.runtime:
-        metadata["时长"] = html.escape(detail.runtime)
-    if detail.score:
-        metadata["评分"] = f"<code>{html.escape(detail.score)}</code>"
-    if detail.director:
-        metadata["导演"] = html.escape(detail.director)
-    if detail.studio:
-        metadata["制作商"] = html.escape(detail.studio)
-    if detail.publisher:
-        metadata["发行商"] = html.escape(detail.publisher)
-    if detail.series:
-        metadata["系列"] = html.escape(detail.series)
-    if detail.actors:
-        metadata["演员"] = html.escape(" / ".join(detail.actors))
-    if detail.genres:
-        metadata["类型"] = html.escape(" / ".join(detail.genres))
+    - ``private_view=False``（**群内**）：与加入「下载地址」之前逐字一致的历史排版
+      ——单块元数据 + 标题 + 简介。群内绝不内联磁力链，由回归测试逐字守住。
+    - ``private_view=True``（**私聊**）：基本信息 / 标题 + 简介 / 下载地址 /
+      制作信息 /（可选）AI 概述 分块排版。
 
-    if detail.seeds:
-        metadata["种子"] = f"<code>{len(detail.seeds)}</code> 条（点下方按钮浏览）"
+    ``inline_seed_count=None`` 时按视图取默认值：私聊 :data:`AV_INLINE_SEED_DEFAULT`、
+    群内 0。磁力链本身不截断：整条消息超长时按 N→N-1→…→1 减条数，
+    连一条都放不下就整块不出现。
+    """
+
+    if not private_view:
+        metadata: dict[str, object] = {
+            "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
+            "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
+        }
+
+        if detail.date:
+            metadata["发行日期"] = f"<code>{html.escape(detail.date)}</code>"
+        if detail.runtime:
+            metadata["时长"] = html.escape(detail.runtime)
+        if detail.score:
+            metadata["评分"] = f"<code>{html.escape(detail.score)}</code>"
+        if detail.director:
+            metadata["导演"] = html.escape(detail.director)
+        if detail.studio:
+            metadata["制作商"] = html.escape(detail.studio)
+        if detail.publisher:
+            metadata["发行商"] = html.escape(detail.publisher)
+        if detail.series:
+            metadata["系列"] = html.escape(detail.series)
+        if detail.actors:
+            metadata["演员"] = html.escape(" / ".join(detail.actors))
+        if detail.genres:
+            metadata["类型"] = html.escape(" / ".join(detail.genres))
+
+        if detail.seeds:
+            metadata["种子"] = f"<code>{len(detail.seeds)}</code> 条（点下方按钮浏览）"
+        else:
+            metadata["种子"] = "无"
+        if detail.url:
+            metadata["详情页"] = (
+                f'<a href="{html.escape(detail.url, quote=True)}">打开详情页</a>'
+            )
+        item_lines = [f"<b>{html.escape(detail.title or '-')}</b>"]
+        if detail.summary:
+            item_lines.extend(
+                ["", html.escape(_truncate_text(detail.summary, 360))]
+            )
+        return render_data_brief("影片详情", metadata=metadata, items=item_lines)
+
+    if inline_seed_count is None:
+        limit = AV_INLINE_SEED_DEFAULT
     else:
-        metadata["种子"] = "无"
-    if detail.url:
-        metadata["详情页"] = (
-            f'<a href="{html.escape(detail.url, quote=True)}">打开详情页</a>'
+        try:
+            limit = int(inline_seed_count)
+        except (TypeError, ValueError):
+            limit = AV_INLINE_SEED_DEFAULT
+    limit = max(0, min(limit, AV_INLINE_SEED_HARD_CAP))
+
+    for candidate in range(limit, 0, -1):
+        text = _build_av_private_detail_text(
+            detail,
+            seed_limit=candidate,
+            ai_synopsis=ai_synopsis,
         )
-    item_lines = [f"<b>{html.escape(detail.title or '-')}</b>"]
-    if detail.summary:
-        item_lines.extend(
-            ["", html.escape(_truncate_text(detail.summary, 360))]
-        )
-    return render_data_brief("影片详情", metadata=metadata, items=item_lines)
+        if len(text) <= _AV_INLINE_SEED_BUDGET:
+            return text
+    return _build_av_private_detail_text(
+        detail,
+        seed_limit=0,
+        ai_synopsis=ai_synopsis,
+    )
+
+
+def _av_synopsis_llm(settings: Settings) -> LLMService:
+    """AI 概述复用的 LLM 服务：**主模型 + 现有端点**，不新增任何厂商/端点。
+
+    每个角色都显式传进去（漏传会静默退化到 main，见平台说明）；调用时只额外带
+    ``stage="synopsis"``，仅影响用量统计与阶段时限。
+    """
+
+    bot_cfg = settings.bot
+    return LLMService(
+        bot_cfg.main_model,
+        bot_cfg.decision_model,
+        bot_cfg.compress_model,
+        moderation=bot_cfg.moderation_model,
+        vision=bot_cfg.vision_model,
+        embed=bot_cfg.embed_model,
+        skill=bot_cfg.skill_model,
+        max_context_tokens=bot_cfg.max_context_tokens,
+    )
+
+
+def _build_av_synopsis_input(detail: AVDetail) -> str:
+    """喂给模型的**只有已经抓到的字段**：标题、类型、系列、演员、时长。"""
+
+    rows = [f"标题：{_truncate_text(detail.title or '', 200) or '（未知）'}"]
+    if detail.genres:
+        rows.append(f"类型：{' / '.join(detail.genres)}")
+    if detail.series:
+        rows.append(f"系列：{_truncate_text(detail.series, 80)}")
+    if detail.actors:
+        rows.append(f"演员：{' / '.join(detail.actors)}")
+    if detail.runtime:
+        rows.append(f"时长：{_truncate_text(detail.runtime, 40)}")
+    if detail.code:
+        rows.append(f"番号：{detail.code}")
+    return "\n".join(rows)
+
+
+async def _build_av_ai_synopsis(detail: AVDetail, settings: Settings | None) -> str:
+    """可选 AI「题材与看点概述」（默认关）。
+
+    - 关闭时**一次模型都不调用**（连 LLMService 都不构造）；
+    - 开启时用已抓到的字段生成 1~3 句中文概述，结果由调用方标注
+      「AI 概述，非官方剧情」——它不是官方剧情，也绝不编造情节/台词；
+    - 超时、异常、空返回一律返回空串：这一块只是附加项，**不能让整个查询失败**。
+    """
+
+    if not _av_ai_synopsis_enabled(settings):
+        return ""
+    assert settings is not None  # _av_ai_synopsis_enabled 已排除 None
+    payload = _build_av_synopsis_input(detail)
+    if not payload:
+        return ""
+    try:
+        llm = _av_synopsis_llm(settings)
+        async with asyncio.timeout(_AV_SYNOPSIS_TIMEOUT_SEC):
+            generated = await llm.chat(
+                [
+                    {"role": "system", "content": get_prompt("av_synopsis")},
+                    {"role": "user", "content": payload},
+                ],
+                stage="synopsis",
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("【AV 概述】生成失败，本次跳过该块")
+        return ""
+    text = _truncate_text(str(generated or "").replace("\n", " "), _AV_SYNOPSIS_MAX_CHARS)
+    return text.strip()
 
 
 def _build_av_detail_keyboard(
@@ -893,6 +1165,25 @@ async def _edit_message_as_photo(
         return False
 
 
+async def _send_av_private_detail_follow_up(*, message: Message, text: str) -> bool:
+    """私聊：封面消息之后补发正文（内联下载地址 / 制作信息 / AI 概述所在的那条）。
+
+    只在私聊、且内联块真的开着并且有种子时由调用方传 ``text``；``text`` 为空就什么都
+    不发（此时行为与加这个功能之前**完全一致**——封面 + 说明文字就结束了）。
+    补发失败只记日志：它是附加项，绝不能让详情发送算失败。
+    """
+
+    payload = (text or "").strip()
+    if not payload:
+        return False
+    try:
+        await message.answer(payload, disable_web_page_preview=True)
+        return True
+    except Exception:
+        log.exception("failed to send av private detail follow-up text")
+        return False
+
+
 async def _edit_av_detail_in_place(
     *,
     message: Message,
@@ -900,6 +1191,7 @@ async def _edit_av_detail_in_place(
     keyboard: InlineKeyboardMarkup | None,
     allow_media: bool = True,
     text: str | None = None,
+    follow_up_text: str = "",
 ) -> bool:
     caption = _build_av_detail_caption(detail)
     detail_text = text if text is not None else _build_av_detail_text(detail)
@@ -921,6 +1213,7 @@ async def _edit_av_detail_in_place(
     if getattr(message, "photo", None):
         try:
             await message.edit_caption(caption=caption, reply_markup=keyboard)
+            await _send_av_private_detail_follow_up(message=message, text=follow_up_text)
             return True
         except Exception:
             log.debug("edit_caption for detail failed, will try media refresh")
@@ -934,6 +1227,7 @@ async def _edit_av_detail_in_place(
         referer=detail.url,
     )
     if media_ok:
+        await _send_av_private_detail_follow_up(message=message, text=follow_up_text)
         return True
 
     # Photo message cannot be edited via edit_text.
@@ -1401,16 +1695,16 @@ async def _send_av_detail(
     header: str = "",
     settings: Settings | None = None,
 ) -> bool:
-    caption = _build_av_detail_caption(detail)
-    detail_text = _build_av_detail_text(detail)
-    if header:
-        # 群里那条 /av 命令（和图片）已经删了，结果是一条独立消息，用 header 说明
-        # 是谁问的——绝不 reply 到已删消息上（否则会显示「回复的内容已删除」）。
-        detail_text = f"{header}\n{detail_text}"
     keyboard = _build_av_detail_keyboard(session=session, result_idx=result_idx, detail=detail)
 
     # 群内路径：文字与按钮照旧留群里，封面只走私聊（group path never sends media）。
+    # 群内文案**一个字都不改**：不内联磁力链、不换排版（详情正文仍走 private_view=False）。
     if _av_message_is_group(message):
+        detail_text = _build_av_detail_text(detail)
+        if header:
+            # 群里那条 /av 命令（和图片）已经删了，结果是一条独立消息，用 header 说明
+            # 是谁问的——绝不 reply 到已删消息上（否则会显示「回复的内容已删除」）。
+            detail_text = f"{header}\n{detail_text}"
         return await _send_av_detail_in_group(
             message=message,
             session=session,
@@ -1420,6 +1714,25 @@ async def _send_av_detail(
             in_place=in_place,
             settings=settings,
         )
+
+    # ---- 私聊：内联下载地址 / 制作信息 /（可选）AI 概述 ----------------------
+    caption = _build_av_detail_caption(detail)
+    inline_limit = _av_inline_seed_limit(settings)
+    ai_synopsis = await _build_av_ai_synopsis(detail, settings)
+    detail_text = _build_av_detail_text(
+        detail,
+        private_view=True,
+        inline_seed_count=inline_limit,
+        ai_synopsis=ai_synopsis,
+    )
+    if header:
+        detail_text = f"{header}\n{detail_text}"
+    # 封面消息的 caption 装不下正文（Telegram 上限 1024），所以开着内联块时把正文
+    # 作为封面之后的一条文字消息补出去，下载地址才真的是「直出」。
+    # 关掉内联块（且没有 AI 概述）时这里是空串：私聊行为与加这个功能之前逐字一致。
+    follow_up_text = (
+        detail_text if (inline_limit > 0 and detail.seeds) or ai_synopsis else ""
+    )
 
     # 以下带图路径只剩私聊（最高管理员的诊断入口）：私聊 chat 就是发起者本人。
     # 样例图补发走与群内**同一个**函数，同样放进后台任务（私聊也不必多等）。
@@ -1434,7 +1747,13 @@ async def _send_av_detail(
         )
 
     if in_place:
-        ok = await _edit_av_detail_in_place(message=message, detail=detail, keyboard=keyboard)
+        ok = await _edit_av_detail_in_place(
+            message=message,
+            detail=detail,
+            keyboard=keyboard,
+            text=detail_text,
+            follow_up_text=follow_up_text,
+        )
         if ok:
             _schedule_samples()
         return ok
@@ -1446,6 +1765,9 @@ async def _send_av_detail(
                 photo=detail.cover_url,
                 caption=caption,
                 reply_markup=keyboard,
+            )
+            await _send_av_private_detail_follow_up(
+                message=message, text=follow_up_text
             )
             _schedule_samples()
             return True
@@ -1463,6 +1785,9 @@ async def _send_av_detail(
                     photo=file_obj,
                     caption=caption,
                     reply_markup=keyboard,
+                )
+                await _send_av_private_detail_follow_up(
+                    message=message, text=follow_up_text
                 )
                 _schedule_samples()
                 return True

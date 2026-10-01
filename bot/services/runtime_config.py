@@ -541,6 +541,10 @@ class AVSettingsConfig(StrictModel):
     max_results: int = Field(default=18, ge=1, le=100)
     #: 私聊里封面之后补发的样例图张数（默认 4、硬上限 5、0=关闭）。
     dm_sample_count: int = Field(default=4, ge=0, le=5)
+    #: 私聊详情里内联的下载地址条数（默认 3、硬上限 5、0=关闭该块）。
+    inline_seed_count: int = Field(default=3, ge=0, le=5)
+    #: 私聊详情里的 AI「题材与看点概述」；默认关（开启后每查一次多一次 LLM 调用）。
+    ai_synopsis_enabled: bool = False
     javbus_base_url: str = Field(default="https://www.javbus.com", max_length=1000)
     madouqu_base_url: str = Field(default="https://madouqu.com", max_length=1000)
     dmm_base_url: str = Field(default="https://www.dmm.co.jp", max_length=1000)
@@ -573,6 +577,7 @@ class PromptSettingsConfig(StrictModel):
     persona: str = ""
     proactive_topic: str = ""
     style_distill: str = ""
+    av_synopsis: str = ""
 
     @classmethod
     def defaults(cls) -> PromptSettingsConfig:
@@ -1031,6 +1036,8 @@ class RuntimeConfig(StrictModel):
         settings.av_http_timeout_sec = self.av.http_timeout_sec
         settings.av_max_results = self.av.max_results
         settings.av_dm_sample_count = self.av.dm_sample_count
+        settings.av_inline_seed_count = self.av.inline_seed_count
+        settings.av_ai_synopsis_enabled = self.av.ai_synopsis_enabled
         settings.av_javbus_base_url = self.av.javbus_base_url
         settings.av_madouqu_base_url = self.av.madouqu_base_url
         settings.av_dmm_base_url = self.av.dmm_base_url
@@ -1959,6 +1966,8 @@ def build_legacy_runtime_config(
             http_timeout_sec=settings.av_http_timeout_sec,
             max_results=settings.av_max_results,
             dm_sample_count=settings.av_dm_sample_count,
+            inline_seed_count=settings.av_inline_seed_count,
+            ai_synopsis_enabled=settings.av_ai_synopsis_enabled,
             javbus_base_url=settings.av_javbus_base_url,
             madouqu_base_url=settings.av_madouqu_base_url,
             dmm_base_url=settings.av_dmm_base_url,
