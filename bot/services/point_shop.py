@@ -1105,7 +1105,8 @@ def render_shop_menu(*, available: int) -> str:
 
     return (
         "<b>积分商店</b>\n"
-        f"当前可用 <b>{int(available)}</b> 分。积分靠每天在群里发 /checkin 签到攒。\n"
+        f"当前可用 <b>{int(available)}</b> 分。积分靠签到攒：每天在群里发 /checkin，"
+        "或点群里的签到提醒按钮。\n"
         "\n"
         f"<b>① 自定义头衔 · {TAG_DAYS_7D} 天 —— {TAG_PRICE_7D} 分</b>\n"
         "用法：发 /tag 你的头衔\n"
