@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 
 import regex as safe_regex
-from sqlalchemy import case, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -259,6 +259,11 @@ class ModerationVerdict:
     # ``vision``（机器人生成的图片描述）/``semantic``（语义规则，无法细分）/
     # ""（未知，含测试替身与恢复路径）。调用方据此判断「违规是不是引用内容引起的」。
     match_source: str = ""
+    # True 表示这次命中来自本地确定性规则（关键词 / 正则），``confidence``
+    # 只是"规则命中即视为确定"的占位 1.0，不是模型给的置信度。
+    # 阈值判定照旧读 ``confidence``（行为不变），但落库必须写 NULL：
+    # 报表要算"模型有多确定"，把规则命中的 1.0 记进去会直接拉高置信度分布。
+    deterministic: bool = False
 
 
 def _parse_confidence(value: object) -> tuple[float, bool]:
@@ -623,6 +628,7 @@ class ModerationService:
                         conclusive=True,
                         confidence=1.0,
                         match_source=source,
+                        deterministic=True,
                     )
                 continue
             if rule_type == "regex":
@@ -682,6 +688,7 @@ class ModerationService:
                             conclusive=True,
                             confidence=1.0,
                             match_source=source,
+                            deterministic=True,
                         )
                 continue
             # Unknown legacy rule types are treated as semantic rules rather
@@ -814,6 +821,32 @@ class ModerationService:
             and verdict.confidence >= self.config.high_confidence_threshold
         )
 
+    async def count_rule_hits(
+        self,
+        session: AsyncSession,
+        group_id: int,
+        user_id: int,
+        rule_id: int | None,
+    ) -> int:
+        """该用户在本群本规则下已经记录的命中次数（不含本次，只读）。
+
+        ``violations`` 里每一行都是一次真实命中，所以行数就是累计命中次数。
+        ``rule_id`` 为 NULL（未标注规则/NSFW 守卫）时按 IS NULL 归组，
+        避免把它们混进任何具体规则。
+        """
+
+        conditions = [
+            Violation.group_id == int(group_id),
+            Violation.user_id == int(user_id),
+            Violation.rule_id.is_(None) if rule_id is None else Violation.rule_id == int(rule_id),
+        ]
+        total = (
+            await session.execute(
+                select(func.count()).select_from(Violation).where(*conditions)
+            )
+        ).scalar()
+        return int(total or 0)
+
     async def record_violation(
         self,
         session: AsyncSession,
@@ -827,13 +860,24 @@ class ModerationService:
         confidence: float | None = None,
         verdict_reason: str = "",
     ) -> Violation:
+        rule_id = int(rule.id) if rule is not None and rule.id is not None else None
+        # 纯观测列：该用户在本群本规则下的第几次命中（含本次）。与 warn_threshold
+        # 的 UserWarning 计数器无关，不参与任何质询/警告/封禁判定。
+        # 计数前先 flush：这个 session 关掉了 autoflush，同一事务里"上一条命中"
+        # 还在 identity map 里没落库，不 flush 就会漏数（次数依赖调用方何时 commit
+        # 是隐式约定，不该被观测列继承）。
+        # 注意：ban 计数路径（_apply_counted_moderation_ban）随后会把它覆盖成
+        # add_warning 的返回值——那条链路的幂等重放依赖该值，不能动。
+        await session.flush()
+        hit_count = await self.count_rule_hits(session, group_id, user_id, rule_id) + 1
         values = {
             "group_id": int(group_id),
             "user_id": int(user_id),
-            "rule_id": int(rule.id) if rule is not None and rule.id is not None else None,
+            "rule_id": rule_id,
             "message_text": str(text or "")[:500],
             "action_taken": str(action or "warn")[:32],
             "confidence": None if confidence is None else round(float(confidence), 3),
+            "warning_count": hit_count,
             "verdict_reason": str(verdict_reason or "")[:120],
         }
         normalized_source = int(source_message_id or 0)

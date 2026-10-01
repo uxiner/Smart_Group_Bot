@@ -6228,8 +6228,16 @@ async def flush_pending_inbound_batches() -> None:
 
 
 def _verdict_confidence(verdict: object) -> float | None:
-    """置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。"""
+    """落库用的置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。
 
+    ``verdict.confidence`` 同时服务两个目的：阈值判定（``is_high_confidence``）
+    和落库观测。本地关键词/正则规则命中时它被写成 1.0——那是"字符串匹配成功"
+    的占位值，不是模型置信度。落库必须是 NULL，否则质量报表会把规则命中统计成
+    "模型非常确定"，把置信度分布整体拉高。
+    """
+
+    if getattr(verdict, "deterministic", False):
+        return None
     value = getattr(verdict, "confidence", None)
     try:
         return None if value is None else float(value)

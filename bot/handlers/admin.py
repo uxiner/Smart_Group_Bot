@@ -3940,7 +3940,10 @@ async def cmd_modstats(
             days = 7
     try:
         text = await render_group_quality(
-            session, group_id=int(message.chat.id), days=days
+            session,
+            group_id=int(message.chat.id),
+            days=days,
+            high_threshold=settings.moderation.high_confidence_threshold,
         )
     except Exception:
         log.warning(
