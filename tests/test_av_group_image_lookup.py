@@ -278,7 +278,8 @@ class GroupAVImageEntryPointTests(_GroupAVTestCase):
         self.assertLess(order.index("delete-command"), order.index("vision"))
         message.delete.assert_awaited_once()
 
-        # 一次识图 = 一次 vision，且仍然走 vision 角色。
+        # 一次识图 = 一次 vision（这张图只有 60KB 一档，挑不出更大的档 → 不升级重试），
+        # 且仍然走 vision 角色。
         self.assertEqual(len(llm_instances), 1)
         self.assertEqual(llm_instances[0].vision_describe.await_count, 1)
         service.lookup_by_code.assert_awaited_once_with("SONE-342")

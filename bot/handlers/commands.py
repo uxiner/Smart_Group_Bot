@@ -5,6 +5,7 @@ import html
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 
 from aiogram import F, Router
@@ -65,11 +66,13 @@ from bot.services.av_search import (
 )
 from bot.services.av_image_lookup import (
     AV_NO_IMAGE_MARKER,
+    AV_PHOTO_RETRY_MAX_BYTES,
     AV_VISION_MAX_IMAGE_BYTES,
     AV_VISION_PROMPT,
     AV_VISION_TIMEOUT_SEC,
     AVPrivateRateLimiter,
-    build_av_image_data_uri,
+    av_image_size_kb,
+    build_av_image_data_uri_for,
     extract_av_actor,
     extract_av_code,
     rate_limit_minutes,
@@ -1873,6 +1876,141 @@ async def _delete_av_group_images(
     await _delete_av_group_message(command_message, label="/av 命令")
 
 
+@dataclass(frozen=True)
+class _AVImageVisionOutcome:
+    """一次「识图（含最多一次升级重试）」的结果：只用于日志与兜底判定。"""
+
+    #: 第一次用的档位（声明大小，KB）。
+    primary_kb: int
+    #: 升级重试用的档位（KB）；0 表示没有重试。
+    retry_kb: int
+    #: 最终交给 :func:`_dispatch_av_vision_result` 的模型输出（可能为空）。
+    vision_text: str
+    #: 是否发生了升级重试。
+    escalated: bool
+    #: 升级重试是否读出了编号。
+    retry_succeeded: bool
+
+    @property
+    def last_tier_kb(self) -> int:
+        """最后一次尝试用的档位（KB）——升级过就是重试那档，否则是首选那档。"""
+
+        return self.retry_kb or self.primary_kb
+
+    @property
+    def tier_is_oversized(self) -> bool:
+        """这一档是否已经超过实测安全带（``AV_PHOTO_RETRY_MAX_BYTES`` = 190KB）。
+
+        超过它 base64 后可能撞上视觉阶段的 token 预算被整体跳过（实测 211KB 就是
+        这样）。这种情况识别失败时要明说「换一张更小的图」，而不是笼统的失败。
+        """
+
+        return self.last_tier_kb > av_image_size_kb(AV_PHOTO_RETRY_MAX_BYTES)
+
+    def failure_text(self) -> str:
+        """识别/下载失败时的兜底话术：超安全带的档位单独提示换小图。"""
+
+        return (
+            _AV_IMAGE_TOO_LARGE_TEXT if self.tier_is_oversized else _AV_VISION_FAILED_TEXT
+        )
+
+
+async def _av_image_vision_with_escalation(
+    image_message: Message,
+    settings: Settings,
+    *,
+    user_id: int,
+    typing_message: Message | None = None,
+) -> _AVImageVisionOutcome | None:
+    """私聊与群内**共用**的识图步骤：先偏好档位，没读出编号再升级一档，最多两次。
+
+    逐条对应需求：
+
+    1. 先用偏好上限（``AV_PHOTO_PREFERRED_MAX_BYTES`` = 150KB）挑一档识图；
+    2. ``extract_av_code`` 读到编号就结束——**不浪费**第二次调用；
+    3. 没读到编号时，用 ``AV_PHOTO_RETRY_MAX_BYTES``（190KB）再挑一档：
+       挑出来的 ``file_id`` 与第一次相同（本来就没有更大的档）→ **不重试**，
+       直接拿第一次的输出走原有兜底；
+    4. 最多两次尝试，绝不循环；第二次仍未读到编号 → 同样走原有兜底；
+    5. 顺序与限流由调用方负责（群内仍是「先删图，再识图」）：这里只做
+       「挑档 → 下载 → 同一 vision 角色识图」，**不新增任何别的模型调用**。
+
+    非图片消息返回 ``None``；图片下载失败或模型失败时 ``vision_text`` 为空串。
+    """
+
+    primary = select_av_image_file(image_message)
+    if primary is None:
+        return None
+    primary_file_id, primary_mime, primary_size = primary
+    primary_kb = av_image_size_kb(primary_size)
+    typing_target = typing_message if typing_message is not None else image_message
+
+    data_uri = await build_av_image_data_uri_for(
+        image_message, primary_file_id, primary_mime, declared_size=primary_size
+    )
+    if not data_uri:
+        log.warning(
+            "【识图】档位=%dKB 图片下载失败 → 不重试 | user=%s", primary_kb, user_id
+        )
+        return _AVImageVisionOutcome(primary_kb, 0, "", False, False)
+
+    log.info("【识图】档位=%dKB 首次识图 | user=%s", primary_kb, user_id)
+
+    async with typing_action(
+        typing_target, enabled=settings.bot.enable_typing
+    ):
+        vision_text = await _av_vision_text(data_uri, settings, user_id=user_id)
+        if extract_av_code(vision_text):
+            log.info(
+                "【识图】档位=%dKB 首次读出编号 | 升级=否 | user=%s",
+                primary_kb,
+                user_id,
+            )
+            return _AVImageVisionOutcome(primary_kb, 0, vision_text, False, False)
+
+        retry = select_av_image_file(
+            image_message, preferred_max_bytes=AV_PHOTO_RETRY_MAX_BYTES
+        )
+        if retry is None or retry[0] == primary_file_id:
+            log.info(
+                "【识图】档位=%dKB 首次未读出编号 → 无可升级档位（file_id 相同）"
+                "→ 不重试 | user=%s",
+                primary_kb,
+                user_id,
+            )
+            return _AVImageVisionOutcome(primary_kb, 0, vision_text, False, False)
+
+        retry_file_id, retry_mime, retry_size = retry
+        retry_kb = av_image_size_kb(retry_size)
+        retry_uri = await build_av_image_data_uri_for(
+            image_message, retry_file_id, retry_mime, declared_size=retry_size
+        )
+        if not retry_uri:
+            log.warning(
+                "【识图】档位=%dKB 首次未读出 → 升级重试 %dKB 下载失败 | user=%s",
+                primary_kb,
+                retry_kb,
+                user_id,
+            )
+            return _AVImageVisionOutcome(
+                primary_kb, retry_kb, vision_text, True, False
+            )
+
+        retry_text = await _av_vision_text(retry_uri, settings, user_id=user_id)
+
+    retry_succeeded = bool(extract_av_code(retry_text))
+    log.info(
+        "【识图】档位=%dKB 首次未读出 → 升级重试 %dKB → %s | user=%s",
+        primary_kb,
+        retry_kb,
+        "命中" if retry_succeeded else "仍未读出",
+        user_id,
+    )
+    return _AVImageVisionOutcome(
+        primary_kb, retry_kb, retry_text or vision_text, True, retry_succeeded
+    )
+
+
 async def _handle_group_av_image(
     message: Message,
     *,
@@ -1926,31 +2064,28 @@ async def _handle_group_av_image(
         )
         return
 
-    # ③ 再识图：下载 → 一次 vision_describe（硬超时）→ 抽编号/演员名 → 查详情。
-    data_uri = await build_av_image_data_uri(image_message)
-    if not data_uri:
+    # ③ 再识图：下载 → vision_describe（硬超时）→ 没读出编号就升级一档重试一次
+    #    （最多两次，绝不循环；顺序仍是「先删图，再识图」）→ 抽编号/演员名 → 查详情。
+    outcome = await _av_image_vision_with_escalation(
+        image_message, settings, user_id=int(user.id), typing_message=message
+    )
+
+    if outcome is None or not outcome.vision_text:
         await _answer(
             message,
             settings,
-            _av_vision_notice(_AV_VISION_FAILED_TEXT, requester_name),
-            auto_delete_seconds=0,
-        )
-        return
-
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        vision_text = await _av_vision_text(data_uri, settings, user_id=int(user.id))
-
-    if not vision_text:
-        await _answer(
-            message,
-            settings,
-            _av_vision_notice(_AV_VISION_FAILED_TEXT, requester_name),
+            _av_vision_notice(
+                outcome.failure_text()
+                if outcome is not None
+                else _AV_VISION_FAILED_TEXT,
+                requester_name,
+            ),
             auto_delete_seconds=0,
         )
         return
 
     await _dispatch_av_vision_result(
-        message, settings, vision_text, header=result_header
+        message, settings, outcome.vision_text, header=result_header
     )
 
 
@@ -1959,10 +2094,11 @@ async def _handle_private_av_image(
     session: AsyncSession,
     settings: Settings,
 ) -> None:
-    """私聊图片 → 识图反查番号（一次识图 = 一次 vision 调用，没有其它模型调用）。
+    """私聊图片 → 识图反查番号（最多两次 vision 调用，沿用同一个 vision 角色）。
 
-    流程：挑一档图片 → 限流 → 下载成 data URI → ``vision_describe``（20s 硬超时）
-    → 抽编号 → 命中就直查详情，只读到演员名就给出候选列表，都没有就直说。
+    流程：挑一档图片 → 限流 → 共享步骤识图（首选 150KB 档；这次没读出编号就用
+    190KB 上限再挑一档重试**一次**，两档相同则不重试）→ 抽编号 → 命中就直查详情，
+    只读到演员名就给出候选列表，都没有就直说。
     任何失败都只记日志 + 回一句「请直接发番号」，绝不抛到上层。
     """
 
@@ -1999,29 +2135,23 @@ async def _handle_private_av_image(
         )
         return
 
-    data_uri = await build_av_image_data_uri(message)
-    if not data_uri:
+    outcome = await _av_image_vision_with_escalation(
+        message, settings, user_id=int(user.id)
+    )
+    if outcome is None or not outcome.vision_text:
         await _answer(
             message,
             settings,
-            _av_vision_notice(_AV_VISION_FAILED_TEXT),
+            _av_vision_notice(
+                outcome.failure_text()
+                if outcome is not None
+                else _AV_VISION_FAILED_TEXT
+            ),
             auto_delete_seconds=0,
         )
         return
 
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        vision_text = await _av_vision_text(data_uri, settings, user_id=int(user.id))
-
-    if not vision_text:
-        await _answer(
-            message,
-            settings,
-            _av_vision_notice(_AV_VISION_FAILED_TEXT),
-            auto_delete_seconds=0,
-        )
-        return
-
-    await _dispatch_av_vision_result(message, settings, vision_text)
+    await _dispatch_av_vision_result(message, settings, outcome.vision_text)
 
 
 @router.message(

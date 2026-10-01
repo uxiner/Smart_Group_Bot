@@ -7,7 +7,9 @@
 - 挑图规则与群内视觉**故意不同**：``bot/handlers/group.py`` 固定取
   ``photo[len-2]``，实测大图（211KB → base64 275KB）会撞上视觉阶段的上下文预算，
   日志是 ``LLM request exceeds configured context budget | stage=vision``。
-  私聊识图自己按「最大且 ≤100KB，否则最小」挑，避免这个静默失败。
+  识图自己按「最大且 ≤150KB，否则最小」挑，避免这个静默失败；首选档位没读出
+  编号时，再按 :data:`AV_PHOTO_RETRY_MAX_BYTES`（190KB，实测安全带的上限）
+  挑一次「更大的一档」重试一次（见 ``bot/handlers/commands.py`` 的共享步骤）。
 
 这一层只做三件与 I/O 无关的事 + 一次下载：
 
@@ -47,7 +49,17 @@ AV_VISION_DOWNLOAD_TIMEOUT_SEC = 20.0
 AV_VISION_TIMEOUT_SEC = 20.0
 
 #: ``message.photo`` 每一档的优先上限：超过它 base64 后容易撞视觉上下文预算。
-AV_PHOTO_PREFERRED_MAX_BYTES = 100 * 1024
+#:
+#: 实测（网关按 base64 字符数近似计 token，视觉阶段预算 256k）：211KB 封面 →
+#: base64 ≈275KB → 281,898 tokens → 整次调用被跳过（比降分辨率更糟）；137/166/
+#: 173/184KB 都成功、206KB 失败 → 真实天花板约 190KB。首选取 150KB，留出余量。
+AV_PHOTO_PREFERRED_MAX_BYTES = 150 * 1024
+
+#: 首选档位**没读出编号**时，升级重试用的上限：实测安全带的上限（约 190KB）。
+#:
+#: 注意：升级不等于「任何图都能识别」——天花板来自 token 预算，比这更大的图
+#: 仍可能被整体跳过，那种情况只能提示用户换小图或直接发番号。
+AV_PHOTO_RETRY_MAX_BYTES = 190 * 1024
 
 #: 模型约定的两个「没有结果」标记。
 AV_NO_CODE_MARKER = "NO_CODE"
@@ -74,16 +86,33 @@ class _LimitedBytesIO(io.BytesIO):
         return super().write(data)
 
 
-def pick_av_photo_size(photo_sizes: Sequence[Any] | None) -> Any | None:
+def av_image_size_kb(size_bytes: int) -> int:
+    """把声明大小换算成日志里用的 KB（向上取整；0 保持 0 = 未知）。"""
+
+    size = max(0, int(size_bytes or 0))
+    return (size + 1023) // 1024
+
+
+def pick_av_photo_size(
+    photo_sizes: Sequence[Any] | None,
+    *,
+    preferred_max_bytes: int = AV_PHOTO_PREFERRED_MAX_BYTES,
+) -> Any | None:
     """从 ``message.photo`` 多档尺寸里挑一档。
 
     规则（实测定死，**不是**群内那套固定的 ``len(photo)-2``）：
 
-    1. 优先「最大且 ``file_size`` ≤ 100KB」的那一档；
-    2. 若每一档都 > 100KB，选**最小**的那一档；
+    1. 优先「最大且 ``file_size`` ≤ ``preferred_max_bytes``」的那一档
+       （默认 :data:`AV_PHOTO_PREFERRED_MAX_BYTES` = 150KB）；
+    2. 若每一档都 > ``preferred_max_bytes``，选**最小**的那一档；
     3. ``file_size`` 缺失（0/None）按 0 处理，即视为没超限。
+
+    上限可传参：升级重试时传 :data:`AV_PHOTO_RETRY_MAX_BYTES`（190KB）再挑一次，
+    就能拿到「更大的一档」；两档挑出来一样（``file_id`` 相同）说明本来就没有更大
+    的档可选，调用方据此决定不重试。
     """
 
+    limit = max(0, int(preferred_max_bytes))
     candidates = [
         size for size in (photo_sizes or []) if getattr(size, "file_id", None)
     ]
@@ -94,25 +123,29 @@ def pick_av_photo_size(photo_sizes: Sequence[Any] | None) -> Any | None:
         (max(0, int(getattr(size, "file_size", 0) or 0)), size) for size in candidates
     ]
     within_budget = [
-        (declared, size)
-        for declared, size in sized
-        if declared <= AV_PHOTO_PREFERRED_MAX_BYTES
+        (declared, size) for declared, size in sized if declared <= limit
     ]
     if within_budget:
         return max(within_budget, key=lambda item: item[0])[1]
     return min(sized, key=lambda item: item[0])[1]
 
 
-def select_av_image_file(message: Any) -> tuple[str, str, int] | None:
+def select_av_image_file(
+    message: Any,
+    *,
+    preferred_max_bytes: int = AV_PHOTO_PREFERRED_MAX_BYTES,
+) -> tuple[str, str, int] | None:
     """返回 ``(file_id, mime, 声明大小)``；不是可用图片时返回 ``None``。
 
-    - ``message.photo``：按 :func:`pick_av_photo_size` 挑档，mime 固定 ``image/jpeg``；
-    - ``message.document``：只要 ``image/*``（按需求放开到任意图片子类型）。
+    - ``message.photo``：按 :func:`pick_av_photo_size` 挑档（上限可传参），
+      mime 固定 ``image/jpeg``；
+    - ``message.document``：只要 ``image/*``（按需求放开到任意图片子类型）；
+      文档没有多档尺寸，``preferred_max_bytes`` 对它没有意义。
     """
 
     photo = getattr(message, "photo", None)
     if photo:
-        picked = pick_av_photo_size(photo)
+        picked = pick_av_photo_size(photo, preferred_max_bytes=preferred_max_bytes)
         if picked is None:
             return None
         return (
@@ -135,20 +168,48 @@ def select_av_image_file(message: Any) -> tuple[str, str, int] | None:
     return None
 
 
-async def build_av_image_data_uri(message: Any) -> str:
-    """把 Telegram 图片下载成 base64 data URI；任何失败都返回空串（只记日志）。
+async def build_av_image_data_uri(
+    message: Any,
+    *,
+    preferred_max_bytes: int = AV_PHOTO_PREFERRED_MAX_BYTES,
+) -> str:
+    """按偏好上限挑一档图片，并下载成 base64 data URI；任何失败都返回空串。
 
     这里**不**把远端 URL 交给模型：网关自己抓 javbus 封面会卡死超时。
+    上限可传参（升级重试传 :data:`AV_PHOTO_RETRY_MAX_BYTES`）；要按**已知**的
+    ``file_id`` 下载（重试用「另一档」）用 :func:`build_av_image_data_uri_for`。
     """
 
-    info = select_av_image_file(message)
+    info = select_av_image_file(message, preferred_max_bytes=preferred_max_bytes)
     if info is None:
         return ""
     file_id, mime, declared_size = info
+    return await build_av_image_data_uri_for(
+        message, file_id, mime, declared_size=declared_size
+    )
+
+
+async def build_av_image_data_uri_for(
+    message: Any,
+    file_id: str,
+    mime: str = "image/jpeg",
+    *,
+    declared_size: int = 0,
+) -> str:
+    """把**指定的一档**（``file_id`` + ``mime``）下载成 base64 data URI。
+
+    挑图与下载分开：挑图交给 :func:`select_av_image_file` /
+    :func:`pick_av_photo_size`，这里只负责把选定的一档取回来编码，所以升级重试
+    可以换「另一档」再调一次。任何失败都返回空串（只记日志），绝不抛。
+    """
+
+    file_id = str(file_id or "")
+    mime = str(mime or "image/jpeg") or "image/jpeg"
+    declared_size = max(0, int(declared_size or 0))
     if not file_id:
         return ""
     if declared_size > AV_VISION_MAX_IMAGE_BYTES:
-        log.warning("【私聊识图】跳过超限图片 | 声明大小=%dB | 类型=%s", declared_size, mime)
+        log.warning("【识图】跳过超限图片 | 声明大小=%dB | 类型=%s", declared_size, mime)
         return ""
 
     bot = getattr(message, "bot", None)
@@ -161,7 +222,7 @@ async def build_av_image_data_uri(message: Any) -> str:
             remote_size = int(getattr(tg_file, "file_size", 0) or 0)
             if remote_size > AV_VISION_MAX_IMAGE_BYTES:
                 log.warning(
-                    "【私聊识图】跳过超限图片 | 远端大小=%dB | 类型=%s", remote_size, mime
+                    "【识图】跳过超限图片 | 远端大小=%dB | 类型=%s", remote_size, mime
                 )
                 return ""
             file_path = getattr(tg_file, "file_path", "") or ""
@@ -170,16 +231,16 @@ async def build_av_image_data_uri(message: Any) -> str:
             buf = _LimitedBytesIO(AV_VISION_MAX_IMAGE_BYTES)
             await bot.download_file(file_path, destination=buf)
     except TimeoutError:
-        log.warning("【私聊识图】图片下载超时")
+        log.warning("【识图】图片下载超时")
         return ""
     except Exception as exc:
-        log.warning("【私聊识图】图片下载失败 | error=%s", exc)
+        log.warning("【识图】图片下载失败 | error=%s", exc)
         return ""
 
     raw = buf.getbuffer()
     if not raw:
         return ""
-    log.info("【私聊识图】图片下载完成 | 大小=%dB | 类型=%s", len(raw), mime)
+    log.info("【识图】图片下载完成 | 大小=%dB | 类型=%s", len(raw), mime)
     encoded = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 

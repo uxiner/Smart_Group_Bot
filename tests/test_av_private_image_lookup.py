@@ -275,7 +275,8 @@ class PrivateAVImageLookupTests(unittest.IsolatedAsyncioTestCase):
                 message, session=db_session, settings=_settings()
             )
 
-        # 1) 挑的是「最大且 ≤100KB」那档（90KB），不是 len-2 的 40KB、也不是 300KB。
+        # 1) 挑的是「最大且 ≤150KB」那档（90KB），不是 len-2 的 40KB、也不是 300KB；
+        #    这张图只有一档可选（300KB > 190KB 重试上限）→ 没有升级重试。
         self.assertEqual(bot.download_calls, ["photos/photo-1.jpg"])
 
         # 2) 传进模型的是真 data URI（base64 本地下载，不是远端 URL）。
