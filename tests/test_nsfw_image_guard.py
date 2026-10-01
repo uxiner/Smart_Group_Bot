@@ -7,6 +7,8 @@
   模型拒答 / 视觉失败一律什么都不做；
 - 处置顺序固定：删除 → 群里 @当事人警告（独立一条、2 分钟后自动删除）→ 质询；
   任何一步失败都只记日志并继续——**删图失败也照样警告并质询**；
+- **记账失败不挡删图**：违规记录落库失败（SQLITE_BUSY / 磁盘/DB 异常）时照样
+  删图 + 警告 + 质询，只跳过 ``notice_sent_at`` 写回，并在日志里写明「记账失败」；
 - 贴纸不碰；带 ``/av`` 的图片不碰（已有「先删图再识图」流程负责）；
 - 管理员/群主沿用现有审核豁免；手动豁免成员同样不处置；
 - 同一条消息重复投递只处置一次（幂等）；
@@ -539,7 +541,7 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
         message = _photo_message()
         message.delete = AsyncMock(side_effect=RuntimeError("no rights"))
 
-        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+        message, _llm, moderation, session, challenge = await _run_group_message(
             vision_text=NSFW_YES_TEXT, message=message
         )
 
@@ -547,6 +549,8 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
         message.answer.assert_awaited_once()
         challenge.assert_awaited_once()
         moderation.record_violation.assert_awaited_once()
+        # 记账成功才占住幂等键：删图失败之前违规记录已经落库（不回归）
+        session.commit.assert_awaited()
 
     async def test_warning_failure_still_challenges(self) -> None:
         message = _photo_message()
@@ -628,26 +632,132 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+        async def challenge(**_kwargs):
+            message.conversation.append("challenge")
+            return True
+
+        challenge_mock = AsyncMock(side_effect=challenge)
         for _ in range(2):
-            await _run_group_message(
+            (
+                _message,
+                _llm,
+                _moderation,
+                session,
+                _challenge,
+            ) = await _run_group_message(
                 vision_text=NSFW_YES_TEXT,
                 message=message,
                 moderation_service=moderation,
+                challenge=challenge_mock,
             )
 
+        # 第二次是「已有违规记录」：一条 Telegram 动作都不许重复
         self.assertEqual(message.conversation, ["delete", "warn", "challenge"])
         message.delete.assert_awaited_once()
         message.answer.assert_awaited_once()
+        challenge_mock.assert_awaited_once()
         self.assertEqual(moderation.record_violation.await_count, 2)
+        # 重复投递只是回滚掉这次的多余事务，不占新键也不写回
+        session.rollback.assert_awaited_once()
+        session.commit.assert_not_awaited()
 
-    async def test_record_failure_skips_disposal_without_raising(self) -> None:
-        message, _llm, _moderation, _session_mock, challenge = await _run_group_message(
+    async def test_record_failure_still_deletes_warns_and_challenges(self) -> None:
+        """记账失败（SQLITE_BUSY / 磁盘异常）不许换来「图留在群里」。
+
+        这是本功能的第一目的：NSFW 图尽快离开群。违规记录只用于留痕与幂等，
+        写不进去也要照样删图 → 警告 → 质询，且日志里要写明「记账失败」。
+        """
+        with self.assertLogs("bot.handlers.group", level="ERROR") as logs:
+            message, _llm, moderation, session, challenge = await _run_group_message(
+                vision_text=NSFW_YES_TEXT,
+                moderation_service=_fake_moderation_service(record_error=True),
+            )
+
+        # 核心断言：删图 + 警告 + 质询三者都发生，顺序与正常路径完全一致
+        self.assertEqual(message.conversation, ["delete", "warn", "challenge"])
+        message.delete.assert_awaited_once()
+        message.answer.assert_awaited_once()
+        challenge.assert_awaited_once()
+        # 记账确实尝试过并失败，且失败被明确写进日志（便于排查）
+        moderation.record_violation.assert_awaited_once()
+        self.assertTrue(
+            any("记账失败" in line for line in logs.output),
+            logs.output,
+        )
+        # 没有 violation 行 → 跳过 notice_sent_at 写回：不因此再 commit，
+        # 也不因此把质询炸掉（质询自身在这个用例里是 mock）
+        session.commit.assert_not_awaited()
+        # 已经处置过就必须结束本条消息：不许落回文本审核再走一遍
+        moderation.evaluate.assert_not_awaited()
+        # 质询仍然不给「花积分免除」入口
+        self.assertEqual(challenge.await_args.kwargs["rule_action"], "ban")
+        self.assertFalse(challenge.await_args.kwargs["allow_points_skip"])
+
+    async def test_record_failure_with_delete_failure_still_warns_and_challenges(
+        self,
+    ) -> None:
+        """记账失败 + 删图也失败：警告与质询仍然要发出去。"""
+        message = _photo_message()
+        message.delete = AsyncMock(side_effect=RuntimeError("no rights"))
+
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
             vision_text=NSFW_YES_TEXT,
+            message=message,
             moderation_service=_fake_moderation_service(record_error=True),
         )
 
+        self.assertEqual(message.conversation, ["warn", "challenge"])
+        message.answer.assert_awaited_once()
+        challenge.assert_awaited_once()
+        moderation.record_violation.assert_awaited_once()
+
+    async def test_warning_failure_still_challenges_when_record_failed(self) -> None:
+        """记账失败 + 警告失败：质询照发，异常不外泄。"""
+        message = _photo_message()
+        message.answer = AsyncMock(side_effect=RuntimeError("chat restricted"))
+
+        message, _llm, _moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT,
+            message=message,
+            moderation_service=_fake_moderation_service(record_error=True),
+        )
+
+        self.assertEqual(message.conversation, ["delete", "challenge"])
+        challenge.assert_awaited_once()
+
+    async def test_rollback_failure_after_record_failure_still_disposes(self) -> None:
+        """清失败事务的回滚也失败时，删图/警告/质询一个都不能少。"""
+        session = _session()
+        session.rollback = AsyncMock(side_effect=RuntimeError("rollback failed"))
+
+        message, _llm, _moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT,
+            session=session,
+            moderation_service=_fake_moderation_service(record_error=True),
+        )
+
+        self.assertEqual(message.conversation, ["delete", "warn", "challenge"])
+        message.delete.assert_awaited_once()
+        challenge.assert_awaited_once()
+
+    async def test_duplicate_skips_every_action_even_if_rollback_fails(self) -> None:
+        """已有违规记录：一条 Telegram 动作都不做，回滚失败也不改变这一点。"""
+        session = _session()
+        session.rollback = AsyncMock(side_effect=RuntimeError("rollback failed"))
+
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT,
+            session=session,
+            moderation_service=_fake_moderation_service(event_created=False),
+        )
+
         self.assertEqual(message.conversation, [])
+        message.delete.assert_not_awaited()
+        message.answer.assert_not_awaited()
         challenge.assert_not_awaited()
+        # 已经算处置过：不许落回文本审核再走一遍
+        moderation.evaluate.assert_not_awaited()
+        session.commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

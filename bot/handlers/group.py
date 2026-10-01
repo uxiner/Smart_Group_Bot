@@ -3539,6 +3539,25 @@ async def _best_effort_commit(
         log.warning("[%s] skipped noncritical db commit | context=%s", group_id, context)
 
 
+async def _best_effort_rollback(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    context: str,
+) -> None:
+    """回滚失败只记日志。
+
+    调用点都是「数据库已经出问题」的降级路径：回滚是为了清掉失败事务、让后续
+    步骤（质询）还能用同一个 session，它本身绝不能把还没做的处置动作一起带走。
+    """
+    try:
+        await session.rollback()
+    except Exception:
+        log.exception(
+            "[%s] best-effort rollback failed | context=%s", group_id, context
+        )
+
+
 def _extract_image_file_info(message: Message) -> tuple[str, str, int] | None:
     """Return (file_id, mime, declared_size) for safe image-like messages."""
     if message.photo:
@@ -3749,8 +3768,18 @@ async def _apply_nsfw_image_guard(
 ) -> bool:
     """命中 ``NSFW_YES`` 后的重处置：① 删图 ② 群内 @警告 ③ 质询。
 
-    顺序固定，且三步互相独立：任何一步失败都只记日志并继续下一步——**删图失败
-    也照样警告并质询**（与 ``/av`` 那条「删失败继续识图」的方向相反）。
+    三件事的顺序固定（删图 → 警告 → 质询），且每一步都独立于其他步骤的成败：
+    任何一步失败都只记日志并继续下一步——**删图失败也照样警告并质询**（与 ``/av``
+    那条「删失败继续识图」的方向相反）。
+
+    **记账（违规记录落库）不是删图的前置条件**：违规记录只用来占住幂等键和留痕，
+    它写失败（SQLITE_BUSY / 磁盘或 DB 异常）时照样删图、警告、质询，只把
+    ``violation`` 留空、跳过 ``notice_sent_at`` 写回。让 NSFW 图尽快离开群是
+    本功能的第一目的，记账失败不该换来「图不删」。
+
+    唯一的例外是「确认重复投递」：同一条消息（含 Telegram 重投）已经有违规记录
+    时，一条 Telegram 动作都不做——这个判定在任何动作之前完成，因此顺序调整不会
+    造成删两次 / 警告两次 / 质询两次。
 
     返回 True 表示这条消息已经由本功能处置，调用方应结束后续流程（不再走文本
     审核 / 回复流水线）；返回 False 表示没有处置，调用方照常继续。
@@ -3797,33 +3826,53 @@ async def _apply_nsfw_image_guard(
         return False
 
     claimed = False
+    source_message_id = _source_message_id(message)
     try:
         async with _moderation_user_lock(group_id, user_id):
-            violation = await moderation.record_violation(
-                session,
-                group_id,
-                user_id,
-                f"[nsfw-image] {_NSFW_MARKER_YES}\n{input_text}",
-                "nsfw_image",
-                None,
-                source_message_id=_source_message_id(message),
-                verdict_reason=f"nsfw_image_guard:{_NSFW_MARKER_YES}",
-            )
-            if not _violation_event_created(violation):
-                # 同一条消息（含 Telegram 重投）已经处置过：不重复删图/警告/质询。
-                log.info(
-                    "[%s]【NSFW图片】重复投递，跳过 | user=%s | message_id=%s",
+            # ⓪ 先记账（= 占幂等键）。失败绝不放行「跳过删图」：清掉失败事务后
+            #    继续走下面的删图/警告/质询，只是没有违规记录可写回。
+            violation: Violation | None = None
+            try:
+                violation = await moderation.record_violation(
+                    session,
                     group_id,
                     user_id,
-                    _source_message_id(message),
+                    f"[nsfw-image] {_NSFW_MARKER_YES}\n{input_text}",
+                    "nsfw_image",
+                    None,
+                    source_message_id=source_message_id,
+                    verdict_reason=f"nsfw_image_guard:{_NSFW_MARKER_YES}",
                 )
-                await session.rollback()
-                return True
+                if not _violation_event_created(violation):
+                    # 同一条消息（含 Telegram 重投）已经处置过：不重复删图/警告/质询。
+                    log.info(
+                        "[%s]【NSFW图片】重复投递，跳过 | user=%s | message_id=%s",
+                        group_id,
+                        user_id,
+                        source_message_id,
+                    )
+                    await _best_effort_rollback(
+                        session, group_id=group_id, context="nsfw_image_duplicate"
+                    )
+                    return True
+                # Telegram I/O 之前先落库：不让 SQLite 写锁跨网络调用。
+                await session.commit()
+            except Exception:
+                violation = None
+                log.exception(
+                    "[%s]【NSFW图片】记账失败，仍继续删图/警告/质询 | user=%s | message_id=%s",
+                    group_id,
+                    user_id,
+                    source_message_id,
+                )
+                await _best_effort_rollback(
+                    session, group_id=group_id, context="nsfw_image_record_violation"
+                )
+            # 不论记账成功与否，从这里开始都要处置这条消息，也就算「已处置」：
+            # 后面万一还有意外异常，调用方也不能把同一条消息再送进文本审核流水线。
             claimed = True
-            # Telegram I/O 之前先落库：不让 SQLite 写锁跨网络调用。
-            await session.commit()
 
-            # ① 删图（尽力，失败只记日志继续）
+            # ① 删图：只依赖这条消息本身，不依赖记账是否成功（尽力，失败只记日志继续）。
             deleted = False
             try:
                 await message.delete()
@@ -3857,6 +3906,8 @@ async def _apply_nsfw_image_guard(
                 )
 
             # ③ 发起质询：复用现有质询卡与超时处置；不给「花积分免除」入口。
+            #    不依赖违规记录：记账失败（violation 为空）时照常发起，只是跳过
+            #    notice_sent_at 的写回。
             challenged = False
             try:
                 challenged = await begin_moderation_challenge(
@@ -3872,18 +3923,27 @@ async def _apply_nsfw_image_guard(
                     session_factory=session_factory,
                     allow_points_skip=False,
                 )
-                if challenged:
-                    violation.notice_sent_at = now_shanghai_naive()
-                    await session.commit()
+                if challenged and violation is not None:
+                    try:
+                        violation.notice_sent_at = now_shanghai_naive()
+                        await session.commit()
+                    except Exception:
+                        # 质询已经发起了，写回失败不能反过来算质询失败。
+                        log.exception(
+                            "[%s]【NSFW图片】质询通知时间写回失败（质询已发起）| user=%s",
+                            group_id,
+                            user_id,
+                        )
             except Exception:
                 log.exception(
                     "[%s]【NSFW图片】质询失败 | user=%s", group_id, user_id
                 )
 
             log.info(
-                "[%s]【NSFW图片】处置完成 | user=%s | 已删图=%s | 已警告=%s | 已质询=%s",
+                "[%s]【NSFW图片】处置完成 | user=%s | 已记录=%s | 已删图=%s | 已警告=%s | 已质询=%s",
                 group_id,
                 user_id,
+                violation is not None,
                 deleted,
                 warned,
                 challenged,
