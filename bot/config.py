@@ -166,6 +166,10 @@ class ModerationConfig(BaseModel):
     # 连续 bot_screening_message_count 条干净后加入白名单不再审核。
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = 5
+    # 群内公开发布露骨色情图片（色情/裸露）→ 删图 + 群内 @警告 + 质询。
+    # 判定复用审核链路本来就有的那次视觉调用（不新增模型调用）；默认开启。
+    # 关闭后不做判定（提示词里也不加 NSFW 要求）也不做任何处置。
+    nsfw_image_guard_enabled: bool = True
 
 
 class Settings(BaseSettings):

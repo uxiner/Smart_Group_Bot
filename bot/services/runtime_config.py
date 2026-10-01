@@ -352,6 +352,9 @@ class ModerationSettingsConfig(StrictModel):
     challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = Field(default=5, ge=1, le=100)
+    # 群内露骨色情图片处置（删图 + @警告 + 质询）。默认开启；关掉后
+    # 视觉提示词不再要求 NSFW 判定，也不会有任何处置动作。
+    nsfw_image_guard_enabled: bool = True
 
 
 class PatrolSettingsConfig(StrictModel):

@@ -2995,6 +2995,72 @@ class ModerationChallengeTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 1))
 
+    async def test_begin_offers_points_skip_when_the_member_can_afford_it(self) -> None:
+        """默认行为不变：有余分的人仍能花分免除这次质询。"""
+
+        settings = _settings(join_verification_enabled=False)
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(return_value=True),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=819)),
+        )
+
+        with patch(
+            "bot.services.join_verification.available_points",
+            new=AsyncMock(return_value=100),
+        ):
+            async with self.session_factory() as session:
+                started = await begin_moderation_challenge(
+                    bot=bot,
+                    session=session,
+                    settings=settings,
+                    group_id=-100,
+                    user_id=919,
+                    display_name="可疑用户",
+                    bot_username="my_bot",
+                    reason="疑似发布广告",
+                    rule_action="ban",
+                )
+
+        self.assertTrue(started)
+        prompt = bot.send_message.await_args.args[1]
+        self.assertIn("积分", prompt)
+        keyboard = bot.send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(len(keyboard.inline_keyboard), 3)
+
+    async def test_begin_withholds_points_skip_for_nsfw_image_challenge(self) -> None:
+        """群内色情图片处置不给「花积分免除本次质询」入口（连余额都不查）。"""
+
+        settings = _settings(join_verification_enabled=False)
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(return_value=True),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=820)),
+        )
+        affordable = AsyncMock(return_value=100)
+
+        with patch("bot.services.join_verification.available_points", new=affordable):
+            async with self.session_factory() as session:
+                started = await begin_moderation_challenge(
+                    bot=bot,
+                    session=session,
+                    settings=settings,
+                    group_id=-100,
+                    user_id=920,
+                    display_name="发图用户",
+                    bot_username="my_bot",
+                    reason="检测到在群内公开发布裸露/色情图片（图片已删除）",
+                    rule_action="ban",
+                    allow_points_skip=False,
+                )
+
+        self.assertTrue(started)
+        affordable.assert_not_awaited()
+        prompt = bot.send_message.await_args.args[1]
+        self.assertNotIn("积分", prompt)
+        self.assertIn("色情", prompt)
+        keyboard = bot.send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(len(keyboard.inline_keyboard), 2)
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "复核 / 开始验证")
+
 
 def _verification_callback(
     *,
