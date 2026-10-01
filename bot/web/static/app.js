@@ -975,6 +975,7 @@
             ${field("moderation.challenge_timeout_seconds", "ban 质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
           </div>
         </section>
         <section class="settings-section">

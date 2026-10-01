@@ -4267,12 +4267,17 @@ async def begin_moderation_challenge(
     reason: str,
     rule_action: str,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    allow_points_skip: bool = True,
 ) -> bool:
     """Mute a sender, issue a provider challenge, and persist its deadline.
 
     Returns False when the challenge is unavailable or cannot be presented.
     A prompt failure restores permissions so callers can safely fall back to
     the rule's normal high-confidence action without stranding the member.
+
+    ``allow_points_skip=False`` drops the "spend points to skip this challenge"
+    entry from the card (the NSFW image guard must not offer a paid bypass);
+    callers that omit it keep the historical behaviour.
     """
     if str(rule_action or "").strip().lower() != "ban":
         log.error(
@@ -4301,6 +4306,7 @@ async def begin_moderation_challenge(
             reason=reason,
             rule_action=rule_action,
             session_factory=session_factory,
+            allow_points_skip=allow_points_skip,
         )
 
 
@@ -4316,6 +4322,7 @@ async def _begin_moderation_challenge_locked(
     reason: str,
     rule_action: str,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    allow_points_skip: bool = True,
 ) -> bool:
     if str(rule_action or "").strip().lower() != "ban":
         return False
@@ -4473,20 +4480,28 @@ async def _begin_moderation_challenge_locked(
                     user_id,
                 )
             return True
-        # 有余分的人可以花分免除这次质询：余额在这里查一次，按钮文案与卡片一致
-        try:
-            affordable = await available_points(
-                session, group_id=group_id, user_id=user_id
-            )
-        except Exception:
-            log.warning(
-                "moderation challenge points lookup failed | group=%s user=%s",
-                group_id,
-                user_id,
-                exc_info=True,
-            )
-            affordable = 0
-        skip_cost = CHALLENGE_SKIP_COST if affordable >= CHALLENGE_SKIP_COST else 0
+        # 有余分的人可以花分免除这次质询：余额在这里查一次，按钮文案与卡片一致。
+        # allow_points_skip=False 的调用方（群内色情图片处置）不给这条付费通道，
+        # 连余额查询也一并跳过。
+        affordable = 0
+        if allow_points_skip:
+            try:
+                affordable = await available_points(
+                    session, group_id=group_id, user_id=user_id
+                )
+            except Exception:
+                log.warning(
+                    "moderation challenge points lookup failed | group=%s user=%s",
+                    group_id,
+                    user_id,
+                    exc_info=True,
+                )
+                affordable = 0
+        skip_cost = (
+            CHALLENGE_SKIP_COST
+            if allow_points_skip and affordable >= CHALLENGE_SKIP_COST
+            else 0
+        )
         sent = await bot.send_message(
             group_id,
             build_moderation_prompt_text(

@@ -3620,10 +3620,295 @@ async def _build_telegram_image_data_uri(message: Message) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+# ---------------------------------------------------------------------------
+# 群内 NSFW（露骨色情）图片处置
+#
+# 成本红线：判定**复用审核链路本来就会做的那一次视觉调用**（_append_image_context
+# 里的 vision_describe），只在提示词末尾追加一条结构化要求，不新增任何模型调用。
+# 宁可漏判，不可误伤：只有模型明确回 NSFW_YES 才处置，其余（NSFW_NO /
+# NSFW_UNKNOWN / 解析不到 / 拒答 / 视觉失败）一律什么都不做，只记日志。
+# ---------------------------------------------------------------------------
+
+#: 追加在图片描述提示词后面的 NSFW 判定要求（原有描述/OCR 要求一个字都不改）。
+_NSFW_VISION_INSTRUCTION = (
+    "另外判断题图是否为明确露骨色情内容（可见性器官裸露或性行为）。"
+    "是 → 整条回复以 NSFW_YES 开头；否 → 以 NSFW_NO 开头；无法判断 → 以 NSFW_UNKNOWN 开头。"
+)
+_NSFW_MARKER_YES = "NSFW_YES"
+_NSFW_MARKER_NO = "NSFW_NO"
+_NSFW_MARKER_UNKNOWN = "NSFW_UNKNOWN"
+#: 标记必须出现在整条回复的开头；只认这一个位置。
+_NSFW_MARKER_RE = re.compile(r"^\s*(NSFW_(?:YES|NO|UNKNOWN))\b", re.IGNORECASE)
+
+#: 只处理图片 / 图片文件 / 动图。贴纸误判风险最高，一律不碰。
+_NSFW_GUARD_IMAGE_TYPES = frozenset(
+    {
+        "photo",
+        "photo_caption",
+        "document",
+        "document_caption",
+        "animation",
+        "animation_caption",
+    }
+)
+#: 群里「/av + 图片」由 commands.py 的「先删图再识图」流程负责，这里跳过，别打架。
+_AV_IMAGE_COMMAND_RE = re.compile(r"^/av(?:@[A-Za-z0-9_]+)?(?:\s|$)", re.IGNORECASE)
+
+#: 群内警告（独立一条、@当事人）保留多久后自动删除；调这里即可改时长。
+_NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS = 120
+_NSFW_IMAGE_WARNING_REASON = "检测到裸露/色情图片，已删除。请勿在本群发布此类内容。"
+_NSFW_IMAGE_CHALLENGE_REASON = "检测到在群内公开发布裸露/色情图片（图片已删除）"
+
+
+def _parse_nsfw_marker(vision_text: str) -> str:
+    """取视觉回复开头的 ``NSFW_*`` 标记；解析不到返回空串（调用方一律不处置）。"""
+    match = _NSFW_MARKER_RE.match(str(vision_text or ""))
+    return match.group(1).upper() if match else ""
+
+
+def _strip_nsfw_marker(vision_text: str) -> str:
+    """去掉开头的 ``NSFW_*`` 标记，保留原有描述/OCR 文字。
+
+    没有标记时原样返回——审核链路、贴纸库与记忆归档都依赖这段描述，
+    所以只允许删掉标记本身，正文一个字都不能动。
+    """
+    text = str(vision_text or "")
+    match = _NSFW_MARKER_RE.match(text)
+    if not match:
+        return text
+    return text[match.end() :].lstrip(" \t\r\n:：-—").strip()
+
+
+def _has_guardable_image(message: Message) -> bool:
+    """沿用审核链路本来就认的图片类型（照片 / 图片文档 / 图片动图）。"""
+    if not (
+        getattr(message, "photo", None)
+        or getattr(message, "document", None)
+        or getattr(message, "animation", None)
+    ):
+        return False
+    return _extract_image_file_info(message) is not None
+
+
+def _is_group_av_image_message(message: Message) -> bool:
+    """配文里带 ``/av`` 的图片消息（``/av`` 写在 caption 上）。
+
+    这些图已由 ``bot/handlers/commands.py`` 的流程处理（先删图再识图、不质询），
+    本功能必须原样放过：不删、不警告、不质询。「回复某条图片 + 裸 /av」那条是
+    纯文本命令消息（没有图片），本来就进不了本功能。
+    """
+    text = str(
+        getattr(message, "caption", None) or getattr(message, "text", None) or ""
+    ).strip()
+    if not _AV_IMAGE_COMMAND_RE.match(text):
+        return False
+    return _has_guardable_image(message)
+
+
+def _nsfw_image_guard_enabled(settings: Settings) -> bool:
+    """运行时可开关：``moderation.nsfw_image_guard_enabled``（默认开启）。
+
+    审核总开关关闭时本功能同样不生效——质询本身就依赖审核与真人验证配置。
+    """
+    moderation = getattr(settings, "moderation", None)
+    if moderation is None or not bool(getattr(moderation, "enabled", False)):
+        return False
+    return bool(getattr(moderation, "nsfw_image_guard_enabled", True))
+
+
+def _nsfw_image_guard_applies(
+    message: Message, msg_type: str, settings: Settings
+) -> bool:
+    """这条消息是否需要请求 NSFW 判定（= 是否在视觉提示词里追加要求）。"""
+    if not _nsfw_image_guard_enabled(settings):
+        return False
+    if msg_type not in _NSFW_GUARD_IMAGE_TYPES:
+        return False
+    if not _has_guardable_image(message):
+        return False
+    return not _is_group_av_image_message(message)
+
+
+async def _apply_nsfw_image_guard(
+    *,
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    llm: LLMService,
+    group_id: int,
+    user_id: int,
+    display_name: str,
+    bot_username: str,
+    input_text: str,
+    vision_text: str,
+    warn_target: str,
+    sender_is_chat: bool,
+    sender_is_owner: bool,
+    sender_is_tg_admin: bool,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> bool:
+    """命中 ``NSFW_YES`` 后的重处置：① 删图 ② 群内 @警告 ③ 质询。
+
+    顺序固定，且三步互相独立：任何一步失败都只记日志并继续下一步——**删图失败
+    也照样警告并质询**（与 ``/av`` 那条「删失败继续识图」的方向相反）。
+
+    返回 True 表示这条消息已经由本功能处置，调用方应结束后续流程（不再走文本
+    审核 / 回复流水线）；返回 False 表示没有处置，调用方照常继续。
+
+    绝不新增模型调用：判定结果来自审核链路那次视觉识别的返回文本。
+    """
+    marker = _parse_nsfw_marker(vision_text)
+    if marker != _NSFW_MARKER_YES:
+        # 宁可漏，不可误伤：NSFW_NO / NSFW_UNKNOWN / 解析不到（含模型拒答、视觉
+        # 失败）都什么都不做。仍然记一条日志，方便统计漏判与模型不配合的比例。
+        if marker:
+            log.info(
+                "[%s]【NSFW图片】未命中 | 标记=%s user=%s", group_id, marker, user_id
+            )
+        return False
+
+    # 频道身份（sender_chat）没有可质询的用户对象，沿用现有审核对频道的处理边界。
+    if sender_is_chat or int(user_id or 0) <= 0:
+        log.info(
+            "[%s]【NSFW图片】跳过 | reason=sender_chat user=%s", group_id, user_id
+        )
+        return False
+    # 管理员/群主沿用现有审核的自动豁免，不新增豁免也不绕过。
+    if sender_is_owner or sender_is_tg_admin:
+        log.info(
+            "[%s]【NSFW图片】跳过 | reason=admin_exempt user=%s", group_id, user_id
+        )
+        return False
+
+    try:
+        moderation = ModerationService(settings.moderation, llm)
+        if await moderation.is_user_exempt(session, group_id, user_id):
+            log.info(
+                "[%s]【NSFW图片】跳过 | reason=manual_exempt user=%s",
+                group_id,
+                user_id,
+            )
+            return False
+    except Exception:
+        # 连豁免状态都拿不准就什么都不做：误伤代价远高于漏判。
+        log.exception(
+            "[%s]【NSFW图片】豁免检查失败，未处置 | user=%s", group_id, user_id
+        )
+        return False
+
+    claimed = False
+    try:
+        async with _moderation_user_lock(group_id, user_id):
+            violation = await moderation.record_violation(
+                session,
+                group_id,
+                user_id,
+                f"[nsfw-image] {_NSFW_MARKER_YES}\n{input_text}",
+                "nsfw_image",
+                None,
+                source_message_id=_source_message_id(message),
+                verdict_reason=f"nsfw_image_guard:{_NSFW_MARKER_YES}",
+            )
+            if not _violation_event_created(violation):
+                # 同一条消息（含 Telegram 重投）已经处置过：不重复删图/警告/质询。
+                log.info(
+                    "[%s]【NSFW图片】重复投递，跳过 | user=%s | message_id=%s",
+                    group_id,
+                    user_id,
+                    _source_message_id(message),
+                )
+                await session.rollback()
+                return True
+            claimed = True
+            # Telegram I/O 之前先落库：不让 SQLite 写锁跨网络调用。
+            await session.commit()
+
+            # ① 删图（尽力，失败只记日志继续）
+            deleted = False
+            try:
+                await message.delete()
+                deleted = True
+            except Exception as exc:
+                log.warning(
+                    "[%s]【NSFW图片】删图失败，继续警告与质询 | user=%s | error=%s",
+                    group_id,
+                    user_id,
+                    exc,
+                )
+
+            # ② 群里 @当事人文字警告：独立一条，2 分钟后自动删除。
+            #    sanitize_mentions=False 是刻意的：默认净化会把 @handle 拆成
+            #    零宽字符，那就等于没 @ 到人。
+            warned = False
+            try:
+                await answer_with_auto_delete(
+                    message,
+                    f"{warn_target} {_NSFW_IMAGE_WARNING_REASON}",
+                    auto_delete_seconds=_NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS,
+                    sanitize_mentions=False,
+                    parse_mode="HTML",
+                )
+                warned = True
+            except Exception:
+                log.exception(
+                    "[%s]【NSFW图片】群内警告失败，继续质询 | user=%s",
+                    group_id,
+                    user_id,
+                )
+
+            # ③ 发起质询：复用现有质询卡与超时处置；不给「花积分免除」入口。
+            challenged = False
+            try:
+                challenged = await begin_moderation_challenge(
+                    bot=message.bot,
+                    session=session,
+                    settings=settings,
+                    group_id=group_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    bot_username=bot_username,
+                    reason=_NSFW_IMAGE_CHALLENGE_REASON,
+                    rule_action="ban",
+                    session_factory=session_factory,
+                    allow_points_skip=False,
+                )
+                if challenged:
+                    violation.notice_sent_at = now_shanghai_naive()
+                    await session.commit()
+            except Exception:
+                log.exception(
+                    "[%s]【NSFW图片】质询失败 | user=%s", group_id, user_id
+                )
+
+            log.info(
+                "[%s]【NSFW图片】处置完成 | user=%s | 已删图=%s | 已警告=%s | 已质询=%s",
+                group_id,
+                user_id,
+                deleted,
+                warned,
+                challenged,
+            )
+    except Exception:
+        # 处置动作绝不阻塞群消息主流程；已经占住幂等键就按已处置返回。
+        log.exception("[%s]【NSFW图片】处置异常 | user=%s", group_id, user_id)
+        return claimed
+    return True
+
+
 async def _append_image_context(
-    message: Message, llm: LLMService, text: str, msg_type: str
+    message: Message,
+    llm: LLMService,
+    text: str,
+    msg_type: str,
+    *,
+    nsfw_guard: bool = False,
 ) -> tuple[str, str]:
-    """Append image understanding text for moderation/decision/reply and return vision text."""
+    """Append image understanding text for moderation/decision/reply and return vision text.
+
+    ``nsfw_guard=True`` 时只在提示词末尾追加 NSFW 判定要求（复用同一次调用，
+    不新增模型调用）；追加进正文的描述里会去掉 ``NSFW_*`` 标记，避免标记污染
+    文本审核与记忆归档。第二个返回值始终是模型的原始输出。
+    """
     if msg_type not in {
         "photo",
         "photo_caption",
@@ -3640,6 +3925,8 @@ async def _append_image_context(
         "Respond briefly in Chinese within 30 words. "
         "If no useful content can be identified, reply exactly: NO_VALID_IMAGE_CONTENT."
     )
+    if nsfw_guard:
+        vision_prompt = f"{vision_prompt} {_NSFW_VISION_INSTRUCTION}"
 
     data_uri = await _build_telegram_image_data_uri(message)
     vision_text = ""
@@ -3666,7 +3953,18 @@ async def _append_image_context(
         return text, ""
 
     log.info("【视觉】识别结果 | %s", vision_text[:80])
-    return f"{text}\n[image-vision]\n{vision_text}", vision_text
+    if not nsfw_guard:
+        return f"{text}\n[image-vision]\n{vision_text}", vision_text
+
+    # NSFW 判定会把标记顶到整条回复最前面：正文里只去掉标记本身，描述/OCR 一字不改；
+    # 模型原始输出原样返回，交给调用方判定（调用方负责 _strip_nsfw_marker）。
+    description = _strip_nsfw_marker(vision_text)
+    if description == "NO_VALID_IMAGE_CONTENT":
+        description = ""
+    if not description:
+        # 只有标记、没有描述：不追加空的 [image-vision] 块，但标记要传下去。
+        return text, vision_text
+    return f"{text}\n[image-vision]\n{description}", vision_text
 
 
 async def _build_reply_context_for_llm(message: Message, llm: LLMService) -> str:
@@ -6130,7 +6428,17 @@ async def on_group_message(
         max_context_tokens=settings.bot.max_context_tokens,
     )
 
-    input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
+    # 群内色情图片处置：判定复用下面这一次视觉调用（只在提示词里追加要求），
+    # 不新增任何模型调用。开关关闭 / 贴纸 / 带 /av 的图片在这里就是 False。
+    nsfw_guard_active = _nsfw_image_guard_applies(message, msg_type, settings)
+
+    input_text, vision_text = await _append_image_context(
+        message, llm, input_text, msg_type, nsfw_guard=nsfw_guard_active
+    )
+    # 请求了 NSFW 判定时，vision_text 可能以 NSFW_* 标记开头；正文与归档只留描述。
+    vision_body = (
+        _strip_nsfw_marker(vision_text) if nsfw_guard_active else vision_text
+    )
     reply_context = await _build_reply_context_for_llm(message, llm)
     if reply_context:
         input_text = f"{input_text}\n{reply_context}"
@@ -6149,7 +6457,7 @@ async def on_group_message(
                 message,
                 sender_identity=sender_identity,
                 raw_text=text,
-                derived_text=vision_text,
+                derived_text=vision_body,
                 sender_is_owner=sender_is_owner,
                 sender_is_tg_admin=sender_is_tg_admin,
             ),
@@ -6160,7 +6468,7 @@ async def on_group_message(
                 session,
                 group_id,
                 message,
-                vision_description=vision_text,
+                vision_description=vision_body,
             )
             if learned:
                 log.info(
@@ -6183,6 +6491,29 @@ async def on_group_message(
     )
     if not await _fresh_group_authorized_for_moderation(session, group_id):
         return
+
+    # 群内 NSFW 图片：删图 → 群内 @警告（2 分钟后自动删）→ 质询。命中即结束本条消息
+    # 的后续流程（不再走文本审核/回复）；未命中或豁免则照常继续。异常只记日志。
+    if nsfw_guard_active:
+        if await _apply_nsfw_image_guard(
+            message=message,
+            session=session,
+            settings=settings,
+            llm=llm,
+            group_id=group_id,
+            user_id=user_id,
+            display_name=display_name,
+            bot_username=getattr(bot_me, "username", "") or "",
+            input_text=input_text,
+            vision_text=vision_text,
+            warn_target=warn_target,
+            sender_is_chat=sender_identity.is_chat,
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+            session_factory=session_factory,
+        ):
+            return
+
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
