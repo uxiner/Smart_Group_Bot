@@ -230,19 +230,23 @@ class LotteryPrize:
     label: str
 
 
-#: 60% 谢谢参与 / 25% 3 分 / 10% 12 分 / 4% 40 分 / 1% 120 分
+#: 39% 谢谢参与 / 20% 3 分 / 16% 5 分 / 10% 8 分 / 10% 12 分 / 4% 40 分 / 1% 100 分
+#: （2026-10-01 管理员指定：**期望值正好 6.00 分/次**。抽奖成本 5 分 → 玩家长期平均
+#: 每次净赚 1.00 分、每天 10 次约净赚 10 分；仍是净发放，要回收只需上调"谢谢参与"。）
 LOTTERY_TABLE: tuple[LotteryPrize, ...] = (
-    LotteryPrize(0, 6000, "谢谢参与"),
-    LotteryPrize(3, 2500, "3 分"),
+    LotteryPrize(0, 3900, "谢谢参与"),
+    LotteryPrize(3, 2000, "3 分"),
+    LotteryPrize(5, 1600, "5 分"),
+    LotteryPrize(8, 1000, "8 分"),
     LotteryPrize(12, 1000, "12 分"),
     LotteryPrize(40, 400, "40 分"),
-    LotteryPrize(120, 100, "120 分"),
+    LotteryPrize(100, 100, "100 分"),
 )
 LOTTERY_TOTAL_WEIGHT = 10000
 
 
 def expected_lottery_value() -> float:
-    """长期期望值（≈4.75 分/次，略低于 5 分成本：抽奖是积分回收口）。"""
+    """长期期望值（正好 6.00 分/次；2026-10-01 管理员指定）。"""
 
     return sum(prize.points * prize.weight for prize in LOTTERY_TABLE) / LOTTERY_TOTAL_WEIGHT
 
@@ -1121,7 +1125,7 @@ def render_shop_menu(*, available: int) -> str:
         "\n"
         f"<b>④ 抽奖一次 —— {LOTTERY_PRICE} 分</b>\n"
         "用法：发 /draw（每人每天最多 10 次）\n"
-        "奖池：谢谢参与、3 分、12 分、40 分、120 分\n"
+        "奖池：谢谢参与 39%、3 分 20%、5 分 16%、8 分 10%、12 分 10%、40 分 4%、100 分 1%\n"
         "\n"
         f"<i>头衔 1-{TAG_MAX_LENGTH} 个字、不能带表情、不能和别人重名；到期会自动清除。"
         "还没到期就再买一次，时间会往后接着算，不会白花钱。</i>"

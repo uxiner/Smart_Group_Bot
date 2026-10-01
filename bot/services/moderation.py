@@ -557,7 +557,14 @@ class ModerationService:
             return own_candidates
 
         # 用户本人是不是在警示骗子/反对广告（引用/图片描述命中时用来豁免）。
-        own_objects = _own_text_objects(own_candidates)
+        # **懒计算**：只有命中确实来自引用/图片描述时才扫一遍自己的正文，避免给每条
+        # 消息、每条规则都加一次正则调用（也会让"共用一个正则预算"的既有行为保持不变）。
+        objection_state: list[bool] = []
+
+        def own_objects() -> bool:
+            if not objection_state:
+                objection_state.append(_own_text_objects(own_candidates))
+            return objection_state[0]
 
         regex_deadline = time.perf_counter() + 0.1
 
@@ -642,7 +649,7 @@ class ModerationService:
                         include_vision=include_vision,
                         keyword_folded=folded_pattern,
                     )
-                    if source != MATCH_SOURCE_OWN and own_objects:
+                    if source != MATCH_SOURCE_OWN and own_objects():
                         log.info(
                             "审核豁免 (命中来自 %s，但本人在警示): group=%s rule_id=%s",
                             source,
@@ -710,7 +717,7 @@ class ModerationService:
                             include_quote=include_quote,
                             include_vision=include_vision,
                         )
-                        if source != MATCH_SOURCE_OWN and own_objects:
+                        if source != MATCH_SOURCE_OWN and own_objects():
                             log.info(
                                 "审核豁免 (命中来自 %s，但本人在警示): group=%s rule_id=%s",
                                 source,
