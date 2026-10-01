@@ -1003,6 +1003,109 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         begin.assert_not_awaited()
         moderation.record_violation.assert_not_awaited()
 
+    async def test_llm_verdict_forwards_its_real_confidence_to_the_violation_row(
+        self,
+    ) -> None:
+        """落库的置信度必须是这次判定的值，方便之后评估高置信阈值。
+
+        这里钉住的是"处理器把 verdict.confidence 原样交给 record_violation"，
+        不是"某个写死的数字"。
+        """
+
+        rule = SimpleNamespace(
+            id=21,
+            action="warn",
+            rule_type="llm",
+            pattern="禁止刷屏",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="疑似刷屏",
+            rule=rule,
+            conclusive=True,
+            confidence=0.72,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=350, notice_sent_at=None)
+            ),
+        )
+        answer = AsyncMock()
+
+        await self._run(
+            moderation,
+            answer=patch(
+                "bot.handlers.group.answer_with_auto_delete",
+                new=answer,
+            ),
+        )
+
+        moderation.record_violation.assert_awaited_once()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "warn")
+        self.assertAlmostEqual(
+            moderation.record_violation.await_args.kwargs["confidence"],
+            0.72,
+        )
+
+    async def test_deterministic_regex_hit_forwards_null_confidence(self) -> None:
+        """正则命中没有模型置信度：落库写 NULL，而阈值判定照旧按 1.0 走。
+
+        ``evaluate`` 给本地正则规则填 confidence=1.0（确定性命中），处理器把它
+        当高置信使用；但落库值必须是 None——拿 1.0 冒充会把置信度分布拉高。
+        """
+
+        rule = SimpleNamespace(
+            id=22,
+            action="warn",
+            rule_type="regex",
+            pattern="加我.*白名单",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="命中正则规则",
+            rule=rule,
+            conclusive=True,
+            confidence=1.0,
+            deterministic=True,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=351, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        answer = AsyncMock()
+
+        message = await self._run(
+            moderation,
+            ready=patch(
+                "bot.handlers.group.moderation_challenge_ready",
+                return_value=True,
+            ),
+            begin=patch(
+                "bot.handlers.group.begin_moderation_challenge",
+                new=begin,
+            ),
+            answer=patch(
+                "bot.handlers.group.answer_with_auto_delete",
+                new=answer,
+            ),
+        )
+
+        moderation.record_violation.assert_awaited_once()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "warn")
+        self.assertIsNone(moderation.record_violation.await_args.kwargs["confidence"])
+        # 决策不变：正则命中的 warn 规则既不质询也不封禁，只发警告。
+        begin.assert_not_awaited()
+        message.chat.ban.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

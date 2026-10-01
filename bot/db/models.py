@@ -421,8 +421,14 @@ class Violation(Base):
     # stable idempotency key for every moderation side effect derived from one
     # source message.  NULL keeps legacy/manual rows unrestricted.
     source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # Count captured by the atomic warning transaction for this event.  It lets
-    # retries render the original warning state without incrementing again.
+    # 观测列：这一行对应的"累计命中次数"（含本次）。有两种来源，都取自现有
+    # 现成计数，不另造数字：
+    # - ban 计数路径（_apply_counted_moderation_ban）：add_warning 返回的
+    #   UserWarning.count（本群+本用户，就是 warn_threshold 比较的那个计数器）。
+    #   幂等重放靠"该列非 NULL"判断这条是否已经计过数，所以这条链路不能改口径。
+    # - 其它路径（challenge/warn/delete/NSFW 守卫）：该用户在本群+本规则下的
+    #   violations 行数，用来观察同一规则上的复犯。
+    # 历史行是 NULL（这一列是后加的）。
     warning_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 判定细节：置信度与模型给的理由。误伤率报表要能回答"这次命中到底有多确定"，
     # 靠日志不够（日志会滚），必须落库。历史行是 NULL（这一列是后加的）。
