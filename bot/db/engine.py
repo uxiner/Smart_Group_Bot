@@ -1549,6 +1549,48 @@ async def _sqlite_migrate_telegram_delete_jobs(conn) -> None:
         )
 
 
+# 一次性生产配置升级：规则 #6 是部署时用 Mini App 建的硬规则（regex + ban，
+# 「探花招募族」），它必须同时扫「被引用的正文」和「机器人生成的图片描述」——
+# 广告正文常常只存在于被引用/转发的消息或截图里。列默认值仍是 ``message``，
+# 其余老规则（#1–#5 等）行为不变。只匹配 id + 类型 + 动作，避免误伤别的规则。
+_MODERATION_SCAN_SCOPE_UPGRADES: tuple[tuple[int, str, str, str], ...] = (
+    (6, "regex", "ban", "message+quote+vision"),
+)
+
+
+async def _sqlite_upgrade_moderation_rule_scan_scopes(conn) -> int:
+    """把已知的生产规则升级到需要的扫描范围（幂等，可重复启动）。
+
+    返回被升级的行数，方便启动日志与迁移测试断言。只动仍是默认值
+    （``message``/NULL/空）的行，已经手工配置过的规则不会被覆盖。
+    """
+
+    changed = 0
+    for rule_id, rule_type, action, scope in _MODERATION_SCAN_SCOPE_UPGRADES:
+        result = await conn.execute(
+            text(
+                "UPDATE moderation_rules SET scan_scope = :scope "
+                "WHERE id = :rule_id AND rule_type = :rule_type "
+                "AND action = :action "
+                "AND (scan_scope IS NULL OR TRIM(scan_scope) = '' "
+                "OR scan_scope = 'message')"
+            ),
+            {
+                "scope": scope,
+                "rule_id": int(rule_id),
+                "rule_type": rule_type,
+                "action": action,
+            },
+        )
+        changed += int(result.rowcount or 0)
+    if changed:
+        log.info(
+            "Migrated: upgraded %s moderation rule(s) to the production scan scope",
+            changed,
+        )
+    return changed
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -1865,6 +1907,20 @@ async def init_db(
                 "ON message_vectors (group_id, id)",
             ):
                 await conn.execute(text(index_sql))
+            # 审核规则的扫描范围：列存在性 + 老数据默认值 + 生产规则的一次性升级。
+            await _sqlite_ensure_column(
+                conn,
+                "moderation_rules",
+                "scan_scope",
+                "scan_scope VARCHAR(32) NOT NULL DEFAULT 'message'",
+            )
+            await conn.execute(
+                text(
+                    "UPDATE moderation_rules SET scan_scope = 'message' "
+                    "WHERE scan_scope IS NULL OR TRIM(scan_scope) = ''"
+                )
+            )
+            await _sqlite_upgrade_moderation_rule_scan_scopes(conn)
             await _sqlite_ensure_column(
                 conn,
                 "keyword_replies",

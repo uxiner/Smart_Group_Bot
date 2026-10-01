@@ -98,6 +98,16 @@ class ModerationRule(Base):
     pattern: Mapped[str] = mapped_column(Text, default="")
     action: Mapped[str] = mapped_column(String(32), default="warn")  # warn, delete, ban
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 正则/关键词规则的扫描范围（组合值，'+' 连接）：
+    #   ``message``            —— 只扫用户自己写的正文（默认）
+    #   ``message+quote``      —— 再并入被引用/转发消息的正文
+    #   ``message+vision``     —— 再并入机器人自己生成的图片描述（[image-vision]）
+    #   ``message+quote+vision`` —— 三者都扫
+    # 老数据/老规则一律按 ``message`` 处理（默认值即旧行为）。语义（llm）规则
+    # 始终看到完整文本，不受该字段影响。
+    scan_scope: Mapped[str] = mapped_column(
+        String(32), default="message", server_default="message"
+    )
 
     group: Mapped[Group] = relationship(back_populates="moderation_rules")
 
