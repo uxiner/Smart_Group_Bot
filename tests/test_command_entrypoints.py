@@ -81,7 +81,9 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<code>#42</code>", text)
         self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "lmd:42:0")
 
-    async def test_av_private_search_is_rejected_for_non_owner(self) -> None:
+    async def test_av_private_search_is_open_to_regular_users_with_rate_limit(self) -> None:
+        # 行为变更（需求）：私聊 /av 以前只给最高管理员，现在任何跟机器人私聊过的
+        # 用户都可以用，代价是每人每小时 10 次（见 _AV_PRIVATE_RATE_LIMITER）。
         message = SimpleNamespace(
             chat=SimpleNamespace(id=123, type="private", title=""),
             from_user=SimpleNamespace(id=123),
@@ -90,17 +92,22 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(commit=AsyncMock())
         settings = _settings()
         settings.super_admin_id = 999
+        service = SimpleNamespace(
+            enabled=True,
+            search=AsyncMock(return_value=[]),
+            lookup_by_code=AsyncMock(),
+        )
 
         with (
             patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
-            patch("bot.handlers.commands.AVSearchService") as service_cls,
+            patch("bot.handlers.commands.AVSearchService", return_value=service),
+            patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
             patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
         ):
             await commands.cmd_av(message, session=session, settings=settings)
 
-        session.commit.assert_awaited_once()
-        service_cls.assert_not_called()
-        self.assertIn("私聊仅最高管理员", answer_mock.await_args.args[2])
+        service.search.assert_awaited_once_with("test query")
+        self.assertNotIn("私聊仅最高管理员", answer_mock.await_args.args[2])
 
     async def test_av_group_search_requires_group_feature_flag(self) -> None:
         message = SimpleNamespace(
@@ -149,7 +156,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         session.commit.assert_awaited_once()
         service.search.assert_awaited_once_with("test query")
 
-    async def test_av_private_callback_rechecks_current_owner_policy(self) -> None:
+    async def test_av_private_callback_scope_allows_regular_users(self) -> None:
+        # 行为变更（需求）：私聊 /av 放开给普通用户后，私聊按钮也得放开；
+        # 真正的把关是「会话归属 + 会话 TTL」，所以过期 token 会得到过期提示，
+        # 而不再是「私聊仅最高管理员」。
         message = SimpleNamespace(
             chat=SimpleNamespace(id=123, type="private", title=""),
         )
@@ -175,7 +185,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         session.commit.assert_awaited_once()
         callback.answer.assert_awaited_once_with(
-            "私聊仅最高管理员可使用 AV 查询",
+            "查询已过期，请重新 /av 搜索",
             show_alert=True,
         )
 
