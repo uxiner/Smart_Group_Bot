@@ -68,6 +68,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         *,
         message: SimpleNamespace | None = None,
         msg_type: str = "text",
+        settings: SimpleNamespace | None = None,
         **extra_patches,
     ):
         message = message or _message()
@@ -159,7 +160,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             await group.on_group_message(
                 message,
                 session=session,
-                settings=_settings(),
+                settings=settings or _settings(),
             )
         return message
 
@@ -736,6 +737,8 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(receipt.deferred)
 
     async def test_super_admin_is_automatically_exempt_from_moderation(self) -> None:
+        """最高管理员（super admin）完全豁免，D 节也不动他。"""
+
         message = _message()
         message.from_user.id = 1
         moderation = SimpleNamespace(
@@ -744,6 +747,32 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self._run(moderation, message=message)
+
+        message.delete.assert_not_awaited()
+        moderation.is_user_exempt.assert_not_awaited()
+        moderation.evaluate.assert_not_awaited()
+
+    async def test_tg_admin_is_exempt_when_admin_moderation_disabled(self) -> None:
+        """关闭 moderation.admin_moderation_enabled 即回到群管理员的整段跳过。"""
+
+        message = _message()
+        message.from_user.id = 42
+        settings = _settings()
+        settings.moderation.admin_moderation_enabled = False
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(),
+        )
+
+        await self._run(
+            moderation,
+            message=message,
+            settings=settings,
+            admin=patch(
+                "bot.handlers.group._is_user_admin_cached",
+                new=AsyncMock(return_value=True),
+            ),
+        )
 
         moderation.is_user_exempt.assert_not_awaited()
         moderation.evaluate.assert_not_awaited()

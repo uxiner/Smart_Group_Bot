@@ -104,6 +104,7 @@ from bot.services.group_permissions import (
 )
 from bot.services.message_templates import normalize_template_buttons
 from bot.services.member_identity import member_identity_document
+from bot.services.moderation import normalize_scan_scope
 from bot.services.patrol import get_patrol_service, parse_schedule_time, patrol_policy
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
@@ -316,6 +317,15 @@ class _RuleCreate(BaseModel):
     pattern: str = Field(min_length=1, max_length=1000)
     action: Literal["warn", "delete", "ban"] = "warn"
     enabled: StrictBool = True
+    # 正则/关键词规则的扫描范围（语义规则忽略该字段）：
+    # message（默认，只扫用户正文）/ +quote（并入被引用正文）/
+    # +vision（并入机器人图片描述）/ 三者可组合。
+    scan_scope: Literal[
+        "message",
+        "message+quote",
+        "message+vision",
+        "message+quote+vision",
+    ] = "message"
 
 
 class _KeywordReplyCreate(BaseModel):
@@ -376,6 +386,15 @@ class _RuleUpdate(BaseModel):
     pattern: str | None = Field(default=None, min_length=1, max_length=1000)
     action: Literal["warn", "delete", "ban"] | None = None
     enabled: StrictBool | None = None
+    scan_scope: (
+        Literal[
+            "message",
+            "message+quote",
+            "message+vision",
+            "message+quote+vision",
+        ]
+        | None
+    ) = None
 
 
 class _MemoryCreate(BaseModel):
@@ -707,6 +726,8 @@ def _rule_document(rule: ModerationRule) -> dict[str, Any]:
         "pattern": str(rule.pattern or ""),
         "action": str(rule.action or "warn"),
         "enabled": bool(rule.enabled),
+        # 老规则/老数据没有该列时按默认 message 返回，Mini App 读到的永远是合法值。
+        "scan_scope": normalize_scan_scope(getattr(rule, "scan_scope", None)),
     }
 
 
@@ -2565,6 +2586,7 @@ def register_settings_routes(
             pattern=clean_multiline_text(body.pattern, max_len=1000).strip(),
             action=body.action,
             enabled=body.enabled,
+            scan_scope=normalize_scan_scope(body.scan_scope),
         )
         if not row.pattern:
             raise _APIError(400, "empty_rule", "群规内容不能为空。")
@@ -2600,6 +2622,8 @@ def register_settings_routes(
                 row.action = str(body.action)
             if "enabled" in body.model_fields_set:
                 row.enabled = bool(body.enabled)
+            if "scan_scope" in body.model_fields_set:
+                row.scan_scope = normalize_scan_scope(body.scan_scope)
             await session.commit()
             document = _rule_document(row)
         return _success_response({"rule": document})

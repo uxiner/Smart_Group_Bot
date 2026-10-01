@@ -8,7 +8,8 @@
 - 处置顺序固定：删除 → 群里 @当事人警告（独立一条、2 分钟后自动删除）→ 质询；
   任何一步失败都只记日志并继续——**删图失败也照样警告并质询**；
 - 贴纸不碰；带 ``/av`` 的图片不碰（已有「先删图再识图」流程负责）；
-- 管理员/群主沿用现有审核豁免；手动豁免成员同样不处置；
+- 管理员/群主默认同样「删图 + @警告」但不质询不禁言（``admin_moderation_enabled``
+  关闭时回到整段豁免）；手动豁免成员同样不处置；
 - 同一条消息重复投递只处置一次（幂等）；
 - 运行时开关 ``moderation.nsfw_image_guard_enabled`` 关闭后不判定也不处置；
 - 原有图片描述/OCR 提示词与描述文本没有被破坏。
@@ -110,6 +111,9 @@ def _photo_message(
             return_value=SimpleNamespace(file_path="photos/x.jpg", file_size=3)
         ),
         download_file=AsyncMock(side_effect=_write_image),
+        # D2：管理员命中时的证据私聊（最高管理员 settings.super_admin_id=1）。
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001)),
+        send_photo=AsyncMock(return_value=SimpleNamespace(message_id=9002)),
     )
 
     async def delete():
@@ -570,10 +574,42 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.conversation, ["delete", "warn"])
         moderation.record_violation.assert_awaited_once()
 
-    async def test_owner_and_tg_admin_keep_the_existing_exemption(self) -> None:
+    async def test_owner_keeps_full_exemption(self) -> None:
+        """最高管理员（super admin）完全豁免：NSFW 图也不删不警告不记录不私聊。"""
+
         owner = _photo_message(user_id=1, username="owner")
         owner, _llm, moderation, _session_mock, challenge = await _run_group_message(
-            vision_text=NSFW_YES_TEXT, message=owner
+            vision_text=NSFW_YES_TEXT, message=owner, tg_admin=True
+        )
+
+        self.assertEqual(owner.conversation, [])
+        moderation.record_violation.assert_not_awaited()
+        challenge.assert_not_awaited()
+        owner.bot.send_message.assert_not_awaited()
+
+    async def test_tg_admin_is_deleted_and_warned_without_challenge(self) -> None:
+        """D 节：除最高管理员外的群管理员/群主「删图 + @警告」，但不质询不禁言。"""
+
+        admin = _photo_message(user_id=OTHER_USER_ID, username="admin")
+        admin, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT, message=admin, tg_admin=True
+        )
+
+        self.assertEqual(admin.conversation, ["delete", "warn"])
+        moderation.record_violation.assert_awaited_once()
+        challenge.assert_not_awaited()
+        # D2：管理员 NSFW 也会私聊最高管理员一份证据。
+        admin.bot.send_message.assert_awaited_once()
+
+    async def test_owner_and_tg_admin_keep_exemption_when_admin_moderation_disabled(
+        self,
+    ) -> None:
+        """关掉 admin_moderation_enabled 即回到今天的「管理员整段跳过」。"""
+
+        settings = _settings(admin_moderation_enabled=False)
+        owner = _photo_message(user_id=1, username="owner")
+        owner, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT, message=owner, settings=settings
         )
         self.assertEqual(owner.conversation, [])
         moderation.record_violation.assert_not_awaited()
@@ -581,7 +617,7 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
 
         admin = _photo_message(user_id=OTHER_USER_ID, username="admin")
         admin, _llm, moderation, _session_mock, challenge = await _run_group_message(
-            vision_text=NSFW_YES_TEXT, message=admin, tg_admin=True
+            vision_text=NSFW_YES_TEXT, message=admin, tg_admin=True, settings=settings
         )
         self.assertEqual(admin.conversation, [])
         moderation.record_violation.assert_not_awaited()

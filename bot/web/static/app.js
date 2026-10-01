@@ -976,6 +976,10 @@
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
             ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
+            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
+            ${field("moderation.quoted_author_max_age_seconds", "引用追溯上限（秒）", { type: "number", min: 0, max: 31536000, step: 1, required: true, hint: "被引用消息超过该时长不再追溯原作者（只记日志），默认 604800 秒 = 7 天" })}
+            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
+            ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据（对象/时间/规则/置信度/理由/送审原文/已执行动作，带图附图片，best-effort 不刷屏）；普通成员违规不发")}
           </div>
         </section>
         <section class="settings-section">
@@ -2062,6 +2066,13 @@
       </form>`;
   }
 
+  const RULE_SCAN_SCOPES = ["message", "message+quote", "message+vision", "message+quote+vision"];
+
+  function ruleScanScope(rule) {
+    const value = String(rule?.scan_scope || "message");
+    return RULE_SCAN_SCOPES.includes(value) ? value : "message";
+  }
+
   function renderRuleRow(group, rule) {
     if (resourcePendingDelete(group.id, "rules", rule.id)) {
       return pendingDeletionRow(group, "rules", rule, `群规：${rule.pattern}`);
@@ -2076,6 +2087,12 @@
           <option value="llm"${rule.rule_type === "llm" ? " selected" : ""}>语义</option>
         </select>
         <textarea name="pattern" maxlength="1000" rows="2" aria-label="群规内容" required>${escapeHtml(rule.pattern)}</textarea>
+        <select name="scan_scope" aria-label="扫描范围" title="正则/关键词规则扫描哪些内容；语义规则始终看完整文本">
+          <option value="message"${ruleScanScope(rule) === "message" ? " selected" : ""}>仅本人正文</option>
+          <option value="message+quote"${ruleScanScope(rule) === "message+quote" ? " selected" : ""}>正文+引用</option>
+          <option value="message+vision"${ruleScanScope(rule) === "message+vision" ? " selected" : ""}>正文+图片描述</option>
+          <option value="message+quote+vision"${ruleScanScope(rule) === "message+quote+vision" ? " selected" : ""}>正文+引用+图片描述</option>
+        </select>
         <select name="action" aria-label="命中动作">
           <option value="warn"${rule.action === "warn" ? " selected" : ""}>警告</option>
           <option value="delete"${rule.action === "delete" ? " selected" : ""}>删消息</option>
@@ -2184,6 +2201,12 @@
           <div class="resource-create-head"><strong>新建群规</strong><span>填写后加入草稿列表</span></div>
           <select name="rule_type" aria-label="群规类型"><option value="keyword">关键词</option><option value="regex">正则</option><option value="llm">语义</option></select>
           <textarea name="pattern" maxlength="1000" rows="2" placeholder="规则内容" aria-label="群规内容" required></textarea>
+          <select name="scan_scope" aria-label="扫描范围" title="正则/关键词规则扫描哪些内容；语义规则始终看完整文本">
+            <option value="message">仅本人正文</option>
+            <option value="message+quote">正文+引用</option>
+            <option value="message+vision">正文+图片描述</option>
+            <option value="message+quote+vision">正文+引用+图片描述</option>
+          </select>
           <select name="action" aria-label="命中动作"><option value="warn">警告</option><option value="delete">删消息</option><option value="ban">封禁</option></select>
           <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
         </form>
@@ -3197,6 +3220,7 @@
         rule_type: String(snapshotField(snapshot, "rule_type", "keyword")),
         pattern: String(snapshotField(snapshot, "pattern")).trim(),
         action: String(snapshotField(snapshot, "action", "warn")),
+        scan_scope: ruleScanScope({ scan_scope: snapshotField(snapshot, "scan_scope", "message") }),
       };
       if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
       if (!values.pattern) throw new Error("群规内容不能为空");
@@ -4159,6 +4183,7 @@
       return {
         rule_type: form.elements.rule_type.value,
         pattern: form.elements.pattern.value,
+        scan_scope: ruleScanScope({ scan_scope: form.elements.scan_scope?.value }),
         action: form.elements.action.value,
         ...(includeEnabled ? { enabled: form.elements.enabled?.checked !== false } : {}),
       };
@@ -4197,6 +4222,7 @@
       rule_type: values.rule_type || "keyword",
       pattern: values.pattern,
       action: values.action || "warn",
+      scan_scope: ruleScanScope({ scan_scope: values.scan_scope }),
       enabled: values.enabled !== false,
     };
     return { id, content: values.content || "" };
