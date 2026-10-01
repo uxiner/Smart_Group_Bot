@@ -1085,6 +1085,7 @@
             ${toggle("av.enabled", "启用 AV 检索", "群级开关可进一步限制")}
             ${field("av.http_timeout_sec", "请求超时（秒）", { type: "number", min: 1, max: 300, step: 0.1, required: true })}
             ${field("av.max_results", "最大结果数", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${field("av.dm_sample_count", "私聊样例图张数（0=关闭）", { type: "number", min: 0, max: 5, step: 1, required: true })}
             ${field("av.javbus_base_url", "JavBus 地址", { type: "url", maxlength: 1000 })}
             ${field("av.madouqu_base_url", "Madouqu 地址", { type: "url", maxlength: 1000 })}
             ${field("av.dmm_base_url", "DMM 地址", { type: "url", maxlength: 1000 })}

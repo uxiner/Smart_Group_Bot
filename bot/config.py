@@ -310,6 +310,8 @@ class Settings(BaseSettings):
     av_enabled: bool = True
     av_http_timeout_sec: float = 15.0
     av_max_results: int = 18
+    #: 私聊里封面之后补发的样例图张数（默认 4、硬上限 5、0=关闭）。
+    av_dm_sample_count: int = 4
     av_javbus_base_url: str = "https://www.javbus.com"
     av_madouqu_base_url: str = "https://madouqu.com"
     av_dmm_base_url: str = "https://www.dmm.co.jp"
