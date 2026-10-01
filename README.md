@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/aiogram-3.x-0066CC.svg" alt="aiogram">
-  <img src="https://img.shields.io/badge/tests-2282%20passed-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-__TESTS__%20passed-brightgreen.svg" alt="Tests">
 </p>
 
 > **本仓库是 [Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot) 的个人部署分支**，
@@ -90,6 +90,10 @@
 | 申诉与复核 | 被处置者可在卡片上申诉，管理员一键复核 |
 | 质量报表 | `/modstats`：命中构成、边缘判定、**误伤率**；`/health`：今日命中、待完成质询、归档量、当前模型通道 |
 | 名单管理 | `/exemptlist`（豁免 / 回复静默名单，可翻页、一键移除）、`/unaiexempt`（取消某用户的 AI 审核豁免） |
+| 规则扫描范围 | 每条正则/关键词规则可选 `message`（默认，只扫成员自己写的正文）/ `message+quote`（并入被引用正文）/ `message+vision`（并入机器人图片描述）/ 三者组合；机器人生成的图片描述默认**不参与**正则，避免"描述购物界面 → 秒杀/优惠券命中 → 误删"（Mini App 可改） |
+| 引用广告连坐 | 引用/转发内容命中 ban 规则且高置信度时，**被引用消息的原作者**一并处置（删其消息 + 记违规 + 质询）；真实用户限定、管理员/群主/豁免跳过、同一条消息只处置一次、超过 7 天不追溯、警示式引用双方都不处理；`moderation.punish_quoted_author_enabled` 默认开启 |
+| 管理员也受审核 | 除**最高管理员**（完全豁免）外的管理员/群主不再整段跳过：照常判定，命中后只**删消息 + 群内 @警示 + 记违规(delete)**，不质询/不封禁/不禁言/不累计警告；NSFW 图同样删图 + @警告但不质询；手动豁免名单仍完全跳过；`moderation.admin_moderation_enabled` 默认开启 |
+| 管理员违规证据私聊 | 除最高管理员外的管理员命中违规时，私聊最高管理员完整证据（对象/身份/时间/规则/置信度/理由/送审原文/已执行/消息回链，带图附图片）；best-effort 不影响群内处置，同一人 10 分钟内 ≥5 次后合并成一条汇总；`moderation.admin_alert_super_admin_enabled` 默认开启；普通成员违规不发，最高管理员本人完全豁免（不受审核、不产生报告） |
 
 ### 5️⃣ 运营看板与周报（全新）
 
@@ -109,7 +113,6 @@
 - **私聊 `/av` 下载地址直出 + 制作信息分块**：详情正文（标题 + 简介之后）内联前 N 条磁力链（默认 3、硬上限 5、`av.inline_seed_count=0` 关闭），每条两行「大小 · 日期 · 标题」+ `<code>磁力</code>`；整条放不下时按 N→N-1→…→1 减条数，**磁力链本身不截断**。片商 / 发行商 / 导演 / 系列 / 演员 / 时长 / 类型单独成「制作信息」块，与「基本信息」分开。**群内文案一个字都没改**（仍是「种子 N 条」+ 按钮），由逐字回归测试守住。
 - **（可选，默认关）AI 题材概述**：`av.ai_synopsis_enabled=true` 时用**已抓到的字段**（标题 / 类型 / 系列 / 演员 / 时长）生成 1~3 句题材与看点概述，正文明确标注「AI 概述，非官方剧情」；新 stage `synopsis` 便于用量拆分，失败 / 超时只跳过这一块。**不做 ed2k、不做价格、不抓官方剧情**（实测拿不到，详见 `bot/services/av_search.py` 模块注释）。
 - **群内 NSFW 图片处置加固**：违规记账失败不再挡住删图，图一定先离开群。
-- **测试规模**：上游 100 个测试文件 → 本分支 **122 个文件、2316 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
 - **路由完整性回归测试**：`tests/test_router_route_integrity.py`——防止「helper 函数插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 

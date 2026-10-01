@@ -110,6 +110,7 @@ from bot.services.message_templates import (
     render_expandable_blockquote,
     render_progress_notice,
 )
+from bot.services.moderation import normalize_scan_scope
 from bot.services.skills import SkillService
 from bot.utils.telegram import (
     answer_with_auto_delete,
@@ -632,9 +633,12 @@ def _build_rule_list_page(
     for idx, rule in enumerate(rules[start:end], start=start + 1):
         status = "启用" if rule.enabled else "关闭"
         pattern_preview = html.escape(_truncate_text(rule.pattern or "", 120))
+        # 非默认扫描范围才显示，避免默认规则的行文变化（Mini App 里可改）。
+        scope = normalize_scan_scope(getattr(rule, "scan_scope", None))
+        scope_label = "" if scope == "message" else f" · 范围 {scope}"
         lines.extend(
             [
-                f"<b>{idx}.</b> <code>#{rule.id}</code>　{_rule_type_label(rule.rule_type)} · {_action_label(rule.action)} · {status}",
+                f"<b>{idx}.</b> <code>#{rule.id}</code>　{_rule_type_label(rule.rule_type)} · {_action_label(rule.action)} · {status}{scope_label}",
                 pattern_preview,
                 "",
             ]
@@ -3936,7 +3940,10 @@ async def cmd_modstats(
             days = 7
     try:
         text = await render_group_quality(
-            session, group_id=int(message.chat.id), days=days
+            session,
+            group_id=int(message.chat.id),
+            days=days,
+            high_threshold=settings.moderation.high_confidence_threshold,
         )
     except Exception:
         log.warning(

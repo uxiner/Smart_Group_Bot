@@ -98,6 +98,16 @@ class ModerationRule(Base):
     pattern: Mapped[str] = mapped_column(Text, default="")
     action: Mapped[str] = mapped_column(String(32), default="warn")  # warn, delete, ban
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 正则/关键词规则的扫描范围（组合值，'+' 连接）：
+    #   ``message``            —— 只扫用户自己写的正文（默认）
+    #   ``message+quote``      —— 再并入被引用/转发消息的正文
+    #   ``message+vision``     —— 再并入机器人自己生成的图片描述（[image-vision]）
+    #   ``message+quote+vision`` —— 三者都扫
+    # 老数据/老规则一律按 ``message`` 处理（默认值即旧行为）。语义（llm）规则
+    # 始终看到完整文本，不受该字段影响。
+    scan_scope: Mapped[str] = mapped_column(
+        String(32), default="message", server_default="message"
+    )
 
     group: Mapped[Group] = relationship(back_populates="moderation_rules")
 
@@ -411,8 +421,14 @@ class Violation(Base):
     # stable idempotency key for every moderation side effect derived from one
     # source message.  NULL keeps legacy/manual rows unrestricted.
     source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # Count captured by the atomic warning transaction for this event.  It lets
-    # retries render the original warning state without incrementing again.
+    # 观测列：这一行对应的"累计命中次数"（含本次）。有两种来源，都取自现有
+    # 现成计数，不另造数字：
+    # - ban 计数路径（_apply_counted_moderation_ban）：add_warning 返回的
+    #   UserWarning.count（本群+本用户，就是 warn_threshold 比较的那个计数器）。
+    #   幂等重放靠"该列非 NULL"判断这条是否已经计过数，所以这条链路不能改口径。
+    # - 其它路径（challenge/warn/delete/NSFW 守卫）：该用户在本群+本规则下的
+    #   violations 行数，用来观察同一规则上的复犯。
+    # 历史行是 NULL（这一列是后加的）。
     warning_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 判定细节：置信度与模型给的理由。误伤率报表要能回答"这次命中到底有多确定"，
     # 靠日志不够（日志会滚），必须落库。历史行是 NULL（这一列是后加的）。

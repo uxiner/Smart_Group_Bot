@@ -9,7 +9,7 @@ import logging
 import re
 import time
 import weakref
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import Context
@@ -141,7 +141,11 @@ from bot.services.update_completion import (
     request_current_update_retry,
 )
 from bot.utils.security import format_history_message_line
-from bot.utils.timezone import now_shanghai_naive
+from bot.utils.timezone import (
+    format_shanghai_timestamp,
+    now_shanghai_naive,
+    to_shanghai_naive,
+)
 from bot.utils.telegram import (
     answer_with_auto_delete,
     confirm_telegram_delivery,
@@ -3764,6 +3768,7 @@ async def _apply_nsfw_image_guard(
     sender_is_chat: bool,
     sender_is_owner: bool,
     sender_is_tg_admin: bool,
+    sender_username: str = "",
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
     """命中 ``NSFW_YES`` 后的重处置：① 删图 ② 群内 @警告 ③ 质询。
@@ -3780,6 +3785,10 @@ async def _apply_nsfw_image_guard(
     唯一的例外是「确认重复投递」：同一条消息（含 Telegram 重投）已经有违规记录
     时，一条 Telegram 动作都不做——这个判定在任何动作之前完成，因此顺序调整不会
     造成删两次 / 警告两次 / 质询两次。
+
+    除最高管理员之外的管理员/群主不再整段豁免
+    （``moderation.admin_moderation_enabled``）：同样删图 + 群内 @警告 +
+    记违规，但**不质询也不禁言**；最高管理员照旧完全跳过。
 
     返回 True 表示这条消息已经由本功能处置，调用方应结束后续流程（不再走文本
     审核 / 回复流水线）；返回 False 表示没有处置，调用方照常继续。
@@ -3802,8 +3811,16 @@ async def _apply_nsfw_image_guard(
             "[%s]【NSFW图片】跳过 | reason=sender_chat user=%s", group_id, user_id
         )
         return False
-    # 管理员/群主沿用现有审核的自动豁免，不新增豁免也不绕过。
-    if sender_is_owner or sender_is_tg_admin:
+    # 最高管理员完全豁免（保留原样）；除他之外的管理员/群主不再整段豁免：
+    # 同样删图 + @警告，但不质询不禁言（D⑥）。
+    # 关掉 admin_moderation_enabled 即回到今天的"跳过"。
+    if sender_is_owner:
+        log.info(
+            "[%s]【NSFW图片】跳过 | reason=owner_exempt user=%s", group_id, user_id
+        )
+        return False
+    admin_restricted = bool(sender_is_tg_admin) and _admin_moderation_enabled(settings)
+    if sender_is_tg_admin and not admin_restricted:
         log.info(
             "[%s]【NSFW图片】跳过 | reason=admin_exempt user=%s", group_id, user_id
         )
@@ -3907,37 +3924,39 @@ async def _apply_nsfw_image_guard(
 
             # ③ 发起质询：复用现有质询卡与超时处置；不给「花积分免除」入口。
             #    不依赖违规记录：记账失败（violation 为空）时照常发起，只是跳过
-            #    notice_sent_at 的写回。
+            #    notice_sent_at 的写回。管理员/群主跳过这一步（不质询不禁言），
+            #    群内证据改走私聊报告。
             challenged = False
-            try:
-                challenged = await begin_moderation_challenge(
-                    bot=message.bot,
-                    session=session,
-                    settings=settings,
-                    group_id=group_id,
-                    user_id=user_id,
-                    display_name=display_name,
-                    bot_username=bot_username,
-                    reason=_NSFW_IMAGE_CHALLENGE_REASON,
-                    rule_action="ban",
-                    session_factory=session_factory,
-                    allow_points_skip=False,
-                )
-                if challenged and violation is not None:
-                    try:
-                        violation.notice_sent_at = now_shanghai_naive()
-                        await session.commit()
-                    except Exception:
-                        # 质询已经发起了，写回失败不能反过来算质询失败。
-                        log.exception(
-                            "[%s]【NSFW图片】质询通知时间写回失败（质询已发起）| user=%s",
-                            group_id,
-                            user_id,
-                        )
-            except Exception:
-                log.exception(
-                    "[%s]【NSFW图片】质询失败 | user=%s", group_id, user_id
-                )
+            if not admin_restricted:
+                try:
+                    challenged = await begin_moderation_challenge(
+                        bot=message.bot,
+                        session=session,
+                        settings=settings,
+                        group_id=group_id,
+                        user_id=user_id,
+                        display_name=display_name,
+                        bot_username=bot_username,
+                        reason=_NSFW_IMAGE_CHALLENGE_REASON,
+                        rule_action="ban",
+                        session_factory=session_factory,
+                        allow_points_skip=False,
+                    )
+                    if challenged and violation is not None:
+                        try:
+                            violation.notice_sent_at = now_shanghai_naive()
+                            await session.commit()
+                        except Exception:
+                            # 质询已经发起了，写回失败不能反过来算质询失败。
+                            log.exception(
+                                "[%s]【NSFW图片】质询通知时间写回失败（质询已发起）| user=%s",
+                                group_id,
+                                user_id,
+                            )
+                except Exception:
+                    log.exception(
+                        "[%s]【NSFW图片】质询失败 | user=%s", group_id, user_id
+                    )
 
             log.info(
                 "[%s]【NSFW图片】处置完成 | user=%s | 已记录=%s | 已删图=%s | 已警告=%s | 已质询=%s",
@@ -3952,6 +3971,41 @@ async def _apply_nsfw_image_guard(
         # 处置动作绝不阻塞群消息主流程；已经占住幂等键就按已处置返回。
         log.exception("[%s]【NSFW图片】处置异常 | user=%s", group_id, user_id)
         return claimed
+
+    if admin_restricted:
+        # D2：管理员 NSFW 同样私聊最高管理员一份证据（best-effort，失败只记日志）。
+        await _send_admin_violation_alert(
+            message=message,
+            settings=settings,
+            evidence=_AdminViolationEvidence(
+                group_id=group_id,
+                group_title=str(
+                    getattr(getattr(message, "chat", None), "title", "") or ""
+                ),
+                user_id=user_id,
+                display_name=display_name,
+                username=sender_username,
+                identity_label=_admin_identity_label(
+                    is_owner=sender_is_owner,
+                    is_tg_admin=sender_is_tg_admin,
+                ),
+                occurred_at=getattr(message, "date", None),
+                rule=None,
+                action="nsfw_image",
+                confidence=None,
+                reason=_NSFW_IMAGE_WARNING_REASON,
+                submitted_text=f"[nsfw-image] {_NSFW_MARKER_YES}\n{input_text}",
+                executed=(
+                    "已删图" if deleted else "删图失败",
+                    "已群内警示" if warned else "警示未发送",
+                    "已跳过质询",
+                    "未封禁/未禁言/未累计",
+                ),
+                message_link=_message_evidence_link(
+                    getattr(message, "chat", None), _source_message_id(message)
+                ),
+            ),
+        )
     return True
 
 
@@ -6234,8 +6288,16 @@ async def flush_pending_inbound_batches() -> None:
 
 
 def _verdict_confidence(verdict: object) -> float | None:
-    """置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。"""
+    """落库用的置信度（verdict 可能是 None——重放/恢复路径里允许没有判定）。
 
+    ``verdict.confidence`` 同时服务两个目的：阈值判定（``is_high_confidence``）
+    和落库观测。本地关键词/正则规则命中时它被写成 1.0——那是"字符串匹配成功"
+    的占位值，不是模型置信度。落库必须是 NULL，否则质量报表会把规则命中统计成
+    "模型非常确定"，把置信度分布整体拉高。
+    """
+
+    if getattr(verdict, "deterministic", False):
+        return None
     value = getattr(verdict, "confidence", None)
     try:
         return None if value is None else float(value)
@@ -6260,6 +6322,773 @@ def _moderation_reply_text(message: Message) -> str | None:
         if value:
             return str(value)
     return None
+
+
+# ---------------------------------------------------------------------------
+# 引用/转发广告：被引用的当事人一并处罚
+#
+# 广告主把广告正文放在被引用的那条消息里，转发者自己的正文只有 "v"/"+1"，
+# 于是只有转发者被处理。命中 ban 规则且高置信度时，这里连同被引用消息的
+# 原作者一起处置——沿用既有链路（record_violation + begin_moderation_challenge
+# = 删消息 + 记违规 + 质询），不新造一套。
+# 保护：只在原作者是本群真实用户（非频道/机器人/自己）时；管理员/群主/豁免
+# 名单照旧跳过；同一条被引用消息只处置一次（violations 的
+# (group_id, source_message_id) 唯一键即幂等键）；超过追溯时长只记日志；
+# 转发者在反对/警示（骗子/别信/假的/举报/风险）则双方都不处置。
+# ---------------------------------------------------------------------------
+
+# 警示式引用：转发者自己的正文出现这些词，说明他是在提醒群友而不是传播广告。
+_QUOTE_WARNING_MARKERS = (
+    "骗子",
+    "别信",
+    "不要信",
+    "假的",
+    "假货",
+    "举报",
+    "风险",
+    "警惕",
+    "谨防",
+    "提醒",
+    "曝光",
+    "避雷",
+    "上当",
+    "诈骗",
+)
+
+
+def _punish_quoted_author_enabled(settings: Settings) -> bool:
+    """运行时可开关：``moderation.punish_quoted_author_enabled``（默认开启）。"""
+
+    moderation = getattr(settings, "moderation", None)
+    return bool(getattr(moderation, "punish_quoted_author_enabled", True))
+
+
+def _quoted_author_max_age_seconds(settings: Settings) -> int:
+    """被引用消息的追溯上限（秒），默认 7 天。"""
+
+    moderation = getattr(settings, "moderation", None)
+    try:
+        value = int(
+            getattr(moderation, "quoted_author_max_age_seconds", 7 * 24 * 60 * 60)
+        )
+    except (TypeError, ValueError):
+        value = 7 * 24 * 60 * 60
+    return max(0, value)
+
+
+def _text_looks_like_quote_warning(text: object) -> bool:
+    payload = str(text or "")
+    if not payload:
+        return False
+    return any(marker in payload for marker in _QUOTE_WARNING_MARKERS)
+
+
+def _quote_violation_is_warning(verdict: object, own_text: object) -> bool:
+    """转发者在反对/警示？只用现成数据判断，不额外调用模型。
+
+    主要依据转发者自己的正文（task 明确列出的词），其次看 verdict 的 reason
+    ——模型有时会把"这是群友在提醒/举报"写进理由里。
+    """
+
+    return _text_looks_like_quote_warning(own_text) or _text_looks_like_quote_warning(
+        getattr(verdict, "reason", "")
+    )
+
+
+def _is_warning_style_quote_hit(
+    *,
+    message: Message,
+    verdict: ModerationVerdict,
+    rule: ModerationRule | None,
+    settings: Settings,
+    bot_id: int,
+    forwarder_id: int,
+    own_text: object,
+    high_confidence: bool,
+) -> bool:
+    """这条 ban 命中是不是"转发者在警示"？
+
+    是的话转发者与原作者都不处罚——消息照常进入后续流程（不因为引用里的广告
+    去动任何一方）。判定只用现成数据，不额外调用模型。
+    """
+
+    if not high_confidence or not _punish_quoted_author_enabled(settings):
+        return False
+    if str(getattr(rule, "action", "") or "").strip().lower() != "ban":
+        return False
+    if str(getattr(verdict, "match_source", "") or "") == "own":
+        return False
+    if not _quote_violation_is_warning(verdict, own_text):
+        return False
+    return (
+        _resolve_quoted_author_target(
+            message,
+            bot_id=bot_id,
+            forwarder_id=forwarder_id,
+        )
+        is not None
+    )
+
+
+def _quoted_author_age_seconds(sent_at: object) -> float | None:
+    """被引用消息距今多少秒；拿不到时间返回 None（调用方按"时间未知、放行"处理）。"""
+
+    if not isinstance(sent_at, datetime):
+        return None
+    try:
+        return (now_shanghai_naive() - to_shanghai_naive(sent_at)).total_seconds()
+    except (TypeError, ValueError, OverflowError):  # pragma: no cover - 防御
+        return None
+
+
+@dataclass(slots=True)
+class _QuotedAuthorTarget:
+    user_id: int
+    display_name: str
+    message_id: int
+    sent_at: datetime | None
+
+
+@dataclass(slots=True)
+class _AdminLookupUser:
+    id: int
+
+
+@dataclass(slots=True)
+class _AdminLookupMessage:
+    """供 ``is_user_admin_cached`` 查询"被引用作者是不是管理员"的最小替身。"""
+
+    chat: Any
+    from_user: Any
+
+
+def _resolve_quoted_author_target(
+    message: Message,
+    *,
+    bot_id: int,
+    forwarder_id: int,
+) -> _QuotedAuthorTarget | None:
+    """被引用消息的原作者，前提是「本群真实用户」。
+
+    频道身份（sender_chat）、其他 bot、机器人自己、转发者本人（自引用）、
+    以及转述自别处（forward_origin）的消息都不算。
+    """
+
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        return None
+    if getattr(reply, "sender_chat", None) is not None:
+        return None
+    if (
+        getattr(reply, "forward_origin", None) is not None
+        or getattr(reply, "forward_from_chat", None) is not None
+        or getattr(reply, "forward_from", None) is not None
+    ):
+        return None
+    user = getattr(reply, "from_user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return None
+    user_id = int(getattr(user, "id", 0) or 0)
+    if user_id <= 0 or user_id == int(bot_id or 0) or user_id == int(forwarder_id or 0):
+        return None
+    message_id = _source_message_id(reply)
+    if message_id is None:
+        return None
+    display_name = member_display_name(
+        user_id,
+        full_name=getattr(user, "full_name", ""),
+        username=getattr(user, "username", ""),
+    )
+    return _QuotedAuthorTarget(
+        user_id=user_id,
+        display_name=display_name,
+        message_id=message_id,
+        sent_at=getattr(reply, "date", None),
+    )
+
+
+async def _delete_quoted_message(message: Message, target: _QuotedAuthorTarget) -> bool:
+    """删除被引用的那条消息。Telegram 失败只记日志，不影响记违规/质询。"""
+
+    reply = getattr(message, "reply_to_message", None)
+    delete = getattr(reply, "delete", None)
+    if callable(delete):
+        try:
+            await delete()
+            return True
+        except Exception:
+            log.warning(
+                "quoted-author message delete failed | message_id=%s",
+                target.message_id,
+                exc_info=True,
+            )
+            return False
+    bot = getattr(message, "bot", None)
+    delete_message = getattr(bot, "delete_message", None)
+    if callable(delete_message):
+        try:
+            await delete_message(
+                chat_id=getattr(getattr(message, "chat", None), "id", 0),
+                message_id=target.message_id,
+            )
+            return True
+        except Exception:
+            log.warning(
+                "quoted-author message delete failed | message_id=%s",
+                target.message_id,
+                exc_info=True,
+            )
+    return False
+
+
+async def _punish_quoted_author(
+    *,
+    moderation: ModerationService,
+    session: AsyncSession,
+    message: Message,
+    settings: Settings,
+    group_id: int,
+    target: _QuotedAuthorTarget,
+    rule: ModerationRule | None,
+    verdict: ModerationVerdict,
+    quoted_text: str,
+    bot_username: str,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+) -> bool:
+    """对被引用消息的原作者执行既有处置；返回是否真的动了他。
+
+    幂等：`violations` 的 (group_id, source_message_id) 唯一键保证同一条被引用
+    消息只产生一个事件；重复引用时 `record_violation` 返回已存在的事件，这里直接
+    跳过，不再删消息/再发起质询。
+    """
+
+    if is_super_admin_user_id(target.user_id, settings):
+        log.info(
+            "[%s] quoted-author punishment skipped | reason=owner user=%s",
+            group_id,
+            target.user_id,
+        )
+        return False
+    proxy = _AdminLookupMessage(
+        chat=getattr(message, "chat", None),
+        from_user=_AdminLookupUser(id=target.user_id),
+    )
+    try:
+        if await _is_user_admin_cached(proxy):
+            log.info(
+                "[%s] quoted-author punishment skipped | reason=tg_admin user=%s",
+                group_id,
+                target.user_id,
+            )
+            return False
+    except Exception:  # pragma: no cover - 查询失败按非管理员处理
+        log.debug("quoted-author admin lookup failed", exc_info=True)
+
+    async with _moderation_user_lock(group_id, target.user_id):
+        if not await _claim_current_moderation_verdict(
+            session,
+            group_id=group_id,
+            user_id=target.user_id,
+            verdict=verdict,
+        ):
+            log.info(
+                "[%s] quoted-author punishment skipped | reason=not_claimable user=%s",
+                group_id,
+                target.user_id,
+            )
+            return False
+        violation = await moderation.record_violation(
+            session,
+            group_id,
+            target.user_id,
+            quoted_text,
+            "challenge",
+            rule,
+            source_message_id=target.message_id,
+            confidence=_verdict_confidence(verdict),
+            verdict_reason=_verdict_reason(verdict),
+        )
+        created = _violation_event_created(violation)
+        await session.flush()
+        await session.commit()
+        if not created:
+            log.info(
+                "[%s] quoted-author punishment skipped | reason=duplicate "
+                "quoted_message=%s user=%s",
+                group_id,
+                target.message_id,
+                target.user_id,
+            )
+            return False
+
+    deleted = await _delete_quoted_message(message, target)
+    if not moderation_challenge_ready(settings):
+        log.info(
+            "[%s] quoted-author punished without challenge | reason=challenge_unavailable "
+            "user=%s deleted=%s",
+            group_id,
+            target.user_id,
+            deleted,
+        )
+        return True
+    challenged = await begin_moderation_challenge(
+        bot=message.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=target.user_id,
+        display_name=target.display_name,
+        bot_username=bot_username,
+        reason=_verdict_reason(verdict) or "命中群规（引用转载）",
+        rule_action="ban",
+        session_factory=session_factory,
+    )
+    if challenged:
+        violation.notice_sent_at = now_shanghai_naive()
+    else:
+        violation.action_taken = "delete"
+    await session.commit()
+    log.info(
+        "[%s] quoted-author punished | user=%s quoted_message=%s deleted=%s challenged=%s",
+        group_id,
+        target.user_id,
+        target.message_id,
+        deleted,
+        challenged,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 除最高管理员之外的管理员/群主不再豁免日常审核（D）+ 证据私聊转发（D2）
+#
+# **最高管理员（is_super_admin_user_id，用户本人）完全豁免**：不判定、不删、
+# 不 @警示、不质询、不禁言、不写违规记录、不发私信——那条整段跳过的路径保持
+# 原样（见 on_group_message 里的 sender_is_owner 分支）。
+#
+# 其余管理员（sender_is_tg_admin and not sender_is_owner）照常判定；命中违规时
+# 只做「删消息 + 群内 @警示 + 记违规」，不质询、不封禁、不禁言、不扣分，也不会
+# 被累计次数升级成 ban。手动豁免名单（/aiexempt）仍然整段跳过；关闭
+# admin_moderation_enabled 即回到旧行为（整段跳过）。
+#
+# D2：命中后 best-effort 私聊最高管理员一份完整证据（含原文/规则/置信度/动作，
+# 带图附图片）；同一人 10 分钟内 ≥5 次后合并成一条汇总，避免刷屏。
+# 所有动作都不新增 LLM 调用。
+# ---------------------------------------------------------------------------
+
+_ADMIN_IDENTITY_OWNER = "最高管理员"
+_ADMIN_IDENTITY_TG_ADMIN = "TG 群管理员/群主"
+# 违反窗口：同一 (群, 用户) 在 10 分钟内的第 6 次起改为发汇总。
+_ADMIN_ALERT_WINDOW_SECONDS = 600.0
+_ADMIN_ALERT_AGGREGATE_AFTER = 5
+_ADMIN_ALERT_STATE_LIMIT = 512
+_ADMIN_ALERT_TEXT_LIMIT = 900
+
+
+@dataclass(slots=True)
+class _AdminAlertState:
+    events: deque = field(default_factory=deque)
+    summary_sent: bool = False
+
+
+_ADMIN_ALERT_STATE: dict[tuple[int, int], _AdminAlertState] = {}
+
+
+@dataclass(slots=True)
+class _AdminViolationEvidence:
+    group_id: int
+    group_title: str
+    user_id: int
+    display_name: str
+    username: str
+    identity_label: str
+    occurred_at: object
+    rule: ModerationRule | None
+    action: str
+    confidence: float | None
+    reason: str
+    submitted_text: str
+    executed: tuple[str, ...]
+    message_link: str
+
+
+def _admin_moderation_enabled(settings: Settings) -> bool:
+    """运行时可开关：``moderation.admin_moderation_enabled``（默认开启）。"""
+
+    moderation = getattr(settings, "moderation", None)
+    return bool(getattr(moderation, "admin_moderation_enabled", True))
+
+
+def _admin_alert_enabled(settings: Settings) -> bool:
+    """运行时可开关：``moderation.admin_alert_super_admin_enabled``（默认开启）。"""
+
+    moderation = getattr(settings, "moderation", None)
+    return bool(getattr(moderation, "admin_alert_super_admin_enabled", True))
+
+
+def _admin_identity_label(*, is_owner: bool, is_tg_admin: bool) -> str:
+    if is_owner and is_tg_admin:
+        return f"{_ADMIN_IDENTITY_OWNER} · {_ADMIN_IDENTITY_TG_ADMIN}"
+    if is_owner:
+        return _ADMIN_IDENTITY_OWNER
+    if is_tg_admin:
+        return _ADMIN_IDENTITY_TG_ADMIN
+    return ""
+
+
+def _message_evidence_link(chat: object, message_id: object) -> str:
+    """能给就给一条 t.me 消息回链，拿不到返回空串。"""
+
+    try:
+        mid = int(message_id or 0)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if mid <= 0 or chat_id == 0:
+        return ""
+    username = str(getattr(chat, "username", "") or "").strip().lstrip("@")
+    if username:
+        return f"https://t.me/{username}/{mid}"
+    # 超级群内部链接：-100XXXXXXXXXX → t.me/c/XXXXXXXXXX/<message_id>
+    raw = str(chat_id)
+    if raw.startswith("-100") and len(raw) > 4:
+        return f"https://t.me/c/{raw[4:]}/{mid}"
+    return ""
+
+
+def _admin_alert_attachment(message: Message) -> tuple[str, str] | None:
+    """证据附图：优先图片，其次图片类文件；没有就返回 None。"""
+
+    photos = getattr(message, "photo", None)
+    if photos:
+        try:
+            last = list(photos)[-1]
+        except (TypeError, IndexError):
+            last = None
+        file_id = str(getattr(last, "file_id", "") or "")
+        if file_id:
+            return ("photo", file_id)
+    document = getattr(message, "document", None)
+    if document is not None:
+        file_id = str(getattr(document, "file_id", "") or "")
+        mime = str(getattr(document, "mime_type", "") or "")
+        if file_id and mime.startswith("image/"):
+            return ("document", file_id)
+    return None
+
+
+def _truncate_alert_text(text: object, *, limit: int = _ADMIN_ALERT_TEXT_LIMIT) -> str:
+    clean = str(text or "").strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + f"…（已截断，原文共 {len(clean)} 字）"
+
+
+def _admin_alert_aggregation(
+    group_id: int, user_id: int, *, now: float | None = None
+) -> tuple[bool, int]:
+    """返回 (是否发汇总, 窗口内次数)；次数为 0 表示本次应静默。
+
+    同一个 (群, 用户) 在窗口内第 ``_ADMIN_ALERT_AGGREGATE_AFTER + 1`` 次触发
+    汇总，之后窗口内不再逐条发；窗口清空后自动恢复逐条提醒。
+    """
+
+    key = (int(group_id), int(user_id))
+    moment = time.monotonic() if now is None else float(now)
+    state = _ADMIN_ALERT_STATE.get(key)
+    if state is None:
+        if len(_ADMIN_ALERT_STATE) >= _ADMIN_ALERT_STATE_LIMIT:
+            _ADMIN_ALERT_STATE.clear()
+        state = _AdminAlertState()
+        _ADMIN_ALERT_STATE[key] = state
+    while state.events and moment - state.events[0] > _ADMIN_ALERT_WINDOW_SECONDS:
+        state.events.popleft()
+    if not state.events:
+        state.summary_sent = False
+    state.events.append(moment)
+    count = len(state.events)
+    if count > _ADMIN_ALERT_AGGREGATE_AFTER:
+        if state.summary_sent:
+            return False, 0
+        state.summary_sent = True
+        return True, count
+    return False, count
+
+
+def _admin_rule_reference(rule: ModerationRule | None) -> str:
+    if rule is None:
+        return "未定位具体规则（AI 语义判定）"
+    rule_type = {
+        "keyword": "关键词",
+        "regex": "正则",
+        "llm": "语义",
+    }.get(str(rule.rule_type or "").lower(), str(rule.rule_type or "未知"))
+    pattern = _truncate_text(rule.pattern or "", 60)
+    if pattern:
+        return f"#{rule.id}（{rule_type}） {pattern}"
+    return f"#{rule.id}（{rule_type}）"
+
+
+def _admin_evidence_object_line(evidence: _AdminViolationEvidence) -> str:
+    name = _truncate_text(evidence.display_name, 60) or "unknown"
+    handle = f" @{evidence.username}" if evidence.username else ""
+    return f"{name}{handle}（id:{evidence.user_id}）"
+
+
+def _render_admin_violation_report(evidence: _AdminViolationEvidence) -> str:
+    confidence_text = (
+        "—" if evidence.confidence is None else f"{float(evidence.confidence):.2f}"
+    )
+    details = [
+        card_field("对象", html.escape(_admin_evidence_object_line(evidence))),
+        card_field("身份", html.escape(evidence.identity_label or "成员")),
+        card_field(
+            "群组",
+            html.escape(_truncate_text(evidence.group_title, 40) or "未知")
+            + f"（id:{evidence.group_id}）",
+        ),
+        card_field("时间", html.escape(format_shanghai_timestamp(evidence.occurred_at))),
+        card_field("命中规则", html.escape(_admin_rule_reference(evidence.rule))),
+        card_field("动作", html.escape(evidence.action)),
+        card_field("置信度", html.escape(confidence_text)),
+        card_field("判定理由", html.escape(evidence.reason or "—")),
+        card_field("已执行", html.escape(" · ".join(evidence.executed) or "—")),
+        card_field("送审原文", html.escape(_truncate_alert_text(evidence.submitted_text))),
+    ]
+    if evidence.message_link:
+        details.append(
+            card_field(
+                "消息回链",
+                f'<a href="{html.escape(evidence.message_link, quote=True)}">点此查看</a>',
+            )
+        )
+    return render_summary_notice(
+        "管理员违规 · 证据",
+        summary=[card_field("对象", html.escape(_admin_evidence_object_line(evidence)))],
+        details=details,
+    )
+
+
+def _render_admin_violation_summary(
+    evidence: _AdminViolationEvidence, *, count: int
+) -> str:
+    confidence_text = (
+        "—" if evidence.confidence is None else f"{float(evidence.confidence):.2f}"
+    )
+    details = [
+        card_field("对象", html.escape(_admin_evidence_object_line(evidence))),
+        card_field("身份", html.escape(evidence.identity_label or "成员")),
+        card_field("10 分钟内次数", f"<code>{int(count)}</code>"),
+        card_field("最近一次规则", html.escape(_admin_rule_reference(evidence.rule))),
+        card_field("最近一次动作", html.escape(evidence.action)),
+        card_field("最近一次置信度", html.escape(confidence_text)),
+        card_field("最近一次理由", html.escape(evidence.reason or "—")),
+        card_field("已执行", html.escape(" · ".join(evidence.executed) or "—")),
+    ]
+    return render_summary_notice(
+        "管理员违规 · 汇总",
+        summary=[
+            card_field(
+                "提示",
+                f"10 分钟内 ≥{_ADMIN_ALERT_AGGREGATE_AFTER + 1} 次，已合并为汇总；"
+                "窗口内的后续违规不再逐条私聊。",
+            )
+        ],
+        details=details,
+    )
+
+
+async def _send_admin_violation_alert(
+    *,
+    message: Message,
+    settings: Settings,
+    evidence: _AdminViolationEvidence,
+) -> bool:
+    """best-effort 私聊最高管理员；任何失败只记日志，绝不影响群内处置。"""
+
+    if not _admin_alert_enabled(settings):
+        return False
+    try:
+        super_admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
+    except (TypeError, ValueError):
+        super_admin_id = 0
+    if super_admin_id <= 0:
+        return False
+    bot = getattr(message, "bot", None)
+    send_message = getattr(bot, "send_message", None)
+    if not callable(send_message):
+        # 没有可用的 Bot（测试替身 / 异常状态）：只记日志，不影响群内处置。
+        log.info(
+            "admin violation alert skipped | reason=no_bot super_admin=%s",
+            super_admin_id,
+        )
+        return False
+
+    try:
+        send_summary, count = _admin_alert_aggregation(
+            evidence.group_id, evidence.user_id
+        )
+        if count == 0:
+            log.info(
+                "[%s] admin violation alert suppressed | reason=window_summary user=%s",
+                evidence.group_id,
+                evidence.user_id,
+            )
+            return False
+        if send_summary:
+            text = _render_admin_violation_summary(evidence, count=count)
+        else:
+            text = _render_admin_violation_report(evidence)
+        await send_message(
+            chat_id=super_admin_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        if not send_summary:
+            attachment = _admin_alert_attachment(message)
+            if attachment is not None:
+                kind, file_id = attachment
+                sender = getattr(
+                    bot, "send_photo" if kind == "photo" else "send_document", None
+                )
+                if callable(sender):
+                    payload = {"photo": file_id} if kind == "photo" else {"document": file_id}
+                    await sender(chat_id=super_admin_id, **payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "[%s] admin violation alert failed | super_admin=%s user=%s",
+            evidence.group_id,
+            super_admin_id,
+            evidence.user_id,
+        )
+        return False
+    return True
+
+
+async def _apply_admin_moderation(
+    *,
+    moderation: ModerationService,
+    session: AsyncSession,
+    message: Message,
+    settings: Settings,
+    group_id: int,
+    user_id: int,
+    display_name: str,
+    username: str,
+    identity_label: str,
+    warn_target: str,
+    input_text: str,
+    rule: ModerationRule | None,
+    verdict: ModerationVerdict,
+    reason: str,
+) -> None:
+    """「非最高管理员的管理员/群主」命中违规：删消息 + 群内 @警示 + 记违规。
+
+    action_taken=delete；不发起质询、不封禁/禁言、不累计警告次数（因此也不会被
+    升级成 ban）。最高管理员不会走到这里——他在 on_group_message 里整段跳过。
+    """
+
+    async with _moderation_user_lock(group_id, user_id):
+        if not await _claim_current_moderation_verdict(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            verdict=verdict,
+        ):
+            return
+        violation = await moderation.record_violation(
+            session,
+            group_id,
+            user_id,
+            input_text,
+            "delete",
+            rule,
+            source_message_id=_source_message_id(message),
+            confidence=_verdict_confidence(verdict),
+            verdict_reason=_verdict_reason(verdict),
+        )
+        event_created = _violation_event_created(violation)
+        await session.flush()
+        await session.commit()
+
+        deleted = False
+        try:
+            await message.delete()
+            deleted = True
+        except Exception:
+            log.warning(
+                "[%s] admin violation delete failed | user=%s", group_id, user_id
+            )
+
+        notice = _build_moderation_notice(
+            warn_target=warn_target,
+            reason=reason,
+            rule=rule,
+            hit_action="delete",
+        )
+        warned = False
+        try:
+            warned = await _send_moderation_notice_once_locked(
+                session=session,
+                violation=violation,
+                message=message,
+                notice=notice,
+                auto_delete_seconds=configured_auto_delete_seconds(
+                    settings, "moderation"
+                ),
+                reply_markup=None,
+            )
+        except Exception:
+            log.exception(
+                "[%s] admin violation notice failed | user=%s", group_id, user_id
+            )
+
+    executed: list[str] = []
+    executed.append("已删消息" if deleted else "删消息失败")
+    executed.append("已群内警示" if warned else "警示未发送")
+    executed.append("已跳过质询")
+    executed.append("未封禁/未禁言/未累计")
+    if not event_created:
+        # Telegram 重投同一条消息：事件已存在，群内处置已做过，别重复私聊刷屏。
+        log.info(
+            "[%s] admin violation alert skipped | reason=duplicate_event user=%s",
+            group_id,
+            user_id,
+        )
+        return
+    evidence = _AdminViolationEvidence(
+        group_id=group_id,
+        group_title=str(getattr(getattr(message, "chat", None), "title", "") or ""),
+        user_id=user_id,
+        display_name=display_name,
+        username=username,
+        identity_label=identity_label,
+        occurred_at=getattr(message, "date", None),
+        rule=rule,
+        action="delete",
+        confidence=_verdict_confidence(verdict),
+        reason=reason,
+        submitted_text=input_text,
+        executed=tuple(executed),
+        message_link=_message_evidence_link(
+            getattr(message, "chat", None), _source_message_id(message)
+        ),
+    )
+    await _send_admin_violation_alert(
+        message=message,
+        settings=settings,
+        evidence=evidence,
+    )
+    log.info(
+        "[%s]【结束】管理员审核拦截 | user=%s | 已删=%s | 已警示=%s | 已记录=是",
+        group_id,
+        user_id,
+        deleted,
+        warned,
+    )
 
 
 @router.message(
@@ -6570,6 +7399,7 @@ async def on_group_message(
             sender_is_chat=sender_identity.is_chat,
             sender_is_owner=sender_is_owner,
             sender_is_tg_admin=sender_is_tg_admin,
+            sender_username=sender_identity.username,
             session_factory=session_factory,
         ):
             return
@@ -6577,7 +7407,16 @@ async def on_group_message(
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
-        auto_exempt_moderation = sender_is_owner or sender_is_tg_admin
+        # 最高管理员（super admin，用户本人）**完全跳过**：不判定、不处置、
+        # 不记录、不私聊——保留现有 is_super_admin_user_id 那条路径原样不动。
+        # 除他之外的管理员/群主不再整段跳过：默认照常判定，命中后走
+        # "删 + @警示 + 记违规、不质询不封禁"的受限处置（见 _apply_admin_moderation）。
+        # 开关关闭或手动豁免名单命中时仍然是整段跳过。
+        restricted_admin = bool(sender_is_tg_admin and not sender_is_owner)
+        admin_moderation = restricted_admin and _admin_moderation_enabled(settings)
+        auto_exempt_moderation = bool(sender_is_owner) or (
+            restricted_admin and not admin_moderation
+        )
         if sender_is_owner:
             auto_exempt_reason = "owner_auto_exempt"
         elif sender_is_tg_admin:
@@ -6630,13 +7469,105 @@ async def on_group_message(
             )
             if not await _fresh_group_authorized_for_moderation(session, group_id):
                 return
-            if violated:
+            # 警示式引用（转发者在反对/提醒）时谁都不处罚：既不删/质询转发者，
+            # 也不追溯原作者，消息照常进入后面的正常回复流程。
+            warning_style_quote = violated and _is_warning_style_quote_hit(
+                message=message,
+                verdict=verdict,
+                rule=rule,
+                settings=settings,
+                bot_id=int(getattr(bot_me, "id", 0) or 0),
+                forwarder_id=user_id,
+                own_text=text,
+                high_confidence=mod.is_high_confidence(verdict),
+            )
+            if warning_style_quote:
+                log.info(
+                    "[%s]【流程】审核 | 警示式引用，转发者与原作者都不处理，照常回复 | "
+                    "user=%s | %s",
+                    group_id,
+                    user_id,
+                    (reason or "")[:60],
+                )
+            if violated and not warning_style_quote:
                 action = str(rule.action if rule else "warn").strip().lower()
                 if action not in {"warn", "delete", "ban"}:
                     action = "warn"
 
                 message_deleted = False
                 high_confidence = mod.is_high_confidence(verdict)
+                # 除最高管理员之外的管理员/群主：只做「删 + 群内 @警示 + 记违规」，
+                # 不质询/不封禁/不禁言/不累计（因此不会被升级成 ban）。放在引用连坐
+                # 之前，管理员命中时不额外追溯被引用的第三方——证据私聊给最高管理员。
+                if admin_moderation:
+                    if not verdict.conclusive:
+                        log.warning(
+                            "[%s] admin moderation inconclusive; no action | user=%s",
+                            group_id,
+                            user_id,
+                        )
+                        return
+                    await _apply_admin_moderation(
+                        moderation=mod,
+                        session=session,
+                        message=message,
+                        settings=settings,
+                        group_id=group_id,
+                        user_id=user_id,
+                        display_name=display_name,
+                        username=sender_username,
+                        identity_label=_admin_identity_label(
+                            is_owner=sender_is_owner,
+                            is_tg_admin=sender_is_tg_admin,
+                        ),
+                        warn_target=warn_target,
+                        input_text=input_text,
+                        rule=rule,
+                        verdict=verdict,
+                        reason=reason,
+                    )
+                    return
+                # 广告经「引用/转发」再传播：广告正文只在被引用那条消息里，
+                # 转发者自己的正文只有 "v"/"+1"。ban 规则 + 高置信度命中时，
+                # 除转发者外，被引用消息的原作者也一并处置（见 _punish_quoted_author）。
+                if (
+                    action == "ban"
+                    and high_confidence
+                    and _punish_quoted_author_enabled(settings)
+                ):
+                    quoted_target = _resolve_quoted_author_target(
+                        message,
+                        bot_id=int(getattr(bot_me, "id", 0) or 0),
+                        forwarder_id=user_id,
+                    )
+                    if quoted_target is not None and str(
+                        getattr(verdict, "match_source", "") or ""
+                    ) != "own":
+                        age = _quoted_author_age_seconds(quoted_target.sent_at)
+                        max_age = _quoted_author_max_age_seconds(settings)
+                        if age is not None and age > max_age:
+                            log.info(
+                                "[%s]【流程】审核 | 被引用消息超出追溯时长，不处理原作者 | "
+                                "quoted_user=%s age=%.0fs max=%ss",
+                                group_id,
+                                quoted_target.user_id,
+                                age,
+                                max_age,
+                            )
+                        else:
+                            await _punish_quoted_author(
+                                moderation=mod,
+                                session=session,
+                                message=message,
+                                settings=settings,
+                                group_id=group_id,
+                                target=quoted_target,
+                                rule=rule,
+                                verdict=verdict,
+                                quoted_text=_moderation_reply_text(message) or "",
+                                bot_username=getattr(bot_me, "username", "") or "",
+                                session_factory=session_factory,
+                            )
                 if action == "ban" and not high_confidence:
                     # A marginal verdict is close to a coin flip: the model
                     # returned violated=True with a confidence below the
