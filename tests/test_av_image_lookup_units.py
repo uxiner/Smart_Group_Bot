@@ -19,9 +19,12 @@ from types import SimpleNamespace
 
 from bot.services.av_image_lookup import (
     AV_PHOTO_PREFERRED_MAX_BYTES,
+    AV_PHOTO_RETRY_MAX_BYTES,
     AV_VISION_MAX_IMAGE_BYTES,
     AVPrivateRateLimiter,
+    av_image_size_kb,
     build_av_image_data_uri,
+    build_av_image_data_uri_for,
     extract_av_actor,
     extract_av_code,
     pick_av_photo_size,
@@ -60,7 +63,23 @@ class _FakeBot:
 
 
 class PickPhotoSizeTests(unittest.TestCase):
-    def test_prefers_largest_size_within_100kb(self) -> None:
+    def test_preferred_limit_defaults_to_150kb_not_100kb(self) -> None:
+        """新上限 150KB：140KB 那档必须赢过 90KB（旧的 100KB 规则会选 90KB）。"""
+
+        self.assertEqual(AV_PHOTO_PREFERRED_MAX_BYTES, 150 * KB)
+
+        photo = [
+            _photo("90kb", 90 * KB),
+            _photo("140kb", 140 * KB),
+            _photo("300kb", 300 * KB),
+        ]
+
+        picked = pick_av_photo_size(photo)
+
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.file_id, "140kb")
+
+    def test_prefers_largest_size_within_the_preferred_limit(self) -> None:
         photo = [
             _photo("tiny", 20 * KB),
             _photo("ok-big", 90 * KB),
@@ -73,6 +92,29 @@ class PickPhotoSizeTests(unittest.TestCase):
         self.assertIsNotNone(picked)
         self.assertEqual(picked.file_id, "ok-big")
 
+    def test_custom_limit_is_honoured(self) -> None:
+        """上限可传参：升级重试用 190KB 就能挑到「更大的一档」。"""
+
+        self.assertEqual(AV_PHOTO_RETRY_MAX_BYTES, 190 * KB)
+
+        photo = [
+            _photo("primary", 142 * KB),
+            _photo("retry", 188 * KB),
+            _photo("too-big", 300 * KB),
+        ]
+
+        self.assertEqual(
+            pick_av_photo_size(photo, preferred_max_bytes=AV_PHOTO_RETRY_MAX_BYTES).file_id,
+            "retry",
+        )
+        # 默认（150KB）仍然是首选那档。
+        self.assertEqual(pick_av_photo_size(photo).file_id, "primary")
+        # 收得更紧时同样生效。
+        self.assertEqual(
+            pick_av_photo_size(photo, preferred_max_bytes=100 * KB).file_id,
+            "primary",
+        )
+
     def test_falls_back_to_smallest_when_every_size_is_oversized(self) -> None:
         photo = [
             _photo("bigger", 400 * KB),
@@ -81,6 +123,17 @@ class PickPhotoSizeTests(unittest.TestCase):
         ]
 
         picked = pick_av_photo_size(photo)
+
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.file_id, "smallest-of-bad")
+
+    def test_oversized_fallback_also_applies_to_a_custom_limit(self) -> None:
+        photo = [
+            _photo("bigger", 400 * KB),
+            _photo("smallest-of-bad", 211 * KB),
+        ]
+
+        picked = pick_av_photo_size(photo, preferred_max_bytes=190 * KB)
 
         self.assertIsNotNone(picked)
         self.assertEqual(picked.file_id, "smallest-of-bad")
@@ -116,9 +169,25 @@ class PickPhotoSizeTests(unittest.TestCase):
 
         self.assertEqual(pick_av_photo_size(photo).file_id, "known")
 
+    def test_missing_file_size_is_not_treated_as_oversized_for_a_custom_limit(self) -> None:
+        photo = [
+            _photo("unknown", 0),
+            _photo("huge", 300 * KB),
+        ]
+
+        self.assertEqual(
+            pick_av_photo_size(photo, preferred_max_bytes=190 * KB).file_id, "unknown"
+        )
+
     def test_empty_photo_list_returns_none(self) -> None:
         self.assertIsNone(pick_av_photo_size([]))
         self.assertIsNone(pick_av_photo_size(None))
+
+    def test_size_kb_is_ceiling_rounded(self) -> None:
+        self.assertEqual(av_image_size_kb(0), 0)
+        self.assertEqual(av_image_size_kb(1), 1)
+        self.assertEqual(av_image_size_kb(142 * KB), 142)
+        self.assertEqual(av_image_size_kb(142 * KB + 1), 143)
 
 
 class SelectImageFileTests(unittest.TestCase):
@@ -131,6 +200,43 @@ class SelectImageFileTests(unittest.TestCase):
         info = select_av_image_file(message)
 
         self.assertEqual(info, ("b", "image/jpeg", 40 * KB))
+
+    def test_photo_message_custom_limit_picks_the_bigger_tier(self) -> None:
+        """同一张图：默认上限挑 142KB 档，升级上限挑 188KB 档（file_id 不同）。"""
+
+        message = SimpleNamespace(
+            photo=[
+                _photo("primary", 142 * KB),
+                _photo("retry", 188 * KB),
+                _photo("too-big", 300 * KB),
+            ],
+            document=None,
+        )
+
+        self.assertEqual(
+            select_av_image_file(message), ("primary", "image/jpeg", 142 * KB)
+        )
+        self.assertEqual(
+            select_av_image_file(
+                message, preferred_max_bytes=AV_PHOTO_RETRY_MAX_BYTES
+            ),
+            ("retry", "image/jpeg", 188 * KB),
+        )
+
+    def test_document_is_unaffected_by_the_limit(self) -> None:
+        """文档只有一档，上限对它没有意义（升级重试自然也不会换档）。"""
+
+        message = SimpleNamespace(
+            photo=None,
+            document=SimpleNamespace(
+                file_id="doc", mime_type="image/png", file_size=900 * KB
+            ),
+        )
+
+        self.assertEqual(
+            select_av_image_file(message, preferred_max_bytes=190 * KB),
+            ("doc", "image/png", 900 * KB),
+        )
 
     def test_document_with_image_mime_is_supported(self) -> None:
         message = SimpleNamespace(
@@ -188,6 +294,65 @@ class BuildDataUriTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(await build_av_image_data_uri(message), "")
+        self.assertEqual(bot.get_file_calls, [])
+
+    async def test_custom_limit_can_download_the_bigger_tier(self) -> None:
+        bot = _FakeBot(b"\xff\xd8retry-tier")
+        message = SimpleNamespace(
+            bot=bot,
+            photo=[_photo("primary", 142 * KB), _photo("retry", 188 * KB)],
+            document=None,
+        )
+
+        self.assertEqual(bot.download_calls, [])
+        await build_av_image_data_uri(message, preferred_max_bytes=190 * KB)
+
+        self.assertEqual(bot.get_file_calls, ["retry"])
+        self.assertEqual(bot.download_calls, ["photos/retry.jpg"])
+
+    async def test_build_for_an_explicit_file_id_uses_that_tier(self) -> None:
+        """重试要按**已知**的一档下载：``build_av_image_data_uri_for`` 不再自己挑图。"""
+
+        payload = b"\xff\xd8explicit-tier"
+        bot = _FakeBot(payload)
+        message = SimpleNamespace(
+            bot=bot,
+            photo=[_photo("primary", 142 * KB), _photo("retry", 188 * KB)],
+            document=None,
+        )
+
+        data_uri = await build_av_image_data_uri_for(
+            message, "retry", "image/png", declared_size=188 * KB
+        )
+
+        self.assertTrue(data_uri.startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(data_uri.split(",", 1)[1]), payload)
+        self.assertEqual(bot.get_file_calls, ["retry"])
+
+    async def test_build_for_rejects_oversize_declared_size_without_download(self) -> None:
+        bot = _FakeBot(b"x" * 10)
+        message = SimpleNamespace(
+            bot=bot,
+            photo=[_photo("huge", AV_VISION_MAX_IMAGE_BYTES + 1)],
+            document=None,
+        )
+
+        self.assertEqual(
+            await build_av_image_data_uri_for(
+                message,
+                "huge",
+                "image/jpeg",
+                declared_size=AV_VISION_MAX_IMAGE_BYTES + 1,
+            ),
+            "",
+        )
+        self.assertEqual(bot.get_file_calls, [])
+
+    async def test_build_for_empty_file_id_returns_empty(self) -> None:
+        bot = _FakeBot(b"x" * 10)
+        message = SimpleNamespace(bot=bot, photo=[_photo("a", KB)], document=None)
+
+        self.assertEqual(await build_av_image_data_uri_for(message, ""), "")
         self.assertEqual(bot.get_file_calls, [])
 
     async def test_remote_oversize_image_is_rejected(self) -> None:
