@@ -8,6 +8,7 @@ import time
 from datetime import timedelta
 
 from aiogram import F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
@@ -62,11 +63,25 @@ from bot.services.av_search import (
     AVSearchService,
     is_av_code_query,
 )
+from bot.services.av_image_lookup import (
+    AV_NO_IMAGE_MARKER,
+    AV_VISION_MAX_IMAGE_BYTES,
+    AV_VISION_PROMPT,
+    AV_VISION_TIMEOUT_SEC,
+    AVPrivateRateLimiter,
+    build_av_image_data_uri,
+    extract_av_actor,
+    extract_av_code,
+    rate_limit_minutes,
+    run_with_hard_deadline,
+    select_av_image_file,
+)
 from bot.services.join_verification import (
     maybe_send_private_verification,
     parse_private_verify_group_id,
 )
 from bot.services.llm import LLMService
+from bot.services.member_identity import member_display_name
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.message_templates import render_action_notice, render_data_brief
 from bot.services.point_shop import (
@@ -103,6 +118,119 @@ _AV_SEED_PAGE_SIZE = 1
 _LIST_PAGE_SIZE = 5
 _AV_SESSION_STORE = AVQuerySessionStore(ttl_seconds=15 * 60, max_sessions=256)
 _AV_GROUP_ENABLE_KEY = "av_enabled"
+
+# ---------------------------------------------------------------------------
+# 私聊 /av（识图反查 + 文字查询）限流
+#
+# 私聊以前只给最高管理员用，就是为了防止有人把机器人当作免费的外部搜索代理。
+# 现在放开给「任何跟机器人私聊过的用户」，代价是每人每小时最多
+# _AV_PRIVATE_HOURLY_LIMIT 次（识图 + 文字查询合计）。计数只在内存里，
+# 进程重启清零——单实例部署可以接受，也避免为了限流去写数据库。
+# 群里只有「/av + 图片」识图走这个桶（见 _handle_group_av_image）；群里的文字
+# /av 查询保持现状、不计数（群内仍按 groups.settings.av_enabled 与授权群判断）。
+# ---------------------------------------------------------------------------
+_AV_PRIVATE_HOURLY_LIMIT = 10
+_AV_PRIVATE_RATE_WINDOW_SECONDS = 3600.0
+_AV_PRIVATE_RATE_LIMITER = AVPrivateRateLimiter(
+    limit=_AV_PRIVATE_HOURLY_LIMIT,
+    window_seconds=_AV_PRIVATE_RATE_WINDOW_SECONDS,
+)
+
+_AV_RATE_LIMITED_TEMPLATE = "太频繁了，请 {minutes} 分钟后再试。"
+_AV_VISION_NO_CODE_TEXT = "没读出编号，请直接把番号发给我。"
+_AV_VISION_NO_CONTENT_TEXT = "这张图没认出作品信息，请直接把番号发给我。"
+_AV_VISION_FAILED_TEXT = "图片识别失败，请直接把番号发给我。"
+_AV_IMAGE_TOO_LARGE_TEXT = "这张图太大了，请发小一点的图，或直接把番号发给我。"
+
+#: 群里删图（识图前）的超时：删除是尽力而为，不能因为 Telegram 卡住就不识图了。
+_AV_GROUP_DELETE_TIMEOUT_SEC = 5.0
+
+#: ``/av`` / ``/av@SomeBot``；群里图片配文用它判断「这条图是被 /av 请求的」。
+_AV_COMMAND_PREFIX_RE = re.compile(r"^\s*/av(?:@[\w_]+)?(?:\s|$)", re.IGNORECASE)
+#: 裸命令（没有参数）：只有裸 ``/av`` 回复图片才当识图请求，``/av SONE-342`` 不当。
+_AV_BARE_COMMAND_RE = re.compile(r"^\s*/av(?:@[\w_]+)?\s*$", re.IGNORECASE)
+
+
+def _av_rate_limited_text(retry_after_seconds: int) -> str:
+    return _AV_RATE_LIMITED_TEMPLATE.format(
+        minutes=rate_limit_minutes(retry_after_seconds)
+    )
+
+
+def _av_command_text(message: Message) -> str:
+    """``/av`` 命令可能写在 text 或图片 caption 上（aiogram 的 Command 两者都认）。"""
+
+    return str(getattr(message, "text", None) or getattr(message, "caption", None) or "")
+
+
+def _av_vision_notice(text: str, requester_name: str = "") -> str:
+    """识图相关的一句话提示；群里会带上发起者名字，私聊保持原样（多一个字节都不行）。"""
+
+    if requester_name:
+        return f"<b>AV 识图</b>\n<b>{requester_name}</b>：{text}"
+    return f"<b>AV 识图</b>\n{text}"
+
+
+def _av_requester_name(message: Message) -> str:
+    """群里报「谁的识图结果」用；取不到名字就退化成 @用户名 / 数字 ID。"""
+
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return "有人"
+    name = member_display_name(
+        int(getattr(user, "id", 0) or 0),
+        full_name=getattr(user, "full_name", "") or "",
+        username=getattr(user, "username", "") or "",
+    )
+    return html.escape(_truncate_text(name, 40))
+
+
+def _group_av_image_request(message: Message) -> tuple[Message, Message] | None:
+    """群里「/av + 图片」的两种入口；不是这种请求返回 ``None``。
+
+    返回 ``(图片消息, /av 命令消息)``——配文触发时两者是同一条消息，回复触发时
+    图片是 ``reply_to_message``、命令是当前这条。
+
+    - 配文触发：自己能发的图配 ``/av``（同一群、同一条消息），普通聊天里的图片
+      根本不满足这个条件，所以不会被碰；
+    - 回复触发：只认**裸** ``/av``（``/av SONE-342`` 回复图片仍然按文字查询走，
+      免得误删别人刚发的图）；
+    - 只认图片/图片文档，别的类型（视频、贴纸……）一律不当识图请求。
+    """
+
+    if not _AV_COMMAND_PREFIX_RE.match(_av_command_text(message)):
+        return None
+
+    if select_av_image_file(message) is not None:
+        return message, message
+
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        return None
+    if not _AV_BARE_COMMAND_RE.match(_av_command_text(message)):
+        return None
+    if select_av_image_file(reply) is None:
+        return None
+    return reply, message
+
+
+def _av_private_fetch_blocked(callback: CallbackQuery, message: Message) -> int | None:
+    """私聊里「点按钮触发外部抓取」也受同一小时配额约束。
+
+    这里**只查不计数**：翻页、看种子这类纯展示不受影响，只有真的要去源站抓详情
+    （``fetch_detail``）才拦；返回 ``None`` = 放行，否则是建议等待秒数。
+    群里（群授权 + 群开关另有约束）一律不拦。
+    """
+
+    if _av_message_is_group(message):
+        return None
+    user = callback.from_user
+    blocked, retry_after = _AV_PRIVATE_RATE_LIMITER.blocked(
+        int(user.id) if user is not None else 0
+    )
+    return retry_after if blocked else None
+
+
 _LEGACY_ACTION_RESPONSE_RE = re.compile(
     r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
 )
@@ -408,9 +536,11 @@ async def _ensure_av_callback_scope(
 
     await session.commit()
     user = callback.from_user
-    if user is None or not is_super_admin_user_id(user.id, settings):
-        await callback.answer("私聊仅最高管理员可使用 AV 查询", show_alert=True)
+    if user is None:
+        await callback.answer("无法确认操作人，请重新 /av", show_alert=True)
         return False
+    # 私聊里的 /av 已经放开给普通用户（受 _AV_PRIVATE_RATE_LIMITER 限流），
+    # 按钮自然也得跟着放开；会话归属由调用方的 _av_session_owner_ok 兜底。
     return True
 
 
@@ -1005,9 +1135,14 @@ async def _send_av_detail(
     result_idx: int,
     detail: AVDetail,
     in_place: bool = False,
+    header: str = "",
 ) -> bool:
     caption = _build_av_detail_caption(detail)
     detail_text = _build_av_detail_text(detail)
+    if header:
+        # 群里那条 /av 命令（和图片）已经删了，结果是一条独立消息，用 header 说明
+        # 是谁问的——绝不 reply 到已删消息上（否则会显示「回复的内容已删除」）。
+        detail_text = f"{header}\n{detail_text}"
     keyboard = _build_av_detail_keyboard(session=session, result_idx=result_idx, detail=detail)
 
     # 群内路径：文字与按钮照旧留群里，封面只走私聊（group path never sends media）。
@@ -1524,6 +1659,390 @@ async def on_memory_delete(
     await callback.answer(f"已删除记忆 #{memory_id}")
 
 
+async def _send_av_query_result(
+    message: Message,
+    settings: Settings,
+    *,
+    query: str,
+    header: str = "",
+) -> None:
+    """跑一次「编号直查 / 演员名或关键词搜索」，结果照旧走现有按钮。
+
+    私聊识图与群内识图共用它；``header`` 只在群内识图时非空（那条命令和图片已经
+    删了，结果必须是一条独立消息并写明是谁问的）。分页/详情按钮就是 ``cmd_av``
+    那一套（``avs:``/``avd:``），点选行为与文字查询完全一致；封面是否私聊发送由
+    :func:`_send_av_detail` 按 chat 类型自己判断，这里不掺和。
+    """
+
+    svc = AVSearchService(settings)
+    if not svc.enabled:
+        await _answer(
+            message,
+            settings,
+            "<b>AV 查询</b>\n当前已禁用。",
+            auto_delete_seconds=0,
+        )
+        return
+
+    owner_user_id = int(message.from_user.id) if message.from_user else 0
+    cleaned = _truncate_text(query, 120)
+    if not cleaned:
+        return
+
+    if is_av_code_query(cleaned):
+        detail = await svc.lookup_by_code(cleaned)
+        if detail:
+            item = AVSearchItem(
+                source=detail.source,
+                title=detail.title,
+                code=detail.code,
+                url=detail.url,
+                cover_url=detail.cover_url,
+                date=detail.date,
+                summary=detail.summary,
+            )
+            av_session = _AV_SESSION_STORE.create(
+                owner_user_id=owner_user_id,
+                query=cleaned,
+                results=[item],
+            )
+            av_session.details[0] = detail
+            sent_ok = await _send_av_detail(
+                message=message,
+                session=av_session,
+                result_idx=0,
+                detail=detail,
+                header=header,
+            )
+            if not sent_ok:
+                await _answer(
+                    message,
+                    settings,
+                    "<b>AV 查询</b>\n详情发送失败，请稍后重试。",
+                    auto_delete_seconds=0,
+                )
+            return
+
+    results = await svc.search(cleaned)
+    if not results:
+        empty_brief = render_data_brief(
+            "AV 搜索结果",
+            metadata={"关键词": f"<code>{html.escape(cleaned)}</code>"},
+            empty="未找到匹配内容。",
+        )
+        await _answer(
+            message,
+            settings,
+            f"{header}\n{empty_brief}" if header else empty_brief,
+            auto_delete_seconds=0,
+        )
+        return
+
+    av_session = _AV_SESSION_STORE.create(
+        owner_user_id=owner_user_id,
+        query=cleaned,
+        results=results,
+    )
+    text, keyboard = _build_av_search_page(av_session, page=0)
+    if header:
+        text = f"{header}\n{text}"
+    await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+def _av_llm(settings: Settings) -> LLMService:
+    """构造一次性的 LLMService；识图只碰 ``vision`` 角色（vision_describe）。"""
+
+    return LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
+        embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
+    )
+
+
+async def _av_vision_text(data_uri: str, settings: Settings, *, user_id: int) -> str:
+    """一次识图 = 一次 ``vision_describe``；超时/失败只记日志并返回空串，绝不抛。
+
+    用硬超时（``run_with_hard_deadline``）：视觉链路卡住时也必须到点返回，把
+    「请直接发番号」的降级话术说出去，而不是把处理器挂在那里。
+    """
+
+    try:
+        llm = _av_llm(settings)
+        text = await run_with_hard_deadline(
+            llm.vision_describe(data_uri, AV_VISION_PROMPT),
+            timeout_seconds=AV_VISION_TIMEOUT_SEC,
+        )
+    except TimeoutError:
+        log.warning("【AV 识图】识别超时 | user=%s", user_id)
+        return ""
+    except Exception as exc:
+        log.warning("【AV 识图】识别失败 | user=%s | error=%s", user_id, exc)
+        return ""
+    return str(text or "").strip()
+
+
+async def _dispatch_av_vision_result(
+    message: Message,
+    settings: Settings,
+    vision_text: str,
+    *,
+    header: str = "",
+) -> None:
+    """识图结果 → 编号直查 / 演员名搜索 / 明说没读出编号（私聊与群内共用）。"""
+
+    if AV_NO_IMAGE_MARKER in vision_text:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_VISION_NO_CONTENT_TEXT, header),
+            auto_delete_seconds=0,
+        )
+        return
+
+    code = extract_av_code(vision_text)
+    if code:
+        log.info("【AV 识图】命中编号 | code=%s", code)
+        async with typing_action(message, enabled=settings.bot.enable_typing):
+            await _send_av_query_result(
+                message, settings, query=code, header=header
+            )
+        return
+
+    actor = extract_av_actor(vision_text)
+    if actor:
+        log.info("【AV 识图】只读到演员名 | actor=%s", actor)
+        async with typing_action(message, enabled=settings.bot.enable_typing):
+            await _send_av_query_result(
+                message, settings, query=actor, header=header
+            )
+        return
+
+    await _answer(
+        message,
+        settings,
+        _av_vision_notice(_AV_VISION_NO_CODE_TEXT, header),
+        auto_delete_seconds=0,
+    )
+
+
+async def _delete_av_group_message(target: Message, *, label: str) -> None:
+    """尽力删掉群里那条消息；删失败（权限不足 / 超 48 小时 / 已删）只记日志。
+
+    这是本功能的核心顺序要求：**先删图，再识图**。所以这里绝不允许把异常抛出去，
+    否则一次删除失败就会让 NSFW 图留在群里、连识别也不做了。
+    """
+
+    try:
+        await run_with_hard_deadline(
+            target.delete(),
+            timeout_seconds=_AV_GROUP_DELETE_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        log.warning(
+            "【群内识图】删除%s消息失败，继续识图 | message_id=%s | error=%s",
+            label,
+            getattr(target, "message_id", 0),
+            exc,
+        )
+        return
+    log.info(
+        "【群内识图】已删除%s消息 | message_id=%s",
+        label,
+        getattr(target, "message_id", 0),
+    )
+
+
+async def _delete_av_group_images(
+    *,
+    image_message: Message,
+    command_message: Message,
+) -> None:
+    """删图片消息，并在 ``/av`` 命令行不是同一条时一并删掉；两条互相独立。"""
+
+    await _delete_av_group_message(image_message, label="图片")
+    if command_message is image_message:
+        return
+    image_id = int(getattr(image_message, "message_id", 0) or 0)
+    command_id = int(getattr(command_message, "message_id", 0) or 0)
+    if image_id and image_id == command_id:
+        return
+    await _delete_av_group_message(command_message, label="/av 命令")
+
+
+async def _handle_group_av_image(
+    message: Message,
+    *,
+    settings: Settings,
+    image_message: Message,
+    command_message: Message,
+) -> None:
+    """群里「/av + 图片」→ **先删图，再识图**，结果只发文字（封面仍旧只走私聊）。
+
+    顺序是硬要求：第一步就把图片消息（以及不是同一条的 ``/av`` 命令行）删掉，
+    之后才去做视觉识别与查询——这样即使识别失败、超时、查不到，图也已经不在群里。
+    删除失败不影响后面的流程（只记日志）。
+
+    调用方（``cmd_av``）已经做完了授权 / 群开关判断并 commit 过 DB，所以这里不再
+    碰 session——删图与识图之间不持有 SQLite 写锁。
+    """
+
+    user = message.from_user
+    if user is None:
+        return
+
+    # 全局开关关掉时不动用户的图：既然不会识图，就不该删。
+    svc = AVSearchService(settings)
+    if not svc.enabled:
+        await _answer(
+            message,
+            settings,
+            "<b>AV 查询</b>\n当前已禁用。",
+            auto_delete_seconds=0,
+        )
+        return
+
+    requester_name = _av_requester_name(message)
+    # 结果正文的抬头：命令与图片都删了，得说明这条独立消息是谁问的。
+    result_header = f"<b>{requester_name}</b> 的识图结果"
+
+    # ① 先删图（连带 /av 命令行）。删除失败只记日志，继续识图。
+    await _delete_av_group_images(
+        image_message=image_message,
+        command_message=command_message,
+    )
+
+    # ② 限流：与私聊查询共用一个桶（每人每小时 10 次）。超限不调模型、不搜索。
+    allowed, retry_after = _AV_PRIVATE_RATE_LIMITER.allow(int(user.id))
+    if not allowed:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_av_rate_limited_text(retry_after), requester_name),
+            auto_delete_seconds=0,
+        )
+        return
+
+    # ③ 再识图：下载 → 一次 vision_describe（硬超时）→ 抽编号/演员名 → 查详情。
+    data_uri = await build_av_image_data_uri(image_message)
+    if not data_uri:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_VISION_FAILED_TEXT, requester_name),
+            auto_delete_seconds=0,
+        )
+        return
+
+    async with typing_action(message, enabled=settings.bot.enable_typing):
+        vision_text = await _av_vision_text(data_uri, settings, user_id=int(user.id))
+
+    if not vision_text:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_VISION_FAILED_TEXT, requester_name),
+            auto_delete_seconds=0,
+        )
+        return
+
+    await _dispatch_av_vision_result(
+        message, settings, vision_text, header=result_header
+    )
+
+
+async def _handle_private_av_image(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """私聊图片 → 识图反查番号（一次识图 = 一次 vision 调用，没有其它模型调用）。
+
+    流程：挑一档图片 → 限流 → 下载成 data URI → ``vision_describe``（20s 硬超时）
+    → 抽编号 → 命中就直查详情，只读到演员名就给出候选列表，都没有就直说。
+    任何失败都只记日志 + 回一句「请直接发番号」，绝不抛到上层。
+    """
+
+    # Telegram I/O 与模型调用之前先放掉 SQLite 写锁。
+    await session.commit()
+
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", "") != ChatType.PRIVATE:
+        # 群里绝不走这条路径（群内行为一个字都不动）。
+        return
+
+    user = message.from_user
+    info = select_av_image_file(message)
+    if user is None or info is None:
+        return
+
+    _file_id, _mime, declared_size = info
+    if declared_size > AV_VISION_MAX_IMAGE_BYTES:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_IMAGE_TOO_LARGE_TEXT),
+            auto_delete_seconds=0,
+        )
+        return
+
+    allowed, retry_after = _AV_PRIVATE_RATE_LIMITER.allow(int(user.id))
+    if not allowed:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_av_rate_limited_text(retry_after)),
+            auto_delete_seconds=0,
+        )
+        return
+
+    data_uri = await build_av_image_data_uri(message)
+    if not data_uri:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_VISION_FAILED_TEXT),
+            auto_delete_seconds=0,
+        )
+        return
+
+    async with typing_action(message, enabled=settings.bot.enable_typing):
+        vision_text = await _av_vision_text(data_uri, settings, user_id=int(user.id))
+
+    if not vision_text:
+        await _answer(
+            message,
+            settings,
+            _av_vision_notice(_AV_VISION_FAILED_TEXT),
+            auto_delete_seconds=0,
+        )
+        return
+
+    await _dispatch_av_vision_result(message, settings, vision_text)
+
+
+@router.message(
+    F.chat.type == ChatType.PRIVATE,
+    F.photo | F.document.mime_type.startswith("image/"),
+)
+async def on_private_av_image(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """私聊发图片（配 ``/av`` 或不配）→ 识图反查番号。
+
+    注册在 ``cmd_av`` **前面**：带 ``/av`` 说明文字的图片也走识图，而不是落到
+    文字用法分支。过滤器只匹配私聊照片与 ``image/*`` 文档，所以群里的照片、
+    私聊里的 PDF 都不会被这个处理器吞掉（``select_av_image_file`` 再兜一层底）。
+    """
+
+    await _handle_private_av_image(message, session, settings)
+
+
 @router.message(Command("av"))
 async def cmd_av(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
@@ -1533,26 +2052,24 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         message.chat and message.chat.type in ("group", "supergroup")
     )
     if not is_group_chat:
-        # Private chats have no per-group feature flag or authorization scope.
-        # Keep the diagnostic entrypoint available to the configured owner only
-        # instead of turning it into a public, unmetered external-search proxy.
+        # 私聊没有「群授权 / 群开关」的概念。以前这里只放最高管理员，是为了
+        # 避免变成免费的外部搜索代理；现在放开给任何跟机器人私聊过的用户，
+        # 代价是每人每小时 _AV_PRIVATE_HOURLY_LIMIT 次（见下方限流）。
         await session.commit()
-        user = message.from_user
-        if user is None or not is_super_admin_user_id(user.id, settings):
-            await _answer(
-                message,
-                settings,
-                "<b>AV 查询</b>\n私聊仅最高管理员可使用；普通用户请在已启用该功能的授权群内查询。",
-                auto_delete_seconds=0,
-            )
+        if message.from_user is None:
             return
 
-    args = (message.text or "").partition(" ")[2].strip()
-    if not args:
+    # 群里「/av + 图片」的两种入口都在这里识别；不是这种请求就是 None（普通聊天里的
+    # 图片不会被碰）。配文触发时命令与图片是同一条消息，回复触发时是两条。
+    group_image_request = (
+        _group_av_image_request(message) if is_group_chat else None
+    )
+
+    # /av 命令也可能写在图片 caption 上（aiogram 的 Command 过滤器认 text 也认 caption）。
+    args = _av_command_text(message).partition(" ")[2].strip()
+    if not args and group_image_request is None:
         await session.commit()
-        await _answer(
-            message,
-            settings,
+        usage_lines = (
             "<b>AV 查询用法</b>\n"
             "1. /av WANZ-530（按番号直查并展示详情+种子）\n"
             "2. /av 推川悠里（按演员名查询并弹出可选列表）\n"
@@ -1561,11 +2078,22 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "支持 FC2 编号：/av FC2-PPV-4863846\n\n"
             "默认状态：<b>关闭</b>（每个群独立）\n"
             "需最高管理员在目标群发送 /av enable 后可使用\n\n"
-            "私聊仅最高管理员可查询。\n\n"
+        )
+        if is_group_chat:
+            # 群里的用法文案保持原样，一个字都不改。
+            usage_lines += "私聊仅最高管理员可查询。\n\n"
+        else:
+            usage_lines += (
+                "私聊可以直接发图片（配 /av 或不配）识图反查番号；"
+                "文字查询与识图合计每人每小时最多 "
+                f"{_AV_PRIVATE_HOURLY_LIMIT} 次。\n\n"
+            )
+        usage_lines += (
             "<b>最高管理员命令（群内）</b>\n"
             "4. /av enable（启用本群 AV 查询）\n"
-            "5. /av disable（停用本群 AV 查询）",
+            "5. /av disable（停用本群 AV 查询）"
         )
+        await _answer(message, settings, usage_lines)
         return
 
     args_norm = args.strip().lower()
@@ -1609,10 +2137,35 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         group_av_enabled = _is_group_av_enabled(group_row.settings)
         await session.commit()
         if not group_av_enabled:
+            # 未启用就只回提示：不删任何图片（不越权动用户的图）。
             await _answer(
                 message,
                 settings,
                 "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
+            )
+            return
+        if group_image_request is not None:
+            image_message, command_message = group_image_request
+            await _handle_group_av_image(
+                message,
+                settings=settings,
+                image_message=image_message,
+                command_message=command_message,
+            )
+            return
+    if not is_group_chat:
+        # 私聊放开给普通用户，但每人每小时最多 N 次（识图 + 文字查询合计）。
+        # 超限时既不建服务对象、也不发起任何外部请求/模型调用。
+        user = message.from_user
+        allowed, retry_after = _AV_PRIVATE_RATE_LIMITER.allow(
+            int(user.id) if user is not None else 0
+        )
+        if not allowed:
+            await _answer(
+                message,
+                settings,
+                f"<b>AV 查询</b>\n{_av_rate_limited_text(retry_after)}",
+                auto_delete_seconds=0,
             )
             return
     svc = AVSearchService(settings)
@@ -1768,6 +2321,12 @@ async def on_av_detail_select(
 
     detail = av_session.details.get(idx)
     if not detail:
+        # 私聊里这次点击会去源站抓详情（= 一次外部查询）：超限的人不许再触发，
+        # 但不计数（只查），免得正常用户点几下按钮就被算成超额查询。
+        retry_after = _av_private_fetch_blocked(callback, msg)
+        if retry_after is not None:
+            await callback.answer(_av_rate_limited_text(retry_after), show_alert=True)
+            return
         item = av_session.results[idx]
         svc = AVSearchService(settings)
         async with typing_action(msg, enabled=settings.bot.enable_typing):
@@ -1835,6 +2394,12 @@ async def on_av_seed_paging(
 
     detail = av_session.details.get(idx)
     if not detail:
+        # 私聊里这次点击会去源站抓详情（= 一次外部查询）：超限的人不许再触发，
+        # 但不计数（只查），免得正常用户点几下按钮就被算成超额查询。
+        retry_after = _av_private_fetch_blocked(callback, msg)
+        if retry_after is not None:
+            await callback.answer(_av_rate_limited_text(retry_after), show_alert=True)
+            return
         item = av_session.results[idx]
         svc = AVSearchService(settings)
         async with typing_action(msg, enabled=settings.bot.enable_typing):
