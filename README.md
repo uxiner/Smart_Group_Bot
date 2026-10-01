@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/aiogram-3.x-0066CC.svg" alt="aiogram">
-  <img src="https://img.shields.io/badge/tests-__TESTS__%20passed-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-2388%20passed-brightgreen.svg" alt="Tests">
 </p>
 
 > **本仓库是 [Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot) 的个人部署分支**，
@@ -113,6 +113,8 @@
 - **私聊 `/av` 下载地址直出 + 制作信息分块**：详情正文（标题 + 简介之后）内联前 N 条磁力链（默认 3、硬上限 5、`av.inline_seed_count=0` 关闭），每条两行「大小 · 日期 · 标题」+ `<code>磁力</code>`；整条放不下时按 N→N-1→…→1 减条数，**磁力链本身不截断**。片商 / 发行商 / 导演 / 系列 / 演员 / 时长 / 类型单独成「制作信息」块，与「基本信息」分开。**群内文案一个字都没改**（仍是「种子 N 条」+ 按钮），由逐字回归测试守住。
 - **（可选，默认关）AI 题材概述**：`av.ai_synopsis_enabled=true` 时用**已抓到的字段**（标题 / 类型 / 系列 / 演员 / 时长）生成 1~3 句题材与看点概述，正文明确标注「AI 概述，非官方剧情」；新 stage `synopsis` 便于用量拆分，失败 / 超时只跳过这一块。**不做 ed2k、不做价格、不抓官方剧情**（实测拿不到，详见 `bot/services/av_search.py` 模块注释）。
 - **群内 NSFW 图片处置加固**：违规记账失败不再挡住删图，图一定先离开群。
+- **规则扫描范围 / 引用广告连坐 / 管理员审核**：正则规则带 `scan_scope`（`message`/`quote`/`vision`），只有高风险招嫖规则升到 `message+quote+vision`（修掉「机器人自己的图片描述被当成广告」的误删事故）；转发/引用广告连坐原作者；**除最高管理员外**的管理员违规照常删消息 + 群内 @警示（不质询不禁言不扣分），并以私聊把完整证据（含图片、规则、置信度、动作、消息回链）转发最高管理员，10 分钟内第 6 次起合并为汇总。
+- **测试规模**：上游基线 121 个测试文件 → 本分支 **126 个测试文件、2388 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 规则扫描范围 / 引用广告连坐 / 管理员审核与证据私聊 / `/av` 内联下载地址 / 路由完整性等）。
 - **路由完整性回归测试**：`tests/test_router_route_integrity.py`——防止「helper 函数插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 
