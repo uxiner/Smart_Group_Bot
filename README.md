@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/aiogram-3.x-0066CC.svg" alt="aiogram">
-  <img src="https://img.shields.io/badge/tests-2189%20passed-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-2243%20passed-brightgreen.svg" alt="Tests">
 </p>
 
 > **本仓库是 [Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot) 的个人部署分支**，
@@ -104,7 +104,8 @@
   群里「`/av` + 图片」的识图反查是**先删图再识别**（删除失败也继续识别）；
   私聊 `/av` 支持发图识图反查番号（视觉读编号/演员名 → 自动查详情），
   每人每小时 10 次限流；只有演员名时退化为按演员检索。
-- **测试规模**：上游 100 个测试文件 → 本分支 **117 个文件、2189 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
+- **群内 NSFW 图片处置**：公开发露骨图片 → 删图 + 群内 @警告（2 分钟自删）+ 质询，复用审核那次视觉调用、零额外成本；带 `/av` 的图不经此流程。
+- **测试规模**：上游 100 个测试文件 → 本分支 **119 个文件、2243 条用例全绿**（新增签到 / 积分 / 活跃激励 / 质量与成本报表 / 审核上下文 / 申诉 / 路由完整性等）
 - **路由完整性回归测试**：`tests/test_router_route_integrity.py`——防止「helper 函数插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 
