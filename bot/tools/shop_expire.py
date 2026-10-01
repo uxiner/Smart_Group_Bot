@@ -21,7 +21,7 @@ import asyncio
 import logging
 import sys
 
-from bot.config import Settings
+from bot.config import load_bootstrap_settings
 from bot.db.engine import init_db
 from bot.loader import create_bot
 from bot.services.point_shop import expire_due_entitlements
@@ -54,7 +54,7 @@ def _print_outcome(outcome: object) -> bool:
 
 
 async def _expire(*, dry_run: bool, notify: bool, limit: int) -> int:
-    settings = Settings()
+    settings = load_bootstrap_settings()
     engine, session_factory = await init_db(settings.database_url)
     bot = None
     try:
