@@ -355,6 +355,17 @@ class ModerationSettingsConfig(StrictModel):
     # 群内露骨色情图片处置（删图 + @警告 + 质询）。默认开启；关掉后
     # 视觉提示词不再要求 NSFW 判定，也不会有任何处置动作。
     nsfw_image_guard_enabled: bool = True
+    # 引用/转发广告：除转发者外，被引用消息的原作者同样处置。默认开启。
+    punish_quoted_author_enabled: bool = True
+    # 被引用消息的追溯上限（秒）。默认 7 天；更老的消息只记日志不处置。
+    quoted_author_max_age_seconds: int = Field(
+        default=7 * 24 * 60 * 60, ge=0, le=365 * 24 * 60 * 60
+    )
+    # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 +
+    # 记违规，不质询/不封禁/不禁言/不累计。关闭即回到"整段跳过"的旧行为。
+    admin_moderation_enabled: bool = True
+    # 管理员命中违规时私聊最高管理员一份完整证据（best-effort、限流合并）。
+    admin_alert_super_admin_enabled: bool = True
 
 
 class PatrolSettingsConfig(StrictModel):
