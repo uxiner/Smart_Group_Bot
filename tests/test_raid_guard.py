@@ -773,6 +773,94 @@ class DetectionTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 91))
 
+    async def test_lost_lease_restore_failure_does_not_escape_the_chunk(self) -> None:
+        """F-013：拿到租约后又失去租约那条分支里的 restore 必须被兜住。
+
+        这一处 ``restore_member_permissions`` 以前没有 try/except：它是 Telegram
+        调用，一旦抛异常就会从 ``asyncio.gather`` 逃出去，整个批次的后续入群处理被
+        跳过，最坏留下「已禁言但既无挑战也无补偿」的成员。修好后异常只记日志，并
+        退回 reconciler 兜底，成员不会再被搁置。
+        """
+        service, _bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+        renew_calls = {"count": 0}
+
+        async def renew(_session, *, prepared):
+            renew_calls["count"] += 1
+            # 第一次续租成功（正常静音），第二次续租失败 → 走「失去租约」分支
+            return prepared if renew_calls["count"] == 1 else None
+
+        async def restore_boom(*_args, **_kwargs):
+            raise RuntimeError("telegram restore failed")
+
+        with (
+            patch(
+                "bot.services.raid_guard.renew_prepared_join_verification",
+                new=renew,
+            ),
+            patch(
+                "bot.services.raid_guard.reconcile_stale_verification_restriction",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.services.raid_guard.restore_member_permissions",
+                new=restore_boom,
+            ),
+        ):
+            with self.assertLogs("bot.services.raid_guard", level="ERROR") as logs:
+                enforced = await service._challenge_suspects(
+                    -100,
+                    [RaidSuspect(95, "丢租约用户", "lost", now_shanghai_naive())],
+                    config,
+                    "turnstile",
+                )
+
+        self.assertEqual(enforced, [])
+        self.assertTrue(
+            any("lost lease failed" in line for line in logs.output), logs.output
+        )
+
+    async def test_crashed_mute_task_is_compensated_instead_of_escaping(self) -> None:
+        """F-013：单个禁言任务抛异常不许掀翻整批，失败项必须显式走补偿。
+
+        改 ``return_exceptions=True`` 之后，异常被归一成「未禁言 + 未授权」，从而
+        触发 abort_many，并且该成员的 ``restore_permissions`` 必须是 True（他的禁言
+        状态未知，必须恢复说话权限）。
+        """
+        service, _bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+        shield_calls: list[tuple[int, bool]] = []
+
+        async def fake_shield(
+            _bot, _session, *, prepared, restore_permissions=True, **_kwargs
+        ):
+            shield_calls.append((int(prepared.user_id), bool(restore_permissions)))
+            return True
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("telegram delete failed")
+
+        with (
+            patch("bot.services.raid_guard.delete_messages_since_join", new=boom),
+            patch(
+                "bot.services.raid_guard.shield_abort_prepared_join_verification",
+                new=fake_shield,
+            ),
+        ):
+            with self.assertLogs("bot.services.raid_guard", level="ERROR") as logs:
+                enforced = await service._challenge_suspects(
+                    -100,
+                    [RaidSuspect(96, "崩溃用户", "crash", now_shanghai_naive())],
+                    config,
+                    "turnstile",
+                )
+
+        self.assertEqual(enforced, [])
+        self.assertTrue(
+            any("compensating" in line for line in logs.output), logs.output
+        )
+        self.assertIn((96, True), shield_calls)
+
     async def test_below_threshold_does_not_trigger(self) -> None:
         service, bot = self._service()
         self.assertFalse(await self._join(service, 1))
