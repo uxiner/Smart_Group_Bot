@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy import func, insert, literal, select
+from sqlalchemy import DateTime, func, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -392,13 +392,17 @@ async def spend_points(
     statement = (
         sqlite_insert(MemberPointSpend)
         .from_select(
-            ("group_id", "user_id", "points", "reason", "ref"),
+            # F-050：Core 的 INSERT ... SELECT 不会套用 Python 侧列默认值，所以
+            # created_at 必须显式带上，且用本地（Asia/Shanghai）时钟，和
+            # member_checkins / member_entitlements / member_point_awards 同口径。
+            ("group_id", "user_id", "points", "reason", "ref", "created_at"),
             select(
                 literal(gid),
                 literal(uid),
                 literal(cost),
                 literal(str(reason or "")[:64]),
                 literal(idempotency_key[:64]),
+                literal(now_shanghai_naive(), type_=DateTime),
             ).where(earned + awarded - spent >= cost),
         )
         # F-053 验收修补（SQLite 原子性）：这里原来包在 ``session.begin_nested()``
