@@ -131,6 +131,9 @@ async def _notify(text: str) -> bool:
 async def _probe(*, dry_run: bool, refresh: bool) -> tuple[bool, str]:
     settings = load_bootstrap_settings()
     provider = resolve_av_reverse_provider(settings)
+    if provider is None:
+        # F-025：没有显式配置 endpoint 就没有可以探测的第三方入口。
+        return False, "未配置 av_reverse_endpoint：默认不外发用户图片，金丝雀跳过"
     try:
         timeout = float(getattr(settings, "av_reverse_timeout_sec", AV_SCAN_TIMEOUT_SEC))
     except (TypeError, ValueError):
