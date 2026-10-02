@@ -433,10 +433,15 @@ class Violation(Base):
     # 判定细节：置信度与模型给的理由。误伤率报表要能回答"这次命中到底有多确定"，
     # 靠日志不够（日志会滚），必须落库。历史行是 NULL（这一列是后加的）。
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # server_default 不能省：老代码/迁移测试会用裸 SQL 插入 violations，
-    # NOT NULL 而没有库级默认值会直接撞约束。
-    verdict_reason: Mapped[str] = mapped_column(
-        String(120), default="", server_default=""
+    # F-060：这一列的定义必须和迁移 DDL 完全一致，否则新库（create_all）与升级库
+    # （_sqlite_ensure_column）会长出不同的 schema。两者统一为**可空 + 库级默认 ''**：
+    #   * SQLite 无法给已存在的表加 NOT NULL（ALTER 不支持），要做到 NOT NULL 就得
+    #     整表重建——对一个纯观测列来说风险远大于收益；
+    #   * server_default 不能省：老代码/迁移测试会用裸 SQL 插入 violations。
+    # 写入路径（ModerationService.record_violation）始终写字符串，不会真的留 NULL；
+    # 读取侧一律 ``str(x or "")``。
+    verdict_reason: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, default="", server_default=""
     )
     # NULL means a threshold/sender-chat ban has not completed its Telegram +
     # audit persistence stage.  False is an attempted but unconfirmed ban.
