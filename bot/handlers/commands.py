@@ -3664,13 +3664,25 @@ async def cmd_find(
         return
     if not await ensure_group_authorized(message, session, settings):
         return
-    query = str(message.text or "").partition(" ")[2].strip()
+    raw_query = str(message.text or "").partition(" ")[2].strip()
+    # F-016：默认口径（给所有成员）一律不返回已被审核删除的消息；只有本群管理员
+    # 显式写 ``--all`` 才能连已删除内容一起检索，而且每一次都留审计日志。
+    include_disposed = False
+    if raw_query == "--all" or raw_query.startswith("--all "):
+        if not await ensure_group_admin_permission(message, session, settings):
+            return
+        include_disposed = True
+        raw_query = raw_query[len("--all") :].strip()
+    query = raw_query
     if len(query) < 2:
         await _answer(
             message,
             settings,
             "<b>/find 用法</b>\n/find &lt;关键词&gt;\n\n"
-            "在当前群的保留期聊天记录里找你需要的消息（默认 5 条）。",
+            "在当前群的保留期聊天记录里找你需要的消息（默认 5 条）。\n"
+            "已被审核删除的消息不会出现在结果里。\n"
+            "本群管理员可用 <code>/find --all &lt;关键词&gt;</code> 连已删除内容一起查"
+            "（会记录操作日志）。",
         )
         return
 
@@ -3679,9 +3691,20 @@ async def cmd_find(
         await _answer(message, settings, "记忆服务还没就绪，稍后再试。")
         return
     await session.commit()
+    operator_id = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    if include_disposed:
+        log.warning(
+            "[%s] /find --all 含已删除内容 | operator=%s | query=%s",
+            message.chat.id,
+            operator_id,
+            query,
+        )
     try:
         hits = await memory.recall_archive(
-            int(message.chat.id), query=query, limit=5
+            int(message.chat.id),
+            query=query,
+            limit=5,
+            include_disposed=include_disposed,
         )
     except Exception:
         log.warning("[%s] /find recall failed", message.chat.id, exc_info=True)
@@ -3714,7 +3737,15 @@ async def cmd_find(
             or "未知"
         )
         lines.append(f"{index}. <code>{when}</code> {html.escape(who)}：{html.escape(body)}")
-    lines.append("\n<i>最多列出 5 条，按相关度排序。</i>")
+    lines.append(
+        "\n<i>最多列出 5 条，按相关度排序。"
+        + (
+            "已包含被审核删除的消息（管理员审计口径）。"
+            if include_disposed
+            else "已排除被审核删除的消息。"
+        )
+        + "</i>"
+    )
     await _answer(message, settings, "\n".join(lines), disable_web_page_preview=True)
 
 
