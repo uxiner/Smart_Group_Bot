@@ -1,6 +1,7 @@
 """Load LLM prompt templates from prompt/ directory."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from bot.utils.bot_identity import build_bot_identity_context
@@ -48,8 +49,57 @@ def set_runtime_prompts(values: dict[str, str]) -> None:
         _RUNTIME_PROMPTS[key] = value or _load(_PROMPT_FILES[key])
 
 
+# ---------------------------------------------------------------------------
+# 群内「成人文字放开」指令块
+#
+# 权威正文只有一份：``prompt/persona.md`` 末尾的 ``[Content Boundaries]`` 小节。
+# 默认人设里必须先把这一节摘掉，否则等于对所有群都放开了成人文字；只有群内开启
+# ``groups.settings.av_enabled`` 时，才由 ``build_content_boundaries_context``
+# 把这**同一段文本**作为独立指令块按群注入回复链路。
+# ---------------------------------------------------------------------------
+
+_CONTENT_BOUNDARIES_SECTION = "Content Boundaries"
+
+
+def _persona_section_pattern(name: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^\[{re.escape(name)}\]\s*$.*?(?=^\[[^\]\n]+\]\s*$|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+
+
+def extract_persona_section(persona: str, name: str) -> str:
+    """取出 ``[name]`` 小节（含标题行）；找不到返回空串。"""
+    match = _persona_section_pattern(name).search(str(persona or ""))
+    return match.group(0).strip() if match else ""
+
+
+def strip_persona_section(persona: str, name: str) -> str:
+    """删掉 ``[name]`` 小节（含标题行与紧随的空白）；找不到时原样返回。"""
+    text = str(persona or "")
+    pattern = _persona_section_pattern(name)
+    if not pattern.search(text):
+        return text
+    return pattern.sub("", text).strip()
+
+
+#: 文字放开指令块：直接取自 ``prompt/persona.md`` 的 ``[Content Boundaries]``。
+CONTENT_BOUNDARIES_BLOCK: str = extract_persona_section(
+    _load("persona.md"), _CONTENT_BOUNDARIES_SECTION
+)
+
+
+def build_content_boundaries_context() -> str:
+    """返回成人文字放开指令块（调用方负责按群开关决定是否注入）。"""
+    return CONTENT_BOUNDARIES_BLOCK
+
+
 def with_persona(task_prompt: str) -> str:
-    persona = get_prompt("persona").strip()
+    # 默认人设里永远不含 ``[Content Boundaries]``：该节只在群内开启 /av 时，
+    # 由调用方以独立系统指令块按群注入（见 ``build_content_boundaries_context``）。
+    persona = strip_persona_section(
+        get_prompt("persona").strip(), _CONTENT_BOUNDARIES_SECTION
+    )
     project_info = build_bot_project_info_context().strip()
     identity = build_bot_identity_context().strip()
     task = (task_prompt or "").strip()

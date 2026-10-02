@@ -90,7 +90,10 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.member_identity import member_display_name
-from bot.services.group_settings import acquire_group_settings_write_intent
+from bot.services.group_settings import (
+    acquire_group_settings_write_intent,
+    is_group_av_enabled,
+)
 from bot.services.message_templates import (
     card_field,
     render_action_notice,
@@ -342,21 +345,9 @@ async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) ->
 
 
 def _is_group_av_enabled(group_settings: dict | None) -> bool:
-    settings_dict = group_settings if isinstance(group_settings, dict) else {}
-    value = settings_dict.get(_AV_GROUP_ENABLE_KEY)
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on", "enabled"}:
-            return True
-        if normalized in {"0", "false", "no", "off", "disabled"}:
-            return False
-    return bool(value)
+    # 单一实现放在 services/group_settings.py，回复链路（文字放开注入）用同一判据，
+    # 避免两处逻辑漂移。
+    return is_group_av_enabled(group_settings)
 
 
 def _truncate_text(text: str, max_len: int) -> str:

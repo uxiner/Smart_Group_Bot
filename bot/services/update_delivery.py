@@ -115,6 +115,7 @@ _SECURITY_COMMANDS = frozenset(
 _ADMIN_CALLBACK_PREFIXES = (
     "bsc:",  # local/global ban and unban scope
     "mact:",  # moderation action
+    "mrev:",  # moderation evidence review (人工放行 / 放行收回)
     "rul:",  # moderation-rule pages
     "rud:",  # moderation-rule deletion
     "atl:",  # authorized-group pages

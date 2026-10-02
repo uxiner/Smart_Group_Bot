@@ -16,6 +16,16 @@
 - 运行时开关 ``moderation.nsfw_image_guard_enabled`` 关闭后不判定也不处置；
 - 原有图片描述/OCR 提示词与描述文本没有被破坏。
 
+视频（``video`` / ``video_caption`` / ``video_note``）同样并入这条守卫，**不设群
+限制**，跟随同一个开关：只拿 Telegram 缩略图去判（``video`` / ``video_note`` 的
+``thumbnail``），拿不到缩略图就什么都不做、只记日志；命中 ``NSFW_YES`` 后复用
+「删除 + @警告 + 质询」那条链路，文案泛化为「图片/视频」。贴纸仍然不碰，视频的
+媒体旁路与 caption 审核路径除新增守卫外一律不变。
+
+另外覆盖「文字放开」的按群注入：只有当前群 ``groups.settings.av_enabled`` 为真时，
+``[Content Boundaries]`` 指令块才进入 SkillService / CasualService 的回复提示词；
+为假时一个字都不注入（默认人设里的这一节也会被摘掉）。
+
 所有 Telegram / LLM 调用都是 mock，不触网。
 """
 
@@ -24,11 +34,14 @@ from __future__ import annotations
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from bot.config import ModelConfig, Settings
 from bot.handlers import group
+from bot.services.casual import CasualService
 from bot.services.moderation import ModerationVerdict
+from bot.services.skills.service import SkillService
+from bot.utils import prompts as prompt_utils
 
 GROUP_ID = -10001
 USER_ID = 42
@@ -168,6 +181,98 @@ def _sticker_message() -> SimpleNamespace:
     return message
 
 
+def _base_message(
+    *,
+    caption: str | None = None,
+    user_id: int = USER_ID,
+    username: str | None = "member",
+    message_id: int = MESSAGE_ID,
+) -> SimpleNamespace:
+    """图片/视频消息共享的骨架（bot / chat / delete / answer 都在这里）。"""
+    conversation: list[str] = []
+    bot = SimpleNamespace(
+        me=AsyncMock(return_value=SimpleNamespace(username="selfbot", id=1)),
+        get_file=AsyncMock(
+            return_value=SimpleNamespace(file_path="media/x.jpg", file_size=3)
+        ),
+        download_file=AsyncMock(side_effect=_write_image),
+        # D2：管理员命中时的证据私聊（最高管理员 settings.super_admin_id=1）。
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=9001)),
+        send_photo=AsyncMock(return_value=SimpleNamespace(message_id=9002)),
+    )
+
+    async def delete():
+        conversation.append("delete")
+
+    async def answer(_text, **_kwargs):
+        conversation.append("warn")
+        return SimpleNamespace(
+            chat=SimpleNamespace(id=GROUP_ID),
+            message_id=WARNING_SENT_MESSAGE_ID,
+        )
+
+    message = SimpleNamespace(
+        message_id=message_id,
+        date=None,
+        chat=SimpleNamespace(id=GROUP_ID, type="supergroup", title="测试群"),
+        from_user=_user(user_id, username=username),
+        sender_chat=None,
+        photo=None,
+        document=None,
+        animation=None,
+        sticker=None,
+        video=None,
+        video_note=None,
+        audio=None,
+        contact=None,
+        voice=None,
+        location=None,
+        text=None,
+        caption=caption,
+        reply_to_message=None,
+        delete=AsyncMock(side_effect=delete),
+        answer=AsyncMock(side_effect=answer),
+        bot=bot,
+    )
+    message.conversation = conversation
+    return message
+
+
+def _video_message(
+    *,
+    caption: str | None = None,
+    thumbnail: bool = True,
+    video_note: bool = False,
+    user_id: int = USER_ID,
+    username: str | None = "member",
+    message_id: int = MESSAGE_ID,
+) -> SimpleNamespace:
+    """视频消息：命中判定的是 ``video`` / ``video_note`` 的 Telegram 缩略图。"""
+    message = _base_message(
+        caption=caption, user_id=user_id, username=username, message_id=message_id
+    )
+    thumb = (
+        SimpleNamespace(file_id="video-thumb-id", file_size=3) if thumbnail else None
+    )
+    media = SimpleNamespace(
+        file_id="video-file-id",
+        file_size=3,
+        mime_type="video/mp4",
+        thumbnail=thumb,
+    )
+    if video_note:
+        message.video_note = media
+    else:
+        message.video = media
+    return message
+
+
+def _text_message(text: str = "普通聊天") -> SimpleNamespace:
+    message = _base_message()
+    message.text = text
+    return message
+
+
 def _verdict() -> ModerationVerdict:
     return ModerationVerdict(
         violated=False, reason="", rule=None, conclusive=True, confidence=0.0
@@ -229,7 +334,7 @@ def _vision_llm(vision_text: str) -> SimpleNamespace:
 
 async def _run_group_message(
     *,
-    vision_text: str,
+    vision_text: str = "",
     message: SimpleNamespace | None = None,
     moderation_service: SimpleNamespace | None = None,
     settings: SimpleNamespace | None = None,
@@ -237,6 +342,7 @@ async def _run_group_message(
     fresh_side_effect=(True, False),
     tg_admin: bool = False,
     challenge=None,
+    llm: SimpleNamespace | None = None,
 ):
     """跑一遍 ``on_group_message``：Telegram / LLM 全部 mock，不触网。
 
@@ -245,7 +351,7 @@ async def _run_group_message(
     """
     message = message or _photo_message()
     moderation_service = moderation_service or _fake_moderation_service()
-    llm = _vision_llm(vision_text)
+    llm = llm or _vision_llm(vision_text)
     settings = settings or _settings()
     session = session or _session()
 
@@ -404,6 +510,56 @@ class NsfwGuardScopeTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 视频守卫适用范围（video / video_caption / video_note，全部跟随图片守卫开关）
+# ---------------------------------------------------------------------------
+
+
+class NsfwVideoGuardScopeTests(unittest.TestCase):
+    def test_video_with_thumbnail_is_in_scope_regardless_of_group_av_switch(
+        self,
+    ) -> None:
+        for msg_type in ("video", "video_caption", "video_note"):
+            with self.subTest(msg_type=msg_type):
+                message = _video_message(
+                    video_note=msg_type == "video_note",
+                    caption="/av WANZ-530" if msg_type == "video_caption" else None,
+                )
+                self.assertTrue(
+                    group._nsfw_image_guard_applies(message, msg_type, _settings())
+                )
+
+    def test_video_without_thumbnail_is_out_of_scope(self) -> None:
+        message = _video_message(thumbnail=False)
+        self.assertIsNone(group._extract_video_thumbnail_file_info(message))
+        for msg_type in ("video", "video_caption", "video_note"):
+            with self.subTest(msg_type=msg_type):
+                self.assertFalse(
+                    group._nsfw_image_guard_applies(message, msg_type, _settings())
+                )
+
+    def test_video_note_thumbnail_is_extracted(self) -> None:
+        message = _video_message(video_note=True)
+        info = group._extract_video_thumbnail_file_info(message)
+        self.assertIsNotNone(info)
+        self.assertEqual(info[0], "video-thumb-id")
+        self.assertTrue(info[1].startswith("image/"))
+
+    def test_video_scope_follows_the_existing_image_guard_switch(self) -> None:
+        message = _video_message()
+        self.assertFalse(
+            group._nsfw_image_guard_applies(
+                message, "video", _settings(nsfw_image_guard_enabled=False)
+            )
+        )
+        # 审核总开关关闭时同样不生效
+        self.assertFalse(
+            group._nsfw_image_guard_applies(message, "video", _settings(enabled=False))
+        )
+        # 与群内 av_enabled 无关：守卫不设群限制
+        self.assertTrue(group._nsfw_image_guard_applies(message, "video", _settings()))
+
+
+# ---------------------------------------------------------------------------
 # 视觉提示词与描述文本
 # ---------------------------------------------------------------------------
 
@@ -466,6 +622,63 @@ class NsfwVisionPromptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual((text, vision), ("[image]", ""))
+
+
+# ---------------------------------------------------------------------------
+# 视频缩略图判定（复用同一条 NSFW 视觉要求，绝不判定视频本体）
+# ---------------------------------------------------------------------------
+
+
+class NsfwVideoVisionPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_thumbnail_verdict_reuses_the_nsfw_instruction(self) -> None:
+        message = _video_message()
+        llm = _vision_llm(f"NSFW_YES {IMAGE_DESCRIPTION}")
+
+        vision = await group._nsfw_video_thumbnail_vision_text(message, llm)
+
+        self.assertEqual(llm.vision_describe.await_count, 1)
+        data_uri, prompt = llm.vision_describe.await_args.args
+        self.assertTrue(data_uri.startswith("data:image/"))
+        self.assertTrue(prompt.startswith(ORIGINAL_VISION_PROMPT))
+        self.assertIn("NSFW_YES", prompt)
+        self.assertIn("明确露骨色情内容", prompt)
+        self.assertEqual(vision, f"NSFW_YES {IMAGE_DESCRIPTION}")
+
+    async def test_video_note_thumbnail_is_judged_too(self) -> None:
+        message = _video_message(video_note=True)
+        llm = _vision_llm(NSFW_NO_TEXT)
+
+        vision = await group._nsfw_video_thumbnail_vision_text(message, llm)
+
+        self.assertEqual(llm.vision_describe.await_count, 1)
+        self.assertEqual(vision, NSFW_NO_TEXT)
+
+    async def test_missing_thumbnail_makes_no_model_call(self) -> None:
+        message = _video_message(thumbnail=False)
+        llm = _vision_llm(NSFW_YES_TEXT)
+
+        vision = await group._nsfw_video_thumbnail_vision_text(message, llm)
+
+        self.assertEqual(vision, "")
+        llm.vision_describe.assert_not_awaited()
+
+    async def test_vision_failure_returns_empty_verdict(self) -> None:
+        message = _video_message()
+        llm = SimpleNamespace(
+            vision_describe=AsyncMock(side_effect=RuntimeError("model down"))
+        )
+
+        vision = await group._nsfw_video_thumbnail_vision_text(message, llm)
+
+        self.assertEqual(vision, "")
+
+    async def test_empty_vision_reply_returns_empty_verdict(self) -> None:
+        message = _video_message()
+        llm = _vision_llm("NO_VALID_IMAGE_CONTENT")
+
+        self.assertEqual(
+            await group._nsfw_video_thumbnail_vision_text(message, llm), ""
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +1010,156 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# 视频守卫处置（走到 on_group_message 的完整接线）
+# ---------------------------------------------------------------------------
+
+
+class NsfwVideoDisposalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_hit_deletes_warns_and_challenges(self) -> None:
+        message, llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT, message=_video_message()
+        )
+
+        # ① 删除整条视频消息
+        message.delete.assert_awaited_once()
+        # ② 群里 @当事人警告（文案把「图片」泛化为「图片/视频」）
+        message.answer.assert_awaited_once()
+        warn_text = message.answer.await_args.args[0]
+        self.assertTrue(warn_text.startswith("@member"), warn_text)
+        self.assertIn("裸露/色情图片或视频", warn_text)
+        self.assertIn("已删除", warn_text)
+        self.assertNotIn("\u200b", warn_text)
+        # ③ 质询
+        challenge.assert_awaited_once()
+        self.assertEqual(challenge.await_args.kwargs["rule_action"], "ban")
+        self.assertFalse(challenge.await_args.kwargs["allow_points_skip"])
+        # 判定来自缩略图那一次视觉调用，且只调一次
+        self.assertEqual(llm.vision_describe.await_count, 1)
+        self.assertEqual(moderation.record_violation.await_args.args[4], "nsfw_image")
+
+    async def test_video_note_hit_is_disposed(self) -> None:
+        message, _llm, _moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT, message=_video_message(video_note=True)
+        )
+
+        message.delete.assert_awaited_once()
+        message.answer.assert_awaited_once()
+        challenge.assert_awaited_once()
+
+    async def test_video_negative_markers_and_failures_do_nothing(self) -> None:
+        for vision_text in (
+            NSFW_NO_TEXT,
+            NSFW_UNKNOWN_TEXT,
+            REFUSAL_TEXT,
+            IMAGE_DESCRIPTION,
+            "",
+        ):
+            with self.subTest(vision_text=vision_text):
+                message, _llm, moderation, _session_mock, challenge = (
+                    await _run_group_message(
+                        vision_text=vision_text, message=_video_message()
+                    )
+                )
+                self.assertEqual(message.conversation, [])
+                message.delete.assert_not_awaited()
+                message.answer.assert_not_awaited()
+                challenge.assert_not_awaited()
+                moderation.record_violation.assert_not_awaited()
+
+    async def test_video_without_thumbnail_is_never_judged(self) -> None:
+        llm = _vision_llm(NSFW_YES_TEXT)
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            message=_video_message(thumbnail=False), llm=llm
+        )
+
+        # 拿不到缩略图：不判定（没有模型调用）、不处置，照旧走媒体旁路
+        llm.vision_describe.assert_not_awaited()
+        self.assertEqual(message.conversation, [])
+        moderation.record_violation.assert_not_awaited()
+        moderation.evaluate.assert_not_awaited()
+        challenge.assert_not_awaited()
+
+    async def test_video_vision_failure_disposes_nothing(self) -> None:
+        llm = SimpleNamespace(
+            vision_describe=AsyncMock(side_effect=RuntimeError("model down"))
+        )
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            message=_video_message(), llm=llm
+        )
+
+        self.assertEqual(message.conversation, [])
+        moderation.record_violation.assert_not_awaited()
+        challenge.assert_not_awaited()
+
+    async def test_video_switch_off_means_no_judgement_and_no_disposal(self) -> None:
+        llm = _vision_llm(NSFW_YES_TEXT)
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            message=_video_message(),
+            llm=llm,
+            settings=_settings(nsfw_image_guard_enabled=False),
+        )
+
+        self.assertEqual(llm.vision_describe.await_count, 0)
+        self.assertEqual(message.conversation, [])
+        moderation.record_violation.assert_not_awaited()
+        challenge.assert_not_awaited()
+
+    async def test_video_message_still_takes_the_media_bypass(self) -> None:
+        """视频原有行为不变：无命中时不进文本审核，也不进回复流水线。"""
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_NO_TEXT, message=_video_message()
+        )
+
+        moderation.evaluate.assert_not_awaited()
+        challenge.assert_not_awaited()
+        self.assertEqual(message.conversation, [])
+
+    async def test_video_caption_hit_is_disposed_from_the_caption_path(self) -> None:
+        message, llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT,
+            message=_video_message(caption="看看这个"),
+        )
+
+        message.delete.assert_awaited_once()
+        message.answer.assert_awaited_once()
+        challenge.assert_awaited_once()
+        self.assertEqual(llm.vision_describe.await_count, 1)
+        moderation.record_violation.assert_awaited_once()
+
+    async def test_video_caption_clean_still_runs_caption_moderation(self) -> None:
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_NO_TEXT,
+            message=_video_message(caption="普通视频说明"),
+        )
+
+        # caption 审核路径没有被破坏：仍然进入文本审核，且没有 NSFW 处置
+        self.assertEqual(message.conversation, [])
+        moderation.evaluate.assert_awaited_once()
+        challenge.assert_not_awaited()
+        self.assertEqual(moderation.record_violation.await_count, 0)
+
+    async def test_video_owner_keeps_full_exemption(self) -> None:
+        owner = _video_message(user_id=1, username="owner")
+        owner, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            vision_text=NSFW_YES_TEXT, message=owner, tg_admin=True
+        )
+
+        self.assertEqual(owner.conversation, [])
+        moderation.record_violation.assert_not_awaited()
+        challenge.assert_not_awaited()
+
+    async def test_plain_text_message_is_untouched(self) -> None:
+        llm = _vision_llm(NSFW_YES_TEXT)
+        message, _llm, moderation, _session_mock, challenge = await _run_group_message(
+            message=_text_message(), llm=llm
+        )
+
+        llm.vision_describe.assert_not_awaited()
+        self.assertEqual(message.conversation, [])
+        challenge.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # 与 on_group_message 的接线：贴纸 / /av / 开关
 # ---------------------------------------------------------------------------
 
@@ -841,6 +1204,291 @@ class NsfwGuardWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.conversation, [])
         moderation.record_violation.assert_not_awaited()
         challenge.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 文字放开按群注入（只有群内开了 /av 才注入 [Content Boundaries]）
+# ---------------------------------------------------------------------------
+
+
+class ContentBoundariesInjectionTests(unittest.TestCase):
+    def test_persona_file_declares_the_content_boundaries_section(self) -> None:
+        persona = prompt_utils.get_prompt("persona")
+        self.assertIn("[Content Boundaries]", persona)
+        for needle in (
+            "Adult-work text is not restricted",
+            "codes/serial numbers (番号)",
+            "never tell the user to go search for it themselves",
+            "Your two roles do not conflict",
+            "Adult media is the only hard line",
+            "Never send, forward, or display adult images or videos in any group",
+            "Never fabricate",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, persona)
+
+    def test_default_persona_never_carries_the_open_text_block(self) -> None:
+        # 默认人设里必须先摘掉这一节：否则等于对所有群都放开了成人文字。
+        rendered = prompt_utils.with_persona("task")
+        self.assertNotIn("[Content Boundaries]", rendered)
+        self.assertNotIn("Adult-work text is not restricted", rendered)
+        # 其他小节一字不动
+        self.assertIn("[Safety Boundaries]", rendered)
+
+    def test_group_switch_decides_whether_the_block_is_injected(self) -> None:
+        on = group._content_boundaries_context_for_group({"av_enabled": True})
+        self.assertIn("[Content Boundaries]", on)
+        self.assertIn("Adult-work text is not restricted", on)
+
+        for group_settings in (
+            {},
+            None,
+            {"av_enabled": False},
+            {"other_key": True},
+            {"av_enabled": "0"},
+        ):
+            with self.subTest(group_settings=group_settings):
+                self.assertEqual(
+                    group._content_boundaries_context_for_group(group_settings), ""
+                )
+
+    def test_skill_prompt_contains_the_block_only_when_the_group_switch_is_on(self) -> None:
+        on_context = group._content_boundaries_context_for_group({"av_enabled": True})
+        off_context = group._content_boundaries_context_for_group({"av_enabled": False})
+
+        on_prompt = _skill_prompt_with_context(on_context)
+        self.assertIn("[Content Boundaries]", on_prompt)
+        self.assertIn("Adult-work text is not restricted", on_prompt)
+
+        off_prompt = _skill_prompt_with_context(off_context)
+        self.assertNotIn("[Content Boundaries]", off_prompt)
+        self.assertNotIn("Adult-work text is not restricted", off_prompt)
+
+    def test_casual_prompt_contains_the_block_only_when_the_group_switch_is_on(self) -> None:
+        on_prompt = _casual_prompt_with_context(
+            group._content_boundaries_context_for_group({"av_enabled": True})
+        )
+        self.assertIn("[Content Boundaries]", on_prompt)
+
+        off_prompt = _casual_prompt_with_context(
+            group._content_boundaries_context_for_group({})
+        )
+        self.assertNotIn("[Content Boundaries]", off_prompt)
+        self.assertNotIn("Adult-work text is not restricted", off_prompt)
+
+
+def _skill_prompt_with_context(context: str) -> str:
+    service = SkillService(SimpleNamespace(), settings=None)
+    service.content_boundaries_context = context
+    messages = service._build_answer_messages(
+        "番号是多少",
+        history=None,
+        sender_user_id=USER_ID,
+        sender_username="member",
+        sender_is_owner=False,
+        sender_is_tg_admin=False,
+        intent_type="casual",
+        merged_count=1,
+        merged_context="",
+        reply_targets_context="",
+        selected_skills={},
+    )
+    return "\n".join(str(item.get("content") or "") for item in messages)
+
+
+def _casual_prompt_with_context(context: str) -> str:
+    service = CasualService(SimpleNamespace(), settings=None, skill_names=[])
+    service.content_boundaries_context = context
+    payload = service.build_prompt_payload(
+        "番号是多少",
+        history=None,
+        sender_user_id=USER_ID,
+        sender_username="member",
+        sender_is_owner=False,
+        sender_is_tg_admin=False,
+        style_profile_context="",
+    )
+    messages = payload["messages"] if isinstance(payload, dict) else payload
+    return "\n".join(str(item.get("content") or "") for item in messages)
+
+
+class ContentBoundariesWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batch_reply_wiring_passes_the_block_into_the_skill_service(
+        self,
+    ) -> None:
+        for av_enabled, expected in ((True, True), (False, False)):
+            with self.subTest(av_enabled=av_enabled):
+                fake_skill = SimpleNamespace(
+                    tts_service=SimpleNamespace(available=False),
+                    build_answer_prompt_payload=Mock(
+                        return_value={"messages": [], "tools": []}
+                    ),
+                    answer_with_skill=AsyncMock(
+                        return_value=SimpleNamespace(
+                            text="",
+                            handled=True,
+                            sticker_sent=False,
+                            tts_sent=False,
+                            sticker_file_id="",
+                            tts_text="",
+                        )
+                    ),
+                )
+                await _run_pending_batch(av_enabled=av_enabled, fake_skill=fake_skill)
+                context = getattr(fake_skill, "content_boundaries_context", "")
+                if expected:
+                    self.assertIn("[Content Boundaries]", context)
+                else:
+                    self.assertEqual(context, "")
+
+
+def _pending_wiring_message() -> SimpleNamespace:
+    return SimpleNamespace(
+        message_id=99,
+        text="这个番号是什么",
+        caption=None,
+        from_user=SimpleNamespace(
+            id=USER_ID, is_bot=False, username="member", full_name="Member"
+        ),
+        sender_chat=None,
+        reply_to_message=None,
+        chat=SimpleNamespace(id=GROUP_ID, type="supergroup"),
+    )
+
+
+async def _run_pending_batch(*, av_enabled: bool, fake_skill: SimpleNamespace) -> None:
+    message = _pending_wiring_message()
+    item = group._PendingReplyItem(
+        message=message,
+        group_id=GROUP_ID,
+        user_id=USER_ID,
+        input_text=message.text,
+        msg_type="text",
+        sender_username="member",
+        sender_is_owner=False,
+        sender_is_tg_admin=False,
+        user_tag="id:42",
+        explicit_mention=True,
+        mentioned=True,
+        is_reply=False,
+        reply_to_bot=False,
+        reply_to_other=False,
+        mention_other=False,
+    )
+
+    class _Session:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def get(self, _model, _key):
+            return SimpleNamespace(settings={"av_enabled": av_enabled})
+
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+        async def rollback(self):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    session = _Session()
+    memory = SimpleNamespace(
+        session_factory=lambda: session,
+        get_history=Mock(return_value=[]),
+        get_history_for_llm=AsyncMock(return_value=[]),
+    )
+    fake_progress = SimpleNamespace(
+        visible=False,
+        start=AsyncMock(),
+        report=AsyncMock(),
+        composing=AsyncMock(),
+        handoff=AsyncMock(return_value=None),
+        finish=AsyncMock(),
+        fail=AsyncMock(),
+        dismiss=AsyncMock(),
+        close=AsyncMock(),
+    )
+    settings = SimpleNamespace(
+        bot=SimpleNamespace(
+            inbound_debounce_seconds=1.0,
+            main_model="",
+            decision_model="",
+            compress_model="",
+            moderation_model="",
+            vision_model="",
+            embed_model="",
+            max_context_tokens=0,
+            decision_context_items=0,
+            enable_typing=False,
+            enable_streaming=False,
+            stream_chunk_size=100,
+            stream_edit_interval_sec=0.0,
+            disable_link_preview=True,
+        ),
+        skill_sticker_file_ids="",
+    )
+
+    with (
+        patch("bot.handlers.group.memory_holder") as holder,
+        patch("bot.handlers.group.LLMService", return_value=SimpleNamespace()),
+        patch("bot.handlers.group.SkillService", return_value=fake_skill),
+        patch("bot.handlers.group.CasualService", return_value=fake_skill),
+        patch(
+            "bot.handlers.group.ReplyProgressTracker", return_value=fake_progress
+        ),
+        patch(
+            "bot.handlers.group._resolve_pending_reply_action",
+            new=AsyncMock(return_value=("reply", True)),
+        ),
+        patch("bot.handlers.group._is_user_admin_cached", new=AsyncMock(return_value=False)),
+        patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
+        patch("bot.handlers.group._fresh_group_authorized_for_moderation", new=AsyncMock(return_value=True)),
+    ):
+        holder.get.return_value = memory
+        holder.get_optional.return_value = None
+        await group._process_pending_reply_batch([item], settings)
+
+
+# ---------------------------------------------------------------------------
+# 机器人自己永远不在群里发 NSFW 媒体（现有行为，只做回归断言）
+# ---------------------------------------------------------------------------
+
+
+class BotNeverPostsNsfwMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_av_sample_sender_refuses_group_chat_ids(self) -> None:
+        from bot.handlers import commands
+
+        for group_chat_id in (-10001, -1, 0):
+            with self.subTest(chat_id=group_chat_id):
+                bot = SimpleNamespace(send_photo=AsyncMock())
+                sent = await commands._send_av_samples_to_sender_dm(
+                    bot=bot,
+                    sender_user_id=group_chat_id,
+                    detail=SimpleNamespace(),
+                    limit=3,
+                )
+                self.assertEqual(sent, 0)
+                bot.send_photo.assert_not_awaited()
+
+    def test_sample_scheduling_refuses_group_chat_ids(self) -> None:
+        from bot.handlers import commands
+
+        bot = SimpleNamespace(send_photo=AsyncMock())
+        scheduled = commands._schedule_av_samples_dm(
+            bot=bot,
+            sender_user_id=-10001,
+            detail=SimpleNamespace(),
+            settings=None,
+        )
+        self.assertFalse(scheduled)
+        bot.send_photo.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

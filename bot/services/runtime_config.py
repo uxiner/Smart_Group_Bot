@@ -366,6 +366,11 @@ class ModerationSettingsConfig(StrictModel):
     admin_moderation_enabled: bool = True
     # 管理员命中违规时私聊最高管理员一份完整证据（best-effort、限流合并）。
     admin_alert_super_admin_enabled: bool = True
+    # 审核命中证据投递频道（取代私聊最高管理员）：每条命中单独发一条证据卡，
+    # 带「人工放行 / 放行收回」按钮。默认开启；关掉回到私聊老路径（含聚合）。
+    log_channel_enabled: bool = True
+    # 证据频道 id；0 表示未配置（频道投递不可用，回退私聊老路径）。
+    log_channel_id: int = -1004337744233
 
 
 class PatrolSettingsConfig(StrictModel):

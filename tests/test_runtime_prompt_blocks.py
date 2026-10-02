@@ -6,6 +6,7 @@ from bot.utils.prompts import (
     REPLY_MODE_SYSTEM,
     SKILL_TOOL_SYSTEM,
     STICKER_DECISION_SYSTEM,
+    with_persona,
 )
 
 
@@ -58,3 +59,30 @@ class RuntimePromptBlockTests(unittest.TestCase):
             SKILL_TOOL_SYSTEM,
         )
         self.assertIn("a blank line never splits anything", SKILL_TOOL_SYSTEM)
+
+    def test_persona_declares_content_boundaries_for_open_adult_text(self) -> None:
+        self.assertIn("[Content Boundaries]", PERSONA_SYSTEM)
+        for needle in (
+            "Adult-work text is not restricted",
+            "codes/serial numbers (番号)",
+            "never tell the user to go search for it themselves",
+            "Your two roles do not conflict",
+            "Adult media is the only hard line",
+            "Never send, forward, or display adult images or videos in any group",
+            "the guard flow handles it (delete + warning + challenge)",
+            "Never fabricate",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, PERSONA_SYSTEM)
+        # 位置：紧跟 [Safety Boundaries] 之后
+        self.assertGreater(
+            PERSONA_SYSTEM.index("[Content Boundaries]"),
+            PERSONA_SYSTEM.index("[Safety Boundaries]"),
+        )
+
+    def test_default_persona_does_not_carry_the_open_text_block(self) -> None:
+        # 该节只在群内开了 /av 时按群单独注入，默认人设里必须先摘掉。
+        rendered = with_persona("task")
+        self.assertNotIn("[Content Boundaries]", rendered)
+        self.assertNotIn("Adult-work text is not restricted", rendered)
+        self.assertIn("[Safety Boundaries]", rendered)

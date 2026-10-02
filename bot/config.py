@@ -180,6 +180,12 @@ class ModerationConfig(BaseModel):
     admin_moderation_enabled: bool = True
     # 管理员命中违规时，私聊最高管理员一份完整证据（best-effort，不刷屏）。默认开启。
     admin_alert_super_admin_enabled: bool = True
+    # 审核命中证据投递到「审核日志」频道（取代私聊最高管理员）：群里所有被处置
+    # 的命中都单独发一条完整证据卡（带「人工放行 / 放行收回」按钮）。默认开启；
+    # 关掉后回到私聊最高管理员的老路径（含 10 分钟聚合抑制）。
+    log_channel_enabled: bool = True
+    # 证据频道 id；0 表示未配置（此时频道投递不可用，回退私聊老路径）。
+    log_channel_id: int = -1004337744233
 
 
 class Settings(BaseSettings):
@@ -855,6 +861,12 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.moderation.admin_alert_super_admin_enabled = bool(
         settings.moderation.admin_alert_super_admin_enabled
+    )
+    settings.moderation.log_channel_enabled = bool(
+        settings.moderation.log_channel_enabled
+    )
+    settings.moderation.log_channel_id = int(
+        settings.moderation.log_channel_id or 0
     )
 
     settings.bot.token = settings.bot_token

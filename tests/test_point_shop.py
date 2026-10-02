@@ -269,13 +269,8 @@ class LotteryTableTests(unittest.TestCase):
         self.assertEqual(table[40], 400)
         self.assertEqual(table[100], 100)
 
-    def test_expected_value_matches_the_2026_10_01_table(self) -> None:
-        """2026-10-01 管理员指定的新概率；期望值正好 6.00 分/次。
-
-        注意：这仍高于 5 分的抽奖成本，抽奖是**净发放**（玩家平均每次净赚 1.00 分），
-        不再是积分回收口。想改回回收口就上调"谢谢参与"的权重，并同步这里。
-        """
-
+    def test_expected_value_is_exactly_six_points(self) -> None:
+        # 2026-10-01 管理员指定：期望值**正好** 6.00 分/次（成本 5 分 → 长期每次净赚 1 分）。
         self.assertAlmostEqual(expected_lottery_value(), 6.0, places=6)
         self.assertGreater(expected_lottery_value(), LOTTERY_PRICE)
 
@@ -824,7 +819,7 @@ class LotteryPurchaseTests(_DbTestCase):
 
     async def test_big_prizes_are_paid_out(self) -> None:
         for index, (roll, points) in enumerate(
-            ((9900, 100), (9500, 40), (8500, 12), (6000, 5))
+            ((9900, 100), (9500, 40), (8500, 12), (7500, 8), (5900, 5), (3900, 3))
         ):
             with self.subTest(roll=roll):
                 await self._grant_points(7, 36)
@@ -833,8 +828,7 @@ class LotteryPurchaseTests(_DbTestCase):
                 self.assertEqual(reply.status, "ok")
                 self.assertIn(f"{points} 分", reply.text)
 
-        # 100 + 40 + 12 + 5 = 157
-        self.assertEqual(await self._balance(7), 36 * 4 - 4 * LOTTERY_PRICE + 157)
+        self.assertEqual(await self._balance(7), 36 * 6 - 6 * LOTTERY_PRICE + 168)
 
     async def test_ten_draws_a_day_then_it_stops(self) -> None:
         await self._grant_points(7, 500)

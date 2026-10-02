@@ -258,9 +258,12 @@ class SkillService:
         tool_timeout_seconds: float = 15.0,
         max_tool_calls_per_round: int = 4,
         max_total_tool_calls: int = 8,
+        content_boundaries_context: str = "",
     ) -> None:
         self.llm = llm
         self.settings = settings
+        # 按群注入的成人文字放开指令块：只有该群开了 /av 才非空（空串=一个字都不注入）。
+        self.content_boundaries_context = str(content_boundaries_context or "")
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.tool_timeout_seconds = max(0.1, float(tool_timeout_seconds))
         self.max_tool_calls_per_round = max(1, int(max_tool_calls_per_round))
@@ -473,6 +476,13 @@ class SkillService:
         # recency; its own wording keeps structural safety/identity rules intact.
         if style_profile_context.strip():
             messages.append({"role": "system", "content": style_profile_context.strip()})
+        # 群内开了 /av 才注入的成人文字放开指令块（未开启时为空串，一个字都不加）。
+        # 放在人设块之后、项目事实块之前：与 [ACTIVE_PERSONA] 的拼装方式一致，
+        # 但不会盖掉项目事实。
+        if self.content_boundaries_context.strip():
+            messages.append(
+                {"role": "system", "content": self.content_boundaries_context.strip()}
+            )
         # Keep canonical public project facts after focus/style blocks so
         # neither user-derived context nor a cloned persona can overwrite them.
         messages.append({"role": "system", "content": build_bot_project_info_context()})

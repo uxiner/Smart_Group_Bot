@@ -18,7 +18,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+)
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -51,7 +57,10 @@ from bot.services.call_admin import (
     remove_call_admin_resolution_button,
 )
 from bot.services.api_model_query import api_model_query_tool_enabled
-from bot.services.group_settings import acquire_group_settings_write_intent
+from bot.services.group_settings import (
+    acquire_group_settings_write_intent,
+    is_group_av_enabled,
+)
 from bot.services.vote_ban import (
     VOTE_BAN_ADMIN_RESOLUTION_BAN,
     VOTE_BAN_ADMIN_RESOLUTION_CANCEL,
@@ -104,6 +113,7 @@ from bot.services.join_verification import (
     manual_unban_generation_is_active,
     moderation_challenge_ready,
     release_moderation_restriction_after_exemption,
+    restrict_new_member,
     restore_member_permissions,
     telegram_ban_failure_is_deterministic,
     unban_member,
@@ -140,6 +150,7 @@ from bot.services.update_completion import (
     current_update_completion,
     request_current_update_retry,
 )
+from bot.utils.prompts import build_content_boundaries_context
 from bot.utils.security import format_history_message_line
 from bot.utils.timezone import (
     format_shanghai_timestamp,
@@ -192,6 +203,8 @@ _PENDING_REPLY_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 _MODERATION_ACTION_CALLBACK_PREFIX = "mact"
+# 审核命中证据卡上的「人工放行 / 放行收回」回调前缀（只有最高管理员可点）。
+_REVIEW_CALLBACK_PREFIX = "mrev"
 _MODERATION_ACTION_BASES = {"warn", "ban_warning", "ban_applied"}
 _MODERATION_ACTION_MARKERS = ("direct", "reverted")
 _MODERATION_USER_LOCKS: weakref.WeakValueDictionary[
@@ -2298,6 +2311,483 @@ async def _moderation_add_permanent_exemption(
     return "exempt" if existing is None else None
 
 
+# --------------------------------------------------------------------------- #
+# 「人工放行 / 放行收回」回调（mrev:）—— 证据卡按钮；只有最高管理员可点
+# --------------------------------------------------------------------------- #
+def _review_card_field(html_text: str, label: str) -> str:
+    """从证据卡 HTML 里取一个 ``card_field`` 的值；取不到返回空串。"""
+
+    if not html_text:
+        return ""
+    match = re.search(
+        r"<b>" + re.escape(str(label)) + r"</b>[^\S\n]*([^\n<]*)", html_text
+    )
+    if match is None:
+        return ""
+    return match.group(1).strip()
+
+
+def _review_card_link(html_text: str) -> str:
+    if not html_text:
+        return ""
+    match = re.search(
+        r"<b>消息回链</b>[^\S\n]*<a href=\"([^\"]+)\"", html_text
+    )
+    if match is None:
+        return ""
+    return match.group(1).strip()
+
+
+async def _release_member_restriction_for_review(*, bot, session, violation) -> bool:
+    """人工放行时「只做解禁那一半」。
+
+    照抄 ``_moderation_add_permanent_exemption`` 的恢复流程，但**不**添加
+    ``ModerationExemption`` 行——人工放行不是永久豁免。这样质询超时封禁会被作废、
+    成员恢复发言权限。``recovery is None``（没有待处理质询/本来就没事）视为无需解禁，
+    不算错误。
+    """
+
+    violation_id = int(getattr(violation, "id", 0) or 0)
+    try:
+        group_id = int(getattr(violation, "group_id", 0) or 0)
+        user_id = int(getattr(violation, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if group_id == 0 or user_id == 0:
+        return True
+    try:
+        recovery = await lease_join_verification_for_unban(
+            session, group_id, user_id, manual_unban=False
+        )
+    except Exception:
+        log.exception("review release: lease failed | violation=%s", violation_id)
+        return False
+    if recovery is None:
+        return True
+    try:
+        await session.commit()
+    except Exception:
+        log.exception(
+            "review release: recovery commit failed | violation=%s", violation_id
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        return False
+    activate_manual_unban_recovery(recovery)
+    try:
+        released = await release_moderation_restriction_after_exemption(
+            bot, session, recovery
+        )
+    except Exception:
+        log.exception("review release: unban failed | violation=%s", violation_id)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        return False
+    return bool(released)
+
+
+async def _reapply_restriction_for_review(
+    *,
+    bot,
+    settings: Settings,
+    session,
+    violation: object,
+    card_text: str = "",
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> str:
+    """「放行收回」时按该 case 的**原始处置**重新施加限制，返回一句结果说明。
+
+    - 原始 ``challenge``（ban 规则 + 质询）→ 重新禁言并重新发起质询（600 秒重新
+      开始）；质询不可用/创建失败时退化为只重新禁言。
+    - 原始 ``ban_applied`` / ``ban`` → 重新封禁（sender-chat 分支不碰）。
+    - 原始 ``delete`` / ``warn`` → 没有限制可恢复，只撤回规则调整请求。
+    - 最高管理员与手动豁免名单（/aiexempt）里的人不动。
+
+    任何失败都被 catch 住并反映在返回值里（写进频道），绝不向上抛异常。
+    """
+
+    violation_id = int(getattr(violation, "id", 0) or 0)
+    try:
+        group_id = int(getattr(violation, "group_id", 0) or 0)
+        user_id = int(getattr(violation, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        return "无可恢复（缺少群/用户信息）"
+    if group_id == 0 or user_id == 0:
+        return "无可恢复（缺少群/用户信息）"
+    action = str(getattr(violation, "action_taken", "") or "").strip().lower()
+    display_name = _review_card_field(card_text, "对象") or ""
+    reason = _review_card_field(card_text, "判定理由") or str(
+        getattr(violation, "verdict_reason", "") or ""
+    )
+
+    # 最高管理员完全豁免：不施加任何限制。
+    try:
+        if is_super_admin_user_id(user_id, settings):
+            return "该用户是最高管理员，完全豁免，不施加限制"
+    except Exception:
+        pass
+
+    # 手动豁免名单（/aiexempt）里的人不动。
+    try:
+        exempt_result = await session.execute(
+            select(ModerationExemption).where(
+                ModerationExemption.group_id == group_id,
+                ModerationExemption.user_id == user_id,
+            )
+        )
+        if exempt_result.scalar_one_or_none() is not None:
+            return "该用户当前在手动豁免名单，跳过限制恢复"
+    except Exception:
+        log.warning(
+            "review revoke: exemption check failed | violation=%s", violation_id
+        )
+
+    # sender-chat 身份（群/频道）不是用户，禁用申请与封禁都不适用。
+    if user_id < 0:
+        return "sender-chat 身份，跳过限制恢复"
+
+    if action == "challenge":
+        if moderation_challenge_ready(settings):
+            try:
+                bot_username = str(getattr(await bot.me(), "username", "") or "")
+            except Exception:
+                bot_username = ""
+            try:
+                challenged = await begin_moderation_challenge(
+                    bot=bot,
+                    session=session,
+                    settings=settings,
+                    group_id=group_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    bot_username=bot_username,
+                    reason=reason,
+                    rule_action="ban",
+                    session_factory=session_factory,
+                )
+            except Exception:
+                log.warning(
+                    "review revoke: re-challenge failed | violation=%s",
+                    violation_id,
+                    exc_info=True,
+                )
+                challenged = False
+            if challenged:
+                return "已重新禁言并重新发起质询（600 秒质询重新开始）"
+            remuted = await _reapply_restriction_mute(
+                bot, group_id, user_id, violation_id=violation_id
+            )
+            return (
+                "已重新禁言（质询创建失败，退化为仅禁言）"
+                if remuted
+                else "重新禁言失败"
+            )
+        remuted = await _reapply_restriction_mute(
+            bot, group_id, user_id, violation_id=violation_id
+        )
+        return "已重新禁言（质询未配置，未重新发起质询）" if remuted else "重新禁言失败"
+
+    if action in {"ban_applied", "ban"}:
+        try:
+            banned = await ban_member(bot, group_id, user_id)
+        except Exception:
+            log.warning(
+                "review revoke: re-ban failed | violation=%s",
+                violation_id,
+                exc_info=True,
+            )
+            return "恢复限制失败（重新封禁异常）"
+        return "已重新封禁" if banned else "重新封禁失败"
+
+    return "该次处置未禁言，无可恢复"
+
+
+async def _reapply_restriction_mute(
+    bot, group_id: int, user_id: int, *, violation_id: int
+) -> bool:
+    """只重新禁言（退化路径）；失败只记日志、返回 False。"""
+
+    try:
+        return bool(await restrict_new_member(bot, group_id, user_id))
+    except Exception:
+        log.warning(
+            "review revoke: re-mute failed | violation=%s", violation_id, exc_info=True
+        )
+        return False
+
+
+async def _edit_review_channel_status(
+    callback: CallbackQuery, settings: Settings, violation: object, *, line: str
+) -> None:
+    """在频道那条证据消息上追加一行状态（best-effort，失败只记日志）。"""
+
+    bot = getattr(callback, "bot", None)
+    message = getattr(callback, "message", None)
+    edit = getattr(bot, "edit_message_text", None)
+    if not callable(edit):
+        return
+    try:
+        target_chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+    except (TypeError, ValueError):
+        target_chat_id = 0
+    if target_chat_id == 0:
+        target_chat_id = _admin_log_channel_id(settings)
+    try:
+        message_id = int(getattr(message, "message_id", 0) or 0)
+    except (TypeError, ValueError):
+        message_id = 0
+    if target_chat_id == 0 or message_id <= 0:
+        return
+    current = getattr(message, "html_text", None)
+    if not isinstance(current, str) or not current.strip():
+        log.info(
+            "review status edit skipped | reason=no_html_text violation=%s",
+            getattr(violation, "id", 0),
+        )
+        return
+    new_text = f"{current.rstrip()}\n\n{line}"
+    try:
+        await edit(
+            chat_id=target_chat_id,
+            message_id=message_id,
+            text=new_text,
+            parse_mode="HTML",
+        )
+    except Exception:
+        log.warning(
+            "review status edit failed | violation=%s", getattr(violation, "id", 0)
+        )
+
+
+async def _send_review_handover(
+    *,
+    callback: CallbackQuery,
+    settings: Settings,
+    violation: object,
+    header: str,
+    extra_lines: tuple[str, ...] = (),
+) -> int | None:
+    """在频道里新发一条交接消息（第一行逐字为 ``header``），@ 上规则调整用的 bot。
+
+    正文以 **mention 实体**（不是纯文本）指向 ``@Ming_GPT_bot``，让 Telegram 认成
+    对该用户的 mention。best-effort：失败只记日志、返回 None。
+    """
+
+    bot = getattr(callback, "bot", None)
+    send_message = getattr(bot, "send_message", None)
+    channel_id = _admin_log_channel_id(settings)
+    if channel_id == 0 or not callable(send_message):
+        return None
+    card = getattr(getattr(callback, "message", None), "html_text", None)
+    card = card if isinstance(card, str) else ""
+    violation_id = int(getattr(violation, "id", 0) or 0)
+    try:
+        group_id = int(getattr(violation, "group_id", 0) or 0)
+        user_id = int(getattr(violation, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        group_id = 0
+        user_id = 0
+
+    sender = _review_card_field(card, "对象") or f"id:{user_id}"
+    identity = _review_card_field(card, "身份") or "成员"
+    rule_ref = _review_card_field(card, "命中规则") or _admin_rule_reference(None)
+    action = _review_card_field(card, "动作") or str(
+        getattr(violation, "action_taken", "") or "—"
+    )
+    confidence = _review_card_field(card, "置信度")
+    if not confidence:
+        raw_confidence = getattr(violation, "confidence", None)
+        confidence = "—" if raw_confidence is None else f"{float(raw_confidence):.2f}"
+    reason = _review_card_field(card, "判定理由") or str(
+        getattr(violation, "verdict_reason", "") or "—"
+    )
+    submitted = _review_card_field(card, "送审原文") or _truncate_alert_text(
+        getattr(violation, "message_text", "") or ""
+    )
+    link = _review_card_link(card) or _message_evidence_link(
+        SimpleNamespace(id=group_id, username=None),
+        getattr(violation, "source_message_id", None),
+    )
+
+    lines = [
+        header,
+        "",
+        f"case：{violation_id}",
+        f"群组：{group_id}",
+        f"发送者：{sender}",
+        f"身份：{identity}",
+        f"命中规则：{rule_ref}",
+        f"动作：{action}",
+        f"置信度：{confidence}",
+        f"判定理由：{reason}",
+        f"送审原文：{submitted}",
+    ]
+    if link:
+        lines.append(f"消息回链：{link}")
+    for extra in extra_lines:
+        if str(extra).strip():
+            lines.append(str(extra))
+    lines.append("")
+    lines.append(f"请 {_REVIEW_HANDOVER_MENTION} 处理规则调整。")
+    text = "\n".join(lines)
+    mention_index = text.rfind(_REVIEW_HANDOVER_MENTION)
+    entities = None
+    if mention_index >= 0:
+        offset = len(text[:mention_index].encode("utf-16-le")) // 2
+        entities = [
+            MessageEntity(
+                type="mention",
+                offset=offset,
+                length=len(_REVIEW_HANDOVER_MENTION),
+            )
+        ]
+    try:
+        if entities is None:
+            sent = await send_message(
+                chat_id=channel_id, text=text, disable_web_page_preview=True
+            )
+        else:
+            sent = await send_message(
+                chat_id=channel_id,
+                text=text,
+                entities=entities,
+                disable_web_page_preview=True,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "review handover send failed | violation=%s", violation_id
+        )
+        return None
+    try:
+        return int(getattr(sent, "message_id", 0) or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+@router.callback_query(F.data.startswith(f"{_REVIEW_CALLBACK_PREFIX}:"))
+async def on_review_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """证据卡上的「人工放行 / 放行收回」。只有最高管理员（settings.super_admin_id）可点。"""
+
+    if session is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[0] != _REVIEW_CALLBACK_PREFIX:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    action = parts[1]
+    if action not in {"rel", "rev"}:
+        await callback.answer("不支持的审核操作", show_alert=True)
+        return
+    try:
+        violation_id = int(parts[2])
+    except (TypeError, ValueError):
+        violation_id = 0
+    if violation_id <= 0:
+        await callback.answer("审核事件无效", show_alert=True)
+        return
+
+    operator_id = int(getattr(callback.from_user, "id", 0) or 0)
+    try:
+        super_admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
+    except (TypeError, ValueError):
+        super_admin_id = 0
+    # 只有最高管理员本人可点：其他人只弹提示，不改状态、不调 Telegram 管理接口。
+    if super_admin_id <= 0 or operator_id != super_admin_id:
+        await callback.answer("无权限", show_alert=True)
+        return
+
+    violation = await session.get(Violation, violation_id)
+    if violation is None:
+        await callback.answer("审核事件不存在", show_alert=True)
+        return
+    current_state = str(
+        getattr(violation, "review_state", _REVIEW_STATE_NONE) or _REVIEW_STATE_NONE
+    ).strip().lower()
+
+    if action == "rev":
+        if current_state != _REVIEW_STATE_RELEASED:
+            await callback.answer("这条没有放行过，不需要调整", show_alert=True)
+            return
+        violation.review_state = _REVIEW_STATE_REVOKED
+        violation.reviewed_by = operator_id
+        violation.reviewed_at = now_shanghai_naive()
+        await session.commit()
+        # 收回：撤回「规则调整请求」，并按该 case 的**原始处置**把限制重新施加回去
+        # （challenge → 重新禁言 + 重新质询；ban_applied/ban → 重新封禁；
+        #  delete/warn → 无限制可恢复）。原始处置的恢复失败/结果都会被 catch 住并
+        # 写进频道消息与状态行；频道通知失败也绝不影响群内状态。
+        restriction_note = await _reapply_restriction_for_review(
+            bot=getattr(callback, "bot", None),
+            settings=settings,
+            session=session,
+            violation=violation,
+            card_text=getattr(getattr(callback, "message", None), "html_text", "") or "",
+            session_factory=session_factory,
+        )
+        await _edit_review_channel_status(
+            callback,
+            settings,
+            violation,
+            line=f"🔴 已收回放行申请 · 规则无需调整 · 限制恢复：{restriction_note}",
+        )
+        await _send_review_handover(
+            callback=callback,
+            settings=settings,
+            violation=violation,
+            header=_REVIEW_REVOKE_HEADER,
+            extra_lines=(f"限制恢复：{restriction_note}",),
+        )
+        await callback.answer("已收回放行申请，正在恢复该成员的原始处置")
+        return
+
+    if current_state == _REVIEW_STATE_RELEASED:
+        await callback.answer("这条已经放行过了", show_alert=True)
+        return
+    violation.review_state = _REVIEW_STATE_RELEASED
+    violation.reviewed_by = operator_id
+    violation.reviewed_at = now_shanghai_naive()
+    await session.commit()
+    released = await _release_member_restriction_for_review(
+        bot=getattr(callback, "bot", None),
+        session=session,
+        violation=violation,
+    )
+    await _edit_review_channel_status(
+        callback,
+        settings,
+        violation,
+        line="🟢 已人工放行 · 已解除该成员限制 · 待规则调整",
+    )
+    await _send_review_handover(
+        callback=callback,
+        settings=settings,
+        violation=violation,
+        header=_REVIEW_RELEASE_HEADER,
+    )
+    log.info(
+        "manual review released | violation=%s operator=%s unbanned=%s",
+        violation_id,
+        operator_id,
+        released,
+    )
+    await callback.answer("已放行，正在交接给规则调整")
+
+
 @router.callback_query(F.data.startswith(f"{_MODERATION_ACTION_CALLBACK_PREFIX}:"))
 async def on_moderation_action(
     callback: CallbackQuery,
@@ -3562,6 +4052,14 @@ async def _best_effort_rollback(
         )
 
 
+#: 图片/视频缩略图共用的基础描述提示词（原有描述/OCR 要求一个字都不改）。
+_VISION_DESCRIBE_PROMPT = (
+    "Please describe key information in this image, prioritizing visible text (OCR) and main objects. "
+    "Respond briefly in Chinese within 30 words. "
+    "If no useful content can be identified, reply exactly: NO_VALID_IMAGE_CONTENT."
+)
+
+
 def _extract_image_file_info(message: Message) -> tuple[str, str, int] | None:
     """Return (file_id, mime, declared_size) for safe image-like messages."""
     if message.photo:
@@ -3609,8 +4107,32 @@ async def _build_telegram_image_data_uri(message: Message) -> str:
     info = _extract_image_file_info(message)
     if not info:
         return ""
+    return await _build_vision_data_uri(message, *info)
 
-    file_id, mime, declared_size = info
+
+def _extract_video_thumbnail_file_info(message: Message) -> tuple[str, str, int] | None:
+    """视频/视频留言的 Telegram 缩略图 → ``(file_id, mime, declared_size)``。
+
+    沿用 ``_extract_image_file_info`` 对动图贴纸「取 thumbnail 当图片去判」的先例。
+    **拿不到缩略图就返回 None**（调用方什么都不做，只记日志），绝不退回视频本体。
+    """
+    for attr in ("video", "video_note"):
+        media = getattr(message, attr, None)
+        if not media:
+            continue
+        thumb = getattr(media, "thumbnail", None)
+        if thumb and getattr(thumb, "file_id", None):
+            return (
+                thumb.file_id,
+                "image/jpeg",
+                int(getattr(thumb, "file_size", 0) or 0),
+            )
+    return None
+
+
+async def _build_vision_data_uri(
+    message: Message, file_id: str, mime: str, declared_size: int
+) -> str:
     if declared_size > _MAX_VISION_IMAGE_BYTES:
         log.warning("【视觉】跳过超限图片 | 声明大小=%dB | 类型=%s", declared_size, mime)
         return ""
@@ -3644,10 +4166,14 @@ async def _build_telegram_image_data_uri(message: Message) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 群内 NSFW（露骨色情）图片处置
+# 群内 NSFW（露骨色情）图片/视频处置
 #
-# 成本红线：判定**复用审核链路本来就会做的那一次视觉调用**（_append_image_context
+# 成本红线：图片判定**复用审核链路本来就会做的那一次视觉调用**（_append_image_context
 # 里的 vision_describe），只在提示词末尾追加一条结构化要求，不新增任何模型调用。
+# 视频（video / video_caption / video_note）本体不进文本流水线，改为拿 Telegram
+# 提供的缩略图单独判定一次；拿不到缩略图就什么都不做，只记日志。**不设群限制**：
+# 跟随 moderation.nsfw_image_guard_enabled，与群内 av_enabled 无关（机器人自己也
+# 永远不在任何群里发这类媒体）。
 # 宁可漏判，不可误伤：只有模型明确回 NSFW_YES 才处置，其余（NSFW_NO /
 # NSFW_UNKNOWN / 解析不到 / 拒答 / 视觉失败）一律什么都不做，只记日志。
 # ---------------------------------------------------------------------------
@@ -3674,13 +4200,18 @@ _NSFW_GUARD_IMAGE_TYPES = frozenset(
         "animation_caption",
     }
 )
+#: 视频类消息：本体不进文本流水线，只拿 Telegram 提供的缩略图做 NSFW 判定
+#: （``message.video.thumbnail`` / ``message.video_note.thumbnail``）。**不设群限制**，
+#: 跟随图片守卫的 ``moderation.nsfw_image_guard_enabled``，与群内 ``av_enabled`` 无关。
+_NSFW_GUARD_VIDEO_TYPES = frozenset({"video", "video_caption", "video_note"})
 #: 群里「/av + 图片」由 commands.py 的「先删图再识图」流程负责，这里跳过，别打架。
 _AV_IMAGE_COMMAND_RE = re.compile(r"^/av(?:@[A-Za-z0-9_]+)?(?:\s|$)", re.IGNORECASE)
 
 #: 群内警告（独立一条、@当事人）保留多久后自动删除；调这里即可改时长。
 _NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS = 120
-_NSFW_IMAGE_WARNING_REASON = "检测到裸露/色情图片，已删除。请勿在本群发布此类内容。"
-_NSFW_IMAGE_CHALLENGE_REASON = "检测到在群内公开发布裸露/色情图片（图片已删除）"
+#: 文案把「图片」泛化为「图片/视频」：守卫同时覆盖这两类媒体。
+_NSFW_IMAGE_WARNING_REASON = "检测到裸露/色情图片或视频，已删除。请勿在本群发布此类内容。"
+_NSFW_IMAGE_CHALLENGE_REASON = "检测到在群内公开发布裸露/色情图片或视频（内容已删除）"
 
 
 def _parse_nsfw_marker(vision_text: str) -> str:
@@ -3742,14 +4273,127 @@ def _nsfw_image_guard_enabled(settings: Settings) -> bool:
 def _nsfw_image_guard_applies(
     message: Message, msg_type: str, settings: Settings
 ) -> bool:
-    """这条消息是否需要请求 NSFW 判定（= 是否在视觉提示词里追加要求）。"""
+    """这条消息是否需要请求 NSFW 判定（= 是否在视觉提示词里追加要求）。
+
+    不设群限制：图片与视频都跟随 ``moderation.nsfw_image_guard_enabled``。
+    视频看的是**缩略图**，拿不到缩略图就不判定（只记日志）。
+    """
     if not _nsfw_image_guard_enabled(settings):
         return False
+    if msg_type in _NSFW_GUARD_VIDEO_TYPES:
+        return _extract_video_thumbnail_file_info(message) is not None
     if msg_type not in _NSFW_GUARD_IMAGE_TYPES:
         return False
     if not _has_guardable_image(message):
         return False
     return not _is_group_av_image_message(message)
+
+
+async def _nsfw_video_thumbnail_vision_text(message: Message, llm: LLMService) -> str:
+    """对视频缩略图跑一次 NSFW 判定，返回模型原始输出。
+
+    拿不到缩略图 / 下载失败 / 识别失败 / 识别为空 → 返回空串（调用方一律不处置，
+    只记日志）。**绝不**退回视频本体或额外再调一次模型。
+    """
+    info = _extract_video_thumbnail_file_info(message)
+    if not info:
+        log.info("【NSFW视频】跳过 | reason=no_thumbnail")
+        return ""
+
+    data_uri = await _build_vision_data_uri(message, *info)
+    if not data_uri:
+        log.info("【NSFW视频】跳过 | reason=thumbnail_unavailable")
+        return ""
+
+    vision_prompt = f"{_VISION_DESCRIBE_PROMPT} {_NSFW_VISION_INSTRUCTION}"
+    try:
+        vision_text = (
+            await _await_hard_deadline(
+                llm.vision_describe(data_uri, vision_prompt),
+                timeout_seconds=20.0,
+            )
+        ).strip()
+    except asyncio.TimeoutError:
+        log.warning("【NSFW视频】缩略图识别超时，跳过")
+        return ""
+    except Exception as exc:
+        log.warning("【NSFW视频】缩略图识别失败，跳过 | error=%s", exc)
+        return ""
+
+    if vision_text == "NO_VALID_IMAGE_CONTENT":
+        return ""
+    return vision_text
+
+
+async def _guard_nsfw_video_only_message(
+    *,
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    group_id: int,
+    user_id: int,
+    sender_identity: _SenderIdentity,
+    warn_target: str,
+    bot_me: object,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> bool:
+    """``video`` / ``video_note``（无 caption）的守卫。
+
+    这两类消息走「媒体旁路」直接 return，所以判定必须发生在旁路之前。除新增守卫
+    外，旁路、归档等原有行为一律不变：判定不通过就照旧旁路返回。
+    """
+    if not _nsfw_image_guard_enabled(settings):
+        return False
+    if _extract_video_thumbnail_file_info(message) is None:
+        log.info(
+            "[%s]【NSFW视频】跳过 | reason=no_thumbnail user=%s", group_id, user_id
+        )
+        return False
+
+    llm = LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
+        embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
+    )
+    vision_text = await _nsfw_video_thumbnail_vision_text(message, llm)
+    marker = _parse_nsfw_marker(vision_text)
+    if marker != _NSFW_MARKER_YES:
+        # 宁可漏，不可误伤：NSFW_NO / NSFW_UNKNOWN / 解析不到（含拒答、视觉失败）
+        # 一律什么都不做，只记日志。
+        log.info("[%s]【NSFW视频】未命中 | 标记=%s user=%s", group_id, marker, user_id)
+        return False
+
+    user = getattr(message, "from_user", None)
+    sender_is_owner = bool(
+        user
+        and not sender_identity.is_chat
+        and is_super_admin_user_id(user.id, settings)
+    )
+    sender_is_tg_admin = sender_identity.is_chat or await _is_user_admin_cached(message)
+    return await _apply_nsfw_image_guard(
+        message=message,
+        session=session,
+        settings=settings,
+        llm=llm,
+        group_id=group_id,
+        user_id=user_id,
+        display_name=sender_identity.display_name,
+        bot_username=getattr(bot_me, "username", "") or "",
+        input_text=str(
+            getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        ),
+        vision_text=vision_text,
+        warn_target=warn_target,
+        sender_is_chat=sender_identity.is_chat,
+        sender_is_owner=sender_is_owner,
+        sender_is_tg_admin=sender_is_tg_admin,
+        sender_username=sender_identity.username,
+        session_factory=session_factory,
+    )
 
 
 async def _apply_nsfw_image_guard(
@@ -3771,15 +4415,16 @@ async def _apply_nsfw_image_guard(
     sender_username: str = "",
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
-    """命中 ``NSFW_YES`` 后的重处置：① 删图 ② 群内 @警告 ③ 质询。
+    """命中 ``NSFW_YES`` 后的重处置：① 删消息 ② 群内 @警告 ③ 质询。
 
-    三件事的顺序固定（删图 → 警告 → 质询），且每一步都独立于其他步骤的成败：
-    任何一步失败都只记日志并继续下一步——**删图失败也照样警告并质询**（与 ``/av``
+    图片与视频共用这条处置链（视频判定来自缩略图）：文案统一写成「图片/视频」。
+    三件事的顺序固定（删消息 → 警告 → 质询），且每一步都独立于其他步骤的成败：
+    任何一步失败都只记日志并继续下一步——**删除失败也照样警告并质询**（与 ``/av``
     那条「删失败继续识图」的方向相反）。
 
-    **记账（违规记录落库）不是删图的前置条件**：违规记录只用来占住幂等键和留痕，
-    它写失败（SQLITE_BUSY / 磁盘或 DB 异常）时照样删图、警告、质询，只把
-    ``violation`` 留空、跳过 ``notice_sent_at`` 写回。让 NSFW 图尽快离开群是
+    **记账（违规记录落库）不是删除的前置条件**：违规记录只用来占住幂等键和留痕，
+    它写失败（SQLITE_BUSY / 磁盘或 DB 异常）时照样删消息、警告、质询，只把
+    ``violation`` 留空、跳过 ``notice_sent_at`` 写回。让 NSFW 媒体尽快离开群是
     本功能的第一目的，记账失败不该换来「图不删」。
 
     唯一的例外是「确认重复投递」：同一条消息（含 Telegram 重投）已经有违规记录
@@ -4034,11 +4679,7 @@ async def _append_image_context(
     }:
         return text, ""
 
-    vision_prompt = (
-        "Please describe key information in this image, prioritizing visible text (OCR) and main objects. "
-        "Respond briefly in Chinese within 30 words. "
-        "If no useful content can be identified, reply exactly: NO_VALID_IMAGE_CONTENT."
-    )
+    vision_prompt = _VISION_DESCRIBE_PROMPT
     if nsfw_guard:
         vision_prompt = f"{vision_prompt} {_NSFW_VISION_INSTRUCTION}"
 
@@ -5069,6 +5710,19 @@ def _log_pending_reply_action(
         )
 
 
+def _content_boundaries_context_for_group(group_settings: dict | None) -> str:
+    """群内成人文字放开的注入判据。
+
+    **只看该群自己的开关** ``groups.settings.av_enabled``（不是全局
+    ``config.av_enabled``）：为真才返回指令块，为假/缺失返回空串——调用方据此
+    决定是否注入，空串时提示词里一个字都不加。
+    """
+
+    if not is_group_av_enabled(group_settings):
+        return ""
+    return build_content_boundaries_context()
+
+
 async def _process_pending_reply_batch(
     items: list[_PendingReplyItem],
     settings: Settings,
@@ -5167,6 +5821,12 @@ async def _process_pending_reply_batch(
                 str(style_state.get("profile_text") or ""),
                 target_name=str(style_state.get("target_user_name") or ""),
             )
+            # 成人文字放开只对「本群自己开了 /av」的群生效；其他群一个字都不注入。
+            # SkillService 在本批次早期就建好了，这里按群补上注入块（默认空串）。
+            content_boundaries_context = _content_boundaries_context_for_group(
+                group_settings
+            )
+            skill.content_boundaries_context = content_boundaries_context
 
             mute_stmt = select(ReplyMute.id).where(
                 ReplyMute.group_id == group_id,
@@ -5392,6 +6052,7 @@ async def _process_pending_reply_batch(
                                 allow_tts=is_tts_tool_enabled(tts_mode),
                                 allow_api_model_query=allow_api_model_query,
                             ),
+                            content_boundaries_context=content_boundaries_context,
                         )
                         raw_reply = await casual.reply(
                             merged_input_text,
@@ -6726,6 +7387,229 @@ def _admin_alert_enabled(settings: Settings) -> bool:
     return bool(getattr(moderation, "admin_alert_super_admin_enabled", True))
 
 
+# --------------------------------------------------------------------------- #
+# 审核命中证据 → 频道 + 「人工放行 / 放行收回」两个按钮
+# --------------------------------------------------------------------------- #
+# 设计口径（本次上线）：
+# - ``log_channel_enabled`` 且 ``log_channel_id`` 有效时，群里所有被处置的命中
+#   （普通成员 / 群管理员，除最高管理员整段豁免外）都往频道发一条完整证据卡；
+#   频道里**每条单独发**（不再用 10 分钟聚合抑制），都带两个按钮。
+# - 频道未启用/未配置 id 时，回到私聊最高管理员的老路径（仅管理员命中、含聚合）。
+_EVIDENCE_TITLE_MEMBER = "审核命中 · 证据"
+_EVIDENCE_TITLE_ADMIN = "管理员违规 · 证据"
+_REVIEW_RELEASE_HEADER = "🟢 人工放行 · 待调整规则"
+_REVIEW_REVOKE_HEADER = "🔴 放行收回 · 无需调整"
+_REVIEW_HANDOVER_MENTION = "@Ming_GPT_bot"
+_REVIEW_STATE_NONE = "none"
+_REVIEW_STATE_RELEASED = "released"
+_REVIEW_STATE_REVOKED = "revoked"
+
+
+def _log_channel_enabled(settings: Settings) -> bool:
+    """运行时可开关：``moderation.log_channel_enabled``（默认开启）。"""
+
+    moderation = getattr(settings, "moderation", None)
+    return bool(getattr(moderation, "log_channel_enabled", True))
+
+
+def _admin_log_channel_id(settings: Settings) -> int:
+    """证据频道 id；未配置（0）时频道投递不可用，回退私聊老路径。"""
+
+    moderation = getattr(settings, "moderation", None)
+    try:
+        return int(getattr(moderation, "log_channel_id", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _log_channel_route_active(settings: Settings) -> bool:
+    return _log_channel_enabled(settings) and _admin_log_channel_id(settings) != 0
+
+
+def _build_review_action_keyboard(violation_id: int) -> InlineKeyboardMarkup:
+    prefix = _REVIEW_CALLBACK_PREFIX
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="人工放行",
+                    callback_data=f"{prefix}:rel:{int(violation_id)}",
+                ),
+                InlineKeyboardButton(
+                    text="放行收回",
+                    callback_data=f"{prefix}:rev:{int(violation_id)}",
+                ),
+            ]
+        ]
+    )
+
+
+def _violation_evidence(
+    *,
+    message: Message,
+    group_id: int,
+    user_id: int,
+    display_name: str,
+    username: str,
+    identity_label: str,
+    rule: ModerationRule | None,
+    action: str,
+    confidence: float | None,
+    reason: str,
+    submitted_text: str,
+    executed: tuple[str, ...],
+) -> _AdminViolationEvidence:
+    """按现有 ``_AdminViolationEvidence`` 字段拼一份证据（复用现有渲染）。"""
+
+    return _AdminViolationEvidence(
+        group_id=int(group_id),
+        group_title=str(getattr(getattr(message, "chat", None), "title", "") or ""),
+        user_id=int(user_id),
+        display_name=str(display_name or ""),
+        username=str(username or ""),
+        identity_label=str(identity_label or ""),
+        occurred_at=getattr(message, "date", None),
+        rule=rule,
+        action=str(action or ""),
+        confidence=confidence,
+        reason=str(reason or ""),
+        submitted_text=str(submitted_text or ""),
+        executed=tuple(executed),
+        message_link=_message_evidence_link(
+            getattr(message, "chat", None), _source_message_id(message)
+        ),
+    )
+
+
+async def _send_channel_violation_evidence(
+    *,
+    message: Message,
+    settings: Settings,
+    evidence: _AdminViolationEvidence,
+    violation_id: int,
+    title: str,
+) -> int | None:
+    """把一条完整证据卡发到审核日志频道，带两个按钮；best-effort，返回频道消息 id。"""
+
+    channel_id = _admin_log_channel_id(settings)
+    if channel_id == 0 or int(violation_id) <= 0:
+        return None
+    bot = getattr(message, "bot", None)
+    send_message = getattr(bot, "send_message", None)
+    if not callable(send_message):
+        log.info(
+            "[%s] log-channel evidence skipped | reason=no_bot channel=%s violation=%s",
+            evidence.group_id,
+            channel_id,
+            violation_id,
+        )
+        return None
+    text = _render_admin_violation_report(evidence, title=title)
+    keyboard = _build_review_action_keyboard(int(violation_id))
+    try:
+        sent = await send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "[%s] log-channel evidence send failed | channel=%s violation=%s",
+            evidence.group_id,
+            channel_id,
+            violation_id,
+        )
+        return None
+    try:
+        sent_id: int | None = int(getattr(sent, "message_id", 0) or 0) or None
+    except (TypeError, ValueError):
+        sent_id = None
+    # 带图则附图片，沿用 _admin_alert_attachment 的 file_id 逻辑。
+    attachment = _admin_alert_attachment(message)
+    if attachment is not None:
+        kind, file_id = attachment
+        sender = getattr(
+            bot, "send_photo" if kind == "photo" else "send_document", None
+        )
+        if callable(sender):
+            payload = {"photo": file_id} if kind == "photo" else {"document": file_id}
+            try:
+                await sender(chat_id=channel_id, **payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "[%s] log-channel evidence attachment failed | channel=%s violation=%s",
+                    evidence.group_id,
+                    channel_id,
+                    violation_id,
+                )
+    return sent_id
+
+
+async def _deliver_moderation_evidence(
+    *,
+    message: Message,
+    settings: Settings,
+    evidence: _AdminViolationEvidence,
+    violation: object | None = None,
+    is_admin: bool = False,
+    session: AsyncSession | None = None,
+) -> None:
+    """best-effort 证据投递入口。
+
+    频道可用（``log_channel_enabled`` 且配置了 ``log_channel_id``）时：往频道发
+    一条带按钮的证据卡，并回写 ``violations.log_channel_message_id``。频道不可用
+    时：仅管理员/群主命中回退到「私聊最高管理员」老路径（含 10 分钟聚合），普通
+    成员维持旧行为（不发）。任何失败只记日志，绝不影响群内处置。
+    """
+
+    if _log_channel_route_active(settings):
+        try:
+            violation_id = int(getattr(violation, "id", 0) or 0)
+        except (TypeError, ValueError):
+            violation_id = 0
+        if violation_id <= 0:
+            log.info(
+                "[%s] log-channel evidence skipped | reason=no_violation_id admin=%s",
+                evidence.group_id,
+                is_admin,
+            )
+            return
+        title = _EVIDENCE_TITLE_ADMIN if is_admin else _EVIDENCE_TITLE_MEMBER
+        sent_id = await _send_channel_violation_evidence(
+            message=message,
+            settings=settings,
+            evidence=evidence,
+            violation_id=violation_id,
+            title=title,
+        )
+        if sent_id and violation is not None:
+            try:
+                setattr(violation, "log_channel_message_id", int(sent_id))
+                if session is not None:
+                    await session.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "[%s] log-channel evidence id persist failed | violation=%s",
+                    evidence.group_id,
+                    violation_id,
+                )
+        return
+    if is_admin:
+        await _send_admin_violation_alert(
+            message=message,
+            settings=settings,
+            evidence=evidence,
+        )
+
+
 def _admin_identity_label(*, is_owner: bool, is_tg_admin: bool) -> str:
     if is_owner and is_tg_admin:
         return f"{_ADMIN_IDENTITY_OWNER} · {_ADMIN_IDENTITY_TG_ADMIN}"
@@ -6835,7 +7719,9 @@ def _admin_evidence_object_line(evidence: _AdminViolationEvidence) -> str:
     return f"{name}{handle}（id:{evidence.user_id}）"
 
 
-def _render_admin_violation_report(evidence: _AdminViolationEvidence) -> str:
+def _render_admin_violation_report(
+    evidence: _AdminViolationEvidence, *, title: str = _EVIDENCE_TITLE_ADMIN
+) -> str:
     confidence_text = (
         "—" if evidence.confidence is None else f"{float(evidence.confidence):.2f}"
     )
@@ -6863,7 +7749,7 @@ def _render_admin_violation_report(evidence: _AdminViolationEvidence) -> str:
             )
         )
     return render_summary_notice(
-        "管理员违规 · 证据",
+        title,
         summary=[card_field("对象", html.escape(_admin_evidence_object_line(evidence)))],
         details=details,
     )
@@ -7077,9 +7963,12 @@ async def _apply_admin_moderation(
             getattr(message, "chat", None), _source_message_id(message)
         ),
     )
-    await _send_admin_violation_alert(
+    await _deliver_moderation_evidence(
         message=message,
         settings=settings,
+        session=session,
+        violation=violation,
+        is_admin=True,
         evidence=evidence,
     )
     log.info(
@@ -7243,6 +8132,20 @@ async def on_group_message(
     # Placeholder-only videos still bypass the text pipeline. Captions carry
     # user-controlled text and must pass moderation before we stop processing.
     if msg_type in {"video", "video_note"}:
+        # NSFW 视频守卫：这两类走媒体旁路，判定必须发生在旁路之前。命中即已处置
+        # （删消息 + @警告 + 质询）并结束本条消息；未命中/无缩略图/豁免照旧旁路。
+        if await _guard_nsfw_video_only_message(
+            message=message,
+            session=session,
+            settings=settings,
+            group_id=group_id,
+            user_id=user_id,
+            sender_identity=sender_identity,
+            warn_target=warn_target,
+            bot_me=bot_me,
+            session_factory=session_factory,
+        ):
+            return
         log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
         return
     media_moderation_only = msg_type == "video_caption"
@@ -7317,17 +8220,27 @@ async def on_group_message(
         max_context_tokens=settings.bot.max_context_tokens,
     )
 
-    # 群内色情图片处置：判定复用下面这一次视觉调用（只在提示词里追加要求），
-    # 不新增任何模型调用。开关关闭 / 贴纸 / 带 /av 的图片在这里就是 False。
+    # 群内色情媒体处置：图片复用下面这一次视觉调用（只在提示词里追加要求），
+    # 不新增任何模型调用；视频没有可复用的描述调用，改为对 Telegram 缩略图单独
+    # 判定一次。开关关闭 / 贴纸 / 带 /av 的图片 / 拿不到缩略图的视频在这里就是 False。
     nsfw_guard_active = _nsfw_image_guard_applies(message, msg_type, settings)
+    video_nsfw_guard_active = bool(
+        nsfw_guard_active and msg_type in _NSFW_GUARD_VIDEO_TYPES
+    )
 
     input_text, vision_text = await _append_image_context(
         message, llm, input_text, msg_type, nsfw_guard=nsfw_guard_active
     )
+    if video_nsfw_guard_active:
+        # 视频判定文本只用于守卫，不进正文/归档：视频原有的归档与 caption 审核不变。
+        vision_text = await _nsfw_video_thumbnail_vision_text(message, llm)
     # 请求了 NSFW 判定时，vision_text 可能以 NSFW_* 标记开头；正文与归档只留描述。
-    vision_body = (
-        _strip_nsfw_marker(vision_text) if nsfw_guard_active else vision_text
-    )
+    if video_nsfw_guard_active:
+        vision_body = ""
+    elif nsfw_guard_active:
+        vision_body = _strip_nsfw_marker(vision_text)
+    else:
+        vision_body = vision_text
     reply_context = await _build_reply_context_for_llm(message, llm)
     if reply_context:
         input_text = f"{input_text}\n{reply_context}"
@@ -7691,6 +8604,30 @@ async def on_group_message(
                                             await delete_row(challenge_violation)
                                             await session.commit()
                             if challenged:
+                                await _deliver_moderation_evidence(
+                                    message=message,
+                                    settings=settings,
+                                    session=session,
+                                    violation=challenge_violation,
+                                    is_admin=False,
+                                    evidence=_violation_evidence(
+                                        message=message,
+                                        group_id=group_id,
+                                        user_id=user_id,
+                                        display_name=display_name,
+                                        username=sender_username,
+                                        identity_label="",
+                                        rule=rule,
+                                        action=action,
+                                        confidence=_verdict_confidence(verdict),
+                                        reason=reason,
+                                        submitted_text=input_text,
+                                        executed=(
+                                            "已删消息" if message_deleted else "删消息失败",
+                                            "已禁言并质询",
+                                        ),
+                                    ),
+                                )
                                 log.info(
                                     "[%s]【结束】审核质询 | user=%s | confidence=%.2f | 已删=%s | 总耗时=%dms",
                                     group_id,
@@ -7820,6 +8757,30 @@ async def on_group_message(
                         )
                         if not ban_enforced and ban_retryable:
                             request_current_update_retry()
+                        await _deliver_moderation_evidence(
+                            message=message,
+                            settings=settings,
+                            session=session,
+                            violation=violation,
+                            is_admin=False,
+                            evidence=_violation_evidence(
+                                message=message,
+                                group_id=group_id,
+                                user_id=user_id,
+                                display_name=display_name,
+                                username=sender_username,
+                                identity_label="",
+                                rule=rule,
+                                action=action,
+                                confidence=_verdict_confidence(verdict),
+                                reason=reason,
+                                submitted_text=input_text,
+                                executed=(
+                                    "已封禁" if ban_enforced else "封禁未确认",
+                                    "已删消息" if message_deleted else "删消息失败",
+                                ),
+                            ),
+                        )
                     return
 
                 if action == "warn":
@@ -7866,6 +8827,27 @@ async def on_group_message(
                                 else _build_moderation_action_keyboard(violation_id)
                             ),
                         )
+                    await _deliver_moderation_evidence(
+                        message=message,
+                        settings=settings,
+                        session=session,
+                        violation=violation,
+                        is_admin=False,
+                        evidence=_violation_evidence(
+                            message=message,
+                            group_id=group_id,
+                            user_id=user_id,
+                            display_name=display_name,
+                            username=sender_username,
+                            identity_label="",
+                            rule=rule,
+                            action=action,
+                            confidence=_verdict_confidence(verdict),
+                            reason=reason,
+                            submitted_text=input_text,
+                            executed=("已群内警示", "消息保留"),
+                        ),
+                    )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=warn | 已回复=是 | 总耗时=%dms",
                         group_id,
@@ -7916,6 +8898,27 @@ async def on_group_message(
                                 "moderation",
                             ),
                         )
+                    await _deliver_moderation_evidence(
+                        message=message,
+                        settings=settings,
+                        session=session,
+                        violation=violation,
+                        is_admin=False,
+                        evidence=_violation_evidence(
+                            message=message,
+                            group_id=group_id,
+                            user_id=user_id,
+                            display_name=display_name,
+                            username=sender_username,
+                            identity_label="",
+                            rule=rule,
+                            action=action,
+                            confidence=_verdict_confidence(verdict),
+                            reason=reason,
+                            submitted_text=input_text,
+                            executed=("已删消息", "已群内警示"),
+                        ),
+                    )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=delete | 已回复=是 | 总耗时=%dms",
                         group_id,
@@ -7969,6 +8972,30 @@ async def on_group_message(
                     )
                 if ban_retryable:
                     request_current_update_retry()
+                await _deliver_moderation_evidence(
+                    message=message,
+                    settings=settings,
+                    session=session,
+                    violation=violation,
+                    is_admin=False,
+                    evidence=_violation_evidence(
+                        message=message,
+                        group_id=group_id,
+                        user_id=user_id,
+                        display_name=display_name,
+                        username=sender_username,
+                        identity_label="",
+                        rule=rule,
+                        action=action,
+                        confidence=_verdict_confidence(verdict),
+                        reason=reason,
+                        submitted_text=input_text,
+                        executed=(
+                            f"警告 {int(count)}/{int(warn_threshold)}",
+                            "已封禁" if ban_enforced else "未封禁（计数）",
+                        ),
+                    ),
+                )
                 log.info(
                     "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",
                     group_id,
