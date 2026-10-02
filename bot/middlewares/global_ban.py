@@ -260,8 +260,19 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
         log.info("[%s] blocked message from durably banned user %s", chat.id, user.id)
         try:
             await event.delete()
-        except Exception:
-            pass
+        except Exception as exc:
+            # F-056: never swallow this silently. A failed delete leaves the
+            # banned member's message visible while every other enforcement
+            # step still looks successful, which is exactly the kind of
+            # "looks fine, isn't" state an operator must be able to see.
+            log.warning(
+                "[%s] failed to delete message from durably banned user; "
+                "message stays visible | user=%s | message=%s | error=%s",
+                chat.id,
+                user.id,
+                getattr(event, "message_id", 0),
+                exc,
+            )
         # A banned rejoin may have raced several messages in before this one;
         # sweep the residue from the same fresh-join window and (for a fresh
         # rejoin) arm deletion of the "X was removed" notice the imminent ban
