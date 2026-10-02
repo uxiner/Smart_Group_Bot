@@ -1097,7 +1097,12 @@ class MemberCheckin(Base):
     # 预留：以后要做连续奖励/管理员补分，改这里即可，不用动表结构。
     points: Mapped[int] = mapped_column(Integer, default=1)
     display_name: Mapped[str] = mapped_column(String(255), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # F-050：时钟口径 = 本地（Asia/Shanghai）朴素时间，和 checkin_date 同口径。
+    # Python 侧 default 负责应用写入；server_default 只作为裸 SQL 插入的兜底
+    # （它是 SQLite CURRENT_TIMESTAMP = UTC，数值上会差 8 小时，不要依赖它）。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_shanghai_naive, server_default=func.now()
+    )
 
     __table_args__ = (
         Index(
@@ -1133,7 +1138,13 @@ class MemberPointSpend(Base):
     reason: Mapped[str] = mapped_column(String(64), default="")
     # 幂等键：同一次质询只能扣一次（重复点按钮时唯一索引会挡住第二条）
     ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # F-050：与 member_checkins / member_entitlements / member_point_awards 统一为
+    # 本地（Asia/Shanghai）朴素时间。扣分走 Core
+    # ``INSERT ... SELECT``（checkin.spend_points），Python 侧 default 不会自动生效，
+    # 那里必须显式带上 created_at；server_default（UTC）只作裸 SQL 兜底。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_shanghai_naive, server_default=func.now()
+    )
 
     __table_args__ = (
         Index(

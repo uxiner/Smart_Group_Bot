@@ -24,7 +24,14 @@ log = logging.getLogger(__name__)
 
 _SQLITE_TIMEOUT_SECONDS = 5
 _SQLITE_BUSY_TIMEOUT_MS = _SQLITE_TIMEOUT_SECONDS * 1000
-_SQLITE_SCHEMA_VERSION = 1
+#: 当前 schema 版本（`PRAGMA user_version`）。每个一次性迁移用自己的历史版本号
+#: 作为闸门，**不要**直接拿这个常量去判断"是否需要跑"——否则下次抬版本会把老迁移
+#: 再跑一遍（时间戳迁移重跑就是再 +8 小时，属于真实数据损坏）。
+_SQLITE_SCHEMA_VERSION = 2
+#: v1：message_vectors 的 UTC 时间戳一次性转成本地（Asia/Shanghai）。
+_SQLITE_MESSAGE_VECTOR_CLOCK_VERSION = 1
+#: v2：F-050 签到/扣分台账 created_at 的 UTC → 本地（Asia/Shanghai）。
+_SQLITE_LEDGER_CLOCK_VERSION = 2
 _SQLITE_VOTE_BAN_DEDUPE_SQL = (
     "UPDATE vote_ban_sessions AS candidate "
     "SET status = 'cancelled' "
@@ -737,7 +744,8 @@ async def _sqlite_migrate_admin_authorization_fk(conn) -> bool:
 
 async def _sqlite_migrate_message_vector_timestamps(conn) -> bool:
     user_version = await _sqlite_get_user_version(conn)
-    if user_version >= _SQLITE_SCHEMA_VERSION:
+    # 用自己的历史版本号做闸门：已经跑过（>=v1）就不再 +8 小时。
+    if user_version >= _SQLITE_MESSAGE_VECTOR_CLOCK_VERSION:
         return False
 
     columns = await _sqlite_table_columns(conn, "message_vectors")
@@ -763,10 +771,52 @@ async def _sqlite_migrate_message_vector_timestamps(conn) -> bool:
         )
         changed = True
 
-    await _sqlite_set_user_version(conn, _SQLITE_SCHEMA_VERSION)
+    await _sqlite_set_user_version(conn, _SQLITE_MESSAGE_VECTOR_CLOCK_VERSION)
     if changed:
         log.info("Migrated: normalized message_vectors timestamps to Asia/Shanghai")
     return changed
+
+
+async def _sqlite_migrate_ledger_created_at_clock(conn) -> bool:
+    """F-050：把签到/扣分台账里由 SQLite ``CURRENT_TIMESTAMP``（UTC）写入的
+    ``created_at`` 一次性转成 Asia/Shanghai。
+
+    这两张表（``member_checkins`` / ``member_point_spends``）此前**只**有库级默认值，
+    代码从不显式传 ``created_at``，所以存量行全部是 UTC。ORM 现在改为本地默认之后，
+    如果不迁移存量行，老库与新库就会出现两套时钟口径（本地 00:00-08:00 的行会落到
+    前一个 UTC 日）。迁移用 ``PRAGMA user_version`` 的独立版本号做闸门，**只跑一次**：
+    重跑会再次 +8 小时，属于真实数据损坏。
+    """
+
+    user_version = await _sqlite_get_user_version(conn)
+    if user_version >= _SQLITE_LEDGER_CLOCK_VERSION:
+        return False
+
+    changed_tables: list[str] = []
+    for table in ("member_checkins", "member_point_spends"):
+        if not await _sqlite_table_exists(conn, table):
+            continue
+        columns = await _sqlite_table_columns(conn, table)
+        if "created_at" not in columns:
+            continue
+        result = await conn.execute(
+            text(
+                f"UPDATE {table} "
+                "SET created_at = datetime(created_at, '+8 hours') "
+                "WHERE created_at IS NOT NULL"
+            )
+        )
+        shifted = max(0, int(getattr(result, "rowcount", 0) or 0))
+        if shifted:
+            changed_tables.append(f"{table}={shifted}")
+
+    await _sqlite_set_user_version(conn, _SQLITE_LEDGER_CLOCK_VERSION)
+    if changed_tables:
+        log.warning(
+            "Migrated: normalized ledger created_at to Asia/Shanghai | %s",
+            ", ".join(changed_tables),
+        )
+    return bool(changed_tables)
 
 
 async def _sqlite_ensure_message_vector_unique_key(conn) -> bool:
@@ -1771,6 +1821,7 @@ async def init_db(
                 )
             )
             await _sqlite_migrate_message_vector_timestamps(conn)
+            await _sqlite_migrate_ledger_created_at_clock(conn)
             await _sqlite_ensure_message_vector_unique_key(conn)
             for archive_index_sql in (
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
