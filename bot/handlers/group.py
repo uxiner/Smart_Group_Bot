@@ -4499,14 +4499,19 @@ async def _apply_nsfw_image_guard(
     """命中 ``NSFW_YES`` 后的重处置：① 删消息 ② 群内 @警告 ③ 质询。
 
     图片与视频共用这条处置链（视频判定来自缩略图）：文案统一写成「图片/视频」。
-    三件事的顺序固定（删消息 → 警告 → 质询），且每一步都独立于其他步骤的成败：
-    任何一步失败都只记日志并继续下一步——**删除失败也照样警告并质询**（与 ``/av``
-    那条「删失败继续识图」的方向相反）。
+    三件事的顺序固定（删消息 → 警告 → 质询），删消息与质询各自独立于其他步骤的
+    成败：失败都只记日志并继续——**删除失败也照样告警并质询**（与 ``/av`` 那条
+    「删失败继续识图」的方向相反）。
 
     **记账（违规记录落库）不是删除的前置条件**：违规记录只用来占住幂等键和留痕，
-    它写失败（SQLITE_BUSY / 磁盘或 DB 异常）时照样删消息、警告、质询，只把
-    ``violation`` 留空、跳过 ``notice_sent_at`` 写回。让 NSFW 媒体尽快离开群是
-    本功能的第一目的，记账失败不该换来「图不删」。
+    它写失败（SQLITE_BUSY / 磁盘或 DB 异常）时照样删消息、质询，只把 ``violation``
+    留空、跳过 ``notice_sent_at`` 写回。让 NSFW 媒体尽快离开群是本功能的第一目的，
+    记账失败不该换来「图不删」。
+
+    F-041：记账失败时**跳过**群内 @警告与管理员私聊这两条用户可见的告警——幂等键
+    没落库，同一条 update 的持久化重投递会再次走到这里，没有任何落库的键能挡住
+    第二次打扰。重复 @ 用户属于误伤，宁可漏发一次；跳过本身会记 WARNING 日志，
+    不是静默降级。
 
     唯一的例外是「确认重复投递」：同一条消息（含 Telegram 重投）已经有违规记录
     时，一条 Telegram 动作都不做——这个判定在任何动作之前完成，因此顺序调整不会
@@ -4631,22 +4636,36 @@ async def _apply_nsfw_image_guard(
             # ② 群里 @当事人文字警告：独立一条，2 分钟后自动删除。
             #    sanitize_mentions=False 是刻意的：默认净化会把 @handle 拆成
             #    零宽字符，那就等于没 @ 到人。
+            #
+            #    F-041：只有幂等键已经落库（``violation`` 不为 None）时才发这条
+            #    用户可见的告警。记账失败意味着同一条 update 的持久化重投递会再次
+            #    走到这里，而没有任何落库的键能阻止第二次告警——重复 @ 用户属于
+            #    误伤，宁可少发一次（漏判），也不重复打扰。删图与质询不受影响。
             warned = False
-            try:
-                await answer_with_auto_delete(
-                    message,
-                    f"{warn_target} {_NSFW_IMAGE_WARNING_REASON}",
-                    auto_delete_seconds=_NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS,
-                    sanitize_mentions=False,
-                    parse_mode="HTML",
-                )
-                warned = True
-            except Exception:
-                log.exception(
-                    "[%s]【NSFW图片】群内警告失败，继续质询 | user=%s",
+            if violation is None:
+                log.warning(
+                    "[%s]【NSFW图片】记账未成功，跳过群内警告以避免重复打扰"
+                    "（删图与质询照常）| user=%s | message_id=%s",
                     group_id,
                     user_id,
+                    source_message_id,
                 )
+            else:
+                try:
+                    await answer_with_auto_delete(
+                        message,
+                        f"{warn_target} {_NSFW_IMAGE_WARNING_REASON}",
+                        auto_delete_seconds=_NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS,
+                        sanitize_mentions=False,
+                        parse_mode="HTML",
+                    )
+                    warned = True
+                except Exception:
+                    log.exception(
+                        "[%s]【NSFW图片】群内警告失败，继续质询 | user=%s",
+                        group_id,
+                        user_id,
+                    )
 
             # ③ 发起质询：复用现有质询卡与超时处置；不给「花积分免除」入口。
             #    不依赖违规记录：记账失败（violation 为空）时照常发起，只是跳过
@@ -4698,8 +4717,10 @@ async def _apply_nsfw_image_guard(
         log.exception("[%s]【NSFW图片】处置异常 | user=%s", group_id, user_id)
         return claimed
 
-    if admin_restricted:
+    if admin_restricted and violation is not None:
         # D2：管理员 NSFW 同样私聊最高管理员一份证据（best-effort，失败只记日志）。
+        # F-041：与群内警告同一口径——幂等键没落库时私聊也可能被重投递重复触发，
+        # 所以同样只发一次（宁可漏发，也不重复打扰）。
         await _send_admin_violation_alert(
             message=message,
             settings=settings,

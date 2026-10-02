@@ -12,7 +12,9 @@
 - 处置顺序固定：删除 → 群里 @当事人警告（独立一条、2 分钟后自动删除）→ 质询；
   任何一步失败都只记日志并继续——**删图失败也照样警告并质询**；
 - **记账失败不挡删图**：违规记录落库失败（SQLITE_BUSY / 磁盘/DB 异常）时照样
-  删图 + 警告 + 质询，只跳过 ``notice_sent_at`` 写回，并在日志里写明「记账失败」；
+  删图 + 质询，只跳过 ``notice_sent_at`` 写回，并在日志里写明「记账失败」；
+  F-041：此时**跳过群内 @警告与管理员私聊**（幂等键没落库，重投递会重复打扰
+  用户），跳过本身必须留日志；
 - 贴纸不碰；带 ``/av`` 的图片不碰（已有「先删图再识图」流程负责）；
 - 管理员/群主默认同样「删图 + @警告」但不质询不禁言（``admin_moderation_enabled``
   关闭时回到整段豁免）；手动豁免成员同样不处置；
@@ -960,27 +962,37 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
         session.rollback.assert_awaited_once()
         session.commit.assert_not_awaited()
 
-    async def test_record_failure_still_deletes_warns_and_challenges(self) -> None:
+    async def test_record_failure_still_deletes_and_challenges_but_skips_the_warning(
+        self,
+    ) -> None:
         """记账失败（SQLITE_BUSY / 磁盘异常）不许换来「图留在群里」。
 
         这是本功能的第一目的：NSFW 图尽快离开群。违规记录只用于留痕与幂等，
-        写不进去也要照样删图 → 警告 → 质询，且日志里要写明「记账失败」。
+        写不进去也要照样删图 → 质询，且日志里要写明「记账失败」。
+
+        F-041：唯一不再无条件执行的是**群内警告**——记账失败时幂等键没落库，
+        同一条 update 的持久化重投递会再次走到这里，而没有任何落库的键能挡住
+        第二次 @ 用户；重复 @ 属于误伤，宁可漏发一次。跳过这件事本身必须留日志。
         """
-        with self.assertLogs("bot.handlers.group", level="ERROR") as logs:
+        with self.assertLogs("bot.handlers.group", level="WARNING") as logs:
             message, _llm, moderation, session, challenge = await _run_group_message(
                 vision_text=NSFW_YES_TEXT,
                 moderation_service=_fake_moderation_service(record_error=True),
             )
 
-        # 核心断言：删图 + 警告 + 质询三者都发生，顺序与正常路径完全一致
-        self.assertEqual(message.conversation, ["delete", "warn", "challenge"])
+        # 删图 + 质询照旧（顺序不变）；只有用户可见的群内警告被跳过
+        self.assertEqual(message.conversation, ["delete", "challenge"])
         message.delete.assert_awaited_once()
-        message.answer.assert_awaited_once()
+        message.answer.assert_not_awaited()
         challenge.assert_awaited_once()
-        # 记账确实尝试过并失败，且失败被明确写进日志（便于排查）
+        # 记账确实尝试过并失败，且失败/跳过都被明确写进日志（便于排查）
         moderation.record_violation.assert_awaited_once()
         self.assertTrue(
             any("记账失败" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertTrue(
+            any("跳过群内警告" in line for line in logs.output),
             logs.output,
         )
         # 没有 violation 行 → 跳过 notice_sent_at 写回：不因此再 commit，
@@ -992,10 +1004,8 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(challenge.await_args.kwargs["rule_action"], "ban")
         self.assertFalse(challenge.await_args.kwargs["allow_points_skip"])
 
-    async def test_record_failure_with_delete_failure_still_warns_and_challenges(
-        self,
-    ) -> None:
-        """记账失败 + 删图也失败：警告与质询仍然要发出去。"""
+    async def test_record_failure_with_delete_failure_still_challenges(self) -> None:
+        """记账失败 + 删图也失败：质询仍然要发出去（警告同样被去重跳过）。"""
         message = _photo_message()
         message.delete = AsyncMock(side_effect=RuntimeError("no rights"))
 
@@ -1005,27 +1015,46 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
             moderation_service=_fake_moderation_service(record_error=True),
         )
 
-        self.assertEqual(message.conversation, ["warn", "challenge"])
-        message.answer.assert_awaited_once()
+        self.assertEqual(message.conversation, ["challenge"])
+        message.answer.assert_not_awaited()
         challenge.assert_awaited_once()
         moderation.record_violation.assert_awaited_once()
 
-    async def test_warning_failure_still_challenges_when_record_failed(self) -> None:
-        """记账失败 + 警告失败：质询照发，异常不外泄。"""
-        message = _photo_message()
-        message.answer = AsyncMock(side_effect=RuntimeError("chat restricted"))
+    async def test_repeat_delivery_after_record_failure_never_double_alerts(
+        self,
+    ) -> None:
+        """F-041：记账失败后的重投递不许产生重复群内警告 / 重复管理员私聊。
 
-        message, _llm, _moderation, _session_mock, challenge = await _run_group_message(
-            vision_text=NSFW_YES_TEXT,
-            message=message,
-            moderation_service=_fake_moderation_service(record_error=True),
+        第一次投递记账失败（无幂等键）→ 不 @ 用户、不私聊；第二次投递记账成功
+        → 恰好一次群内警告 + 恰好一次管理员私聊。整条链路对用户可见的告警恰好
+        一次，而不是两次。
+        """
+        message = _photo_message(user_id=OTHER_USER_ID, username="admin")
+        moderation = _fake_moderation_service(
+            record_side_effect=[
+                RuntimeError("db write failed"),
+                SimpleNamespace(id=1, notice_sent_at=None, _source_event_created=True),
+            ]
         )
+        challenge = AsyncMock(return_value=True)
 
-        self.assertEqual(message.conversation, ["delete", "challenge"])
-        challenge.assert_awaited_once()
+        for _ in range(2):
+            await _run_group_message(
+                vision_text=NSFW_YES_TEXT,
+                message=message,
+                tg_admin=True,
+                moderation_service=moderation,
+                challenge=challenge,
+            )
+
+        self.assertEqual(moderation.record_violation.await_count, 2)
+        # 群内 @警告恰好一次（第一次记账失败时被去重跳过）
+        self.assertEqual(message.answer.await_count, 1)
+        # 管理员私聊证据也恰好一次
+        self.assertEqual(message.bot.send_message.await_count, 1)
 
     async def test_rollback_failure_after_record_failure_still_disposes(self) -> None:
-        """清失败事务的回滚也失败时，删图/警告/质询一个都不能少。"""
+        """清失败事务的回滚也失败时，删图/质询一个都不能少。"""
         session = _session()
         session.rollback = AsyncMock(side_effect=RuntimeError("rollback failed"))
 
@@ -1035,7 +1064,7 @@ class NsfwDisposalTests(unittest.IsolatedAsyncioTestCase):
             moderation_service=_fake_moderation_service(record_error=True),
         )
 
-        self.assertEqual(message.conversation, ["delete", "warn", "challenge"])
+        self.assertEqual(message.conversation, ["delete", "challenge"])
         message.delete.assert_awaited_once()
         challenge.assert_awaited_once()
 
