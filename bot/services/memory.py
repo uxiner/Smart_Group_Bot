@@ -28,6 +28,7 @@ from bot.db.models import (
     GroupMessageArchive,
     GroupPermanentMemory,
     MessageVector,
+    Violation,
 )
 from bot.services.ban_audit import build_ban_knowledge_blocks
 from bot.services.llm import LLMService
@@ -66,6 +67,45 @@ _ARCHIVE_RECALL_CONTEXT_RADIUS = 2
 _ARCHIVE_RECALL_INDEX_MAX_CHARS = 1150
 _ARCHIVE_VECTOR_CANDIDATE_LIMIT = 64
 _ARCHIVE_RECALL_RRF_K = 60.0
+#: F-016：一次 recall 里最多用多少条"已处置"消息去提示排序（best-effort，只影响
+#: 召回质量）；真正的"不返回已删除内容"由 :meth:`MemoryService._removed_message_ids`
+#: 对最终选中的少量行做精确核对来保证，不受这个上限影响。
+_ARCHIVE_DISPOSED_RANK_HINT_LIMIT = 64
+
+#: F-016：``violations.action_taken`` 的基名里，代表"消息已经被删除、不再是群里
+#: 现存内容"的那几个动作（见 bot/handlers/group.py 的 record_violation 调用点与
+#: _MODERATION_ACTION_BASES）。``warn`` / ``ban_warning`` / ``challenge`` 只是留痕或
+#: 质询，消息本身还在群里，所以不算"已删除"，不参与检索排除。
+_ARCHIVE_DISPOSED_ACTION_BASES = frozenset(
+    {"delete", "ban", "ban_applied", "bot_ban", "bot_delete", "nsfw_image"}
+)
+#: 动作名可能带 ``_direct`` / ``_reverted`` 观测后缀，判断前先剥掉。
+_ARCHIVE_DISPOSED_ACTION_SUFFIXES = ("_direct", "_reverted")
+
+
+def _moderation_action_removed_message(action: object) -> bool:
+    """这条违规记录是否对应一次"消息已被删除"的处置。"""
+
+    base = str(action or "").strip().lower()
+    stripped = True
+    while stripped:
+        stripped = False
+        for suffix in _ARCHIVE_DISPOSED_ACTION_SUFFIXES:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                stripped = True
+                break
+    return base in _ARCHIVE_DISPOSED_ACTION_BASES
+
+
+def _archive_message_key(group_id: int, telegram_message_id: object) -> str:
+    """复刻 :meth:`MemoryService._scoped_message_id` 的键形状（``group:message``）。"""
+
+    raw = str(telegram_message_id or "").strip()
+    if not raw:
+        return ""
+    return f"{int(group_id)}:{raw}"[:64]
+
 
 _ARCHIVE_METADATA_FIELDS = frozenset(
     {
@@ -1962,6 +2002,94 @@ class MemoryService:
         }
         return ordered, reasons
 
+    async def _recent_disposed_archive_keys(
+        self,
+        group_id: int,
+        *,
+        limit: int = _ARCHIVE_DISPOSED_RANK_HINT_LIMIT,
+    ) -> set[str]:
+        """最近被审核删除的消息键（只用于排序提示，不保证完整）。
+
+        F-016：这些键塞进已有的 ``exclude_message_keys`` 通道，让 FTS / LIKE /
+        向量召回在排序阶段就跳过它们。条数上限只影响召回质量，**不影响正确性**：
+        最终选中哪些行还会由 :meth:`_removed_message_ids` 精确核对一次。
+        """
+
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            Violation.source_message_id,
+                            Violation.action_taken,
+                        )
+                        .where(
+                            Violation.group_id == int(group_id),
+                            Violation.source_message_id.is_not(None),
+                        )
+                        .order_by(Violation.id.desc())
+                        .limit(max(1, int(limit)) * 4)
+                    )
+                ).all()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 拿不到"已删除"清单时不能再声称结果已经过滤过：调用方必须知道
+            # 这次降级（由 _removed_message_ids 的兜底查询与这里的日志共同暴露）。
+            log.exception(
+                "archive disposed-message filter lookup failed | group=%s", group_id
+            )
+            raise
+
+        keys: set[str] = set()
+        for source_message_id, action in rows:
+            if not _moderation_action_removed_message(action):
+                continue
+            key = _archive_message_key(group_id, source_message_id)
+            if key:
+                keys.add(key)
+            if len(keys) >= max(1, int(limit)):
+                break
+        return keys
+
+    async def _removed_message_ids(
+        self,
+        group_id: int,
+        telegram_message_ids: set[int],
+    ) -> set[int]:
+        """精确核对：这批 Telegram 消息 id 里哪些已被审核删除。
+
+        这是 F-016 的**正确性兜底**：不管排序阶段排除了多少，最终候选行都要在
+        这里逐个核对，保证已删除内容不会因为提示词上限而漏出去。
+        """
+
+        wanted = {int(value) for value in telegram_message_ids if int(value or 0) > 0}
+        if not wanted:
+            return set()
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Violation.source_message_id,
+                        Violation.action_taken,
+                    ).where(
+                        Violation.group_id == int(group_id),
+                        Violation.source_message_id.in_(sorted(wanted)),
+                    )
+                )
+            ).all()
+        removed: set[int] = set()
+        for source_message_id, action in rows:
+            if not _moderation_action_removed_message(action):
+                continue
+            try:
+                value = int(source_message_id)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                removed.add(value)
+        return removed
+
     async def recall_archive(
         self,
         group_id: int,
@@ -1972,12 +2100,17 @@ class MemoryService:
         before_after: int = _ARCHIVE_RECALL_CONTEXT_RADIUS,
         limit: int = 12,
         mark_accessed: bool = False,
+        include_disposed: bool = False,
     ) -> list[dict[str, Any]]:
         """Recall raw records from one group's retained archive.
 
         ``group_id`` is always supplied by trusted runtime code. The public
         model tool deliberately exposes no group selector, preventing cross-
         group memory access even if a prompt attempts to request one.
+
+        ``include_disposed`` 默认 False（F-016）：被审核删除的消息不再出现在
+        召回结果里，避免任何成员把"已经被删掉的广告正文"重新检索出来。只有
+        明确需要审计的管理员路径才允许传 True，并且必须在调用点留下审计日志。
         """
 
         normalized_group_id = int(group_id)
@@ -2007,6 +2140,18 @@ class MemoryService:
             return []
 
         excluded_key_set = set(excluded_keys)
+        if not include_disposed:
+            # F-016：把最近被审核删除的消息塞进既有的排除通道，让 FTS / LIKE /
+            # 向量召回在排序阶段就跳过它们。这是质量优化；正确性由下面的
+            # _removed_message_ids 对最终候选逐条核对来保证。
+            disposed_hint_keys = await self._recent_disposed_archive_keys(
+                normalized_group_id
+            )
+            if disposed_hint_keys:
+                excluded_key_set |= disposed_hint_keys
+                excluded_keys = list(
+                    dict.fromkeys([*excluded_keys, *sorted(disposed_hint_keys)])
+                )
         vector_ranked_keys: list[str] = []
         if not requested_keys:
             vector_ranked_keys = await self._vector_archive_ranked_keys(
@@ -2278,6 +2423,24 @@ class MemoryService:
                 *kept_anchors,
                 *context_rows[: max(0, result_limit - len(kept_anchors))],
             ]
+            if not include_disposed and selected_rows:
+                # F-016 正确性兜底：排序阶段的排除清单是有上限的 best-effort，
+                # 这里对最终候选行逐条核对"这条是否已被审核删除"，命中即剔除
+                # （宁可返回少于 limit 条，也不把已删除内容回显给成员）。
+                removed_ids = await self._removed_message_ids(
+                    normalized_group_id,
+                    {
+                        int(row.telegram_message_id)
+                        for row in selected_rows
+                        if row.telegram_message_id is not None
+                    },
+                )
+                if removed_ids:
+                    selected_rows = [
+                        row
+                        for row in selected_rows
+                        if int(row.telegram_message_id or 0) not in removed_ids
+                    ]
             if requested_keys or radius:
                 selected_rows.sort(key=lambda row: (row.sent_at, row.id))
 
