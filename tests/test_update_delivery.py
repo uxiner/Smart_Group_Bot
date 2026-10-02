@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import unittest
 from contextlib import ExitStack
@@ -1657,6 +1658,81 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             await server.disable_webhook_route()
             await bot.session.close()
 
+    async def test_healthz_does_not_expose_internal_error_text(self) -> None:
+        """F-009：/healthz 免鉴权，异常原文（表名/库路径）不能进响应体。"""
+
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        dispatcher.feed_raw_update = AsyncMock()
+        server = VerifyWebServer(
+            bot=bot,
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+            webhook_dispatcher=dispatcher,
+            webhook_path="/telegram/webhook",
+            webhook_secret=WEBHOOK_SECRET,
+        )
+        server.build_app()
+        server.enable_webhook_route()
+        assert server._webhook_processor is not None
+        server._webhook_processor._record_business_failure(
+            11,
+            "OperationalError: no such table: webhook_inbox_updates",
+        )
+        try:
+            response = await server.handle_health(SimpleNamespace())
+            payload = json.loads(response.text)
+
+            self.assertNotIn("OperationalError", response.text)
+            self.assertNotIn("webhook_inbox_updates", response.text)
+            self.assertIs(payload["webhook"]["last_business_error"], True)
+            # 计数器仍然可用，便于排障
+            self.assertEqual(
+                payload["webhook"]["consecutive_distinct_failures"],
+                1,
+            )
+        finally:
+            await server.disable_webhook_route()
+            await bot.session.close()
+
+    async def test_non_ascii_webhook_secret_header_gets_401_not_500(self) -> None:
+        """F-045：乱码 secret 头必须被拒为 401，不能抛 TypeError 变成 500。
+
+        aiohttp 按 latin-1 解码请求头，所以 ``\\x80`` 会以非 ASCII 字符到达
+        ``secrets.compare_digest``，旧实现直接抛 TypeError。
+        """
+
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        dispatcher.feed_raw_update = AsyncMock()
+        server = VerifyWebServer(
+            bot=bot,
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+            webhook_dispatcher=dispatcher,
+            webhook_path="/telegram/webhook",
+            webhook_secret=WEBHOOK_SECRET,
+        )
+        app = server.build_app()
+        handler = next(
+            route.handler
+            for route in app.router.routes()
+            if route.method == "POST"
+            and route.resource.canonical == "/telegram/webhook"
+        )
+        server.enable_webhook_route()
+        request = SimpleNamespace(
+            headers={"X-Telegram-Bot-Api-Secret-Token": "ünïcode-\x80"},
+            json=AsyncMock(return_value={"update_id": 12}),
+        )
+        try:
+            response = await handler(request)
+            self.assertEqual(response.status, 401)
+            dispatcher.feed_raw_update.assert_not_awaited()
+        finally:
+            await server.disable_webhook_route()
+            await bot.session.close()
+
     async def test_exhausted_update_retries_fail_health_and_reject_new_updates(self) -> None:
         bot = Bot(token="42:TEST_TOKEN")
         dispatcher = Dispatcher()
@@ -2637,6 +2713,33 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         middleware = dispatcher.edited_message.middlewares[0]
         self.assertIsInstance(middleware, DbSessionMiddleware)
         self.assertIs(middleware.session_factory, session_factory)
+
+    async def test_edited_message_observer_gets_the_enforcement_middlewares(
+        self,
+    ) -> None:
+        """F-008：编辑消息也必须先过全局封禁与入群验证门，且顺序与普通消息一致。"""
+
+        from bot import __main__ as bot_main
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+        from bot.middlewares.verification_gate import (
+            PendingVerificationGateMiddleware,
+        )
+
+        dispatcher = _MainDispatcher()
+        session_factory = object()
+
+        bot_main._register_update_middlewares(dispatcher, session_factory)
+
+        outer = dispatcher.edited_message.outer_middlewares
+        self.assertEqual(len(outer), 2)
+        self.assertIsInstance(outer[0], GlobalBanEnforcementMiddleware)
+        self.assertIsInstance(outer[1], PendingVerificationGateMiddleware)
+        for enforcement in outer:
+            self.assertIs(enforcement.session_factory, session_factory)
+
+        message_outer = dispatcher.message.outer_middlewares
+        self.assertIsInstance(message_outer[0], GlobalBanEnforcementMiddleware)
+        self.assertIsInstance(message_outer[1], PendingVerificationGateMiddleware)
 
     async def test_bootstrap_validation_runs_before_database_initialization(self) -> None:
         from bot import __main__ as bot_main

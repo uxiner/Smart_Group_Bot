@@ -6,13 +6,18 @@ from typing import Any
 from bot.utils.timezone import format_shanghai_timestamp
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+# 中文分支曾经是「GBK 字节被当成 UTF-8 解码」的产物（例如
+# ``'浣犵幇鍦ㄦ槸'.encode('gbk').decode('utf-8')`` == ``'你现在是'``），
+# 与被检测的真实中文**永不相等**，所以只有英文分支有效（F-019）。这里按真实
+# 中文重写，并把「忽略…指令/规则」的距离限制成有界窗口：``(?s)`` 下用 ``.*?``
+# 会让一条长消息里任意位置的「忽略」和「规则」互相命中。
 _INJECTION_RE = re.compile(
     r"(?is)"
     r"(ignore\s+(all|previous|prior)\s+instructions|"
     r"system\s+prompt|developer\s+message|jailbreak|"
-    r"浣犵幇鍦ㄦ槸|蹇界暐(浠ヤ笂|涔嬪墠|鍏堝墠).*?(鎸囦护|瑙勫垯)|"
-    r"(娉勯湶|杈撳嚭).{0,8}(绯荤粺鎻愮ず璇峾鎻愮ず璇峾瀵嗛挜|token)|"
-    r"瓒婄嫳|DAN)"
+    r"你现在是|忽略(以上|之前|先前).{0,20}(指令|规则)|"
+    r"(泄露|输出).{0,8}(系统提示|提示词|密钥|token)|"
+    r"越狱|DAN)"
 )
 _LEGACY_HISTORY_PREFIX_RE = re.compile(r"^\[(?P<meta>[^\]]+)\]\s*(?P<body>.*)$", re.DOTALL)
 _LEGACY_STRUCTURED_META_RE = re.compile(
@@ -62,6 +67,17 @@ def clean_multiline_text(text: str, max_len: int = 4000) -> str:
 
 
 def contains_prompt_injection(text: str) -> bool:
+    """Heuristic prompt-injection telemetry for *untrusted* inbound text.
+
+    Deliberately advisory: every caller only logs a warning and still wraps the
+    text with :func:`wrap_untrusted`, because the real boundary is the
+    system-prompt preamble plus the untrusted wrapper, not this regex. Nothing
+    is authorized or blocked on the strength of a match, so a false positive
+    costs a log line and a false negative changes no permission. Keep it that
+    way: do not start gating replies on this predicate without making the
+    detection trustworthy first (the pattern list is necessarily incomplete).
+    """
+
     return bool(_INJECTION_RE.search(text or ""))
 
 

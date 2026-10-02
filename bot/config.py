@@ -359,7 +359,12 @@ class Settings(BaseSettings):
     join_verification_hcaptcha_secret_key: str = ""
     # 验证页面对外可访问的地址（反代/隧道后的 https 地址）。
     join_verification_public_base_url: str = ""
-    join_verification_listen_host: str = "0.0.0.0"
+    # 默认只监听回环：这个 HTTP 服务承载 /verify、/settings 与**免鉴权**的
+    # /healthz，监听 0.0.0.0 会把它暴露给同网段/公网的任何主机（F-017）。
+    # 容器部署需要在容器内被宿主机端口映射命中，可显式设
+    # MINIAPP_LISTEN_HOST=0.0.0.0（docker-compose 已代劳），启动日志会给出
+    # 明确的对外暴露告警。
+    join_verification_listen_host: str = "127.0.0.1"
     join_verification_listen_port: int = 8480
 
     # 资料自动巡检：按名单批量复查所有已知成员的名字/简介。
@@ -1128,7 +1133,7 @@ def load_bootstrap_settings() -> Settings:
     listen_host = (
         settings.miniapp_listen_host
         or settings.join_verification_listen_host
-        or "0.0.0.0"
+        or "127.0.0.1"
     ).strip()
     listen_port = min(
         65535,

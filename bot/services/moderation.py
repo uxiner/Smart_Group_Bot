@@ -18,6 +18,10 @@ from bot.config import ModerationConfig
 from bot.db.models import ModerationExemption, ModerationRule, UserWarning, Violation
 from bot.services import llm_metrics
 from bot.services.llm import LLMService
+from bot.services.moderation_throttle import (
+    MODERATION_ADMISSION,
+    ModerationAdmissionGate,
+)
 from bot.utils.prompts import get_prompt
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
@@ -419,9 +423,25 @@ def _parse_moderation_json(raw: str) -> dict | None:
 
 
 class ModerationService:
-    def __init__(self, config: ModerationConfig, llm: LLMService) -> None:
+    def __init__(
+        self,
+        config: ModerationConfig,
+        llm: LLMService | None = None,
+        *,
+        admission_gate: ModerationAdmissionGate | None = None,
+    ) -> None:
+        """``llm`` 可以为 None：只跑本地确定性规则（编辑消息的"只删不罚"检查，
+        F-008）时不需要模型，也就不会为一次编辑付一次审核模型调用。
+
+        ``admission_gate``：F-021 的送审整形闸（只推迟送审时刻、不降判定口径）。
+        """
         self.config = config
         self.llm = llm
+        #: F-021 的按 (群, 成员) 送审整形闸；默认用进程级共享实例，
+        #: 测试可以注入一个带假时钟的实例。
+        self._admission = (
+            admission_gate if admission_gate is not None else MODERATION_ADMISSION
+        )
 
     async def is_user_exempt(self, session: AsyncSession, group_id: int, user_id: int) -> bool:
         stmt = select(ModerationExemption.id).where(
@@ -453,6 +473,8 @@ class ModerationService:
         text: str,
         *,
         context: str = "",
+        deterministic_only: bool = False,
+        sender_id: int = 0,
     ) -> ModerationVerdict:
         """Evaluate deterministic rules locally and semantic rules with the LLM.
 
@@ -461,6 +483,15 @@ class ModerationService:
 
         ``context`` 是这条消息之前的群内对话（见 ``bot.services.moderation_context``）。
         本地正则只匹配消息本身，上下文只交给语义规则——否则上下文里的广告词会算到别人头上。
+
+        ``deterministic_only=True`` 只跑本地关键词/正则规则就返回（conclusive=False，
+        因为语义规则没跑），用于编辑消息的"只删不罚"检查（F-008）：一次编辑不该
+        触发第二次模型调用与处罚，但本地规则命中时正文必须从群里删掉。
+
+        ``sender_id`` 是这条消息的发送者（群消息路径必须传）：F-021 的送审整形闸
+        只对"成员主动发的消息"生效，并且**只推迟送审时刻**——判定内容、模型、置信度
+        口径一字不改，也绝不因为有闸就把语义规则降级成本地正则。0 表示非成员触发的
+        路径（申诉复核 / 资料巡检 / 入群筛查 / /report），完全不整形。
         """
         stmt = select(ModerationRule).where(
             ModerationRule.group_id == group_id,
@@ -755,6 +786,23 @@ class ModerationService:
             # than silently ignored.
             llm_rules.append(rule)
 
+        if deterministic_only:
+            # Nothing below this point may run without a model call: this pass
+            # exists so an *edit* is checked against local rules without paying
+            # for (or waiting on) a second moderation completion (F-008).
+            log.info(
+                "审核通过 (只跑本地规则，未调用语义规则): group=%s 本地=%d 语义=%d",
+                group_id,
+                len(rules),
+                len(llm_rules),
+            )
+            return make_verdict(
+                violated=False,
+                reason="",
+                rule=None,
+                conclusive=False,
+            )
+
         if not llm_rules:
             log.info("审核通过 (检查了 %d 条本地规则)", len(rules))
             return make_verdict(
@@ -762,6 +810,17 @@ class ModerationService:
                 reason="",
                 rule=None,
                 conclusive=not deterministic_inconclusive,
+            )
+
+        if self.llm is None:
+            # Defensive: deterministic_only is the only supported way to run
+            # without a model, and it returned above.
+            log.warning("审核缺少可用模型，按不可信的不违规处理")
+            return make_verdict(
+                violated=False,
+                reason="",
+                rule=None,
+                conclusive=False,
             )
 
         rules_payload = [
@@ -789,6 +848,11 @@ class ModerationService:
             user_input = wrap_untrusted(
                 "待审核消息", clean_text(text, max_len=1200), max_len=1200
             )
+        # F-021：送审之前先按 (群, 成员) 整形。位置刻意放在**本地确定性规则之后**：
+        # 命中本地关键词/正则的消息零延迟处置；只有真要花一次模型调用时才整形。
+        # 闸只推迟送审时刻，不改 send 的内容，也绝不跳过模型。
+        if sender_id > 0:
+            await self._admission.acquire(int(group_id), int(sender_id))
         try:
             llm_raw = await self.llm.moderation(system_prompt, user_input)
         except Exception:

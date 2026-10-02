@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ from bot.db.models import (
     AuthorizedGroup,
     Group,
     JoinVerification,
+    MemberPointAward,
+    MemberPointSpend,
     UserWarning,
     Violation,
 )
@@ -127,6 +130,11 @@ from bot.services.ban_audit import record_ban_event
 from bot.services.moderation_context import build_moderation_context
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
+from bot.services.point_shop import (
+    challenge_spend_ref,
+    refund_points,
+    refund_ref,
+)
 from bot.services.raid_guard import (
     RAID_REMOVE_CALLBACK_DATA,
     RaidRemovalResult,
@@ -1707,6 +1715,72 @@ async def _review_moderation_appeal(
     return verdict, "模型二次复核没有给出明确结论，请管理员人工判断"
 
 
+async def _next_challenge_spend_ref(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    verification_id: int,
+) -> str:
+    """挑一个这次点击真正能扣分的幂等键（F-010）。
+
+    ``challenge:<id>`` 的唯一索引保证连点只扣一次；但它也让**已退款**的扣分
+    永远无法重来：同一个 ref 再花一次只会返回 False，界面还会误报"积分不足"。
+    所以取第一个"还没扣过、或扣过但已退款"的 attempt 后缀。
+    """
+
+    for attempt in range(0, 6):
+        ref = challenge_spend_ref(verification_id, attempt)
+        spent = await session.scalar(
+            select(MemberPointSpend.id).where(
+                MemberPointSpend.group_id == int(group_id),
+                MemberPointSpend.user_id == int(user_id),
+                MemberPointSpend.ref == ref,
+            )
+        )
+        if spent is None:
+            return ref
+        refunded = await session.scalar(
+            select(MemberPointAward.id).where(
+                MemberPointAward.group_id == int(group_id),
+                MemberPointAward.user_id == int(user_id),
+                MemberPointAward.ref == refund_ref(ref),
+            )
+        )
+        if refunded is None:
+            # 已经扣过且没退：沿用同一个 ref，这次是重复点击，不该再扣一次
+            return ref
+    return challenge_spend_ref(verification_id, 6)
+
+
+async def _challenge_release_owned(
+    session: AsyncSession,
+    *,
+    verification_id: int,
+) -> bool:
+    """成员是否已被放行，或有后台工单正在/将会放行他（F-010）。
+
+    读的是裸状态列而不是 ORM 对象：放行链路自己的每一步都已 commit，identity map
+    里的旧对象可能还带着过期状态。读之前先结束上一个（只读）事务，否则 SQLite 的
+    快照会让这里读到旧状态。调用点只在"花积分免除质询"（kind=moderation、
+    system_points>0）之后使用，那条路径没有未提交的写入会被这次 rollback 丢掉。
+    """
+
+    try:
+        await session.rollback()
+    except Exception:  # pragma: no cover - 会话已坏时读状态也没意义
+        log.debug("challenge release status rollback failed", exc_info=True)
+    status = await session.scalar(
+        select(JoinVerification.status).where(
+            JoinVerification.id == int(verification_id)
+        )
+    )
+    if status is None:
+        # 记录已终态删除：release 成功（封禁分支不经过这里）
+        return True
+    return str(status) == VERIFICATION_STATUS_RELEASING
+
+
 async def _handle_verification_spend_callback(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -1719,6 +1793,12 @@ async def _handle_verification_spend_callback(
 
     扣分带幂等键 ``challenge:<质询ID>``（唯一索引），连点两次按钮只会扣一次。
     余额在点按钮的这一刻再查一遍：卡片是几分钟前发的，这期间分可能已经花掉。
+
+    扣分之后、放行之前还有若干"只 ack 不动作"的退出分支（lease 被并发管理员
+    抢走、目标已被封禁、群被取消授权……）。那些分支过去会让成员白扣分：这里在
+    调用之后核对记录状态，只有确实没人放行他时才退款（``shop-refund:<ref>``
+    唯一索引保证只退一次），并把这次尝试的 ref 换成新的 attempt，避免退款后
+    再点一次按钮被唯一索引卡死（F-010）。
     """
 
     operator = callback.from_user
@@ -1736,22 +1816,30 @@ async def _handle_verification_spend_callback(
         return
 
     group_id = int(record.group_id)
+    verification_id = int(record.id)
     cost = CHALLENGE_SKIP_COST
+    spend_ref = await _next_challenge_spend_ref(
+        session,
+        group_id=group_id,
+        user_id=target_user_id,
+        verification_id=verification_id,
+    )
     charged = await spend_points(
         session,
         group_id=group_id,
         user_id=target_user_id,
         points=cost,
         reason=SPEND_REASON_CHALLENGE,
-        ref=f"challenge:{int(record.id)}",
+        ref=spend_ref,
     )
     await session.commit()
     if not charged:
         log.info(
-            "moderation challenge skip refused | group=%s user=%s cost=%s",
+            "moderation challenge skip refused | group=%s user=%s cost=%s ref=%s",
             group_id,
             target_user_id,
             cost,
+            spend_ref,
         )
         await _ack_security_callback(
             callback,
@@ -1761,10 +1849,11 @@ async def _handle_verification_spend_callback(
         return
 
     log.info(
-        "moderation challenge skipped with points | group=%s user=%s cost=%s",
+        "moderation challenge skipped with points | group=%s user=%s cost=%s ref=%s",
         group_id,
         target_user_id,
         cost,
+        spend_ref,
     )
     # 扣分和放行共用管理员"通过"那条链路：lease、恢复权限、终态落库、补偿重试都在那一处
     await _handle_verification_admin_callback(
@@ -1778,6 +1867,72 @@ async def _handle_verification_spend_callback(
         system_points=cost,
     )
 
+    if await _challenge_release_owned(session, verification_id=verification_id):
+        return
+    refunded = await refund_points(
+        session,
+        group_id=group_id,
+        user_id=target_user_id,
+        points=cost,
+        original_ref=spend_ref,
+    )
+    await session.commit()
+    log.warning(
+        "moderation challenge skip did not release the member; points refunded | "
+        "group=%s user=%s cost=%s refunded=%s ref=%s",
+        group_id,
+        target_user_id,
+        cost,
+        refunded,
+        spend_ref,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 申诉复核的冷却（F-023）
+# --------------------------------------------------------------------------- #
+#: 同一名成员两次申诉复核之间的最小间隔（秒）。
+#:
+#: 依据：``jv:p:<uid>`` 是成员可见按钮，每点一次都会触发一次完整的审核模型复核
+#: （阶段预算 35s）；复核维持原判时质询记录仍是 pending，所以连点没有任何次数
+#: 上限，一个被质询的成员就能持续占用 HIGH 更新通道（4 个 worker，同时还承载
+#: chat_member / 入群验证）。一次复核 + 少量 Telegram 往返远小于 1 分钟，而正常
+#: 成员在拿到结果前重复点击对本人没有任何好处，所以 60 秒只掐掉"连点/循环"，
+#: 不影响任何正常使用。与 ``/report``、``@admin`` 的既有冷却同一写法：只用单调
+#: 时钟的内存字典，进程重启清零。
+_APPEAL_RECHECK_COOLDOWN_SECONDS = 60.0
+#: 内存字典上限：满了先清已经过期的条目，避免长期运行只增不减。
+_APPEAL_RECHECK_MAX_TRACKED = 4096
+_APPEAL_RECHECK_AT: dict[tuple[int, int], float] = {}
+
+
+def _appeal_recheck_remaining(group_id: int, user_id: int) -> float:
+    """还要等多少秒才能再次复核（0 表示现在就可以）。"""
+
+    last = _APPEAL_RECHECK_AT.get((int(group_id), int(user_id)))
+    if last is None:
+        return 0.0
+    return max(0.0, _APPEAL_RECHECK_COOLDOWN_SECONDS - (time.monotonic() - last))
+
+
+def _claim_appeal_recheck(group_id: int, user_id: int) -> float:
+    """占住这次复核的冷却位；返回 >0 表示本次被冷却挡下（值为还需等待秒数）。
+
+    冷却在**提交时**落下（不是成功后）：它是一条限速线，不是锁——模型侧失败时
+    成员最多等一个冷却周期再试，而连点/循环立刻被挡住。
+    """
+
+    key = (int(group_id), int(user_id))
+    remaining = _appeal_recheck_remaining(*key)
+    if remaining > 0:
+        return remaining
+    if len(_APPEAL_RECHECK_AT) >= _APPEAL_RECHECK_MAX_TRACKED:
+        cutoff = time.monotonic() - _APPEAL_RECHECK_COOLDOWN_SECONDS
+        for stale in [k for k, at in _APPEAL_RECHECK_AT.items() if at <= cutoff]:
+            _APPEAL_RECHECK_AT.pop(stale, None)
+    _APPEAL_RECHECK_AT[key] = time.monotonic()
+    return 0.0
+
 
 async def _handle_verification_appeal_callback(
     callback: CallbackQuery,
@@ -1787,12 +1942,19 @@ async def _handle_verification_appeal_callback(
     *,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
-    """「复核 / 开始验证」：先让审核模型重判一次，再决定放行还是继续质询。
+    """「复核 / 开始验证」：先按冷却去抖，再把模型复核交给后台任务（F-023）。
 
-    判定为正常（模型明确说未违规、且该成员当天没有别的命中）→ 直接恢复发言，
-    不打扰管理员；其余情况（仍判违规、结论不明确、一天内多次命中、找不到原文）
-    一律走原有质询流程——送本人去做人机验证，超时照旧封禁。管理员那条路
-    （管理员通过 / 管理员拒绝）不受影响，两条路谁先到算谁。
+    判定口径与旧实现完全一致：判定为正常（模型明确说未违规、且该成员当天没有别的
+    命中）→ 直接恢复发言，不打扰管理员；其余情况（仍判违规、结论不明确、一天内多次
+    命中、找不到原文）一律走原有质询流程——送本人去做人机验证，超时照旧封禁。
+
+    变的是**在哪里跑**：``jv:p:<uid>`` 是成员可见按钮，走 HIGH 更新通道，与
+    ``chat_member`` / 入群验证共用 ``WEBHOOK_SECURITY_CONCURRENT_UPDATES=4`` 个
+    worker，而复核维持原判时记录仍是 pending，连点没有次数上限——一个被质询的成员
+    循环点击就能把这条安全通道拖住。现在：
+      1. 按 ``(group_id, user_id)`` 冷却去抖（见 ``_claim_appeal_recheck``）；
+      2. 复核提交到 ``policy`` lane 的后台任务（2 个独立 worker），handler 立刻回执
+         并返回，不再占用更新 worker。
     """
 
     operator = callback.from_user
@@ -1810,6 +1972,107 @@ async def _handle_verification_appeal_callback(
         return
 
     group_id = int(record.group_id)
+    display_name = str(getattr(record, "display_name", "") or "")
+
+    remaining = _claim_appeal_recheck(group_id, target_user_id)
+    if remaining > 0:
+        log.info(
+            "appeal recheck throttled | group=%s user=%s remaining=%.0fs",
+            group_id,
+            target_user_id,
+            remaining,
+        )
+        await _ack_security_callback(
+            callback,
+            f"刚刚已经复核过了，请 {max(1, int(remaining) + 1)} 秒后再试",
+            show_alert=True,
+        )
+        return
+
+    if session_factory is None:
+        # workflow data 一定会注入 session_factory；真的没有时保持原有内联行为，
+        # 绝不能让"复核"变成静默不做事。
+        log.warning(
+            "appeal recheck has no session factory; running inline | group=%s user=%s",
+            group_id,
+            target_user_id,
+        )
+        await _run_verification_appeal_recheck(
+            callback,
+            session,
+            settings,
+            group_id=group_id,
+            target_user_id=target_user_id,
+            display_name=display_name,
+            session_factory=None,
+            deferred=False,
+        )
+        return
+
+    async def operation() -> None:
+        async with session_factory() as work_session:
+            await _run_verification_appeal_recheck(
+                callback,
+                work_session,
+                settings,
+                group_id=group_id,
+                target_user_id=target_user_id,
+                display_name=display_name,
+                session_factory=session_factory,
+                deferred=True,
+            )
+
+    submission = submit_privileged_task(
+        key=f"verification-appeal:{group_id}:{target_user_id}",
+        label=(
+            f"verification appeal recheck for {target_user_id} in {group_id}"
+        ),
+        operation=operation,
+        lane="policy",
+        priority=0,
+        timeout_seconds=120.0,
+    )
+    if submission.accepted:
+        await _ack_security_callback(
+            callback,
+            "正在复核，结果马上出来…" if submission.created else "复核正在进行中…",
+        )
+        return
+
+    # 队列饱和不能静默吞掉一次申诉：让这条 update 稍后重放，并如实告知点击者。
+    log.error(
+        "appeal recheck queue rejected; scheduling durable retry | "
+        "group=%s user=%s reason=%s",
+        group_id,
+        target_user_id,
+        submission.reason,
+    )
+    request_current_update_retry()
+    await _ack_security_callback(
+        callback,
+        "复核通道正忙，本次操作会自动重试。",
+        show_alert=True,
+    )
+
+
+async def _run_verification_appeal_recheck(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    group_id: int,
+    target_user_id: int,
+    display_name: str,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    deferred: bool,
+) -> None:
+    """复核体（旧内联逻辑原样搬过来，判定口径不变）。
+
+    ``deferred=True`` 表示自己在后台任务里跑（callback 已经回执过），
+    ``False`` 表示退化路径：没有 session_factory，只能在 handler 里内联跑，
+    此时保持旧的回执方式。
+    """
+
     original_text, repeats = await _moderation_appeal_context(
         session, group_id, target_user_id
     )
@@ -1862,14 +2125,102 @@ async def _handle_verification_appeal_callback(
         repeats,
         check_summary,
     )
-    username = await _callback_bot_username(callback)
-    if not username:
-        await _ack_security_callback(
-            callback, "验证入口暂时不可用，请稍后重试", show_alert=True
+    await _notify_appeal_recheck_kept(
+        callback,
+        group_id=group_id,
+        target_user_id=target_user_id,
+        display_name=display_name,
+        check_summary=check_summary,
+        deferred=deferred,
+    )
+
+
+async def _notify_appeal_recheck_kept(
+    callback: CallbackQuery,
+    *,
+    group_id: int,
+    target_user_id: int,
+    display_name: str,
+    check_summary: str,
+    deferred: bool,
+) -> None:
+    """复核维持原判：把本人送回人机验证。
+
+    正常路径（``deferred=True``，复核跑在后台 policy 任务里）：在群里发一条带
+    URL 按钮的通知。旧实现用 ``callback.answer(url=deep_link)`` 直接打开 Mini App，
+    但后台任务运行时 callback 已经回执过，Telegram 不允许对同一次点击二次 answer，
+    所以改成"点一下按钮进验证"的一条可见回执。
+
+    退化路径（``deferred=False``，没有 session_factory 时只能内联）：保持旧行为，
+    直接用 ``callback.answer(url=...)`` 打开 Mini App。
+
+    两条路都必须在发不出去时留日志：不能让成员以为复核通过了。
+    """
+
+    message = getattr(callback, "message", None)
+    chat = getattr(message, "chat", None)
+    if not deferred:
+        username = await _callback_bot_username(callback)
+        if not username:
+            await _ack_security_callback(
+                callback, "验证入口暂时不可用，请稍后重试", show_alert=True
+            )
+            return
+        await callback.answer(url=build_private_deep_link(username, int(group_id)))
+        return
+
+    bot = getattr(callback, "bot", None)
+    if chat is None or bot is None or int(getattr(chat, "id", 0) or 0) == 0:
+        log.warning(
+            "appeal recheck kept but the group entry is gone | group=%s user=%s",
+            group_id,
+            target_user_id,
         )
         return
-    await callback.answer(
-        url=build_private_deep_link(username, group_id),
+    username = await _callback_bot_username(callback)
+    if not username:
+        log.warning(
+            "appeal recheck kept but bot username is unavailable | group=%s user=%s",
+            group_id,
+            target_user_id,
+        )
+        return
+
+    shown = html.escape((display_name or "").strip()) or f"用户 {int(target_user_id)}"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="开始验证",
+                    url=build_private_deep_link(username, int(group_id)),
+                )
+            ]
+        ]
+    )
+    try:
+        await bot.send_message(
+            chat_id=int(chat.id),
+            text=(
+                f"复核结果：{shown} 的这条消息仍判违规。\n"
+                f"{html.escape(str(check_summary or '').strip())}\n"
+                "请在质询到期前点下面的按钮完成人机验证，超时将被封禁。"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        log.warning(
+            "appeal recheck kept notice failed | group=%s user=%s",
+            group_id,
+            target_user_id,
+            exc_info=True,
+        )
+        return
+    log.info(
+        "appeal recheck kept notice sent | group=%s user=%s",
+        group_id,
+        target_user_id,
     )
 
 

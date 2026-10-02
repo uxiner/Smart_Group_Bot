@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.db.models import UserWarning
 from bot.db.engine import init_db
+from bot.middlewares import verification_gate as verify_gate_module
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
 from bot.services.authz import authorize_group
 from bot.services.join_verification import upsert_join_verification
@@ -282,17 +283,133 @@ class PendingVerificationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "handled")
         event.delete.assert_not_awaited()
 
-    async def test_gate_failure_fails_open(self) -> None:
+    async def test_gate_failure_keeps_unverified_without_any_disposal(self) -> None:
+        """F-028：状态读不出来时不做任何处置，只保持"未验证"并告警。
+
+        旧用例名就叫 ``test_gate_failure_fails_open``：``except`` 之后 gated 仍是
+        False，消息既不删也不吞，正好击穿这个中间件存在的意义（挡住禁言竞态窗口
+        里抢跑的消息）。返工后的行为：
+          * 不交给 handler（保持"未验证"，不把没验证的人按已验证对待）
+          * **不删消息**（删掉一个已经通过验证的正常群友的消息就是误伤）
+          * 不登记成"已放行"，不改任何权限
+          * 立即重试（3 次）后仍失败 → 错误日志 + 私聊最高管理员告警 + 尽力重放
+        """
+
         handler = AsyncMock(return_value="handled")
         event = _message_event(user_id=912)
-        with patch(
-            "bot.middlewares.verification_gate.verification_restriction_required",
-            side_effect=RuntimeError("db down"),
+        with (
+            patch(
+                "bot.middlewares.verification_gate.verification_restriction_required",
+                side_effect=RuntimeError("db down"),
+            ) as lookup,
+            patch(
+                "bot.middlewares.verification_gate._GATE_LOOKUP_RETRY_DELAYS",
+                (0.0, 0.0),
+            ),
+            patch(
+                "bot.middlewares.verification_gate.alert_super_admin",
+                new=AsyncMock(return_value=True),
+            ) as alert,
+            patch(
+                "bot.middlewares.verification_gate.request_current_update_retry",
+                return_value=True,
+            ) as retry,
         ):
+            result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        retry.assert_called_once()
+        self.assertEqual(lookup.call_count, 3, "先立即重试再判定失败")
+        alert.assert_awaited_once()
+        self.assertEqual(alert.await_args.kwargs["fields"]["user"], 912)
+        # 负例：状态未知时不删任何人的消息，也不登记成"已放行"
+        event.delete.assert_not_awaited()
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 912), [])
+        # 负例：不写"已清除/已限制"之类的权限动作
+        event.bot.delete_messages.assert_not_awaited()
+
+    async def test_gate_failure_without_durable_retry_still_disposes_nothing(self) -> None:
+        """没有 durable receipt 时同样不做任何处置：不删消息、不抛错，只是告警。"""
+
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=915)
+        with (
+            patch(
+                "bot.middlewares.verification_gate.verification_restriction_required",
+                side_effect=RuntimeError("db down"),
+            ),
+            patch(
+                "bot.middlewares.verification_gate._GATE_LOOKUP_RETRY_DELAYS",
+                (0.0, 0.0),
+            ),
+            patch(
+                "bot.middlewares.verification_gate.alert_super_admin",
+                new=AsyncMock(return_value=False),
+            ) as alert,
+            patch(
+                "bot.middlewares.verification_gate.request_current_update_retry",
+                return_value=False,
+            ),
+        ):
+            result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        alert.assert_awaited_once()
+        event.delete.assert_not_awaited()
+
+    async def test_transient_gate_failure_recovers_without_alert(self) -> None:
+        """一次 SQLite busy 抖动：重试换回正确判定，不产生告警、不冤枉人。"""
+
+        await self._add_pending_verification(916)
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=916)
+        attempts = {"count": 0}
+        original = (
+            verify_gate_module.verification_restriction_required
+        )
+
+        async def flaky(session, *, group_id, user_id):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("database is locked")
+            return await original(session, group_id=group_id, user_id=user_id)
+
+        with (
+            patch(
+                "bot.middlewares.verification_gate.verification_restriction_required",
+                new=AsyncMock(side_effect=flaky),
+            ),
+            patch(
+                "bot.middlewares.verification_gate.alert_super_admin",
+                new=AsyncMock(return_value=True),
+            ) as alert,
+        ):
+            result = await self.middleware(handler, event, {"settings": _settings()})
+
+        # 该成员确实有待验证记录：恢复后照常按 gated 处理（删消息 + 吞掉）
+        self.assertEqual(attempts["count"], 2)
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        event.delete.assert_awaited_once()
+        alert.assert_not_awaited()
+
+    async def test_verified_sender_is_not_gated_or_alerted(self) -> None:
+        """负例：已经通过验证的正常群友不受影响、不告警。"""
+
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=917, message_id=71)
+
+        with patch(
+            "bot.middlewares.verification_gate.alert_super_admin",
+            new=AsyncMock(return_value=True),
+        ) as alert:
             result = await self.middleware(handler, event, {"settings": _settings()})
 
         self.assertEqual(result, "handled")
         event.delete.assert_not_awaited()
+        alert.assert_not_awaited()
 
     async def test_delete_failure_schedules_durable_cleanup(self) -> None:
         await self._add_pending_verification(913)

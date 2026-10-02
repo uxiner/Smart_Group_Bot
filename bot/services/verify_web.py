@@ -301,6 +301,88 @@ def _public_ip(value: object) -> str:
     return address.compressed if address.is_global else ""
 
 
+#: Distinct diagnostic strings already withheld from /healthz and logged once.
+_HEALTHZ_LOGGED_DIAGNOSTICS: set[str] = set()
+_HEALTHZ_LOGGED_DIAGNOSTICS_LIMIT = 64
+
+
+def _log_withheld_health_diagnostic(field: str, detail: str) -> None:
+    """Keep the redacted /healthz detail observable in the log, once per value."""
+
+    text = str(detail or "")
+    if not text or text in _HEALTHZ_LOGGED_DIAGNOSTICS:
+        return
+    if len(_HEALTHZ_LOGGED_DIAGNOSTICS) >= _HEALTHZ_LOGGED_DIAGNOSTICS_LIMIT:
+        _HEALTHZ_LOGGED_DIAGNOSTICS.clear()
+    _HEALTHZ_LOGGED_DIAGNOSTICS.add(text)
+    log.warning(
+        "health diagnostic withheld from /healthz | field=%s detail=%s",
+        field,
+        text[:500],
+    )
+
+
+def _redact_health_diagnostics(value: Any, *, field: str = "") -> Any:
+    """Replace free-form health text with a presence flag for the public payload.
+
+    Every string inside the webhook/resource snapshots is either an exception
+    rendering (``f"{type(exc).__name__}: {exc}"``, i.e. table names and database
+    file paths) or an internal worker diagnosis. ``/healthz`` is unauthenticated
+    and may be reachable on every interface (F-017), so the response keeps the
+    counters and reduces each string to "is there anything here"; the original
+    text is written to the log instead (F-009).
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_health_diagnostics(item, field=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_health_diagnostics(item, field=field) for item in value]
+    if isinstance(value, str):
+        _log_withheld_health_diagnostic(field, value)
+        return bool(value)
+    return value
+
+
+def _listen_host_is_loopback(host: object) -> bool:
+    """True only for an address that is unreachable from other hosts."""
+
+    text = str(host or "").strip().strip("[]")
+    if not text:
+        # Empty means "every interface" for aiohttp, not the loopback.
+        return False
+    if text.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def _warn_if_listen_host_is_public(host: object, port: int) -> None:
+    """Make an externally reachable Mini App/verification bind explicit (F-017).
+
+    The default is loopback now, but a container needs ``0.0.0.0`` to be
+    reachable through a published port. That choice exposes ``/verify``,
+    ``/settings`` and the unauthenticated ``/healthz`` to every interface, so it
+    must never be silent.
+    """
+
+    if _listen_host_is_loopback(host):
+        return
+    log.warning(
+        "Mini App / join-verification HTTP server binds %s:%s, which is not a "
+        "loopback address: every local interface can reach /verify, /settings "
+        "and the unauthenticated /healthz. Keep the port behind the reverse "
+        "proxy or a firewall (set MINIAPP_LISTEN_HOST=127.0.0.1 unless the "
+        "container port mapping requires otherwise).",
+        str(host or "*"),
+        int(port),
+    )
+
+
 def _client_public_ip(request: web.Request) -> str:
     peer = str(getattr(request, "remote", "") or "").strip()
     try:
@@ -1120,7 +1202,14 @@ class _WebhookUpdateQueue:
 
     def verify_secret(self, request: web.Request) -> bool:
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        return secrets.compare_digest(supplied, self.secret_token)
+        # ``secrets.compare_digest`` 只接受纯 ASCII 的 str：aiohttp 按 latin-1
+        # 解码请求头，任何 ≥0x80 的字节都会变成非 ASCII 字符，于是匿名请求带一个
+        # 乱码头就能让这里抛 TypeError，把 webhook 路由变成未鉴权的 500 + traceback
+        # 噪音（F-045）。比较编码后的字节，语义不变，任何非法输入都只是 401。
+        return secrets.compare_digest(
+            supplied.encode("utf-8", "surrogateescape"),
+            str(self.secret_token).encode("utf-8", "surrogateescape"),
+        )
 
     async def _ensure_durable_update(
         self,
@@ -3544,16 +3633,19 @@ class VerifyWebServer:
             shutdown_timeout=_WEB_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
         )
         await self._runner.setup()
+        listen_host = str(self.settings.miniapp_listen_host)
+        listen_port = int(self.settings.miniapp_listen_port)
+        _warn_if_listen_host_is_public(listen_host, listen_port)
         site = web.TCPSite(
             self._runner,
-            host=self.settings.miniapp_listen_host,
-            port=self.settings.miniapp_listen_port,
+            host=listen_host,
+            port=listen_port,
         )
         await site.start()
         log.info(
             "Mini App web server listening on %s:%s",
-            self.settings.miniapp_listen_host,
-            self.settings.miniapp_listen_port,
+            listen_host,
+            listen_port,
         )
 
     async def _stop_impl(self) -> None:
@@ -3643,13 +3735,17 @@ class VerifyWebServer:
             and self._delivery_mode in {"webhook", "polling"}
             and bool(resources.get("ok", False))
         )
+        # /healthz 没有任何鉴权守卫，而服务可能监听所有网卡（F-017）：计数器留着
+        # 便于排障，但里面的自由文本（"<异常类型>: <异常>"——SQLAlchemy/SQLite 的
+        # 表名、数据库路径，worker 内部诊断）一律换成"有没有"的布尔值，原文只进
+        # 日志（F-009）。docker healthcheck 只看状态码，不需要这些字符串。
         return web.json_response(
             {
                 "ok": ok,
                 "delivery_mode": self._delivery_mode,
                 "webhook_accepting_updates": self._webhook_accepting_updates,
-                "webhook": webhook_health,
-                "resources": resources,
+                "webhook": _redact_health_diagnostics(webhook_health),
+                "resources": _redact_health_diagnostics(resources),
                 "config_revision": self.runtime_config.revision
                 if self.runtime_config is not None
                 else None,

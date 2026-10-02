@@ -73,10 +73,82 @@ class PerformanceIndexTests(unittest.TestCase):
             "join_verifications": "ix_join_verifications_status_deadline",
             "vote_ban_sessions": "ix_vote_ban_status_deadline",
             "message_vectors": "ix_message_vectors_group_row",
+            "member_checkins": "ix_member_checkins_group_day",
         }
         for table, index_name in expected.items():
             names = {index["name"] for index in inspector.get_indexes(table)}
             self.assertIn(index_name, names, table)
+
+
+class MemberCheckinDayIndexTests(unittest.IsolatedAsyncioTestCase):
+    """F-030：``member_checkins`` 的按日索引必须对**已有库**也生效。"""
+
+    #: 旧库形状：表 + (group_id, user_id, checkin_date) 唯一索引，没有按日索引。
+    LEGACY_SCHEMA = (
+        "CREATE TABLE member_checkins ("
+        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+        "group_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "checkin_date VARCHAR(10) NOT NULL, "
+        "points INTEGER, "
+        "display_name VARCHAR(255), "
+        "created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE UNIQUE INDEX ix_member_checkins_day "
+        "ON member_checkins (group_id, user_id, checkin_date)",
+    )
+
+    async def test_existing_database_gains_the_day_index_on_startup(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            connection = sqlite3.connect(path)
+            for statement in self.LEGACY_SCHEMA:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO member_checkins "
+                "(group_id, user_id, checkin_date, points, display_name) "
+                "VALUES (-100, 7, '2026-01-01', 1, 'seven')"
+            )
+            connection.commit()
+            connection.close()
+
+            # create_all 不会给已存在的表补索引，启动路径必须补上。
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            async with session_factory() as session:
+                index_names = {
+                    row[0]
+                    for row in (
+                        await session.execute(
+                            text(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type='index' AND tbl_name='member_checkins'"
+                            )
+                        )
+                    ).all()
+                }
+                plan = (
+                    await session.execute(
+                        text(
+                            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM member_checkins "
+                            "WHERE group_id = -100 AND checkin_date = '2026-01-01'"
+                        )
+                    )
+                ).all()
+            self.assertIn("ix_member_checkins_group_day", index_names)
+            # 提醒路径的按日计数不能再扫该群的全部历史签到行。
+            self.assertTrue(
+                any("ix_member_checkins_group_day" in str(row[-1]) for row in plan),
+                plan,
+            )
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
 
 
 class GroupMessageArchiveSchemaTests(unittest.TestCase):

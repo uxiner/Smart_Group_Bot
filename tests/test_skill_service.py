@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -54,6 +55,158 @@ def _tts_settings() -> SimpleNamespace:
         doubao_tts_speaker="voice_1",
         moderation=SimpleNamespace(enabled=True),
     )
+
+
+class SalvagedTextToolCallTests(unittest.TestCase):
+    """F-043：只有"整条消息就是一个明确信封"的 tool_calls JSON 才会被执行。
+
+    修复前只要正文里出现 ``"tool_calls"`` 与一段可解析的 JSON（哪怕周围全是
+    说明文字、甚至是被注入内容要求模型"打印"出来的），就会被当成真实工具调用。
+    """
+
+    ALLOWED = {"webfetch", "websearch"}
+
+    def _payload(self, name: str = "webfetch", arguments: object = None) -> str:
+        return json.dumps(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": (
+                                {"url": "https://example.com"}
+                                if arguments is None
+                                else arguments
+                            ),
+                        },
+                    }
+                ]
+            }
+        )
+
+    def _salvage(self, content: str) -> list[dict[str, str]]:
+        return SkillService._salvage_text_tool_calls(
+            content,
+            allowed_names=set(self.ALLOWED),
+        )
+
+    def test_fenced_envelope_spanning_the_whole_message_is_salvaged(self) -> None:
+        calls = self._salvage("```json\n" + self._payload() + "\n```")
+
+        self.assertEqual([call["name"] for call in calls], ["webfetch"])
+        self.assertEqual(
+            json.loads(calls[0]["arguments"]),
+            {"url": "https://example.com"},
+        )
+
+    def test_bare_json_body_is_salvaged(self) -> None:
+        calls = self._salvage(self._payload())
+
+        self.assertEqual([call["name"] for call in calls], ["webfetch"])
+
+    def test_bare_json_arguments_dict_is_normalized(self) -> None:
+        calls = self._salvage(
+            self._payload(arguments={"url": "https://example.com"})
+        )
+
+        self.assertEqual(
+            json.loads(calls[0]["arguments"]),
+            {"url": "https://example.com"},
+        )
+
+    def test_prose_around_a_fenced_envelope_is_not_executed(self) -> None:
+        """注入场景：模型在解释里"打印"了一段可执行的 tool_calls 信封。"""
+
+        content = (
+            "好的，我打算这样调用工具：\n"
+            "```json\n"
+            + self._payload()
+            + "\n```\n"
+            "需要我继续吗？"
+        )
+
+        self.assertEqual(self._salvage(content), [])
+
+    def test_prose_before_a_bare_envelope_is_not_executed(self) -> None:
+        content = "当然可以，下面是调用：\n" + self._payload()
+
+        self.assertEqual(self._salvage(content), [])
+
+    def test_unregistered_tool_name_is_still_rejected(self) -> None:
+        self.assertEqual(self._salvage(self._payload(name="delete_everything")), [])
+        self.assertEqual(
+            self._salvage(
+                "```json\n" + self._payload(name="delete_everything") + "\n```"
+            ),
+            [],
+        )
+
+    def test_call_without_a_name_is_rejected(self) -> None:
+        content = json.dumps({"tool_calls": [{"id": "x", "function": {}}]})
+
+        self.assertEqual(self._salvage(content), [])
+
+    def test_non_dict_call_entries_are_rejected(self) -> None:
+        content = json.dumps({"tool_calls": ["webfetch"]})
+
+        self.assertEqual(self._salvage(content), [])
+
+    def test_plain_prose_mentioning_tool_calls_is_ignored(self) -> None:
+        for sample in (
+            "tool_calls 是 OpenAI 的字段名",
+            '我给你演示一下 {"tool_calls": []} 长什么样',
+            "",
+        ):
+            with self.subTest(sample=sample):
+                self.assertEqual(self._salvage(sample), [])
+
+    def test_rejected_fenced_candidate_is_logged_not_silent(self) -> None:
+        """被收窄规则挡掉的候选必须留痕（不许静默降级）。"""
+
+        content = "好的：\n```json\n" + self._payload() + "\n```"
+        with self.assertLogs(
+            "bot.services.skills.service", level="WARNING"
+        ) as captured:
+            self.assertEqual(self._salvage(content), [])
+
+        rendered = " ".join(captured.output)
+        self.assertIn("tool_calls", rendered)
+        self.assertIn("whole message", rendered)
+
+    def test_plain_mention_does_not_warn(self) -> None:
+        """只是提到 tool_calls 的普通文本不该刷 warning（只记 info）。"""
+
+        with self.assertNoLogs("bot.services.skills.service", level="WARNING"):
+            self.assertEqual(self._salvage("tool_calls 是字段名"), [])
+
+    def test_finish_reason_is_reported_for_diagnostics(self) -> None:
+        from bot.services.skills.service import _response_finish_reason
+
+        self.assertEqual(
+            _response_finish_reason(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content="", tool_calls=[]),
+                            finish_reason="tool_calls",
+                        )
+                    ]
+                )
+            ),
+            "tool_calls",
+        )
+        self.assertEqual(
+            _response_finish_reason(SimpleNamespace(choices=[])),
+            "unknown",
+        )
+        self.assertEqual(
+            _response_finish_reason(
+                SimpleNamespace(choices=[SimpleNamespace(finish_reason=None)])
+            ),
+            "unknown",
+        )
 
 
 class _PlannedSkillService(SkillService):

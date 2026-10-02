@@ -8,6 +8,23 @@ from bot.middlewares.command_cleanup import ManagementCommandCleanupMiddleware
 from bot.utils.command_catalog import bare_command, management_command_names
 
 
+def _settings(super_admin_id: int = 1) -> SimpleNamespace:
+    return SimpleNamespace(super_admin_id=super_admin_id)
+
+
+def _session_factory() -> object:
+    """最小可用的 session_factory：授权查询本身在用例里被 patch。"""
+
+    class _SessionContext:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace(commit=AsyncMock())
+
+        async def __aexit__(self, *_exc: object) -> bool:
+            return False
+
+    return lambda: _SessionContext()
+
+
 def _message(
     text: str,
     *,
@@ -25,16 +42,51 @@ def _message(
     )
 
 
+_UNSET = object()
+
+
 class ManagementCommandCleanupTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, message: SimpleNamespace, schedule: AsyncMock | None = None):
-        middleware = ManagementCommandCleanupMiddleware()
+    async def _run(
+        self,
+        message: SimpleNamespace,
+        schedule: AsyncMock | None = None,
+        *,
+        settings: SimpleNamespace | None = None,
+        session_factory: object = _UNSET,
+        delegated_admin: bool = True,
+        delegated_admin_error: bool = False,
+    ):
+        """默认发送者是"已确证的委派管理员"（会话查询在用例里被 patch）。
+
+        权限收窄后（F-048）只有两种身份会被清理：超管、以及数据库里被委派的
+        群管理员。`delegated_admin=False` 表示普通成员 —— 命令行必须留着。
+        """
+
+        factory = _session_factory() if session_factory is _UNSET else session_factory
+        middleware = ManagementCommandCleanupMiddleware(factory)
         handler = AsyncMock(return_value="handled")
         spy = schedule or AsyncMock(return_value=True)
-        with patch(
-            "bot.middlewares.command_cleanup.schedule_message_auto_delete_durable",
-            new=spy,
+        delegated_check = AsyncMock(
+            return_value=delegated_admin,
+            side_effect=(
+                RuntimeError("db down") if delegated_admin_error else None
+            ),
+        )
+        with (
+            patch(
+                "bot.middlewares.command_cleanup.schedule_message_auto_delete_durable",
+                new=spy,
+            ),
+            patch(
+                "bot.middlewares.command_cleanup.is_group_admin_authorized",
+                new=delegated_check,
+            ),
         ):
-            result = await middleware(handler, message, {})
+            result = await middleware(
+                handler,
+                message,
+                {"settings": settings if settings is not None else _settings()},
+            )
         return result, spy, handler
 
     async def test_group_operator_command_is_scheduled_for_cleanup(self) -> None:
@@ -85,6 +137,112 @@ class ManagementCommandCleanupTests(unittest.IsolatedAsyncioTestCase):
         result, _, handler = await self._run(message, schedule=AsyncMock(side_effect=RuntimeError("db down")))
         self.assertEqual(result, "handled")
         handler.assert_awaited_once()
+
+    # --- F-048：消息像管理命令 ≠ 发送者是操作者 ---------------------------
+
+    async def test_member_lookalike_command_is_not_deleted(self) -> None:
+        """负例：普通成员把 /ban 当文本发出来时，不替他删掉这条证据。"""
+
+        message = _message("/ban 555 广告", user_id=777)
+        result, schedule, handler = await self._run(
+            message,
+            delegated_admin=False,
+        )
+
+        self.assertEqual(result, "handled")
+        handler.assert_awaited_once()
+        schedule.assert_not_awaited()
+
+    async def test_delegated_group_admin_command_is_cleaned(self) -> None:
+        """数据库里被委派的群管理员：命令确实由机器人服务，照旧清理。"""
+
+        message = _message("/warnings", user_id=778)
+        _, schedule, _ = await self._run(
+            message,
+            session_factory=_session_factory(),
+            delegated_admin=True,
+        )
+
+        schedule.assert_awaited_once()
+
+    async def test_super_admin_command_is_cleaned(self) -> None:
+        message = _message("/warnings", user_id=1)
+        _, schedule, _ = await self._run(
+            message,
+            settings=_settings(super_admin_id=1),
+            session_factory=None,
+            delegated_admin=False,
+        )
+
+        schedule.assert_awaited_once()
+
+    async def test_telegram_admin_status_is_never_consulted(self) -> None:
+        """F-048：只看"已确证的操作者"，不再去问 Telegram 管理员身份。
+
+        未委派的 Telegram 管理员跑管理命令只会得到"权限不足"，那条命令没有被
+        机器人服务，因此也不该被清理（宁可漏删，不可误删）。
+        """
+
+        message = _message("/ban 555", user_id=779)
+        with patch(
+            "bot.middlewares.command_cleanup.is_user_admin_cached",
+            create=True,
+        ) as telegram_admin:
+            _, schedule, handler = await self._run(
+                message,
+                delegated_admin=False,
+            )
+
+        schedule.assert_not_awaited()
+        handler.assert_awaited_once()
+        telegram_admin.assert_not_called()
+
+    async def test_quoted_management_command_text_is_not_deleted(self) -> None:
+        """负例：成员把管理命令当引用/转述文本时，不以 "/" 开头，不清理。"""
+
+        for text in ("> /ban 555", "转发：/mute all", "他说 /warnings 能看名单"):
+            with self.subTest(text=text):
+                _, schedule, handler = await self._run(
+                    _message(text, user_id=780),
+                    delegated_admin=False,
+                )
+                schedule.assert_not_awaited()
+                handler.assert_awaited_once()
+
+    async def test_permission_lookup_failure_keeps_the_message(self) -> None:
+        """权限查不出来时宁可留着消息，也不能删错人的证据。"""
+
+        _, schedule, handler = await self._run(
+            _message("/ban 555"),
+            session_factory=_session_factory(),
+            delegated_admin_error=True,
+        )
+
+        schedule.assert_not_awaited()
+        handler.assert_awaited_once()
+
+    async def test_missing_session_factory_cannot_authorize_a_member(self) -> None:
+        """没有 DB 会话时只剩超管一条路径，成员一律放过（只记日志）。"""
+
+        _, schedule, _ = await self._run(
+            _message("/ban 555", user_id=781),
+            session_factory=None,
+            delegated_admin=False,
+        )
+
+        schedule.assert_not_awaited()
+
+    async def test_missing_session_factory_still_cleans_the_super_admin(self) -> None:
+        """负例的反面：超管不依赖 DB 会话，仍然照旧清理。"""
+
+        _, schedule, _ = await self._run(
+            _message("/ban 555", user_id=1),
+            settings=_settings(super_admin_id=1),
+            session_factory=None,
+            delegated_admin=False,
+        )
+
+        schedule.assert_awaited_once()
 
     def test_management_set_covers_operator_commands_only(self) -> None:
         names = management_command_names()

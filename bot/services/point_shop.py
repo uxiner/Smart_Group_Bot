@@ -81,6 +81,9 @@ _TELEGRAM_CALL_TIMEOUT_SECONDS = 10.0
 _SHOP_EXPIRY_CHECK_SECONDS = 300.0
 _SHOP_EXPIRY_PASS_DEADLINE_SECONDS = 120.0
 _SHOP_EXPIRY_BATCH_LIMIT = 200
+#: 到期撤销失败后的重试间隔：把 expires_at 往后推这么多，下次扫描再试。
+#: 既不会每轮都撞同一条失败记录，也不会让付费头衔永远留在群里没人管（F-052）。
+_SHOP_EXPIRY_RETRY_SECONDS = 900
 
 _ADMIN_STATUSES = ("administrator", "creator")
 #: 取消置顶时这些报错说明"本来就没置顶"，当成功处理
@@ -326,6 +329,18 @@ def refund_ref(original_ref: str) -> str:
     return f"shop-refund:{original_ref}"
 
 
+def challenge_spend_ref(verification_id: int, attempt: int = 0) -> str:
+    """「花积分免除质询」的消费 ref（幂等键）。
+
+    ``attempt=0`` 就是历史格式 ``challenge:<质询ID>``；``attempt>0`` 加一个后缀，
+    用于**上一次扣分已经被退款**之后的重试：唯一索引让同一个 ref 只能扣一次，
+    没有新 ref 的话成员退了款也再点不动这个按钮（还会误报"积分不足"）。
+    """
+
+    base = f"challenge:{int(verification_id)}"
+    return base if int(attempt) <= 0 else f"{base}#{int(attempt)}"
+
+
 def lottery_day(now: object = None) -> str:
     """抽奖次数按本地（Asia/Shanghai）自然日算，格式与 ref 里的片段一致。"""
 
@@ -544,6 +559,81 @@ def minutes_left(expires_at: datetime, now: datetime) -> int:
     return max(1, int((seconds + 59) // 60))
 
 
+@dataclass(frozen=True, slots=True)
+class EntitlementSnapshot:
+    """购买前的一条权益快照，用于 Telegram 调用失败时精确回滚（F-053）。
+
+    ``exists=False`` 表示买之前这个人没有这件权益；续费时要连旧到期时间一起
+    还原，不能简单删行——那会把上一笔已经付过钱的有效期一起吞掉。
+    """
+
+    exists: bool = False
+    payload: str = ""
+    ref: str = ""
+    expires_at: datetime | None = None
+
+
+async def entitlement_snapshot(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    kind: str,
+) -> EntitlementSnapshot:
+    """读取当前权益，供 :func:`restore_entitlement` 回滚用。"""
+
+    row = await active_entitlement(
+        session, group_id=group_id, user_id=user_id, kind=kind
+    )
+    if row is None:
+        return EntitlementSnapshot()
+    return EntitlementSnapshot(
+        exists=True,
+        payload=str(row.payload or ""),
+        ref=str(row.ref or ""),
+        expires_at=row.expires_at,
+    )
+
+
+async def restore_entitlement(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    kind: str,
+    snapshot: EntitlementSnapshot,
+) -> None:
+    """把权益写回 ``snapshot`` 的样子（回滚半途失败的购买，F-053）。
+
+    扣费与权益现在同一个事务提交；Telegram 侧失败时两件事必须一起撤销：
+    退款（:func:`refund_points`）+ 这里的权益还原，由调用方在同一次 commit 里落库。
+    """
+
+    row = await active_entitlement(
+        session, group_id=group_id, user_id=user_id, kind=kind
+    )
+    if row is None:
+        if not snapshot.exists:
+            return
+        session.add(
+            MemberEntitlement(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                kind=str(kind),
+                payload=str(snapshot.payload)[:255],
+                ref=str(snapshot.ref)[:64],
+                expires_at=snapshot.expires_at,
+            )
+        )
+        return
+    if not snapshot.exists:
+        await session.delete(row)
+        return
+    row.payload = str(snapshot.payload)[:255]
+    row.ref = str(snapshot.ref)[:64]
+    row.expires_at = snapshot.expires_at
+
+
 # ---------------------------------------------------------------------------
 # Telegram 侧调用（全部有超时 + 异常转换，绝不把异常甩给调用方之外的流程）
 # ---------------------------------------------------------------------------
@@ -755,6 +845,12 @@ async def _buy_member_tag_locked(
             available=available,
         )
 
+    # F-053：先取一份"购买前"的权益快照。扣费和权益行要在**同一个事务**里提交，
+    # Telegram 侧失败时再用这份快照把权益精确还原（续费场景不能简单删行）。
+    previous_entitlement = await entitlement_snapshot(
+        session, group_id=gid, user_id=uid, kind=KIND_TAG
+    )
+
     charged = await spend_points(
         session,
         group_id=gid,
@@ -769,8 +865,59 @@ async def _buy_member_tag_locked(
             "这笔购买已经处理过了，请重新发一次 /tag。",
             available=await available_points(session, group_id=gid, user_id=uid),
         )
-    # 先落库扣分，再调 Telegram：网络慢或失败时不会有人趁机动别人的账户
-    await session.commit()
+    # 先落库扣分 + 权益，再调 Telegram：网络慢或失败时不会有人趁机动别人的账户；
+    # 两行在同一个事务里提交，所以不存在"扣了分但权益行没写成"的崩溃窗口。
+    try:
+        await upsert_entitlement(
+            session,
+            group_id=gid,
+            user_id=uid,
+            kind=KIND_TAG,
+            payload=request.text,
+            ref=ref,
+            expires_at=expires_at,
+            now=moment,
+        )
+    except Exception:
+        log.exception(
+            "shop tag entitlement write failed | group=%s user=%s ref=%s", gid, uid, ref
+        )
+        # 权益行没写进事务，但扣费还在**同一个未提交事务**里：退款后一起提交，
+        # 用户净扣 0，且不会留下"已扣费但永不过期"的头衔。
+        refunded = await _refund_and_reload(
+            session, group_id=gid, user_id=uid, points=request.price, ref=ref
+        )
+        remaining = await available_points(session, group_id=gid, user_id=uid)
+        head = (
+            f"商店记账失败，已退回 {request.price} 分。"
+            if refunded
+            else "商店记账失败，退款也失败了，请联系管理员核账。"
+        )
+        return ShopReply(
+            "failed",
+            f"{head}当前可用 {remaining} 分，请稍后再试。",
+            available=remaining,
+            refunded=refunded,
+        )
+    try:
+        await session.commit()
+    except Exception:
+        # 提交失败时 SQLAlchemy 已经回滚整个事务：扣费同样没有落库，
+        # 这里**绝不能退款**，否则等于凭空给分。
+        log.exception("shop tag commit failed | group=%s user=%s ref=%s", gid, uid, ref)
+        # F-053 验收修补：「这次没有扣分」这句话必须与显示的余额一致。提交一旦失败，
+        # 这里显式回滚，让会话内被扣分的对象过期、余额从库里重新读——原来直接读
+        # 会话状态，会读出回滚前的值（消息说没扣分、数字却显示已经扣了）。
+        try:
+            await session.rollback()
+        except Exception:
+            log.warning("shop tag commit failure rollback failed", exc_info=True)
+        remaining = await available_points(session, group_id=gid, user_id=uid)
+        return ShopReply(
+            "failed",
+            f"商店暂时不可用，这次没有扣分。当前可用 {remaining} 分，请稍后再试。",
+            available=remaining,
+        )
 
     try:
         await _set_member_tag(bot, gid, uid, request.text)
@@ -784,8 +931,15 @@ async def _buy_member_tag_locked(
             ref,
             exc_info=True,
         )
+        # 退款 + 权益还原同一笔事务：不会留下"钱退了、到期行还在"。
         refunded = await _refund_and_reload(
-            session, group_id=gid, user_id=uid, points=request.price, ref=ref
+            session,
+            group_id=gid,
+            user_id=uid,
+            points=request.price,
+            ref=ref,
+            revert_kind=KIND_TAG,
+            revert_to=previous_entitlement,
         )
         remaining = await available_points(session, group_id=gid, user_id=uid)
         if refunded:
@@ -799,33 +953,12 @@ async def _buy_member_tag_locked(
             refunded=refunded,
         )
 
-    bookkeeping_ok = True
-    try:
-        await upsert_entitlement(
-            session,
-            group_id=gid,
-            user_id=uid,
-            kind=KIND_TAG,
-            payload=request.text,
-            ref=ref,
-            expires_at=expires_at,
-            now=moment,
-        )
-        await session.commit()
-    except Exception:
-        # 头衔已经在群里生效了，不能退款；这里只把记账失败喊出来（到期清理会漏掉它）
-        bookkeeping_ok = False
-        log.exception(
-            "shop tag entitlement write failed | group=%s user=%s ref=%s", gid, uid, ref
-        )
-
     remaining = await available_points(session, group_id=gid, user_id=uid)
     when = expires_at.strftime("%Y-%m-%d %H:%M")
-    tail = "" if bookkeeping_ok else "\n（到期记录写入异常，已通知管理员）"
     return ShopReply(
         "ok",
         f"<b>头衔已生效</b>\n「{escape(request.text)}」有效期到 {when}（{request.days} 天）。\n"
-        f"当前可用 {remaining} 分。到期机器人会自动清除，想续费直接再发一次 /tag。{tail}",
+        f"当前可用 {remaining} 分。到期机器人会自动清除，想续费直接再发一次 /tag。",
         available=remaining,
         expires_at=expires_at,
     )
@@ -838,8 +971,15 @@ async def _refund_and_reload(
     user_id: int,
     points: int,
     ref: str,
+    revert_kind: str = "",
+    revert_to: EntitlementSnapshot | None = None,
 ) -> bool:
-    """退款并提交；退款本身失败也要记日志（绝不能让用户钱没了东西也没有）。"""
+    """退款并提交；退款本身失败也要记日志（绝不能让用户钱没了东西也没有）。
+
+    ``revert_kind``/``revert_to`` 同时给出时，同一笔事务里把权益也还原成购买前
+    的样子（F-053）：扣费与权益是一个事务提交的，撤销就必须一起撤销，否则会留下
+    "钱退了、权益行还在"或"钱没退、权益被删"的不一致。
+    """
 
     try:
         refunded = await refund_points(
@@ -849,6 +989,14 @@ async def _refund_and_reload(
             points=points,
             original_ref=ref,
         )
+        if revert_kind and revert_to is not None:
+            await restore_entitlement(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+                kind=revert_kind,
+                snapshot=revert_to,
+            )
         await session.commit()
         return refunded
     except Exception:
@@ -981,6 +1129,12 @@ async def _buy_pin_locked(
 
     stamp = purchase_stamp(moment)
     ref = pin_spend_ref(group_id=gid, user_id=uid, stamp=stamp)
+    expires_at = moment + timedelta(hours=PIN_HOURS)
+    # F-053：购买前先留一份权益快照（这里正常情况下为空，但置顶行可能刚好被
+    # 到期清理漏掉，保留快照让回滚是精确的）。
+    previous_entitlement = await entitlement_snapshot(
+        session, group_id=gid, user_id=uid, kind=KIND_PIN
+    )
     charged = await spend_points(
         session,
         group_id=gid,
@@ -995,7 +1149,48 @@ async def _buy_pin_locked(
             "这笔购买已经处理过了，请重新发一次 /top。",
             available=await available_points(session, group_id=gid, user_id=uid),
         )
-    await session.commit()
+    # 扣分与权益同一个事务提交：崩溃/重启不会留下"扣了分但没有到期行"。
+    try:
+        await upsert_entitlement(
+            session,
+            group_id=gid,
+            user_id=uid,
+            kind=KIND_PIN,
+            payload=str(target.message_id),
+            ref=ref,
+            expires_at=expires_at,
+            now=moment,
+        )
+    except Exception:
+        log.exception(
+            "shop pin entitlement write failed | group=%s user=%s ref=%s", gid, uid, ref
+        )
+        refunded = await _refund_and_reload(
+            session, group_id=gid, user_id=uid, points=PIN_PRICE, ref=ref
+        )
+        remaining = await available_points(session, group_id=gid, user_id=uid)
+        head = (
+            f"商店记账失败，已退回 {PIN_PRICE} 分。"
+            if refunded
+            else "商店记账失败，退款也失败了，请联系管理员核账。"
+        )
+        return ShopReply(
+            "failed",
+            f"{head}当前可用 {remaining} 分，请稍后再试。",
+            available=remaining,
+            refunded=refunded,
+        )
+    try:
+        await session.commit()
+    except Exception:
+        # 提交失败 = 整个事务（含扣费）已回滚，退款反而会凭空加分。
+        log.exception("shop pin commit failed | group=%s user=%s ref=%s", gid, uid, ref)
+        remaining = await available_points(session, group_id=gid, user_id=uid)
+        return ShopReply(
+            "failed",
+            f"商店暂时不可用，这次没有扣分。当前可用 {remaining} 分，请稍后再试。",
+            available=remaining,
+        )
 
     try:
         await _pin_message(bot, gid, target.message_id)
@@ -1011,7 +1206,13 @@ async def _buy_pin_locked(
             exc_info=True,
         )
         refunded = await _refund_and_reload(
-            session, group_id=gid, user_id=uid, points=PIN_PRICE, ref=ref
+            session,
+            group_id=gid,
+            user_id=uid,
+            points=PIN_PRICE,
+            ref=ref,
+            revert_kind=KIND_PIN,
+            revert_to=previous_entitlement,
         )
         remaining = await available_points(session, group_id=gid, user_id=uid)
         head = (
@@ -1024,24 +1225,6 @@ async def _buy_pin_locked(
             f"{head}当前可用 {remaining} 分。",
             available=remaining,
             refunded=refunded,
-        )
-
-    expires_at = moment + timedelta(hours=PIN_HOURS)
-    try:
-        await upsert_entitlement(
-            session,
-            group_id=gid,
-            user_id=uid,
-            kind=KIND_PIN,
-            payload=str(target.message_id),
-            ref=ref,
-            expires_at=expires_at,
-            now=moment,
-        )
-        await session.commit()
-    except Exception:
-        log.exception(
-            "shop pin entitlement write failed | group=%s user=%s ref=%s", gid, uid, ref
         )
 
     remaining = await available_points(session, group_id=gid, user_id=uid)
@@ -1308,8 +1491,9 @@ async def _revoke(bot: object, row: MemberEntitlement) -> tuple[bool, str]:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        # 用户退群、消息被删、机器人被撤权都会走到这里。记下来，但行照样删：
-        # 否则一条永远失败的记录会让每次扫描都卡在同一个地方。
+        # 用户退群、消息被删、机器人被撤权都会走到这里。失败只记日志并返回
+        # False：调用方保留权益行、推后到期时间来重试（F-052），因为记录删掉
+        # 就再也没人会把还挂在群里的头衔撤下来了。
         log.warning(
             "shop expiry revoke failed | kind=%s group=%s user=%s payload=%s error=%s",
             row.kind,
@@ -1364,7 +1548,9 @@ async def expire_due_entitlements(
     """扫描到期的权益 → 清头衔 / 取消置顶 → 删行。
 
     **幂等**：Telegram 侧的两个操作（把 tag 设成空、取消置顶）本身就是幂等的，
-    而行只有在撤下动作跑过之后才删。所以进程重启、重复执行、一次处理多条都安全。
+    而行只有在撤下动作真的跑成功之后才删。撤不下来时保留这一行并把 ``expires_at``
+    推后一个重试间隔，下次扫描接着撤（F-052）——否则付费头衔会永远留在群里，
+    既没有记录也没有重试。进程重启、重复执行、一次处理多条都安全。
     ``dry_run=True`` 时只返回"打算做什么"，不碰 Telegram 也不改数据库。
     """
 
@@ -1384,7 +1570,26 @@ async def expire_due_entitlements(
             )
             continue
         ok, detail = await _revoke(bot, row)
-        await session.delete(row)
+        if ok:
+            await session.delete(row)
+        else:
+            # 撤不下来就不能删行（F-052）：头衔/置顶还在 Telegram 侧生效，删掉记录
+            # 等于既没清干净、也没有任何东西再重试——付费头衔会永远留在群里。
+            # 把到期时间往后推一个重试间隔：下次扫描接着撤，同时避免这条记录
+            # 每一轮都占住批量的最前面（due_entitlements 按 expires_at 排序）。
+            row.expires_at = moment + timedelta(
+                seconds=_SHOP_EXPIRY_RETRY_SECONDS
+            )
+            log.warning(
+                "shop expiry revoke deferred | kind=%s group=%s user=%s payload=%s "
+                "retry_at=%s detail=%s",
+                row.kind,
+                row.group_id,
+                row.user_id,
+                row.payload,
+                row.expires_at,
+                detail,
+            )
         # 只有真的撤下来了才提醒"已清除"，否则等于骗用户
         notified = await _notify_expiry(bot, item) if (notify and ok) else False
         outcomes.append(
@@ -1452,6 +1657,7 @@ class ShopExpiryService:
 __all__ = [
     "AWARD_REASON_LOTTERY",
     "AWARD_REASON_REFUND",
+    "EntitlementSnapshot",
     "ExpiredItem",
     "ExpiryOutcome",
     "KIND_PIN",
@@ -1480,10 +1686,12 @@ __all__ = [
     "award_points",
     "buy_member_tag",
     "buy_pin",
+    "challenge_spend_ref",
     "check_tag_text",
     "contains_emoji",
     "draw_prize",
     "due_entitlements",
+    "entitlement_snapshot",
     "expire_due_entitlements",
     "expected_lottery_value",
     "expiry_notice",
@@ -1502,6 +1710,7 @@ __all__ = [
     "render_balance",
     "render_shop_menu",
     "resolve_pin_target",
+    "restore_entitlement",
     "tag_price",
     "tag_spend_ref",
     "tag_text_taken",

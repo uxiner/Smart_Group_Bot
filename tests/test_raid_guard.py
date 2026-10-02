@@ -3,6 +3,7 @@ import html
 import os
 import re
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -1924,6 +1925,133 @@ class DetectionTests(_DbTestCase):
                 self.assertIsNotNone(
                     await get_join_verification(session, -100, user_id)
                 )
+
+
+class AdministratorLookupFallbackTests(_DbTestCase):
+    """F-029：管理员名单查不到时不能把群管理员当成爆破嫌疑人。
+
+    旧实现里 Telegram 调用失败只会留下超管，于是普通群管理员/群主进了自动
+    禁言甚至封禁名单——「权限查找失败 → 误伤管理员」。返工后的方向是
+    **误伤优先**：无法判定 → 不做任何限制 + 告警（宁可这一轮漏判）。
+    """
+
+    async def test_lookup_failure_limits_nobody_and_alerts(self) -> None:
+        settings = _settings(super_admin_id=42, raid_guard_join_threshold=3)
+        service, bot = self._service(settings)
+        bot.get_chat_administrators = AsyncMock(
+            side_effect=RuntimeError("telegram down")
+        )
+        alert = AsyncMock(return_value=True)
+
+        with patch(
+            "bot.services.raid_guard.alert_super_admin",
+            new=alert,
+        ):
+            for user_id in (1, 2, 3):
+                await self._join(service, user_id)
+
+        # 锁定照旧生效，但一个都不许动：名单未知时没有"谁是管理员"的答案。
+        self.assertTrue(service.lockdown_active(-100))
+        bot.restrict_chat_member.assert_not_awaited()
+        bot.ban_chat_member.assert_not_awaited()
+        alert.assert_awaited_once()
+        self.assertEqual(alert.await_args.kwargs["fields"]["chat"], -100)
+        async with self.session_factory() as session:
+            for user_id in (1, 2, 3):
+                self.assertIsNone(
+                    await get_join_verification(session, -100, user_id)
+                )
+
+    async def test_lookup_failure_never_enforces_from_a_cached_admin_set(
+        self,
+    ) -> None:
+        """缓存只用于告警内容，绝不用来继续执法。
+
+        否则"上次成功名单之后才被提升的管理员"不在缓存里，照样会被误伤。
+        """
+
+        settings = _settings(super_admin_id=42, raid_guard_join_threshold=3)
+        service, bot = self._service(settings)
+        # 成功一次：群管理员 2 被记进缓存（诊断用）。
+        bot.get_chat_administrators = AsyncMock(
+            return_value=[SimpleNamespace(user=SimpleNamespace(id=2))]
+        )
+        self.assertEqual(
+            await service._known_chat_administrator_ids(-100),
+            frozenset({2}),
+        )
+
+        bot.get_chat_administrators = AsyncMock(
+            side_effect=RuntimeError("telegram down")
+        )
+        alert = AsyncMock(return_value=True)
+        with patch("bot.services.raid_guard.alert_super_admin", new=alert):
+            for user_id in (1, 2, 3):
+                await self._join(service, user_id)
+
+        self.assertTrue(service.lockdown_active(-100))
+        bot.restrict_chat_member.assert_not_awaited()
+        alert.assert_awaited_once()
+        self.assertIn("admins", alert.await_args.kwargs["fields"]["last_known"])
+        async with self.session_factory() as session:
+            for user_id in (1, 2, 3):
+                self.assertIsNone(
+                    await get_join_verification(session, -100, user_id)
+                )
+
+    async def test_successful_lookup_still_excludes_admins_without_alerting(
+        self,
+    ) -> None:
+        """负例：名单正常时照旧排除群管理员，其他人照常质询，且不告警。"""
+
+        settings = _settings(super_admin_id=42, raid_guard_join_threshold=3)
+        service, bot = self._service(settings)
+        bot.get_chat_administrators = AsyncMock(
+            return_value=[SimpleNamespace(user=SimpleNamespace(id=2))]
+        )
+        alert = AsyncMock(return_value=True)
+
+        with patch("bot.services.raid_guard.alert_super_admin", new=alert):
+            for user_id in (1, 2, 3):
+                await self._join(service, user_id)
+
+        challenged = [
+            call.args[1] for call in bot.restrict_chat_member.await_args_list
+        ]
+        self.assertNotIn(2, challenged)
+        self.assertIn(3, challenged)
+        alert.assert_not_awaited()
+
+    async def test_known_administrator_ids_returns_none_on_failure(self) -> None:
+        service, bot = self._service()
+        bot.get_chat_administrators = AsyncMock(side_effect=RuntimeError("nope"))
+
+        self.assertIsNone(await service._known_chat_administrator_ids(-100))
+        self.assertEqual(service._chat_admin_ids, {})
+
+    async def test_known_administrator_ids_caches_the_successful_set(self) -> None:
+        service, bot = self._service()
+        bot.get_chat_administrators = AsyncMock(
+            return_value=[
+                SimpleNamespace(user=SimpleNamespace(id=7)),
+                SimpleNamespace(user=None),
+            ]
+        )
+
+        self.assertEqual(
+            await service._known_chat_administrator_ids(-100),
+            frozenset({7}),
+        )
+        cached_at, cached_ids = service._chat_admin_ids[-100]
+        self.assertEqual(cached_ids, frozenset({7}))
+        self.assertGreater(cached_at, 0.0)
+
+    async def test_last_known_admin_summary_is_diagnostic_only(self) -> None:
+        service, _bot = self._service()
+
+        self.assertEqual(service._last_known_admin_summary(-100), "never")
+        service._chat_admin_ids[-100] = (time.monotonic(), frozenset({1, 2}))
+        self.assertIn("2 admins", service._last_known_admin_summary(-100))
 
 
 class CallbackTests(_DbTestCase):

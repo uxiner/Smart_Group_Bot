@@ -369,7 +369,10 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     dispatcher.message.outer_middleware(MemberRosterMiddleware(session_factory))
     # Operators' own command lines are noise once served: drop them from the
     # group a few seconds later.  Outer so a rejected update is still cleaned.
-    dispatcher.message.outer_middleware(ManagementCommandCleanupMiddleware())
+    # The session factory is used to refuse deleting a member's look-alike line.
+    dispatcher.message.outer_middleware(
+        ManagementCommandCleanupMiddleware(session_factory)
+    )
     dispatcher.message.middleware(LoggingMiddleware())
     # No throttle middleware: it silently drops rapid consecutive messages,
     # which breaks inbound batch merging and lets a fast second violating
@@ -378,6 +381,18 @@ def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     dispatcher.message.middleware(DbSessionMiddleware(session_factory))
     # edited_message is a separate aiogram observer; message middleware is not
     # inherited by edit handlers that also require a database session.
+    #
+    # The two enforcement gates are registered for edits as well (F-008): a
+    # member could post something harmless and then edit it into an advert, and
+    # the edit reached only the archival handler — no ban check, no
+    # verification gate, no moderation. Same order as the message observer:
+    # banned senders first, then unverified ones.
+    dispatcher.edited_message.outer_middleware(
+        GlobalBanEnforcementMiddleware(session_factory)
+    )
+    dispatcher.edited_message.outer_middleware(
+        PendingVerificationGateMiddleware(session_factory)
+    )
     dispatcher.edited_message.middleware(DbSessionMiddleware(session_factory))
     dispatcher.callback_query.middleware(DbSessionMiddleware(session_factory))
     dispatcher.chat_member.middleware(DbSessionMiddleware(session_factory))
