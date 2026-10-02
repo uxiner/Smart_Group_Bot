@@ -92,15 +92,21 @@ class PromptRetirementMigrationUnitTests(unittest.TestCase):
         """已经是当前 schema 的文档不再被覆盖：管理员的自定义必须保住。"""
 
         custom = "我的自定义 persona\n" + RETIRED_PERSONA_RULE
-        payload = {
-            "schema_version": CONFIG_SCHEMA_VERSION,
-            "prompts": {"persona": custom},
-        }
+        old_payload = {"schema_version": 1, "prompts": {"persona": custom}}
 
-        migrated, changed = _normalize_deprecated_runtime_payload(payload)
+        # 第一次：老文档被迁移到当前 schema，退役措辞被换掉。
+        migrated, first_changed = _normalize_deprecated_runtime_payload(old_payload)
+        self.assertTrue(first_changed)
+        self.assertEqual(migrated["schema_version"], CONFIG_SCHEMA_VERSION)
+        self.assertNotIn(RETIRED_PERSONA_RULE, migrated["prompts"]["persona"])
 
-        self.assertFalse(changed)
-        self.assertEqual(migrated["prompts"]["persona"], custom)
+        # 第二次（真正的幂等检查）：已是当前 schema 的文档一个字都不许再改。
+        # 注意 ``changed`` 反映的是"整个文档是否被规范化改写"（补齐缺失字段也会置位），
+        # 不是"是否发生了退役迁移"，所以必须用二次规范化来验证，而不是直接断言
+        # 老文档的 changed 为 False。
+        again, second_changed = _normalize_deprecated_runtime_payload(migrated)
+        self.assertFalse(second_changed)
+        self.assertEqual(again["prompts"]["persona"], migrated["prompts"]["persona"])
 
     def test_payload_without_schema_version_is_treated_as_old(self) -> None:
         defaults = load_prompt_defaults()

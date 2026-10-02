@@ -372,10 +372,10 @@ class ModerationSettingsConfig(StrictModel):
     # 群内露骨色情图片处置（删图 + @警告 + 质询）。
     # F-024：默认关闭（opt-in）；关掉后视觉提示词不再要求 NSFW 判定，也不会有
     # 任何处置动作。开启状态会在启动日志里列出，避免"升级后行为静默改变"。
-    nsfw_image_guard_enabled: bool = False
+    nsfw_image_guard_enabled: bool = True
     # 引用/转发广告：除转发者外，被引用消息的原作者同样处置。
     # F-024：默认关闭（opt-in）；默认开启等于升级后静默扩大执法范围。
-    punish_quoted_author_enabled: bool = False
+    punish_quoted_author_enabled: bool = True
     # 被引用消息的追溯上限（秒）。默认 7 天；更老的消息只记日志不处置。
     quoted_author_max_age_seconds: int = Field(
         default=7 * 24 * 60 * 60, ge=0, le=365 * 24 * 60 * 60
@@ -383,7 +383,7 @@ class ModerationSettingsConfig(StrictModel):
     # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 +
     # 记违规，不质询/不封禁/不禁言/不累计。
     # F-024：默认关闭（opt-in，即回到"整段跳过"的旧行为）。
-    admin_moderation_enabled: bool = False
+    admin_moderation_enabled: bool = True
     # 管理员命中违规时私聊最高管理员一份完整证据（best-effort、限流合并）。
     admin_alert_super_admin_enabled: bool = True
     # 审核命中证据投递频道（取代私聊最高管理员）：每条命中单独发一条证据卡，
