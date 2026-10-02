@@ -170,17 +170,23 @@ class ModerationConfig(BaseModel):
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = 5
     # 群内公开发布露骨色情图片（色情/裸露）→ 删图 + 群内 @警告 + 质询。
-    # 判定复用审核链路本来就有的那次视觉调用（不新增模型调用）；默认开启。
-    # 关闭后不做判定（提示词里也不加 NSFW 要求）也不做任何处置。
-    nsfw_image_guard_enabled: bool = True
+    # 判定复用审核链路本来就有的那次视觉调用（不新增模型调用）。
+    # F-024：默认**关闭**（opt-in）。这是对用户可见的执法行为，必须由运维显式
+    # 开启；开启状态会在启动日志里列出。关闭后不做判定（提示词里也不加 NSFW
+    # 要求）也不做任何处置——即旧版本行为。
+    nsfw_image_guard_enabled: bool = False
     # 广告经「引用/转发」再次传播时，被引用那条消息的原作者同样按规则处置
-    # （删除其消息 + 记违规 + 既有质询/禁言流程）。默认开启；关闭后行为与旧版完全一致。
-    punish_quoted_author_enabled: bool = True
+    # （删除其消息 + 记违规 + 既有质询/禁言流程）。
+    # F-024：默认**关闭**（opt-in）。默认开启等于升级后静默扩大执法范围（最长
+    # 7 天禁言），所以改为由运维显式选择；关闭后行为与旧版完全一致。
+    punish_quoted_author_enabled: bool = False
     # 被引用消息超过该时长（秒）就不再追溯原作者，只记日志。默认 7 天。
     quoted_author_max_age_seconds: int = 7 * 24 * 60 * 60
     # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 + 记违规，
-    # 不质询/不封禁/不禁言/不累计警告。默认开启；关闭即回到"整段跳过"的旧行为。
-    admin_moderation_enabled: bool = True
+    # 不质询/不封禁/不禁言/不累计警告。
+    # F-024：默认**关闭**（opt-in，即回到"整段跳过"的旧行为）——对管理员/群主
+    # 开始执法属于可见的策略变更，应由运维显式决定。
+    admin_moderation_enabled: bool = False
     # 管理员命中违规时，私聊最高管理员一份完整证据（best-effort，不刷屏）。默认开启。
     admin_alert_super_admin_enabled: bool = True
     # 审核命中证据投递到「审核日志」频道（取代私聊最高管理员）：群里所有被处置
@@ -1193,6 +1199,40 @@ def log_av_reverse_privacy_state(settings: Settings) -> None:
         "AV 图像反查：已启用 —— 待识别图片的原始字节会被发送到第三方主机 %s"
         "（数据离开本服务）；不需要时请关闭 AV_REVERSE_ENABLED。",
         endpoint,
+    )
+
+
+def log_enforcement_switch_state(settings: Settings) -> None:
+    """F-024：把「对用户可见的执法开关」的生效状态写进启动日志。
+
+    这三个开关都是 opt-in（默认关闭）。只要有一个是开启的，就用 WARNING 明确
+    列出来，因为每一个都会直接改变群成员看到的行为；全部关闭时记一条 INFO，
+    说明当前是旧版行为，运维想开启去哪里开。
+    """
+
+    moderation = getattr(settings, "moderation", None)
+    switches = (
+        ("nsfw_image_guard", "裸露/色情图片处置（删图 + 群内 @警告 + 质询）"),
+        ("punish_quoted_author", "引用/转发广告连坐原作者"),
+        ("admin_moderation", "管理员/群主不再整段豁免日常审核"),
+    )
+    enabled = [
+        (name, label)
+        for name, label in switches
+        if moderation is not None
+        and bool(getattr(moderation, f"{name}_enabled", False))
+    ]
+    if not enabled:
+        log.info(
+            "审核处置策略：三项新增执法开关全部关闭（默认 opt-in）："
+            "nsfw_image_guard / punish_quoted_author / admin_moderation。"
+            "需要开启请在 /settings 的审核设置里显式打开。"
+        )
+        return
+    log.warning(
+        "审核处置策略：以下对用户可见的执法开关已开启 → %s。"
+        "这些都会改变群成员看到的行为，请确认是有意开启。",
+        "；".join(f"{name}=on（{label}）" for name, label in enabled),
     )
 
 

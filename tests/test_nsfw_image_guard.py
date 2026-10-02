@@ -67,6 +67,9 @@ ORIGINAL_VISION_PROMPT = (
 
 
 def _moderation_settings(**overrides) -> SimpleNamespace:
+    # F-024：真实 Settings 里这三个执法开关默认关闭（opt-in）。本文件测的是
+    # "开启之后"的处置链路，所以这里显式打开；"默认关闭"由
+    # NsfwGuardConfigTests 单独锁定。
     values = {
         "enabled": True,
         "warn_threshold": 3,
@@ -75,6 +78,7 @@ def _moderation_settings(**overrides) -> SimpleNamespace:
         "bot_screening_enabled": True,
         "bot_screening_message_count": 5,
         "nsfw_image_guard_enabled": True,
+        "admin_moderation_enabled": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1497,22 +1501,31 @@ class BotNeverPostsNsfwMediaTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NsfwGuardConfigTests(unittest.TestCase):
-    def test_runtime_config_exposes_the_switch_and_defaults_to_on(self) -> None:
+    def test_runtime_config_exposes_the_switch_and_defaults_to_off(self) -> None:
+        """F-024：这是对用户可见的执法开关，默认必须 opt-in（关闭）。
+
+        旧断言是 ``assertTrue``（默认全开）。改这一条的理由：默认全开等于
+        "升级即静默改变线上执法行为"，与"行为变化必须可见/由运维显式选择"
+        冲突；现在默认关闭，生效状态由 bot/config.py
+        ``log_enforcement_switch_state`` 在启动日志里列出。
+        """
+
         from bot.services.runtime_config import ModerationSettingsConfig, RuntimeConfig
 
-        self.assertTrue(ModerationSettingsConfig().nsfw_image_guard_enabled)
+        self.assertFalse(ModerationSettingsConfig().nsfw_image_guard_enabled)
 
         config = RuntimeConfig()
-        self.assertTrue(config.moderation.nsfw_image_guard_enabled)
+        self.assertFalse(config.moderation.nsfw_image_guard_enabled)
 
         settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
-        config.moderation.nsfw_image_guard_enabled = False
+        config.moderation.nsfw_image_guard_enabled = True
         config.apply_to_settings(settings)
-        self.assertFalse(settings.moderation.nsfw_image_guard_enabled)
-
-    def test_settings_default_keeps_the_guard_on(self) -> None:
-        settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
         self.assertTrue(settings.moderation.nsfw_image_guard_enabled)
+
+    def test_settings_default_keeps_the_guard_off_until_opted_in(self) -> None:
+        settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
+        # F-024：默认关闭（旧断言为 assertTrue），理由同上一条。
+        self.assertFalse(settings.moderation.nsfw_image_guard_enabled)
         self.assertIsInstance(settings.bot.main_model, ModelConfig)
 
 

@@ -11,6 +11,7 @@ from typing import Any
 from bot.config import (
     load_bootstrap_settings,
     log_av_reverse_privacy_state,
+    log_enforcement_switch_state,
     validate_bootstrap_settings,
 )
 from bot.db.engine import init_db
@@ -446,6 +447,9 @@ async def main() -> None:
         raise
 
     dp["settings"] = settings
+    # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
+    # 状态写进启动日志（opt-in 默认关闭；只要有开启就 WARNING 列出）。
+    log_enforcement_switch_state(settings)
     dp["session_factory"] = session_factory
     dp["runtime_config"] = runtime_config
     warmed_operators = await warm_privileged_operator_cache(session_factory)
