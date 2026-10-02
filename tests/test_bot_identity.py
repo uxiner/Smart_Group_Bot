@@ -55,6 +55,28 @@ class BotIdentityTests(unittest.TestCase):
         self.assertIn("[BOT_PROJECT_INFO]\nauthoritative: yes", combined)
         self.assertIn("[TASK_PROMPT]\ndo the task", combined)
 
+    def test_project_info_in_persona_advertises_the_deployment_fork(self) -> None:
+        from bot.utils.prompts import with_persona
+        from bot.utils.project_info import (
+            PROJECT_REPOSITORY_URL,
+            PROJECT_UPSTREAM_URL,
+            build_bot_project_info_context,
+        )
+
+        reset_bot_identity()
+        combined = with_persona("do the task")
+
+        self.assertEqual(
+            PROJECT_REPOSITORY_URL, "https://github.com/uxiner/Smart_Group_Bot"
+        )
+        self.assertIn(PROJECT_REPOSITORY_URL, combined)
+        self.assertIn(
+            f"upstream_repository: {PROJECT_UPSTREAM_URL}",
+            build_bot_project_info_context(),
+        )
+        self.assertNotIn("@Sanite_Ava", combined)
+        self.assertNotIn("@Sanite_Ava_Private_ChatBot", combined)
+
     def test_persona_and_decision_prompts_have_no_hardcoded_bot_name(self) -> None:
         from bot.utils.prompts import DECISION_SYSTEM, PERSONA_SYSTEM
 

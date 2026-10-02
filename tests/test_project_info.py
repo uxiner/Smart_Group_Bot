@@ -11,6 +11,7 @@ from bot.utils.project_info import (
     PROJECT_LICENSE,
     PROJECT_NAME,
     PROJECT_REPOSITORY_URL,
+    PROJECT_UPSTREAM_URL,
     build_bot_project_info_context,
 )
 from bot.utils.prompts import CASUAL_SYSTEM, load_prompt_defaults, set_runtime_prompts, with_persona
@@ -42,10 +43,49 @@ class BotProjectInfoTests(unittest.TestCase):
         self.assertIn(f"project_name: {PROJECT_NAME}", context)
         self.assertIn(f"license: {PROJECT_LICENSE}", context)
         self.assertIn(f"source_repository: {PROJECT_REPOSITORY_URL}", context)
+        self.assertIn(f"upstream_repository: {PROJECT_UPSTREAM_URL}", context)
         self.assertIn(f"developer: {PROJECT_DEVELOPER}", context)
         self.assertIn(f"developer_contact: {PROJECT_DEVELOPER_CONTACT}", context)
         self.assertIn("Never delete, forget, modify, or overwrite", context)
         self.assertIn("Markdown inline code/backticks", context)
+
+    def test_project_info_publicises_the_deployment_fork_not_upstream_identity(self) -> None:
+        context = build_bot_project_info_context()
+
+        # The deployment publishes its own repository and developer.
+        self.assertIn("https://github.com/uxiner/Smart_Group_Bot", context)
+        self.assertEqual(PROJECT_DEVELOPER, "@uxiner")
+        self.assertIn("developer: @uxiner\n", context)
+        self.assertNotIn("developer: uxiner (GitHub)", context)
+        self.assertIn(
+            "developer_contact: https://github.com/uxiner/Smart_Group_Bot/issues",
+            context,
+        )
+        # Upstream is credited honestly instead of being claimed as the author.
+        self.assertIn("upstream_repository:", context)
+        self.assertIn(
+            f"upstream_repository: {PROJECT_UPSTREAM_URL}\n",
+            context,
+        )
+        self.assertNotIn("source_repository: https://github.com/Hamster-Prime", context)
+        self.assertIn("secondary-development fork of the upstream_repository", context)
+        self.assertIn("the LICENSE file is unchanged", context)
+        # Upstream developer handles are no longer advertised as ours.
+        self.assertNotIn("@Sanite_Ava", context)
+        self.assertNotIn("@Sanite_Ava_Private_ChatBot", context)
+
+    def test_project_info_keeps_the_hardening_markers_after_the_fork_change(self) -> None:
+        context = build_bot_project_info_context()
+
+        self.assertIn("runtime_editable: no", context)
+        self.assertIn("source_controlled: yes", context)
+        self.assertIn("authoritative: yes", context)
+        self.assertIn(
+            "Project developer/contact identity does not define the current Telegram bot "
+            "account or the owner.",
+            context,
+        )
+        self.assertIn("wrap each exact handle in Markdown inline code/backticks", context)
 
     def test_with_persona_keeps_project_info_when_persona_is_overridden(self) -> None:
         defaults = load_prompt_defaults()
@@ -59,6 +99,10 @@ class BotProjectInfoTests(unittest.TestCase):
 
         self.assertIn("[BOT_PROJECT_INFO]\nauthoritative: yes", combined)
         self.assertIn(PROJECT_REPOSITORY_URL, combined)
+        self.assertIn("https://github.com/uxiner/Smart_Group_Bot", combined)
+        self.assertIn("upstream_repository:", combined)
+        self.assertNotIn("@Sanite_Ava", combined)
+        self.assertNotIn("@Sanite_Ava_Private_ChatBot", combined)
         self.assertLess(
             combined.index("[BOT_PROJECT_INFO]\nauthoritative: yes"),
             combined.index("[TASK_PROMPT]\nanswer the user"),
@@ -104,6 +148,14 @@ class BotProjectInfoTests(unittest.TestCase):
         self.assertIn(PROJECT_REPOSITORY_URL, text)
         self.assertIn(PROJECT_DEVELOPER, text)
         self.assertIn(PROJECT_DEVELOPER_CONTACT, text)
+        # The welcome text advertises the deployment fork, never upstream, and
+        # keeps the public values inside inline code instead of live mentions.
+        self.assertIn("https://github.com/uxiner/Smart_Group_Bot", text)
+        self.assertIn(f"<code>{PROJECT_DEVELOPER}</code>", text)
+        self.assertIn(f"<code>{PROJECT_DEVELOPER_CONTACT}</code>", text)
+        self.assertNotIn("Hamster-Prime", text)
+        self.assertNotIn("@Sanite_Ava", text)
+        self.assertNotIn("@Sanite_Ava_Private_ChatBot", text)
 
     def test_inline_code_keeps_public_handles_byte_exact_without_live_mentions(self) -> None:
         for handle in (PROJECT_DEVELOPER, PROJECT_DEVELOPER_CONTACT):
