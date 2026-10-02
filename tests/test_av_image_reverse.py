@@ -62,8 +62,16 @@ def _data_uri(payload: bytes = PNG_BYTES) -> str:
 
 
 def _settings(**overrides) -> Settings:
+    # F-025：第三方反查现在默认关闭、且不再内置 endpoint。本文件其余用例验证的是
+    # 解析/阈值/限流/缓存等机制，所以这里显式打开（等价于运维做完决定后的配置）；
+    # “默认不外发” 本身由 tests/test_av_reverse_privacy_default.py 单独锁定。
+    defaults = {
+        "av_reverse_enabled": True,
+        "av_reverse_endpoint": rev.AV_SCAN_ENDPOINT,
+    }
+    defaults.update(overrides)
     settings = Settings(_env_file=None)
-    for key, value in overrides.items():
+    for key, value in defaults.items():
         setattr(settings, key, value)
     return settings
 

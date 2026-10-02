@@ -8,7 +8,11 @@ import time
 from collections.abc import Awaitable, Iterable
 from typing import Any
 
-from bot.config import load_bootstrap_settings, validate_bootstrap_settings
+from bot.config import (
+    load_bootstrap_settings,
+    log_av_reverse_privacy_state,
+    validate_bootstrap_settings,
+)
 from bot.db.engine import init_db
 from bot.handlers import admin, commands, group, membership
 from bot.loader import create_bot, dp
@@ -425,6 +429,8 @@ async def _publish_bot_command_menu(bot: object) -> None:
 async def main() -> None:
     settings = load_bootstrap_settings()
     validate_bootstrap_settings(settings)
+    # F-025：用户图片会不会离开本服务，必须在启动日志里可见（默认不外发）。
+    log_av_reverse_privacy_state(settings)
 
     engine, session_factory = await init_db(settings.database_url)
     try:

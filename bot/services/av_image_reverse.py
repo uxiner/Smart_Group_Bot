@@ -17,7 +17,9 @@
 3. 降级：任何异常（超时 / 非 200 / JSON 形状不对 / 低于阈值 / 被限流）都**只记日志**，
    返回空串，由调用方继续走原有的「提示词读编号 → 演员名兜底」，本模块绝不抛异常，
    也绝不改变群内「先删图、再处理」的顺序；
-4. 隐私：图片会离开本机送到该站点 —— 用户已明确同意。
+4. 隐私：图片会离开本机送到第三方站点。**F-025 起默认关闭**：必须同时显式设置
+   ``av_reverse_enabled=true`` 与 ``av_reverse_endpoint=<第三方入口>`` 才会外发；
+   两个条件缺一个都只记日志、不发请求（见 ``resolve_av_reverse_provider``）。
 """
 
 from __future__ import annotations
@@ -88,14 +90,22 @@ AV_REVERSE_PROVIDERS["avscan"] = AVReverseProvider(
 )
 
 
-def resolve_av_reverse_provider(settings: object) -> AVReverseProvider:
-    """按配置挑提供方；名字不认识就退回默认（宁可降级也不抛）。"""
+def resolve_av_reverse_provider(settings: object) -> AVReverseProvider | None:
+    """按配置挑提供方；没有显式配置 endpoint 时返回 ``None``。
 
+    F-025：这里**不再**回退到内置的第三方地址。``av_reverse_endpoint`` 为空
+    （默认）就意味着"没有决定过要把用户图片发给谁"，调用方必须据此放弃外发，
+    而不是拿一个写死的域名替运维做决定。提供方名字不认识时仍然回退到注册表里的
+    默认提供方——那只是"用哪一家"的问题，前提是 endpoint 已经被显式配置。
+    """
+
+    endpoint = str(getattr(settings, "av_reverse_endpoint", "") or "").strip()
+    if not endpoint:
+        return None
     name = str(getattr(settings, "av_reverse_provider", "") or AV_REVERSE_DEFAULT_PROVIDER)
     name = name.strip().lower()
     provider = AV_REVERSE_PROVIDERS.get(name) or AV_REVERSE_PROVIDERS[AV_REVERSE_DEFAULT_PROVIDER]
-    endpoint = str(getattr(settings, "av_reverse_endpoint", "") or "").strip()
-    if endpoint and endpoint != provider.endpoint:
+    if endpoint != provider.endpoint:
         provider = replace(provider, endpoint=endpoint)
     return provider
 
@@ -385,9 +395,15 @@ async def try_reverse_image_lookup(
     *,
     user_id: int,
 ) -> str:
-    """识图之前的一次尝试：命中返回番号，其余一切情况返回空串。"""
+    """识图之前的一次尝试：命中返回番号，其余一切情况返回空串。
 
-    if not bool(getattr(settings, "av_reverse_enabled", True)):
+    F-025：默认**不外发**。``av_reverse_enabled`` 的缺省值是 ``False``，
+    并且必须是"显式开启 + 显式配置 endpoint"两个条件同时满足才会真正发出
+    multipart POST；只开开关不配 endpoint 时在这里记一条 WARNING 后放弃，
+    绝不回退到任何写死的第三方地址。
+    """
+
+    if not bool(getattr(settings, "av_reverse_enabled", False)):
         return ""
 
     image_bytes = decode_image_data_uri(data_uri)
@@ -415,6 +431,15 @@ async def try_reverse_image_lookup(
         return ""
 
     provider = resolve_av_reverse_provider(settings)
+    if provider is None:
+        # 失败了要说出来：不能"看起来开着、其实什么都没做"。默认不外发用户图片；
+        # 想启用必须显式配置 av_reverse_endpoint，代码里没有任何写死的第三方地址。
+        log.warning(
+            "【AV 反查】跳过 | user=%s | 原因=未配置 av_reverse_endpoint"
+            "（默认不外发用户图片；如需启用请显式配置第三方入口）",
+            user_id,
+        )
+        return ""
     try:
         timeout_seconds = float(getattr(settings, "av_reverse_timeout_sec", AV_SCAN_TIMEOUT_SEC))
     except (TypeError, ValueError):
