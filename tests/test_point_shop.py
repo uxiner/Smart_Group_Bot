@@ -155,6 +155,26 @@ def _bot_error(message: str = "Bad Request: not enough rights") -> TelegramBadRe
     return TelegramBadRequest(method=SimpleNamespace(), message=message)
 
 
+class _CommitFailingSession:
+    """把 ``commit()`` 换成一定失败的实现，其余属性全部委托给真实会话。
+
+    模拟"提交时库锁 / 磁盘满"：真 SQLAlchemy 在 commit 失败时会回滚整个事务，
+    这里照做——否则测试会读到未提交的中间状态，得出错误结论。
+    """
+
+    def __init__(self, session) -> None:
+        self._session = session
+        self.commit_calls = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._session, name)
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        await self._session.rollback()
+        raise RuntimeError("database is locked")
+
+
 # ---------------------------------------------------------------------------
 # 纯函数：头衔校验、抽奖奖池、幂等键
 # ---------------------------------------------------------------------------
@@ -793,6 +813,143 @@ class PinPurchaseTests(_DbTestCase):
 
 
 # ---------------------------------------------------------------------------
+# 事务边界（F-053）：扣费与权益必须一起提交、一起回滚
+# ---------------------------------------------------------------------------
+
+
+class PurchaseAtomicityTests(_DbTestCase):
+    """F-053：旧实现"先提交扣费、再调 Telegram、最后写权益"，中间崩溃就会留下
+    "被扣分、头衔已设、却没有到期行"的永不过期头衔（也没有退款记录）。
+    现在扣费与权益在**同一个事务**提交，Telegram 侧失败时一起撤销。
+    """
+
+    async def test_tag_entitlement_is_visible_when_telegram_is_called(self) -> None:
+        await self._grant_points(7, 100)
+        observed: list[tuple[int, int]] = []
+
+        async def _probe_then_set(bot, chat_id, user_id, tag):
+            # 用一条**全新**连接查库：两条记录都看得到，说明它们已经在
+            # Telegram 调用之前、由同一个事务提交了。
+            async with self.session_factory() as probe:
+                spends = (
+                    await probe.execute(
+                        select(func.count())
+                        .select_from(MemberPointSpend)
+                        .where(MemberPointSpend.group_id == GROUP_ID)
+                    )
+                ).scalar()
+                entitlements = (
+                    await probe.execute(
+                        select(func.count())
+                        .select_from(MemberEntitlement)
+                        .where(MemberEntitlement.group_id == GROUP_ID)
+                    )
+                ).scalar()
+            observed.append((int(spends or 0), int(entitlements or 0)))
+            await bot.set_chat_member_tag(chat_id=chat_id, user_id=user_id, tag=tag)
+
+        with patch.object(point_shop, "_set_member_tag", _probe_then_set):
+            reply = await self._buy_tag(FakeBot())
+
+        self.assertEqual(reply.status, "ok")
+        self.assertEqual(
+            observed, [(1, 1)], "Telegram 调用时扣费与权益都必须已经落库"
+        )
+
+    async def test_pin_entitlement_is_visible_when_telegram_is_called(self) -> None:
+        await self._grant_points(7, 100)
+        observed: list[int] = []
+
+        async def _probe_then_pin(bot, chat_id, message_id):
+            async with self.session_factory() as probe:
+                entitlements = (
+                    await probe.execute(
+                        select(func.count())
+                        .select_from(MemberEntitlement)
+                        .where(MemberEntitlement.group_id == GROUP_ID)
+                    )
+                ).scalar()
+            observed.append(int(entitlements or 0))
+            await bot.pin_chat_message(chat_id=chat_id, message_id=message_id)
+
+        with patch.object(point_shop, "_pin_message", _probe_then_pin):
+            reply = await self._buy_pin(FakeBot())
+
+        self.assertEqual(reply.status, "ok")
+        self.assertEqual(observed, [1])
+
+    async def test_entitlement_write_failure_refunds_and_skips_telegram(self) -> None:
+        """权益没写成就退款：绝不留"已扣费但永不过期"的头衔。"""
+
+        await self._grant_points(7, 100)
+        bot = FakeBot()
+        with patch.object(
+            point_shop,
+            "upsert_entitlement",
+            AsyncMock(side_effect=RuntimeError("entitlements table unavailable")),
+        ):
+            reply = await self._buy_tag(bot)
+
+        self.assertEqual(reply.status, "failed")
+        self.assertTrue(reply.refunded)
+        self.assertEqual(bot.tag_calls, [], "权益没写成就不该动 Telegram")
+        self.assertEqual(await self._balance(7), 100)
+        self.assertEqual(await self._entitlements(), [])
+
+    async def test_commit_failure_does_not_refund_free_points(self) -> None:
+        """提交失败时整个事务（含扣费）已经回滚，退款反而会凭空加分。"""
+
+        await self._grant_points(7, 100)
+        stack = AsyncExitStack()
+        self.addAsyncCleanup(stack.aclose)
+        session = await stack.enter_async_context(self.session_factory())
+        failing = _CommitFailingSession(session)
+
+        reply = await buy_member_tag(
+            failing,
+            bot=FakeBot(),
+            group_id=GROUP_ID,
+            user_id=7,
+            raw_text="摸鱼冠军",
+            now=_day(),
+        )
+
+        self.assertEqual(reply.status, "failed")
+        self.assertFalse(reply.refunded)
+        self.assertIn("没有扣分", reply.text)
+        self.assertEqual(reply.available, 100)
+        self.assertEqual(await self._balance(7), 100)
+        self.assertEqual(await self._entitlements(), [])
+        self.assertEqual(
+            [row for row in await self._awards(7) if row.reason == "shop_refund"],
+            [],
+            "没扣成就不能退，否则等于白送积分",
+        )
+
+    async def test_renewal_failure_restores_the_previous_expiry(self) -> None:
+        """续费失败要把权益还原成购买前的样子，不是删掉上一笔的有效期。"""
+
+        await self._grant_points(7, 200)
+        first = await self._buy_tag(FakeBot(), raw="Tester")
+        self.assertEqual(first.status, "ok")
+        before = (await self._entitlements())[0]
+        before_values = (before.payload, before.ref, before.expires_at)
+
+        failing = FakeBot(tag_error=_bot_error("Bad Request: tag is invalid"))
+        reply = await self._buy_tag(failing, raw="tester", now=_day(1))
+
+        self.assertEqual(reply.status, "telegram_failed")
+        self.assertTrue(reply.refunded)
+        after = (await self._entitlements())[0]
+        self.assertEqual(
+            (after.payload, after.ref, after.expires_at),
+            before_values,
+            "续费失败必须还原旧到期时间，而不是把这一行删掉",
+        )
+        self.assertEqual(await self._balance(7), 170)
+
+
+# ---------------------------------------------------------------------------
 # 并发购买（F-006）：同一个人同一类权益不能重复扣费，已付费的续期不能被吞掉
 # ---------------------------------------------------------------------------
 
@@ -1168,7 +1325,14 @@ class ExpirySweepTests(_DbTestCase):
         self.assertEqual(bot.sent, [])
         self.assertEqual(len(await self._entitlements()), 1, "dry-run 不能删行")
 
-    async def test_revoke_failure_still_deletes_the_row(self) -> None:
+    async def test_revoke_failure_keeps_the_row_and_defers_the_retry(self) -> None:
+        """F-052：撤销失败时不能删行——否则付费头衔永远留在群里且无人重试。
+
+        旧断言（``失败的行也要删``）锁的正是这个 bug：删掉记录只解决了"扫描卡在
+        同一条"，代价是"再也撤不下来"。产品行为已按审查结论改变，所以这里改成
+        保留行 + 推后 ``expires_at``（避免每轮都撞同一条）。
+        """
+
         await self._seed_entitlement(
             kind=KIND_TAG, payload="摸鱼冠军", expires_at=_day(-1)
         )
@@ -1179,7 +1343,37 @@ class ExpirySweepTests(_DbTestCase):
         self.assertEqual(len(outcomes), 1)
         self.assertFalse(outcomes[0].ok)
         self.assertFalse(outcomes[0].notified, "没撤下来就不能说已经清除")
-        self.assertEqual(await self._entitlements(), [], "失败的行也要删，否则会卡住每次扫描")
+        rows = await self._entitlements()
+        self.assertEqual(len(rows), 1, "没撤下来就不能删行")
+        self.assertGreater(
+            rows[0].expires_at,
+            _day(),
+            "失败的行要推后到期时间再重试，而不是每轮都重扫同一条",
+        )
+
+    async def test_deferred_row_is_retried_after_the_interval(self) -> None:
+        """F-052：到了重试时间再扫一次，这次撤销成功才删行。"""
+
+        await self._seed_entitlement(
+            kind=KIND_TAG, payload="摸鱼冠军", expires_at=_day(-1)
+        )
+        failing = FakeBot(tag_error=_bot_error("Bad Request: user not found"))
+        await self._sweep(failing)
+
+        rows = await self._entitlements()
+        self.assertEqual(len(rows), 1)
+        retry_at = rows[0].expires_at
+
+        recovering = FakeBot()
+        before = await self._sweep(recovering, now=retry_at - timedelta(seconds=1))
+        self.assertEqual(before, [], "还没到重试时间就不该再打 Telegram")
+        self.assertEqual(recovering.tag_calls, [])
+
+        after = await self._sweep(recovering, now=retry_at + timedelta(seconds=1))
+        self.assertEqual(len(after), 1)
+        self.assertTrue(after[0].ok)
+        self.assertEqual(recovering.tag_calls, [(GROUP_ID, 7, "")])
+        self.assertEqual(await self._entitlements(), [])
 
     async def test_already_unpinned_is_treated_as_success(self) -> None:
         await self._seed_entitlement(

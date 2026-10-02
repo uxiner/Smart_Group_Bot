@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 import base64
 import html
 import io
@@ -998,7 +999,13 @@ async def _screen_bot_sender_message(
 
     threshold = max(1, int(settings.moderation.bot_screening_message_count))
     moderation_started = time.perf_counter()
-    verdict = await moderation.evaluate(session, group_id, input_text)
+    verdict = await moderation.evaluate(
+        session,
+        group_id,
+        input_text,
+        # F-021：别的机器人连发同样会放大审核成本，按同样的 (群, 发送者) 整形。
+        sender_id=int(bot_id),
+    )
     log.info(
         "[%s]【流程】bot审核 | 完成 | bot=%s | 违规=%s | 置信度=%.2f | 原因=%s | 耗时=%dms",
         group_id,
@@ -7092,7 +7099,15 @@ def _is_warning_style_quote_hit(
 
 
 def _quoted_author_age_seconds(sent_at: object) -> float | None:
-    """被引用消息距今多少秒；拿不到时间返回 None（调用方按"时间未知、放行"处理）。"""
+    """被引用消息距今多少秒；拿不到时间返回 None（调用方按"时间未知、放行"处理）。
+
+    F-012：这条契约是刻意的，不是兜底偷懒。追溯处罚的是**第三方**（被引用的
+    原作者），而他既没有发这条消息、也不在管理员眼前；追溯时长是唯一限制这笔
+    处罚范围的闸门。时间读不出来时闸门失效——按判罚准确第一、宁可漏判不可误伤
+    的原则，这时必须放行：少罚一个确实发了广告的人，远比罚一个无法证明时间范围
+    的正常群友可接受。调用方（``_quoted_author_age_seconds(quoted_target.sent_at)``
+    那里）必须保持 ``age is None → 不处罚``，不要为了"看起来更严"改成按 0 秒处理。
+    """
 
     if not isinstance(sent_at, datetime):
         return None
@@ -8403,7 +8418,13 @@ async def on_group_message(
                 {"context": moderation_context_text} if moderation_context_text else {}
             )
             verdict = await mod.evaluate(
-                session, group_id, input_text, **context_kwargs
+                session,
+                group_id,
+                input_text,
+                # F-021：按 (群, 成员) 整形送审时刻，避免一个成员连发时瞬间吃掉
+                # 全部审核槽（只推迟，不改判定内容、不跳模型）。
+                sender_id=int(user_id),
+                **context_kwargs,
             )
             violated = verdict.violated
             reason = verdict.reason
@@ -8495,7 +8516,21 @@ async def on_group_message(
                         quoted_text = _moderation_reply_text(message) or ""
                         age = _quoted_author_age_seconds(quoted_target.sent_at)
                         max_age = _quoted_author_max_age_seconds(settings)
-                        if age is not None and age > max_age:
+                        # 时间未知（拿不到 ``date``）按"放行"处理，与
+                        # ``_quoted_author_age_seconds`` 的契约一致（F-012）。
+                        # 过去 None 会落进 else 分支照常处罚，等于给第三方的
+                        # 处罚取消了时间上限，把 F-001 的追溯风险放大。
+                        # 判罚准确第一：这里宁可漏判（少罚一个无法确认时间的
+                        # 被引用者），也不误伤（在没有任何时间证据的情况下罚第三方）。
+                        if age is None:
+                            log.info(
+                                "[%s]【流程】审核 | 被引用消息时间未知，不处理原作者 | "
+                                "quoted_user=%s max=%ss",
+                                group_id,
+                                quoted_target.user_id,
+                                max_age,
+                            )
+                        elif age > max_age:
                             log.info(
                                 "[%s]【流程】审核 | 被引用消息超出追溯时长，不处理原作者 | "
                                 "quoted_user=%s age=%.0fs max=%ss",
@@ -9353,6 +9388,74 @@ async def on_group_message(
     return
 
 
+async def _delete_edited_local_rule_violation(
+    message: Message,
+    *,
+    session: AsyncSession,
+    settings: Settings,
+    text: str,
+) -> bool:
+    """Delete-only local-rule check for an edited message (F-008).
+
+    Runs the deterministic (keyword/regex) rules against the new body without
+    paying for a moderation completion and without any punishment side effect:
+    an edit must not trigger a second sanction, but offending text cannot stay
+    in the group. Returns True when the message was handled (deleted) and the
+    caller must stop.
+    """
+
+    moderation_config = getattr(settings, "moderation", None)
+    if moderation_config is None or not bool(
+        getattr(moderation_config, "enabled", False)
+    ):
+        return False
+    group_id = int(message.chat.id)
+    try:
+        verdict = await ModerationService(moderation_config).evaluate(
+            session,
+            group_id,
+            text,
+            deterministic_only=True,
+        )
+    except Exception:
+        log.exception(
+            "[%s]【流程】审核 | 编辑消息本地规则检查失败，未处置 | message=%s",
+            group_id,
+            getattr(message, "message_id", 0),
+        )
+        return False
+    if not verdict.violated:
+        return False
+
+    log.warning(
+        "[%s]【流程】审核 | 编辑后的正文命中本地规则，只删不罚 | message=%s "
+        "rule_id=%s source=%s",
+        group_id,
+        getattr(message, "message_id", 0),
+        getattr(verdict.rule, "id", None),
+        getattr(verdict, "match_source", ""),
+    )
+    try:
+        await message.delete()
+    except Exception:
+        log.warning(
+            "[%s] edited violation delete failed; scheduling durable cleanup | "
+            "message=%s",
+            group_id,
+            getattr(message, "message_id", 0),
+            exc_info=True,
+        )
+        try:
+            await schedule_message_auto_delete_durable(message, 1)
+        except Exception:
+            log.exception(
+                "[%s] edited violation durable cleanup failed | message=%s",
+                group_id,
+                getattr(message, "message_id", 0),
+            )
+    return True
+
+
 @router.edited_message(
     F.text
     | F.caption
@@ -9374,8 +9477,13 @@ async def on_group_message_edited(
     """Refresh the retained raw event when Telegram delivers an edit.
 
     Edited updates are archived without entering the reply pipeline: an edit
-    should update memory truth, not trigger a second answer or moderation side
-    effect. ``edited_at`` remains available for audit and recall display.
+    should update memory truth, not trigger a second answer or a second
+    punishment. ``edited_at`` remains available for audit and recall display.
+
+    Local moderation rules are still applied — delete-only (F-008). Without
+    that, a member could post something harmless and then edit it into an
+    advert: the offending text would stay in the group, would be archived into
+    memory, and no rule would ever see it.
     """
 
     if not is_group(message):
@@ -9384,6 +9492,13 @@ async def on_group_message_edited(
         return
     text, msg_type = extract_message_text(message)
     if not text:
+        return
+    if await _delete_edited_local_rule_violation(
+        message,
+        session=session,
+        settings=settings,
+        text=text,
+    ):
         return
     sender_identity = _resolve_sender_identity(message)
     user = message.from_user

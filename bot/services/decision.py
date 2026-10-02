@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 
+from bot.services import llm_metrics
 from bot.services.llm import LLMService
 from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.prompts import get_prompt
@@ -16,6 +17,9 @@ from bot.utils.security import (
 )
 
 log = logging.getLogger(__name__)
+
+#: 决策模型唯一可接受的三种回答（``question`` 之后会被归一成 ``casual``）。
+_VALID_DECISION_RESULTS = ("skip", "casual", "question")
 
 
 class DecisionService:
@@ -153,17 +157,31 @@ class DecisionService:
             "merged_context": clean_text(merged_context, max_len=1800),
         }
         result = await self._llm_decide(*decision_args, **decision_kwargs)
-        if result not in ("skip", "casual", "question"):
-            # An empty verdict - in practice the stage deadline was hit and the
-            # provider never answered - used to be silently downgraded to skip,
-            # which looked exactly like a deliberate "do not speak". Surface it
-            # (reason=empty_output) and ask once more before giving up.
-            log.warning(
-                "decision retry reason=%s actual=%r",
-                "empty_output" if not result else "invalid_output",
-                result,
-            )
-            result = await self._llm_decide(*decision_args, **decision_kwargs)
+        if result not in _VALID_DECISION_RESULTS:
+            if result:
+                # 模型**回了内容**，只是不是 skip/casual/question——这是真正的
+                # "解析失败"。再问一次有机会拿到有效判定，属于"宁可多花一次也
+                # 不误判"（F-038）；这一跳会真的花钱，所以必须计进成本看板
+                # （``/cost`` 的 stage=decision 解析失败），不能像旧实现那样只写日志。
+                llm_metrics.record("decision", parse_errors=1)
+                log.warning("decision retry reason=invalid_output actual=%r", result)
+                result = await self._llm_decide(*decision_args, **decision_kwargs)
+                if result not in _VALID_DECISION_RESULTS:
+                    # 重试仍然拿不到有效判定：不确定就不发言（绝不猜着处置），
+                    # 但上面的 warn + 记账保证这不是静默放行。
+                    log.warning(
+                        "decision retry unusable; treat as skip | actual=%r", result
+                    )
+                    result = "skip"
+            else:
+                # 空响应 = 阶段 deadline 用尽或上游一声不响。旧实现会对这种
+                # "稳定超时"再打一次完整判定：成本 ×2、延迟叠加，而结果多半
+                # 还是空的。这里不重试，直接按"不发言"处理并留日志。
+                log.warning(
+                    "decision empty output (stage deadline or provider silence); "
+                    "no retry, treat as skip"
+                )
+                result = "skip"
 
         if result == "question":
             result = "casual"

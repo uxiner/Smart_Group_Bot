@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -17,10 +18,19 @@ from bot.services.join_verification import (
     reconcile_moderation_ban_after_lost_lease,
     verification_restriction_required,
 )
+from bot.services.ops_alert import alert_super_admin
 from bot.services.recent_messages import retract_removed_member_residue
 from bot.services.update_completion import request_current_update_retry
 
 log = logging.getLogger(__name__)
+
+#: Delays between immediate re-reads of the ban policy. Two extra attempts absorb
+#: a single SQLite "database is locked" hiccup; total added latency is bounded at
+#: 0.3s and this only runs on the failure path. A retry here costs a database
+#: read, not a model call, so it does not add a cost-board entry.
+_BAN_LOOKUP_RETRY_DELAYS: tuple[float, ...] = (0.1, 0.2)
+#: One alert per kind per cooldown window (see ``bot.services.ops_alert``).
+_BAN_ALERT_KIND = "global_ban_lookup_failed"
 
 
 async def _confirm_pending_local_bans(
@@ -130,6 +140,58 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.session_factory = session_factory
 
+    async def _lookup_ban_policy(
+        self,
+        chat_id: int,
+        user_id: int,
+    ) -> tuple[bool, bool]:
+        """Return ``(banned, authorized)``, re-reading a few times on failure.
+
+        A failed read is usually a locked/full SQLite writer rather than a real
+        outage, so immediate re-reads recover the *correct* verdict without any
+        side effect. A persistent failure propagates to the caller, which then
+        leaves every permission untouched (F-027).
+        """
+
+        failure: Exception | None = None
+        attempts = 1 + len(_BAN_LOOKUP_RETRY_DELAYS)
+        for attempt in range(attempts):
+            try:
+                async with self.session_factory() as session:
+                    authorized = await is_group_authorized(session, int(chat_id))
+                    globally_banned = authorized and await is_globally_banned(
+                        session,
+                        int(user_id),
+                    )
+                    locally_banned = False
+                    scalar = getattr(session, "scalar", None)
+                    if authorized and callable(scalar):
+                        locally_banned = bool(
+                            await scalar(
+                                select(UserWarning.id).where(
+                                    UserWarning.group_id == int(chat_id),
+                                    UserWarning.user_id == int(user_id),
+                                    UserWarning.is_banned.is_(True),
+                                )
+                            )
+                        )
+                return bool(globally_banned or locally_banned), bool(authorized)
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                failure = exc
+                if attempt < len(_BAN_LOOKUP_RETRY_DELAYS):
+                    log.warning(
+                        "global ban check failed; retrying | chat=%s user=%s "
+                        "attempt=%d/%d",
+                        chat_id,
+                        user_id,
+                        attempt + 1,
+                        attempts,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(_BAN_LOOKUP_RETRY_DELAYS[attempt])
+        assert failure is not None
+        raise failure
+
     async def __call__(
         self,
         handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
@@ -151,27 +213,43 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         try:
-            async with self.session_factory() as session:
-                authorized = await is_group_authorized(session, chat.id)
-                globally_banned = authorized and await is_globally_banned(
-                    session,
-                    user.id,
-                )
-                locally_banned = False
-                scalar = getattr(session, "scalar", None)
-                if authorized and callable(scalar):
-                    locally_banned = bool(
-                        await scalar(
-                            select(UserWarning.id).where(
-                                UserWarning.group_id == int(chat.id),
-                                UserWarning.user_id == int(user.id),
-                                UserWarning.is_banned.is_(True),
-                            )
-                        )
-                    )
-                banned = bool(globally_banned or locally_banned)
-        except Exception:
-            log.exception("global ban check failed | chat=%s user=%s", chat.id, user.id)
+            banned, authorized = await self._lookup_ban_policy(chat.id, user.id)
+        except Exception as failure:
+            # F-027（判罚准确第一）：封禁策略读不出来时**不改变任何人的权限、不做
+            # 任何处置**。这里选择放行，而不是 fail-closed 拦人：
+            #   * fail-closed 会误伤——删除一个正常群友的消息、在全群被挡在外面，
+            #     这正是"宁可漏判，不可误伤"禁止的取舍；
+            #   * 放行最多是漏判（被全局封禁的人多活一条消息），而且失败是**可观测**的。
+            #
+            # 立即重试已在 _lookup_ban_policy 里做过（数据库读，零模型成本）；
+            # 这里补上明确的错误日志 + 私聊最高管理员告警。
+            #
+            # **不请求重放**：本条 update 已经按正常流程交给 handler，再重放一次会
+            # 让同一条消息被回复/审核两次——重复处置本身也是误伤。
+            log.error(
+                "global ban policy is unreadable; passing the message through "
+                "unchanged (no permission or message change, super admin alerted) "
+                "| chat=%s user=%s message=%s error=%s",
+                chat.id,
+                user.id,
+                getattr(event, "message_id", 0),
+                failure,
+            )
+            await alert_super_admin(
+                getattr(event, "bot", None),
+                settings,
+                kind=_BAN_ALERT_KIND,
+                summary=(
+                    "封禁策略读取失败（已重试仍失败）：本次不改变任何权限、不做任何"
+                    "处置，消息按正常流程放行。"
+                ),
+                fields={
+                    "chat": chat.id,
+                    "user": user.id,
+                    "message": getattr(event, "message_id", 0),
+                    "error": f"{type(failure).__name__}: {failure}"[:160],
+                },
+            )
             return await handler(event, data)
 
         # The outer middleware owns a private session.  Never keep it checked
@@ -246,7 +324,11 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
                         user.id,
                     )
                     request_current_update_retry()
-            elif final_banned and locally_banned:
+            elif final_banned and await preserve_ban():
+                # F-027 验收修补（原为未定义的 ``locally_banned``，基线里就存在、
+                # 只是从来走不到这条分支）：「本地是否还有持久封禁策略」在本作用域里
+                # 的唯一权威来源就是上面那个 ``preserve_ban`` 闭包（查 DB 的
+                # ``_durable_ban_policy_exists``），语义与原来的意图一致。
                 try:
                     confirmed = await _confirm_pending_local_bans(
                         self.session_factory,

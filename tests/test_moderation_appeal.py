@@ -527,6 +527,317 @@ class ModerationPointsSkipTests(_DbTestCase):
         self.assertEqual(await self._balance(964), (6, 0))
         self.assertIn("不支持", callback.answer.await_args.args[0])
 
+    # --- F-010：扣分已提交但没放行时必须退款 ---------------------------------
+
+    async def _point_refs(self, user_id: int) -> tuple[list[str], list[str]]:
+        """(消费 ref, 退款 ref)，按插入顺序。"""
+
+        from sqlalchemy import select
+
+        from bot.db.models import MemberPointAward, MemberPointSpend
+
+        async with self.session_factory() as session:
+            spend_rows = await session.execute(
+                select(MemberPointSpend.ref)
+                .where(
+                    MemberPointSpend.group_id == -100,
+                    MemberPointSpend.user_id == user_id,
+                )
+                .order_by(MemberPointSpend.id)
+            )
+            award_rows = await session.execute(
+                select(MemberPointAward.ref)
+                .where(
+                    MemberPointAward.group_id == -100,
+                    MemberPointAward.user_id == user_id,
+                )
+                .order_by(MemberPointAward.id)
+            )
+        spends = [str(ref) for ref in spend_rows.scalars().all() if ref]
+        awards = [
+            str(ref)
+            for ref in award_rows.scalars().all()
+            if ref and str(ref).startswith("shop-refund:")
+        ]
+        return spends, awards
+
+    async def _ban_user(self, user_id: int) -> None:
+        from bot.db.models import UserWarning
+
+        async with self.session_factory() as session:
+            session.add(
+                UserWarning(
+                    group_id=-100,
+                    user_id=user_id,
+                    count=3,
+                    is_banned=True,
+                )
+            )
+            await session.commit()
+
+    async def test_refused_release_refunds_the_points(self) -> None:
+        """F-010：目标已被封禁 → 放行链路只 ack 不动作，扣掉的 2 分必须退回。"""
+
+        await self._add_record(user_id=965, message_id=865)
+        await self._seed_points(965, days=2)  # +1 +2 = 3 分
+        await self._ban_user(965)
+        callback = _callback(
+            action=VERIFICATION_CALLBACK_SPEND,
+            target_user_id=965,
+            operator_id=965,
+            message_id=865,
+        )
+
+        restorer = await self._click_spend(callback)
+
+        restorer.assert_not_awaited()
+        record = await self._record(965)
+        self.assertIsNotNone(record, "放行没发生，质询记录还在")
+        self.assertEqual(await self._balance(965), (3, 2), "扣了 2 分，又退了 2 分")
+        spends, refunds = await self._point_refs(965)
+        self.assertEqual(spends, [f"challenge:{int(record.id)}"])
+        self.assertEqual(refunds, [f"shop-refund:challenge:{int(record.id)}"])
+        self.assertIn("已被封禁", callback.answer.await_args.args[0])
+
+    async def test_a_retry_after_a_refund_can_charge_again(self) -> None:
+        """退款后同一个 ref 不能再扣（唯一索引），所以下一次点击要换 attempt。"""
+
+        await self._add_record(user_id=967, message_id=867)
+        await self._seed_points(967, days=2)
+        await self._ban_user(967)
+
+        async def click() -> AsyncMock:
+            return await self._click_spend(
+                _callback(
+                    action=VERIFICATION_CALLBACK_SPEND,
+                    target_user_id=967,
+                    operator_id=967,
+                    message_id=867,
+                )
+            )
+
+        await click()
+        await click()
+
+        record = await self._record(967)
+        self.assertIsNotNone(record)
+        record_id = int(record.id)
+        spends, refunds = await self._point_refs(967)
+        self.assertEqual(
+            spends,
+            [f"challenge:{record_id}", f"challenge:{record_id}#1"],
+            "第二次点击换了一个幂等键，否则退款后永远扣不动",
+        )
+        self.assertEqual(
+            refunds,
+            [
+                f"shop-refund:challenge:{record_id}",
+                f"shop-refund:challenge:{record_id}#1",
+            ],
+        )
+        self.assertEqual(
+            await self._balance(967),
+            (3, 4),
+            "两次扣分两次退款，净值不变",
+        )
+
+    async def test_successful_release_does_not_refund(self) -> None:
+        """放行真的发生了就不退款：否则等于白送一次免除。"""
+
+        await self._add_record(user_id=968, message_id=868)
+        await self._seed_points(968, days=3)  # 6 分
+        callback = _callback(
+            action=VERIFICATION_CALLBACK_SPEND,
+            target_user_id=968,
+            operator_id=968,
+            message_id=868,
+        )
+
+        restorer = await self._click_spend(callback)
+
+        restorer.assert_awaited_once()
+        self.assertIsNone(await self._record(968))
+        self.assertEqual(await self._balance(968), (4, 2))
+        _spends, refunds = await self._point_refs(968)
+        self.assertEqual(refunds, [])
+
+
+class AppealRecheckDeferralTests(_DbTestCase):
+    """F-023：申诉复核不再占着 HIGH 更新通道内联跑模型，并且有按人冷却。
+
+    ``jv:p:<uid>`` 走的是 HIGH 更新通道（与 chat_member / 入群验证共用 4 个
+    worker），旧实现在 handler 里内联 await 整次模型复核，而且维持原判时质询仍是
+    pending，连点没有上限。现在复核提交到 policy lane 的后台任务，并加 60 秒冷却。
+    """
+
+    def setUp(self) -> None:
+        membership._APPEAL_RECHECK_AT.clear()
+        self.addCleanup(membership._APPEAL_RECHECK_AT.clear)
+
+    def _click_for(self, user_id: int, message_id: int):
+        return _callback(
+            action=VERIFICATION_CALLBACK_APPEAL,
+            target_user_id=user_id,
+            operator_id=user_id,
+            message_id=message_id,
+        )
+
+    @staticmethod
+    def _submission(**kwargs):
+        from bot.services.privileged_tasks import PrivilegedTaskSubmission
+
+        return PrivilegedTaskSubmission(
+            accepted=True,
+            created=True,
+            job_id="job-1",
+            lane=str(kwargs.get("lane", "")),
+            queue_depth=0,
+        )
+
+    async def test_the_model_review_is_not_run_inline_in_the_update_worker(self) -> None:
+        await self._add_record(user_id=970, message_id=870)
+        await self._add_violation(user_id=970)
+        callback = self._click_for(970, 870)
+        captured: dict = {}
+
+        def _submit(**kwargs):
+            captured.update(kwargs)
+            return self._submission(**kwargs)
+
+        review = AsyncMock(
+            return_value=(_verdict(violated=True, conclusive=True), "仍判违规")
+        )
+        with (
+            patch.object(membership, "submit_privileged_task", side_effect=_submit),
+            patch.object(membership, "_review_moderation_appeal", new=review),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                    session_factory=self.session_factory,
+                )
+            # handler 已经返回，模型复核还没有被内联调用
+            review.assert_not_awaited()
+
+        self.assertEqual(captured.get("lane"), "policy")
+        self.assertEqual(captured.get("key"), "verification-appeal:-100:970")
+        # 点击的人立刻拿到回执，不用干等模型
+        self.assertIn("复核", callback.answer.await_args.args[0])
+        # 冷却位已经占住
+        self.assertGreater(membership._appeal_recheck_remaining(-100, 970), 0)
+
+    async def test_repeat_clicks_inside_the_cooldown_start_no_second_review(self) -> None:
+        await self._add_record(user_id=971, message_id=871)
+        callback = self._click_for(971, 871)
+        submissions: list = []
+
+        def _submit(**kwargs):
+            submissions.append(kwargs)
+            return self._submission(**kwargs)
+
+        with patch.object(membership, "submit_privileged_task", side_effect=_submit):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                    session_factory=self.session_factory,
+                )
+            self.assertEqual(len(submissions), 1)
+            callback.answer.reset_mock()
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                    session_factory=self.session_factory,
+                )
+
+        self.assertEqual(len(submissions), 1, "冷却期内不能再提交一次复核")
+        self.assertTrue(callback.answer.await_args.kwargs["show_alert"])
+        self.assertIn("复核", callback.answer.await_args.args[0])
+
+    async def test_deferred_kept_outcome_posts_a_one_click_verification_entry(
+        self,
+    ) -> None:
+        await self._add_record(user_id=972, message_id=872)
+        await self._add_violation(user_id=972)
+        callback = self._click_for(972, 872)
+
+        with patch.object(
+            membership,
+            "_review_moderation_appeal",
+            new=AsyncMock(
+                return_value=(
+                    _verdict(violated=True, conclusive=True),
+                    "模型二次复核仍判「违规」",
+                )
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership._run_verification_appeal_recheck(
+                    callback,
+                    session,
+                    _settings(),
+                    group_id=-100,
+                    target_user_id=972,
+                    display_name="用户972",
+                    session_factory=self.session_factory,
+                    deferred=True,
+                )
+
+        sent = callback.bot.send_message.await_args.kwargs
+        self.assertEqual(sent["chat_id"], -100)
+        button = sent["reply_markup"].inline_keyboard[0][0]
+        self.assertIn("t.me/", button.url)
+        self.assertIn("仍判违规", sent["text"])
+        # 维持原判：质询必须还在，不能悄悄放人
+        record = await self._record(972)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.status, "pending")
+
+    async def test_the_deferred_review_still_routes_a_cleared_member_to_approve(
+        self,
+    ) -> None:
+        """挪到后台不能改变判定口径：清白消息照样走管理员「通过」那条放行链路。"""
+
+        await self._add_record(user_id=973, message_id=873)
+        await self._add_violation(user_id=973)
+        callback = self._click_for(973, 873)
+        approve = AsyncMock()
+
+        with (
+            patch.object(
+                membership,
+                "_review_moderation_appeal",
+                new=AsyncMock(
+                    return_value=(_verdict(violated=False, conclusive=True), "未违规")
+                ),
+            ),
+            patch.object(
+                membership, "_handle_verification_admin_callback", new=approve
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership._run_verification_appeal_recheck(
+                    callback,
+                    session,
+                    _settings(),
+                    group_id=-100,
+                    target_user_id=973,
+                    display_name="用户973",
+                    session_factory=self.session_factory,
+                    deferred=True,
+                )
+
+        approve.assert_awaited_once()
+        kwargs = approve.await_args.kwargs
+        self.assertEqual(kwargs["action"], VERIFICATION_CALLBACK_APPROVE)
+        self.assertTrue(kwargs["system_override"])
+        self.assertEqual(kwargs["target_user_id"], 973)
+
 
 if __name__ == "__main__":
     unittest.main()

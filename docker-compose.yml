@@ -21,6 +21,14 @@ services:
       # MINIAPP_BIND_ADDRESS=0.0.0.0 only when another container/host must reach
       # the backend directly and a firewall protects the port.
       - "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}"
+    environment:
+      # The application now defaults to binding loopback (safe for bare-metal
+      # systemd installs). A published port is DNAT'ed to the container's own
+      # interface, so the in-container listener must bind every interface for
+      # that mapping to answer; the host side stays limited to
+      # MINIAPP_BIND_ADDRESS (loopback unless overridden). An explicit
+      # MINIAPP_LISTEN_HOST in .env or the shell still wins.
+      MINIAPP_LISTEN_HOST: "${MINIAPP_LISTEN_HOST:-0.0.0.0}"
     healthcheck:
       test:
         - CMD

@@ -1939,6 +1939,12 @@ async def init_db(
                 "ON vote_ban_sessions (status, deadline_at)",
                 "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_row "
                 "ON message_vectors (group_id, id)",
+                # F-030：已有的库里 member_checkins 只有
+                # (group_id, user_id, checkin_date) 唯一索引，按日期过滤的每日
+                # 提醒只能全表扫。``create_all`` 不会给已存在的表补索引，必须
+                # 在这里用幂等语句建，老库启动即生效。
+                "CREATE INDEX IF NOT EXISTS ix_member_checkins_group_day "
+                "ON member_checkins (group_id, checkin_date)",
             ):
                 await conn.execute(text(index_sql))
             # 审核规则的扫描范围：列存在性 + 老数据默认值 + 生产规则的一次性升级。

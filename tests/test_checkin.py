@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot.db.engine import init_db
-from bot.db.models import MemberCheckin
+from bot.db.models import MemberCheckin, MemberPointSpend
 from bot.services.join_verification import begin_moderation_challenge
 from bot.handlers import commands
 from bot.services.checkin import (
@@ -404,6 +404,58 @@ class PointSpendingTests(_DbTestCase):
             self.assertEqual(
                 await available_points(session, group_id=-100, user_id=7), 4
             )
+
+    async def test_a_missing_idempotency_key_is_rejected_loudly(self) -> None:
+        """F-054：``ref`` 不能为空。
+
+        SQLite 的唯一索引把 NULL 当作互不相等，旧的 ``ref: str | None = None``
+        默认值等于"不传 ref 就没有任何去重保护"。现在缺 ref 在调用点就报错，
+        而不是静默写下一行无法去重的消费流水。
+        """
+
+        await self._earn(2)  # +1 +2 = 3 分
+
+        async with self.session_factory() as session:
+            with self.assertRaises(ValueError):
+                await spend_points(
+                    session,
+                    group_id=-100,
+                    user_id=7,
+                    points=2,
+                    reason=SPEND_REASON_CHALLENGE,
+                    ref=None,
+                )
+            with self.assertRaises(ValueError):
+                await spend_points(
+                    session,
+                    group_id=-100,
+                    user_id=7,
+                    points=2,
+                    reason=SPEND_REASON_CHALLENGE,
+                    ref="   ",
+                )
+            await session.commit()
+
+        # 被拒的调用没有写下任何消费流水，余额原样。
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(func.count()).select_from(MemberPointSpend)
+                )
+            ).scalar()
+            self.assertEqual(int(rows or 0), 0)
+            self.assertEqual(
+                await available_points(session, group_id=-100, user_id=7), 3
+            )
+
+    async def test_ref_is_a_required_keyword_argument(self) -> None:
+        """F-054：漏传 ``ref`` 是 TypeError，不会退化成一个不需要去重的调用。"""
+
+        async with self.session_factory() as session:
+            with self.assertRaises(TypeError):
+                await spend_points(
+                    session, group_id=-100, user_id=7, points=2, reason="test"
+                )
 
     async def test_concurrent_spends_with_different_refs_cannot_overdraw(self) -> None:
         """F-005：两个**不同 ref** 的并发消费不能各自读到同一份旧余额。

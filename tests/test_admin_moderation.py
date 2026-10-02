@@ -291,6 +291,21 @@ class AdminModerationTests(unittest.IsolatedAsyncioTestCase):
         message._moderation = moderation
         return message
 
+    async def test_group_message_audit_declares_the_sender_for_admission(self) -> None:
+        """F-021：群消息审核必须把发送者带进 ``evaluate``，整形闸才有 key。
+
+        没有发送者就无法按 (群, 成员) 摊平连发成本——这条断言守住接线。
+        """
+
+        store = _ViolationStore()
+
+        message = await self._run(store)
+
+        self.assertEqual(
+            message._moderation.evaluate.await_args.kwargs.get("sender_id"),
+            int(message.from_user.id),
+        )
+
     # ------------------------------------------------------------------ D
 
     async def test_admin_violation_deletes_warns_records_without_punishment(

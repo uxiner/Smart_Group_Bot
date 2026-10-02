@@ -1486,6 +1486,140 @@ class GlobalBanMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "handled")
         event.bot.ban_chat_member.assert_not_awaited()
 
+    async def test_unreadable_ban_policy_allows_the_message_and_alerts(self) -> None:
+        """F-027：查询失败时不改变任何人的权限、不做任何处置——放行 + 重试 + 告警。
+
+        判罚准确第一：fail-closed 拦人会误伤（删掉正常群友的消息、把全群挡在外面），
+        而"封禁检查失败就放行"最多是漏判。失败本身必须可观测（日志 + 私聊告警）。
+        """
+
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+
+        middleware = GlobalBanEnforcementMiddleware(self.session_factory)
+        handler = AsyncMock(return_value="handled")
+        event = self._event(user_id=668)
+
+        with (
+            patch(
+                "bot.middlewares.global_ban.is_group_authorized",
+                new=AsyncMock(side_effect=RuntimeError("db down")),
+            ) as lookup,
+            patch(
+                "bot.middlewares.global_ban._BAN_LOOKUP_RETRY_DELAYS",
+                (0.0, 0.0),
+            ),
+            patch(
+                "bot.middlewares.global_ban.alert_super_admin",
+                new=AsyncMock(return_value=True),
+            ) as alert,
+            patch(
+                "bot.middlewares.global_ban.request_current_update_retry",
+                return_value=True,
+            ) as retry,
+        ):
+            result = await middleware(handler, event, {"settings": self._settings()})
+
+        # 放行：消息照常进入 handler（不拦人）
+        self.assertEqual(result, "handled")
+        handler.assert_awaited_once()
+        # 立即重试：1 次 + 2 次重试
+        self.assertEqual(lookup.await_count, 3, "先立即重试再判定失败")
+        # 可观测：私聊最高管理员告警
+        alert.assert_awaited_once()
+        alert_kwargs = alert.await_args.kwargs
+        self.assertEqual(alert_kwargs["fields"]["user"], 668)
+        self.assertEqual(alert_kwargs["fields"]["chat"], -100)
+        # 负例：不删消息、不封禁、不重放（重放会让同一条消息被处理两次 = 重复处置）
+        event.delete.assert_not_awaited()
+        event.bot.ban_chat_member.assert_not_awaited()
+        retry.assert_not_called()
+
+    async def test_unreadable_ban_policy_without_durable_retry_still_allows(self) -> None:
+        """没有 durable receipt 时行为一致：放行 + 告警，不抛错、不拦人。"""
+
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+
+        middleware = GlobalBanEnforcementMiddleware(self.session_factory)
+        handler = AsyncMock(return_value="handled")
+        event = self._event(user_id=669)
+
+        with (
+            patch(
+                "bot.middlewares.global_ban.is_group_authorized",
+                new=AsyncMock(side_effect=RuntimeError("db down")),
+            ),
+            patch(
+                "bot.middlewares.global_ban._BAN_LOOKUP_RETRY_DELAYS",
+                (0.0, 0.0),
+            ),
+            patch(
+                "bot.middlewares.global_ban.alert_super_admin",
+                new=AsyncMock(return_value=False),
+            ) as alert,
+            patch(
+                "bot.middlewares.global_ban.request_current_update_retry",
+                return_value=False,
+            ),
+        ):
+            result = await middleware(handler, event, {"settings": self._settings()})
+
+        self.assertEqual(result, "handled")
+        handler.assert_awaited_once()
+        alert.assert_awaited_once()
+        event.delete.assert_not_awaited()
+
+    async def test_clean_message_is_not_alerted(self) -> None:
+        """负例：正常群友的消息不触发任何告警或处置。"""
+
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+
+        middleware = GlobalBanEnforcementMiddleware(self.session_factory)
+        handler = AsyncMock(return_value="handled")
+        event = self._event(user_id=671)
+
+        with patch(
+            "bot.middlewares.global_ban.alert_super_admin",
+            new=AsyncMock(return_value=True),
+        ) as alert:
+            result = await middleware(handler, event, {"settings": self._settings()})
+
+        self.assertEqual(result, "handled")
+        alert.assert_not_awaited()
+        event.delete.assert_not_awaited()
+
+    async def test_transient_ban_lookup_failure_recovers_on_the_retry(self) -> None:
+        """一次抖动（SQLite busy）恢复后照常判定：重试换回正确结论，不产生告警。"""
+
+        from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
+
+        middleware = GlobalBanEnforcementMiddleware(self.session_factory)
+        handler = AsyncMock(return_value="handled")
+        event = self._event(user_id=670)
+        attempts = {"count": 0}
+
+        async def flaky(session, group_id):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("database is locked")
+            return True
+
+        with (
+            patch(
+                "bot.middlewares.global_ban.is_group_authorized",
+                new=AsyncMock(side_effect=flaky),
+            ),
+            patch(
+                "bot.middlewares.global_ban.alert_super_admin",
+                new=AsyncMock(return_value=True),
+            ) as alert,
+        ):
+            result = await middleware(handler, event, {"settings": self._settings()})
+
+        self.assertEqual(attempts["count"], 2)
+        handler.assert_awaited_once()
+        self.assertEqual(result, "handled")
+        alert.assert_not_awaited()
+
 
 class SuperAdminJoinProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:

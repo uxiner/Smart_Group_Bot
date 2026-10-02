@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 import weakref
 from collections import deque
 from dataclasses import dataclass
@@ -93,6 +94,7 @@ from bot.services.notification_pins import (
     pin_notification_message,
     unpin_notification_message,
 )
+from bot.services.ops_alert import alert_super_admin
 from bot.services.recent_messages import (
     delete_messages_since_join,
     member_join_marker,
@@ -152,6 +154,10 @@ _INVALID_PERSISTED_STATE = object()
 _NOTICE_CALL_CAPACITY = 8
 _NOTICE_CALL_BACKPRESSURE_SECONDS = 0.5
 _NOTICE_CALL_TASKS: set[asyncio.Future[object]] = set()
+
+#: Alert kind for "chat administrator list unavailable" (deduplicated by
+#: ``bot.services.ops_alert``).
+_RAID_ADMIN_ALERT_KIND = "raid_guard_admin_lookup_failed"
 
 
 @dataclass(slots=True)
@@ -1078,6 +1084,11 @@ class RaidGuardService:
         # automatic activation cannot finish pinning after a concurrent off
         # action has already cleared the in-memory state.
         self._lifecycle_locks: dict[int, asyncio.Lock] = {}
+        # Last successfully fetched chat-administrator set per group:
+        # group_id -> (monotonic_timestamp, ids). A failed lookup reuses this
+        # instead of treating "no administrators" as "everybody is a suspect"
+        # (F-029); with no usable cache the automatic enforcement is skipped.
+        self._chat_admin_ids: dict[int, tuple[float, frozenset[int]]] = {}
 
     def _lifecycle_lock(self, group_id: int) -> asyncio.Lock:
         group_id = int(group_id)
@@ -2670,26 +2681,46 @@ class RaidGuardService:
     async def _filter_suspects(
         self, group_id: int, suspects: list[RaidSuspect]
     ) -> list[RaidSuspect]:
-        admin_ids: set[int] = set()
-        if getattr(self.settings, "super_admin_id", 0):
-            admin_ids.add(int(self.settings.super_admin_id))
-        try:
-            admins = await self.bot.get_chat_administrators(group_id)
-            for member in admins or []:
-                user = getattr(member, "user", None)
-                if user is not None:
-                    admin_ids.add(int(user.id))
-        except Exception:
-            log.warning(
-                "[%s] raid guard could not list chat administrators",
+        admin_ids = await self._known_chat_administrator_ids(group_id)
+        if admin_ids is None:
+            # F-029（误伤优先）：名单拿不到就是"无法判定"——**不做任何限制**、
+            # 不把任何人当嫌疑人。自动禁言/封禁会把群管理员/群主一起卷进去，
+            # 而"少限制一轮"最多是漏判。锁定本身照旧生效，失败可观测（日志 + 告警）。
+            #
+            # 这里刻意**不**回退到上一次成功的名单去继续执法：缓存可能已经过期，
+            # 刚被提升的管理员不在里面，照样会被误伤。缓存只用来让告警更有信息量。
+            log.error(
+                "[%s] raid guard skipped automatic enforcement: chat "
+                "administrators are unknown (Telegram lookup failed; no suspect "
+                "is limited this wave) | suspects=%d last_known=%s",
                 group_id,
-                exc_info=True,
+                len(suspects),
+                self._last_known_admin_summary(group_id),
             )
+            await alert_super_admin(
+                self.bot,
+                self.settings,
+                kind=_RAID_ADMIN_ALERT_KIND,
+                summary=(
+                    "爆破防护无法取得群管理员名单：本轮不做任何限制（不把任何人当"
+                    "嫌疑人），仅保留锁定；请检查机器人是否有查看管理员的权限。"
+                ),
+                fields={
+                    "chat": group_id,
+                    "suspects": len(suspects),
+                    "last_known": self._last_known_admin_summary(group_id),
+                },
+            )
+            return []
+
+        known_admin_ids = set(admin_ids)
+        if getattr(self.settings, "super_admin_id", 0):
+            known_admin_ids.add(int(self.settings.super_admin_id))
 
         eligible: list[RaidSuspect] = []
         async with self.session_factory() as session:
             for suspect in suspects:
-                if suspect.user_id in admin_ids:
+                if suspect.user_id in known_admin_ids:
                     continue
                 if await is_globally_banned(session, suspect.user_id):
                     continue
@@ -2702,6 +2733,51 @@ class RaidGuardService:
                     continue
                 eligible.append(suspect)
         return eligible
+
+    async def _known_chat_administrator_ids(
+        self,
+        group_id: int,
+    ) -> frozenset[int] | None:
+        """Administrator ids of one group, or ``None`` when they are unknown.
+
+        Telegram can fail (rate limits, transient errors, the bot losing its
+        rights). Falling back to "only the super admin is an administrator" made
+        ordinary group administrators and the owner eligible for the automatic
+        mute/ban response (F-029). A failed lookup therefore returns ``None`` and
+        the caller refuses to auto-enforce at all; the last successful set is
+        kept only to make the alert/日志 more informative — never to justify
+        enforcement, because a member promoted since that snapshot would still be
+        treated as a suspect.
+        """
+
+        group_id = int(group_id)
+        try:
+            admins = await self.bot.get_chat_administrators(group_id)
+        except Exception:
+            log.warning(
+                "[%s] raid guard could not list chat administrators",
+                group_id,
+                exc_info=True,
+            )
+            return None
+
+        admin_ids: set[int] = set()
+        for member in admins or []:
+            user = getattr(member, "user", None)
+            if user is not None:
+                admin_ids.add(int(user.id))
+        self._chat_admin_ids[group_id] = (time.monotonic(), frozenset(admin_ids))
+        return frozenset(admin_ids)
+
+    def _last_known_admin_summary(self, group_id: int) -> str:
+        """Diagnostic only: ``"N admins (age s ago)"`` or ``"never"``."""
+
+        cached = self._chat_admin_ids.get(int(group_id))
+        if cached is None:
+            return "never"
+        fetched_at, admin_ids = cached
+        age = max(0.0, time.monotonic() - fetched_at)
+        return f"{len(admin_ids)} admins ({age:.0f}s ago)"
 
     async def _challenge_suspects(
         self,

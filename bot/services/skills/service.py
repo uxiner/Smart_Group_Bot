@@ -83,6 +83,27 @@ _ROUTEROS_DOC_RESULT_METADATA_RESERVE = {
     "section": 8192,
 }
 
+#: F-043：正文里的 tool_calls 只在"整条消息就是一个明确信封"时才被采信——
+#: 单个围栏代码块（允许 ```json），或整条消息就是裸 JSON 对象/数组。信封外面
+#: 有任何说明文字都直接判为"模型只是在正文里打印了一段 JSON"，不再执行。
+_WHOLE_MESSAGE_FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*(?P<body>.*?)\s*```\s*$",
+    flags=re.S | re.I,
+)
+
+
+def _response_finish_reason(resp: Any) -> str:
+    """``finish_reason`` of the first choice, for diagnostics only (F-043)."""
+
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        return "unknown"
+    first = choices[0]
+    reason = getattr(first, "finish_reason", None)
+    if reason is None and isinstance(first, dict):
+        reason = first.get("finish_reason")
+    return str(reason or "unknown")
+
 _SKILL_PROGRESS_TEXTS: dict[str, tuple[str, str, str]] = {
     "websearch": ("正在搜索资料", "已搜索资料", "搜索资料失败"),
     "webfetch": ("正在读取网页", "已读取网页", "读取网页失败"),
@@ -594,16 +615,22 @@ class SkillService:
         *,
         allowed_names: set[str],
     ) -> list[dict[str, str]]:
-        """Recover tool calls that an upstream returned as prose instead of JSON.
+        """Recover tool calls that an upstream returned as text instead of JSON.
 
         Some OpenAI-compatible bridges (notably the Gemini web bridge) emit a
         syntactically valid tool call inside the assistant text while leaving
         ``tool_calls`` empty.  Without this, the loop sees "no tool call",
         answers from the model's own prose, and never runs the tool.
 
-        Strict by construction: only a fenced/whole-body JSON object whose
-        ``tool_calls`` array names a registered skill is accepted, so ordinary
-        prose that merely mentions a tool name cannot trigger a call.
+        Strict by construction (F-043): the *whole* assistant message must be one
+        explicit envelope — a single fenced code block, or a bare JSON
+        object/array — whose ``tool_calls`` array names a registered skill.  The
+        previous "otherwise treat the entire text as JSON" fallback meant that
+        prompt-injected content only had to make the model *print* a
+        ``tool_calls`` JSON inside an explanation and it was executed as a real
+        call.  Prose around the envelope now disqualifies it, so a bridge still
+        works as long as it returns the envelope as the message body, while
+        "here is the call I would make: ..." no longer triggers anything.
         """
 
         text = (content or "").strip()
@@ -613,12 +640,31 @@ class SkillService:
             return []
 
         candidates: list[str] = []
-        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.S | re.I):
-            body = (match.group(1) or "").strip()
+        fenced = _WHOLE_MESSAGE_FENCE_RE.match(text)
+        if fenced is not None:
+            body = (fenced.group("body") or "").strip()
             if body:
                 candidates.append(body)
-        if not candidates:
+        elif text.startswith(("{", "[")):
+            # No prose at all: the message body itself is the JSON envelope.
             candidates.append(text)
+        if not candidates:
+            # 不许静默：被收窄规则挡掉的候选要留下痕迹。带围栏的最值得注意
+            # （典型回归：上游把真实 tool call 包在解释文字里），只在正文里提到
+            # ``tool_calls`` 的普通文本降一级，避免噪音。
+            if "```" in text:
+                log.warning(
+                    "skill tool loop ignored a fenced tool_calls candidate: the "
+                    "envelope must be the whole message (F-043) | chars=%d",
+                    len(text),
+                )
+            else:
+                log.info(
+                    "skill tool loop saw tool_calls in plain text without an "
+                    "explicit envelope | chars=%d",
+                    len(text),
+                )
+            return []
 
         decoder = json.JSONDecoder()
         marker_token = '"tool_calls"'
@@ -2612,11 +2658,18 @@ class SkillService:
                     content, allowed_names=set(self.skills)
                 )
                 if tool_calls:
+                    # F-043：抢救式调用必须可观测（哪一步、哪些技能、上游给的
+                    # finish_reason）。finish_reason 不是判定条件：不支持原生
+                    # function calling 的 provider 正常也会回 "stop"，按它拒绝
+                    # 就等于废掉这条路径；它只用于事后分辨"上游丢了 tool call"
+                    # 与"模型在正文里打印了一段 JSON"。
                     log.info(
-                        "skill tool loop salvaged text tool_calls | step=%d count=%d names=%s",
+                        "skill tool loop salvaged text tool_calls | step=%d "
+                        "count=%d names=%s finish_reason=%s",
                         step,
                         len(tool_calls),
                         [call["name"] for call in tool_calls],
+                        _response_finish_reason(resp),
                     )
 
             remaining_calls = self.max_total_tool_calls - total_tool_calls

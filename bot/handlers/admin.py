@@ -8,7 +8,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from aiogram import F, Router
 from aiogram.exceptions import (

@@ -169,6 +169,136 @@ class MessageArchiveMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["extra_metadata"]["sender_is_tg_admin"])
         self.assertTrue(kwargs["defer_persistence"])
 
+    async def test_edited_message_hitting_a_local_rule_is_deleted_not_archived(
+        self,
+    ) -> None:
+        """F-008：先发无害消息再编辑成广告，编辑后的正文不能被留下、也不能归档。"""
+
+        message = _message(
+            62,
+            "加V 领取优惠券",
+            sender=_user(10, "Dave", username="dave"),
+        )
+        message.delete = AsyncMock()
+        archive = AsyncMock()
+        memory = SimpleNamespace(archive_message=archive)
+        verdict = SimpleNamespace(
+            violated=True,
+            rule=SimpleNamespace(id=7),
+            match_source="own",
+        )
+        evaluate = AsyncMock(return_value=verdict)
+
+        with (
+            patch(
+                "bot.handlers.group.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.ModerationService",
+                return_value=SimpleNamespace(evaluate=evaluate),
+            ) as moderation_cls,
+            patch("bot.handlers.group.memory_holder.get", return_value=memory),
+        ):
+            await group.on_group_message_edited(
+                message,
+                session=SimpleNamespace(),
+                settings=SimpleNamespace(
+                    super_admin_id=1,
+                    moderation=SimpleNamespace(enabled=True),
+                ),
+            )
+
+        message.delete.assert_awaited_once()
+        archive.assert_not_awaited()
+        # 只跑本地规则：不传 context、也不允许调用审核模型
+        self.assertTrue(evaluate.await_args.kwargs["deterministic_only"])
+        self.assertEqual(evaluate.await_args.args[1], -10001)
+        self.assertEqual(evaluate.await_args.args[2], "加V 领取优惠券")
+        self.assertTrue(moderation_cls.called)
+
+    async def test_clean_edit_is_still_archived_after_the_rule_check(self) -> None:
+        message = _message(
+            63,
+            "改好的正常内容",
+            sender=_user(11, "Erin", username="erin"),
+        )
+        message.delete = AsyncMock()
+        archive = AsyncMock()
+        evaluate = AsyncMock(
+            return_value=SimpleNamespace(violated=False, rule=None, match_source="")
+        )
+
+        with (
+            patch(
+                "bot.handlers.group.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._is_user_admin_cached",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.group.ModerationService",
+                return_value=SimpleNamespace(evaluate=evaluate),
+            ),
+            patch(
+                "bot.handlers.group.memory_holder.get",
+                return_value=SimpleNamespace(archive_message=archive),
+            ),
+        ):
+            await group.on_group_message_edited(
+                message,
+                session=SimpleNamespace(),
+                settings=SimpleNamespace(
+                    super_admin_id=1,
+                    moderation=SimpleNamespace(enabled=True),
+                ),
+            )
+
+        message.delete.assert_not_awaited()
+        archive.assert_awaited_once()
+
+    async def test_rule_check_is_skipped_when_moderation_is_disabled(self) -> None:
+        message = _message(
+            64,
+            "随便改改",
+            sender=_user(12, "Frank", username="frank"),
+        )
+        message.delete = AsyncMock()
+        evaluate = AsyncMock()
+
+        with (
+            patch(
+                "bot.handlers.group.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._is_user_admin_cached",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.group.ModerationService",
+                return_value=SimpleNamespace(evaluate=evaluate),
+            ) as moderation_cls,
+            patch(
+                "bot.handlers.group.memory_holder.get",
+                return_value=SimpleNamespace(archive_message=AsyncMock()),
+            ),
+        ):
+            await group.on_group_message_edited(
+                message,
+                session=SimpleNamespace(),
+                settings=SimpleNamespace(
+                    super_admin_id=1,
+                    moderation=SimpleNamespace(enabled=False),
+                ),
+            )
+
+        evaluate.assert_not_awaited()
+        moderation_cls.assert_not_called()
+        message.delete.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

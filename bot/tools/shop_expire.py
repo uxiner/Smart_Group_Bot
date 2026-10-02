@@ -92,7 +92,8 @@ async def _expire(*, dry_run: bool, notify: bool, limit: int) -> int:
             failed += 1
     print(
         f"处理完成：{len(outcomes)} 条，其中 Telegram 侧失败 {failed} 条"
-        "（失败的行也已删除，重跑不会重复处理）。"
+        "（失败的行会保留，并把到期时间推后一个重试间隔，下次扫描继续撤；"
+        "重跑不会重复提醒）。"
     )
     return 1 if failed else 0
 

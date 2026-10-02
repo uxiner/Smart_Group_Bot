@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import func, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -343,12 +344,17 @@ async def spend_points(
     user_id: int,
     points: int,
     reason: str = "",
-    ref: str | None = None,
+    ref: str,
 ) -> bool:
-    """扣积分；余额不足或同一 ref 已扣过都返回 False（不抛异常）。
+    """扣积分；余额不足或同一 ref 已扣过都返回 False（业务失败不抛异常）。
 
-    ``ref`` 是幂等键（例如 ``challenge:12``）：唯一索引保证同一次质询只会被扣一次，
-    连点两次按钮不会重复扣分。
+    ``ref`` 是**必填**的幂等键（例如 ``challenge:12``）：唯一索引保证同一次质询
+    只会被扣一次，连点两次按钮不会重复扣分。
+
+    F-054：以前 ``ref`` 默认 ``None``，而 SQLite 的唯一索引把 NULL 视为互不相等，
+    于是"没传 ref"的调用完全没有幂等保护。为了让问题在开发期就暴露，这里把
+    ``ref`` 改成必填参数，并对空串显式抛 ``ValueError``（宁可调用点当场报错，
+    也不要静默地少一层去重）。
 
     余额检查与扣分是**同一条写语句**：可用积分是"签到 + 奖励 − 消费"的 SUM 派生值，
     先 SELECT 余额再 INSERT 消费行的话，两个不同 ``ref`` 的并发消费会各自读到同一份
@@ -356,6 +362,13 @@ async def spend_points(
     ``INSERT ... SELECT ... WHERE 余额 >= cost``，整条语句在 SQLite 的写锁之下执行，
     ``rowcount`` 为 0 就代表余额不足（或并发下已被别人扣掉）。
     """
+
+    idempotency_key = str(ref or "").strip()
+    if not idempotency_key:
+        raise ValueError(
+            "spend_points 需要非空的 ref 幂等键："
+            "SQLite 的唯一索引把 NULL 当作互不相等，ref=None 等于没有去重"
+        )
 
     cost = max(0, int(points))
     if cost <= 0:
@@ -376,22 +389,28 @@ async def spend_points(
         .where(MemberPointSpend.group_id == gid, MemberPointSpend.user_id == uid)
         .scalar_subquery()
     )
-    statement = insert(MemberPointSpend).from_select(
-        ("group_id", "user_id", "points", "reason", "ref"),
-        select(
-            literal(gid),
-            literal(uid),
-            literal(cost),
-            literal(str(reason or "")[:64]),
-            literal(None if ref is None else str(ref)[:64]),
-        ).where(earned + awarded - spent >= cost),
+    statement = (
+        sqlite_insert(MemberPointSpend)
+        .from_select(
+            ("group_id", "user_id", "points", "reason", "ref"),
+            select(
+                literal(gid),
+                literal(uid),
+                literal(cost),
+                literal(str(reason or "")[:64]),
+                literal(idempotency_key[:64]),
+            ).where(earned + awarded - spent >= cost),
+        )
+        # F-053 验收修补（SQLite 原子性）：这里原来包在 ``session.begin_nested()``
+        # 里捕获 IntegrityError，但 pysqlite/aiosqlite 驱动对 SAVEPOINT 支持不完整，
+        # 保存点会**提前提交外层事务**（已实证）。后果是：扣分一旦写入，外层
+        # ``commit()`` 失败再 rollback 也撤不回来 —— 用户白扣分、拿不到权益，
+        # 提示却写着"这次没有扣分"。改成原生 ``ON CONFLICT DO NOTHING``：
+        # 不抛异常、不改变事务边界，幂等仍由唯一索引保证，
+        # ``rowcount == 1`` 依旧是"这次真的扣到了"的判据。
+        .on_conflict_do_nothing()
     )
-    try:
-        async with session.begin_nested():
-            result = await session.execute(statement)
-    except IntegrityError:
-        # 同一个 ref 已经扣过：唯一索引挡住第二次。
-        return False
+    result = await session.execute(statement)
     return int(getattr(result, "rowcount", 0) or 0) == 1
 
 

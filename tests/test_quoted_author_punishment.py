@@ -313,6 +313,50 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(QUOTED_AUTHOR_ID, store.users())
 
+    async def test_quoted_message_with_unknown_time_is_not_punished(self) -> None:
+        """F-012：拿不到被引用消息的时间就放行，与函数文档的契约一致。
+
+        修复前 ``age is None`` 会落进处罚分支：对第三方的追溯失去时间上限，
+        反向放大 F-001 的连坐风险（正常路径不触发，测试替身/字段改名会）。
+        判罚准确第一：没有时间证据时**不得**处罚第三方（宁可漏判，不可误伤）。
+        """
+
+        store = _ViolationStore()
+        quoted = _quoted_message(sent_at="not-a-timestamp")
+        begin = AsyncMock(return_value=True)
+
+        await self._run(store, message=_message(text="v", quoted=quoted), begin=begin)
+
+        # 负例：被引用者不被记违规、不被删消息、不被他发起质询
+        self.assertNotIn(QUOTED_AUTHOR_ID, store.users())
+        self.assertNotIn(QUOTED_AUTHOR_ID, self._challenged_users(begin))
+        quoted.delete.assert_not_awaited()
+        # 主流程不受影响：转发者本身照常处理
+        self.assertIn(FORWARDER_ID, store.users())
+
+    async def test_quoted_message_with_unknown_time_does_not_ban_the_author(self) -> None:
+        """F-012 负例（处罚面）：时间未知时不触发任何封禁类调用。"""
+
+        store = _ViolationStore()
+        quoted = _quoted_message(sent_at=None)
+        quoted.date = None
+        message = _message(text="v", quoted=quoted)
+        begin = AsyncMock(return_value=True)
+
+        await self._run(store, message=message, begin=begin)
+
+        self.assertNotIn(QUOTED_AUTHOR_ID, store.users())
+        for call in message.bot.ban_chat_member.await_args_list:
+            self.assertNotEqual(call.args[1], QUOTED_AUTHOR_ID)
+        self.assertNotIn(QUOTED_AUTHOR_ID, self._challenged_users(begin))
+
+    async def test_quoted_author_age_helper_reports_unknown_time_as_none(self) -> None:
+        from bot.handlers.group import _quoted_author_age_seconds
+
+        self.assertIsNone(_quoted_author_age_seconds(None))
+        self.assertIsNone(_quoted_author_age_seconds("not-a-timestamp"))
+        self.assertIsNotNone(_quoted_author_age_seconds(now_shanghai_naive()))
+
     async def test_owner_quoted_author_is_skipped(self) -> None:
         store = _ViolationStore()
         settings = _settings()

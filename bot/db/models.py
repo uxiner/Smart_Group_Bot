@@ -1102,6 +1102,14 @@ class MemberCheckin(Base):
             "checkin_date",
             unique=True,
         ),
+        # F-030：每日提醒与签到名单只按 (group_id, checkin_date) 过滤，而上面
+        # 唯一索引的前缀是 (group_id, user_id, ...)，按日期过滤命中不了它——
+        # 只能扫该群全部历史签到行（这张表只追加、永不清理，群越大越久越慢）。
+        Index(
+            "ix_member_checkins_group_day",
+            "group_id",
+            "checkin_date",
+        ),
     )
 
 class MemberPointSpend(Base):

@@ -705,7 +705,13 @@ class ActivityAwardPointsTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertTrue(
                 await spend_points(
-                    session, group_id=GROUP_ID, user_id=7, points=2, reason="test"
+                    session,
+                    group_id=GROUP_ID,
+                    user_id=7,
+                    points=2,
+                    reason="test",
+                    # F-054：spend_points 的 ref 现在是必填幂等键。
+                    ref="test:activity-spendable",
                 )
             )
             await session.commit()

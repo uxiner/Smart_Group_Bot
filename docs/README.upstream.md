@@ -992,7 +992,7 @@ Mini App 的「Bot 行为 → 上下文与长期记忆」可调整热窗口、�
 | `CONFIG_MASTER_KEY` | ✅ | — | 数据库密钥加密主密钥，必须长期稳定 |
 | `DATABASE_URL` | | `sqlite+aiosqlite:///./data/bot.db` | 数据库连接串 |
 | `MINIAPP_PUBLIC_BASE_URL` | | 空 | 对外 HTTPS origin，留空则设置与验证按钮不可用 |
-| `MINIAPP_LISTEN_HOST` | | `0.0.0.0` | 监听地址 |
+| `MINIAPP_LISTEN_HOST` | | `127.0.0.1` | 监听地址（容器内需要 `0.0.0.0`，见 docker-compose） |
 | `MINIAPP_LISTEN_PORT` | | `8480` | 监听端口 |
 | `WEBHOOK_URL` | | 空 | Webhook 公网地址，不超过 256 字符 |
 | `WEBHOOK_SECRET` | | 空 | 32–256 位字母、数字、下划线或连字符 |
