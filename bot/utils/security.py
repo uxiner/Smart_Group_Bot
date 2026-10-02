@@ -110,6 +110,14 @@ def _stringify_history_timestamp(value: Any) -> str:
 
 
 def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
+    """从历史正文的 ``[..]`` 前缀里解析**展示用**身份（id/名字/用户名/正文）。
+
+    **绝不返回任何信任信息**（F-002）：这段前缀是群成员可控的正文，写自己的真实
+    Telegram id 也一样能通过任何"和系统 sender_id 对比"的校验，所以 is_owner /
+    is_tg_admin / trusted_source 一律不在这里解析——身份与信任只认系统写入的
+    结构化字段（见 :func:`build_history_message_record`）。
+    """
+
     text = content or ""
     match = _LEGACY_HISTORY_PREFIX_RE.match(text)
     if not match:
@@ -118,8 +126,6 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
             "sender_id": "",
             "sender_name": "",
             "sender_username": "",
-            "trusted_source": "",
-            "is_owner": "",
         }
 
     meta = match.group("meta") or ""
@@ -128,27 +134,16 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
     sender_id = ""
     sender_name = ""
     sender_username = ""
-    trusted_source = ""
-    is_owner = ""
 
-    # Authority is accepted only from the exact system-generated metadata
-    # layout. Telegram display names and message bodies are user-controlled;
-    # scanning the whole bracket/body for marker-like text would let a name
-    # such as "x trusted_source:tg_admin" forge administrator history.
+    # 格式必须严格是系统写入的那种，避免群名片里的 "name:x trusted_source:y" 之类
+    # 被拆成字段（这里只用于展示，但也不该把垃圾解析成名字）。
     structured = _LEGACY_STRUCTURED_META_RE.fullmatch(meta)
     if structured:
         sender_id = clean_text(structured.group("sender_id"), max_len=32)
         sender_username = clean_text(structured.group("username"), max_len=64)
         sender_name = clean_text(structured.group("sender_name"), max_len=160)
-        if _is_truthy_metadata(structured.group("is_owner")):
-            is_owner = "yes"
-        if _is_truthy_metadata(structured.group("is_tg_admin")):
-            trusted_source = _normalize_trusted_history_source(
-                structured.group("trusted_source")
-            )
     else:
-        # Retain best-effort identity rendering for older rows, but never infer
-        # trust from an unstructured legacy string.
+        # Retain best-effort identity rendering for older rows.
         id_match = _LEGACY_ID_RE.search(meta)
         if id_match:
             sender_id = clean_text(id_match.group(1), max_len=32)
@@ -166,8 +161,6 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
         "sender_id": sender_id,
         "sender_name": sender_name,
         "sender_username": sender_username,
-        "trusted_source": trusted_source,
-        "is_owner": is_owner,
     }
 
 
@@ -184,22 +177,33 @@ def build_history_message_record(
     sender_id_raw = msg.get("sender_id")
     if sender_id_raw in (None, "", "None"):
         sender_id_raw = msg.get("user_id")
-    sender_id = clean_text(str(sender_id_raw or legacy["sender_id"]), max_len=32)
+    # 系统写入的身份（来自 Telegram 身份 / 归档元数据 / message_vectors 行），
+    # 成员改不了。正文前缀是**成员可控**的，只能当展示兜底（F-002）。
+    system_sender_id = clean_text(str(sender_id_raw or ""), max_len=32)
+    sender_id = system_sender_id or legacy["sender_id"]
     sender_username = clean_text(
         str(msg.get("sender_username", "") or legacy["sender_username"]),
         max_len=64,
     )
-    trusted_source = _normalize_trusted_history_source(
-        msg.get("trusted_source", "") or legacy["trusted_source"]
-    )
-    # Owner is authoritative only from the system-set flag / system-prepended
-    # tag, never from the user-controlled body. Non-owner lines carry no owner
-    # marker at all so the model can positively bind the owner to the immutable
-    # sender_id instead of guessing from spoofable display names.
-    is_owner = ""
-    raw_owner = msg.get("is_owner", "")
-    if _is_truthy_metadata(raw_owner) or legacy["is_owner"] == "yes":
-        is_owner = "yes"
+    # 身份与信任**只认系统写入的结构化字段**：正文里的
+    # ``[id: … is_owner: yes is_tg_admin: yes trusted_source: tg_admin …]`` 前缀过去
+    # 会产生 is_owner / trusted_source，任何人都能在送进模型的历史里冒充 owner 与
+    # 可信管理员（F-002）。任何"和 sender_id 比对"的校验都挡不住伪造者写自己的真实
+    # id，所以正文一律不参与信任判定；解析不出结构化字段的旧行按 member 处理。
+    raw_trusted = msg.get("trusted_source")
+    if raw_trusted in (None, ""):
+        raw_trusted = msg.get("sender_is_tg_admin")
+    if isinstance(raw_trusted, str):
+        trusted_source = _normalize_trusted_history_source(raw_trusted)
+    else:
+        trusted_source = "tg_admin" if _is_truthy_metadata(raw_trusted) else ""
+    raw_owner = msg.get("is_owner")
+    if raw_owner in (None, ""):
+        raw_owner = msg.get("sender_is_owner")
+    # Owner is authoritative only from the system-set flag. Non-owner lines carry no
+    # owner marker at all so the model can positively bind the owner to the immutable
+    # sender_id instead of guessing from spoofable display names or body text.
+    is_owner = "yes" if _is_truthy_metadata(raw_owner) else ""
     if is_owner == "yes":
         sender_role = "owner"
     elif trusted_source:

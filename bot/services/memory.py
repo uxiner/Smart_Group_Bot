@@ -160,6 +160,49 @@ def _json_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+#: message_vectors.extra_metadata 里承载"系统写入身份"的键。
+_IDENTITY_METADATA_OWNER_KEY = "sender_is_owner"
+_IDENTITY_METADATA_TG_ADMIN_KEY = "sender_is_tg_admin"
+
+
+def _history_identity_metadata(
+    *,
+    sender_is_owner: bool | None = None,
+    sender_is_tg_admin: bool | None = None,
+) -> dict[str, Any]:
+    """把系统判定的身份（owner / TG 管理员）打包成可持久化的结构化字段。
+
+    只接受系统算出来的布尔值：None 表示"这次没判定"，不会写入任何键（fail-closed，
+    重建历史时按 member 处理）。正文里的 ``[id: … is_owner: yes …]`` 前缀**不参与**
+    这个快照（F-002）。
+    """
+
+    metadata: dict[str, Any] = {}
+    if sender_is_owner is not None:
+        metadata[_IDENTITY_METADATA_OWNER_KEY] = bool(sender_is_owner)
+    if sender_is_tg_admin is not None:
+        metadata[_IDENTITY_METADATA_TG_ADMIN_KEY] = bool(sender_is_tg_admin)
+        metadata["trusted_source"] = "tg_admin" if sender_is_tg_admin else "none"
+    return metadata
+
+
+def _history_identity_flags(metadata: Any) -> dict[str, str]:
+    """把持久化的身份快照翻译成 build_history_message_record 认的结构化字段。"""
+
+    payload = _json_dict(metadata)
+    if not payload:
+        return {}
+    flags: dict[str, str] = {}
+    if bool(payload.get(_IDENTITY_METADATA_OWNER_KEY)):
+        flags["is_owner"] = "yes"
+    trusted = str(payload.get("trusted_source", "") or "").strip().lower()
+    if not trusted and bool(payload.get(_IDENTITY_METADATA_TG_ADMIN_KEY)):
+        trusted = "tg_admin"
+    if trusted in {"yes", "tg_admin", "group_admin", "telegram_admin"}:
+        flags["trusted_source"] = trusted
+    return flags
+
+
 def _json_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else []
 
@@ -289,6 +332,7 @@ class _PendingMemoryWrite:
     include_active: bool = True
     archive_record: dict[str, Any] | None = None
     completions: tuple[UpdateCompletionReceipt, ...] = ()
+    identity_metadata: dict[str, Any] | None = None
 
     def values(self) -> dict[str, Any]:
         return {
@@ -304,6 +348,7 @@ class _PendingMemoryWrite:
             "message_type": self.message_type,
             "content": self.content,
             "created_at": self.created_at,
+            "extra_metadata": _json_dict(self.identity_metadata),
         }
 
 
@@ -1099,6 +1144,7 @@ class MemoryService:
                             MessageVector.sender_name,
                             MessageVector.message_type,
                             MessageVector.message_id,
+                            MessageVector.extra_metadata,
                         )
                         .where(
                             MessageVector.group_id == normalized_group_id,
@@ -1123,6 +1169,7 @@ class MemoryService:
                 sender_name,
                 message_type,
                 message_id,
+                extra_metadata,
             ) in reversed(retained_rows):
                 text = str(content or "").strip()
                 if not text:
@@ -1136,6 +1183,8 @@ class MemoryService:
                         sender_name=str(sender_name or ""),
                         message_type=str(message_type or "text"),
                         message_id=str(message_id or ""),
+                        # 身份快照从结构化字段（DB 行）恢复，不从正文前缀推断（F-002）。
+                        identity_metadata=_json_dict(extra_metadata),
                     )
                 )
             self._replace_working_history(normalized_group_id, history)
@@ -1573,8 +1622,9 @@ class MemoryService:
         sender_name: str,
         message_type: str,
         message_id: str = "",
+        identity_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        item = {
             "role": (role or "user")[:16],
             "content": content,
             "created_at": self._stringify_created_at(created_at),
@@ -1584,6 +1634,12 @@ class MemoryService:
             # Scoped DB key; lets compaction delete exactly the snapshotted rows.
             "message_id": str(message_id or ""),
         }
+        # 系统写入的身份快照（is_owner / trusted_source）：历史重建只认它，绝不从
+        # 正文前缀推断（F-002）。
+        item.update(_history_identity_flags(identity_metadata))
+        if identity_metadata:
+            item["extra_metadata"] = dict(identity_metadata)
+        return item
 
     def _working(self, group_id: int) -> list[dict[str, Any]]:
         buf = self._history.get(group_id)
@@ -2635,6 +2691,8 @@ class MemoryService:
         completions: Iterable[UpdateCompletionReceipt] | None = None,
         persist_archive: bool = True,
         archive_metadata: dict[str, Any] | None = None,
+        sender_is_owner: bool | None = None,
+        sender_is_tg_admin: bool | None = None,
     ) -> None:
         text = (content or "").strip()
         if not text:
@@ -2658,6 +2716,11 @@ class MemoryService:
         )
         normalized_message_type = (message_type or "text")[:64]
         normalized_sender_id = user_id if user_id not in (0, None) else None
+        # 只有系统判定的身份才进快照：正文前缀（成员可控）永远不参与（F-002）。
+        identity_metadata = _history_identity_metadata(
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+        )
         history_item = self._history_item(
             role=normalized_role,
             content=text,
@@ -2666,6 +2729,7 @@ class MemoryService:
             sender_name=normalized_sender_name,
             message_type=normalized_message_type,
             message_id=scoped_id,
+            identity_metadata=identity_metadata,
         )
         archive_record: dict[str, Any] | None = None
         if persist_archive:
@@ -2706,6 +2770,7 @@ class MemoryService:
                 include_active=True,
                 archive_record=archive_record,
                 completions=owned_completions,
+                identity_metadata=identity_metadata,
             )
             try:
                 self._pending_write_queue.put_nowait(pending)
@@ -2730,6 +2795,7 @@ class MemoryService:
             scoped_message_id=scoped_id,
             created_at=normalized_created_at,
             archive_record=archive_record,
+            extra_metadata=identity_metadata,
         )
         if inserted:
             self._append_working_history(group_id, history_item)
@@ -2889,6 +2955,7 @@ class MemoryService:
         scoped_message_id: str,
         created_at: datetime,
         archive_record: dict[str, Any] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> bool:
         scoped_id = scoped_message_id
         normalized_role = (role or "user")[:16]
@@ -2912,6 +2979,7 @@ class MemoryService:
                         message_type=normalized_message_type,
                         content=content,
                         created_at=created_at,
+                        extra_metadata=_json_dict(extra_metadata),
                     )
                     session.add(row)
                     flush = getattr(session, "flush", None)
@@ -3049,6 +3117,7 @@ class MemoryService:
                 scoped_message_id=item.message_id,
                 created_at=item.created_at,
                 archive_record=item.archive_record,
+                extra_metadata=item.identity_metadata,
             )
             if inserted:
                 return True

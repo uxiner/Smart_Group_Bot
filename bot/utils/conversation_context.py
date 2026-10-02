@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot.utils.security import clean_multiline_text, format_history_message_line
+from bot.utils.security import (
+    clean_multiline_text,
+    format_history_message_line,
+    wrap_untrusted_multiline,
+)
 
 
 def format_recent_group_context(
@@ -72,3 +76,36 @@ def build_current_turn_focus_context(
         lines.append(normalized_user_text)
 
     return "\n".join(lines)
+
+
+def build_current_turn_focus_message(
+    user_text: str,
+    *,
+    merged_count: int = 1,
+    merged_context: str = "",
+    max_len: int = 2600,
+) -> dict[str, str] | None:
+    """当前轮焦点消息：成员文本一律走 user 角色 + 不可信围栏（F-003）。
+
+    :func:`build_current_turn_focus_context` 里带着成员自己写的正文（以及抖动
+    窗口内合并的上下文），那是**成员可控文本**。把它塞进 ``role="system"`` 就等于
+    给了它系统级优先级（还能伪造 ``[CURRENT_TURN_FOCUS]``/``[SAFETY_RULES]``/
+    ``[ACTIVE_PERSONA]`` 之类的块标记），所以这里统一返回一条 user 角色的消息并
+    套上 ``wrap_untrusted_multiline``——与同一份提示词里 user_message 的写法一致。
+    """
+
+    focus_context = build_current_turn_focus_context(
+        user_text,
+        merged_count=merged_count,
+        merged_context=merged_context,
+    )
+    if not focus_context:
+        return None
+    return {
+        "role": "user",
+        "content": wrap_untrusted_multiline(
+            "current_turn_focus",
+            focus_context,
+            max_len=max_len,
+        ),
+    }

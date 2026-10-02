@@ -3,9 +3,11 @@
 关键不变量：同一天同一个人只加一次分（唯一索引兜底，不靠"先查再插"），
 跨天/断签的连续天数正确，群之间、成员之间互不影响。
 """
+import asyncio
 import os
 import tempfile
 import unittest
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -402,6 +404,87 @@ class PointSpendingTests(_DbTestCase):
             self.assertEqual(
                 await available_points(session, group_id=-100, user_id=7), 4
             )
+
+    async def test_concurrent_spends_with_different_refs_cannot_overdraw(self) -> None:
+        """F-005：两个**不同 ref** 的并发消费不能各自读到同一份旧余额。
+
+        旧写法是"先 SELECT 余额、再 INSERT 消费行"两步：两个请求都会看到 3 分、
+        双双通过检查，最终余额变成 -1（相当于 0 分买到东西）。余额条件现在写在
+        ``INSERT ... SELECT ... WHERE`` 里，与扣分是同一条写语句。
+
+        ``AsyncExitStack`` 里的预热读是为了让两条连接都先建好：否则第二条连接的
+        建连耗时会把两个请求错开，反而掩盖了旧实现的竞态。
+        """
+
+        await self._earn(2)  # +1 +2 = 3 分
+
+        async def _spend(session, ref: str) -> bool:
+            charged = await spend_points(
+                session,
+                group_id=-100,
+                user_id=7,
+                points=CHALLENGE_SKIP_COST,
+                reason=SPEND_REASON_CHALLENGE,
+                ref=ref,
+            )
+            await session.commit()
+            return charged
+
+        async with AsyncExitStack() as stack:
+            sessions = [
+                await stack.enter_async_context(self.session_factory())
+                for _ in range(2)
+            ]
+            for session in sessions:
+                await available_points(session, group_id=-100, user_id=7)
+            results = await asyncio.gather(
+                _spend(sessions[0], "challenge:race-a"),
+                _spend(sessions[1], "challenge:race-b"),
+            )
+
+        self.assertEqual(sum(results), 1, "只有一笔消费能成功")
+        async with self.session_factory() as session:
+            self.assertEqual(
+                await available_points(session, group_id=-100, user_id=7),
+                1,
+                "余额必须等于 3 - 2，绝不允许被扣成负数",
+            )
+
+    async def test_concurrent_spends_never_go_negative_when_balance_is_tight(self) -> None:
+        """F-005：余额刚好够一笔时，并发三笔也只允许成功一笔。"""
+
+        await self._earn(1)  # 只有 1 分
+
+        async def _spend(session, ref: str) -> bool:
+            charged = await spend_points(
+                session,
+                group_id=-100,
+                user_id=7,
+                points=1,
+                reason=SPEND_REASON_CHALLENGE,
+                ref=ref,
+            )
+            await session.commit()
+            return charged
+
+        async with AsyncExitStack() as stack:
+            sessions = [
+                await stack.enter_async_context(self.session_factory())
+                for _ in range(3)
+            ]
+            for session in sessions:
+                await available_points(session, group_id=-100, user_id=7)
+            results = await asyncio.gather(
+                _spend(sessions[0], "challenge:tight-a"),
+                _spend(sessions[1], "challenge:tight-b"),
+                _spend(sessions[2], "challenge:tight-c"),
+            )
+
+        self.assertEqual(sum(results), 1)
+        async with self.session_factory() as session:
+            balance = await available_points(session, group_id=-100, user_id=7)
+        self.assertGreaterEqual(balance, 0, "可用积分永远不能是负数")
+        self.assertEqual(balance, 0)
 
 
 class ModerationCardPointsTests(_DbTestCase):

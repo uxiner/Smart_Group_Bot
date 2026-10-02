@@ -617,9 +617,18 @@ class ModerationService:
                     hit = regex_hits(pattern, bucket_candidates(bucket))
                 if hit:
                     return bucket
-            # 组合文本命中但单段都不命中（例如 ``^``/``$`` 跨段锚定）：按范围
-            # 里最先包含的额外段归类，至少不会把引用命中误标成 own。
-            return SCAN_SCOPE_QUOTE if include_quote else SCAN_SCOPE_VISION
+            # 组合文本命中、但单段都定位不到（``\s``/``^``/``$`` 跨段锚定，或正则
+            # 预算耗尽）：**不能猜**。旧实现按"范围里最先包含的额外段"归到 quote，
+            # 等于把"可能是自己写的"变成"来自引文"，而引用连坐（F-001）正是拿
+            # match_source 当"违规来自引文"的证据，确定性规则还是 1.0 置信度、
+            # 不需要达到高置信阈值——把违禁词拆成自己正文 + 引文两半就能把责任
+            # 推给被引用者。归属未知一律 fail-closed 算 own（由发送者本人承担）。
+            log.info(
+                "审核归属无法判定，按 own 处理: include_quote=%s include_vision=%s",
+                include_quote,
+                include_vision,
+            )
+            return MATCH_SOURCE_OWN
 
         for rule in rules:
             rule_type = (rule.rule_type or "keyword").strip().lower()

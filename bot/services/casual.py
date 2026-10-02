@@ -11,7 +11,7 @@ from bot.services.reply_output import (
     REPLY_RICH_FORMATTING,
 )
 from bot.utils.conversation_context import (
-    build_current_turn_focus_context,
+    build_current_turn_focus_message,
     format_recent_group_context,
 )
 from bot.utils.bot_identity import build_bot_identity_context
@@ -159,13 +159,16 @@ class CasualService:
                 "content": self._build_interaction_mode_context(is_mentioned, is_reply_to_bot),
             }
         )
-        focus_context = build_current_turn_focus_context(
+        # 当前轮焦点里带着成员可控正文：只能走 user 角色 + 不可信围栏，绝不进
+        # system（F-003：system 优先级更高，还能伪造 [CURRENT_TURN_FOCUS]/
+        # [SAFETY_RULES] 之类块标记）。
+        focus_message = build_current_turn_focus_message(
             normalized_text,
             merged_count=merged_count,
             merged_context=merged_context,
         )
-        if focus_context:
-            messages.append({"role": "system", "content": focus_context})
+        if focus_message is not None:
+            messages.append(focus_message)
         # Active-persona follows the default persona so its style wins on
         # recency; its own wording keeps structural safety/identity rules intact.
         if style_profile_context.strip():

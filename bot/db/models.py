@@ -873,6 +873,10 @@ class MessageVector(Base):
     sender_name: Mapped[str] = mapped_column(String(255), default="")
     message_type: Mapped[str] = mapped_column(String(64), default="text")
     content: Mapped[str] = mapped_column(Text, default="")
+    # 系统按 Telegram 身份写入的身份快照（is_owner / trusted_source）。历史重建时
+    # 身份与信任只认这里，绝不从正文的 ``[id: … is_owner: …]`` 前缀推断（F-002）：
+    # 正文是成员可控的，写自己的真实 id 也能骗过任何一致性校验。
+    extra_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

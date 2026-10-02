@@ -298,6 +298,47 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(verdict.violated)
 
+    async def test_cross_segment_match_does_not_fall_back_to_quote(self) -> None:
+        r"""F-004：组合文本命中、单段都定位不到时，绝不能归到 quote。
+
+        `\s` 跨段锚定（own 与 quote 之间是 "\n"）会让两段单独匹配都落空，旧兜底
+        直接 `return SCAN_SCOPE_QUOTE`——"可能是自己写的"就变成了"来自引文"，
+        而引用连坐拿它当证据（确定性规则置信度 1.0，连高置信阈值都不用够）。
+        修复后归属未知一律 fail-closed 算 own。
+        """
+
+        text = "上半段\n[reply_to:text] 下半段"
+        rule = _rule(pattern=r"上半段\s+下半段", scan_scope="message+quote")
+
+        verdict = await _service().evaluate(_session([rule]), -100, text)
+
+        self.assertTrue(verdict.violated, "组合文本命中，规则本身照旧要生效")
+        self.assertEqual(verdict.match_source, "own")
+        self.assertNotEqual(verdict.match_source, "quote")
+
+    async def test_cross_segment_match_with_vision_does_not_fall_back_to_vision(self) -> None:
+        """F-004：图片描述段的跨段命中同样不能凭空归到 vision。"""
+
+        text = "上半段\n[image-vision] 下半段"
+        rule = _rule(pattern=r"上半段\s+下半段", scan_scope="message+vision")
+
+        verdict = await _service().evaluate(_session([rule]), -100, text)
+
+        self.assertTrue(verdict.violated)
+        self.assertEqual(verdict.match_source, "own")
+        self.assertNotEqual(verdict.match_source, "vision")
+
+    async def test_single_segment_quote_hit_still_reports_quote(self) -> None:
+        """F-004 的另一边：引文段自己就能定位到命中时，归属仍然如实报 quote。"""
+
+        text = "v\n[reply_to:text] 探花招募族 加V 私聊"
+        rule = _rule(pattern="招募", scan_scope="message+quote")
+
+        verdict = await _service().evaluate(_session([rule]), -100, text)
+
+        self.assertTrue(verdict.violated)
+        self.assertEqual(verdict.match_source, "quote")
+
 
 _LEGACY_RULES_DDL = (
     "CREATE TABLE moderation_rules ("

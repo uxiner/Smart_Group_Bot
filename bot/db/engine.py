@@ -1756,6 +1756,14 @@ async def init_db(
                 "message_type",
                 "message_type VARCHAR(64) NOT NULL DEFAULT 'text'",
             )
+            # 系统写入的身份快照（is_owner / trusted_source）。历史重建的身份与信任
+            # 只认这一列，绝不从正文前缀推断（F-002）。旧行留空 = 按 member 处理。
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "extra_metadata",
+                "extra_metadata JSON NOT NULL DEFAULT '{}'",
+            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_created "
