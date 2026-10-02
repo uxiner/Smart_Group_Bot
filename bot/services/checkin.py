@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -349,27 +349,50 @@ async def spend_points(
 
     ``ref`` 是幂等键（例如 ``challenge:12``）：唯一索引保证同一次质询只会被扣一次，
     连点两次按钮不会重复扣分。
+
+    余额检查与扣分是**同一条写语句**：可用积分是"签到 + 奖励 − 消费"的 SUM 派生值，
+    先 SELECT 余额再 INSERT 消费行的话，两个不同 ``ref`` 的并发消费会各自读到同一份
+    旧余额、双双通过检查，把余额扣成负数。这里把条件直接写进
+    ``INSERT ... SELECT ... WHERE 余额 >= cost``，整条语句在 SQLite 的写锁之下执行，
+    ``rowcount`` 为 0 就代表余额不足（或并发下已被别人扣掉）。
     """
 
     cost = max(0, int(points))
     if cost <= 0:
         return False
-    if await available_points(session, group_id=group_id, user_id=user_id) < cost:
-        return False
+    gid, uid = int(group_id), int(user_id)
+    earned = (
+        select(func.coalesce(func.sum(MemberCheckin.points), 0))
+        .where(MemberCheckin.group_id == gid, MemberCheckin.user_id == uid)
+        .scalar_subquery()
+    )
+    awarded = (
+        select(func.coalesce(func.sum(MemberPointAward.points), 0))
+        .where(MemberPointAward.group_id == gid, MemberPointAward.user_id == uid)
+        .scalar_subquery()
+    )
+    spent = (
+        select(func.coalesce(func.sum(MemberPointSpend.points), 0))
+        .where(MemberPointSpend.group_id == gid, MemberPointSpend.user_id == uid)
+        .scalar_subquery()
+    )
+    statement = insert(MemberPointSpend).from_select(
+        ("group_id", "user_id", "points", "reason", "ref"),
+        select(
+            literal(gid),
+            literal(uid),
+            literal(cost),
+            literal(str(reason or "")[:64]),
+            literal(None if ref is None else str(ref)[:64]),
+        ).where(earned + awarded - spent >= cost),
+    )
     try:
         async with session.begin_nested():
-            session.add(
-                MemberPointSpend(
-                    group_id=int(group_id),
-                    user_id=int(user_id),
-                    points=cost,
-                    reason=str(reason or "")[:64],
-                    ref=ref,
-                )
-            )
+            result = await session.execute(statement)
     except IntegrityError:
+        # 同一个 ref 已经扣过：唯一索引挡住第二次。
         return False
-    return True
+    return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
 # ---------------------------------------------------------------------------

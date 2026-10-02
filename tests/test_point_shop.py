@@ -12,9 +12,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -788,6 +790,99 @@ class PinPurchaseTests(_DbTestCase):
 
         self.assertTrue(resolve_pin_target(channel).is_channel)
         self.assertTrue(resolve_pin_target(bot_message).is_bot)
+
+
+# ---------------------------------------------------------------------------
+# 并发购买（F-006）：同一个人同一类权益不能重复扣费，已付费的续期不能被吞掉
+# ---------------------------------------------------------------------------
+
+
+class PurchaseConcurrencyTests(_DbTestCase):
+    """并发 /top 与 /tag：读旧状态和落库必须是一个整体。
+
+    两个并发请求会各自看到"还没有生效中的权益"、"续费从旧到期时间往后加"，
+    于是重复扣分（/top 双击各扣 20 分只得到一个置顶），或者第二笔买到的时间被
+    第一笔的写入覆盖掉（/tag 续费时长被吞）。这里用两个已经预热好的连接同时发起
+    购买，真实复现竞态。
+    """
+
+    async def _warm_sessions(self, stack: AsyncExitStack, count: int) -> list:
+        """开 count 条连接并各跑一次读，避免建连耗时把两个请求错开而掩盖竞态。"""
+
+        sessions = []
+        for _ in range(count):
+            session = await stack.enter_async_context(self.session_factory())
+            await available_points(session, group_id=GROUP_ID, user_id=7)
+            sessions.append(session)
+        return sessions
+
+    async def test_concurrent_pins_charge_only_once(self) -> None:
+        """F-006：同一个人的两次并发 /top 只允许扣一次 20 分。"""
+
+        await self._grant_points(7, 100)
+        bot = FakeBot()
+
+        async with AsyncExitStack() as stack:
+            sessions = await self._warm_sessions(stack, 2)
+            replies = await asyncio.gather(
+                *[
+                    buy_pin(
+                        session,
+                        bot=bot,
+                        group_id=GROUP_ID,
+                        user_id=7,
+                        target=PinTarget(message_id=555, sender_id=7),
+                        # 两个请求相差 1 毫秒：ref 不同，唯一索引挡不住重复扣分
+                        now=_ms(index),
+                    )
+                    for index, session in enumerate(sessions)
+                ]
+            )
+
+        self.assertEqual(
+            sorted(reply.status for reply in replies),
+            ["already_pinned", "ok"],
+            "并发双击 /top 只能有一个买到，另一个必须被「已有置顶」挡住",
+        )
+        self.assertEqual(await self._balance(7), 80, "只允许扣 20 分")
+        self.assertEqual(len(await self._spends(7)), 1)
+        self.assertEqual(len(bot.pin_calls), 1, "只允许真正置顶一次")
+        entitlements = await self._entitlements()
+        self.assertEqual(len(entitlements), 1)
+        self.assertEqual(entitlements[0].kind, KIND_PIN)
+
+    async def test_concurrent_tag_renewals_keep_both_paid_durations(self) -> None:
+        """F-006：两笔并发 /tag 都付了钱，续期时长必须累加而不是互相覆盖。"""
+
+        await self._grant_points(7, 200)
+        bot = FakeBot()
+
+        async with AsyncExitStack() as stack:
+            sessions = await self._warm_sessions(stack, 2)
+            replies = await asyncio.gather(
+                *[
+                    buy_member_tag(
+                        session,
+                        bot=bot,
+                        group_id=GROUP_ID,
+                        user_id=7,
+                        raw_text="摸鱼冠军",
+                        now=_ms(index),
+                    )
+                    for index, session in enumerate(sessions)
+                ]
+            )
+
+        self.assertEqual([reply.status for reply in replies], ["ok", "ok"])
+        self.assertEqual(await self._balance(7), 140, "两笔各扣 30 分")
+        self.assertEqual(len(await self._spends(7)), 2)
+        entitlements = await self._entitlements()
+        self.assertEqual(len(entitlements), 1, "续费只能有一行")
+        self.assertEqual(
+            entitlements[0].expires_at,
+            _day() + timedelta(days=14),
+            "第二笔买到的 7 天不能被第一笔的到期时间覆盖掉",
+        )
 
 
 # ---------------------------------------------------------------------------

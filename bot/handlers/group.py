@@ -7202,6 +7202,42 @@ async def _delete_quoted_message(message: Message, target: _QuotedAuthorTarget) 
     return False
 
 
+async def _quoted_author_violation_confirmed(
+    *,
+    moderation: ModerationService,
+    session: AsyncSession,
+    group_id: int,
+    quoted_text: str,
+) -> bool:
+    """被引用者被动之前，确认**引文正文本身**单独也构成高置信违规。
+
+    追溯原告只能看"这条处置是引用带来的"这一个事实，而
+    ``verdict.match_source`` 证明不了它：语义规则的 match_source 恒为
+    "semantic"（见 ModerationService.evaluate），独立决定性规则在跨段命中或
+    正则预算耗尽时的归属也不可靠（见 F-004 的 fail-closed）。把引文正文单独
+    送审一次，只有它自己高置信命中才动手——"转发者自己写广告、顺手引用一个
+    无辜群友"的连坐就再也发生不了。
+
+    任何异常都按"没确认"处理：宁可漏处置被引用者，也不能凭不完整的信息禁言/
+    质询一个第三方。
+    """
+
+    if not str(quoted_text or "").strip():
+        return False
+    try:
+        confirmation = await moderation.evaluate(session, group_id, quoted_text)
+    except Exception:
+        log.warning(
+            "[%s] quoted-author confirmation failed; no punishment",
+            group_id,
+            exc_info=True,
+        )
+        return False
+    return bool(
+        confirmation.violated and moderation.is_high_confidence(confirmation)
+    )
+
+
 async def _punish_quoted_author(
     *,
     moderation: ModerationService,
@@ -8456,6 +8492,7 @@ async def on_group_message(
                     if quoted_target is not None and str(
                         getattr(verdict, "match_source", "") or ""
                     ) != "own":
+                        quoted_text = _moderation_reply_text(message) or ""
                         age = _quoted_author_age_seconds(quoted_target.sent_at)
                         max_age = _quoted_author_max_age_seconds(settings)
                         if age is not None and age > max_age:
@@ -8467,6 +8504,23 @@ async def on_group_message(
                                 age,
                                 max_age,
                             )
+                        # 归属确认：match_source != "own" 只说明"这次命中里含引文段"，
+                        # 语义规则更是恒为 "semantic"（F-001）。把引文正文单独再
+                        # 审一次，只有它自己也高置信命中才追溯原作者——否则
+                        # "转发者自己写广告 + 引用无辜群友"会连坐第三方。
+                        elif not await _quoted_author_violation_confirmed(
+                            moderation=mod,
+                            session=session,
+                            group_id=group_id,
+                            quoted_text=quoted_text,
+                        ):
+                            log.info(
+                                "[%s]【流程】审核 | 引文正文单独复核未命中，不处理原作者 | "
+                                "quoted_user=%s match_source=%s",
+                                group_id,
+                                quoted_target.user_id,
+                                getattr(verdict, "match_source", ""),
+                            )
                         else:
                             await _punish_quoted_author(
                                 moderation=mod,
@@ -8477,7 +8531,7 @@ async def on_group_message(
                                 target=quoted_target,
                                 rule=rule,
                                 verdict=verdict,
-                                quoted_text=_moderation_reply_text(message) or "",
+                                quoted_text=quoted_text,
                                 bot_username=getattr(bot_me, "username", "") or "",
                                 session_factory=session_factory,
                             )
@@ -9043,6 +9097,10 @@ async def on_group_message(
                     created_at=message.date,
                     defer_persistence=True,
                     persist_archive=False,
+                    # 身份只以系统结构化字段的形式入库：history 重建时绝不解析正文
+                    # 前缀（F-002）。
+                    sender_is_owner=sender_is_owner,
+                    sender_is_tg_admin=sender_is_tg_admin,
                 )
             log.info(
                 "[%s]【结束】呼叫管理员 | user=%s | 总耗时=%dms",
@@ -9110,6 +9168,10 @@ async def on_group_message(
             created_at=message.date,
             defer_persistence=True,
             persist_archive=False,
+            # 身份只以系统结构化字段的形式入库：history 重建时绝不解析正文前缀
+            # （F-002）。
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
         )
         _schedule_memory_compaction(memory, group_id)
     elif not should_index_user_memory:

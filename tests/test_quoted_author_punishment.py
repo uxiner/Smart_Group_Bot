@@ -162,6 +162,7 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
         verdict: ModerationVerdict | None = None,
         challenge_ready: bool = True,
         begin: AsyncMock | None = None,
+        evaluate: AsyncMock | None = None,
         **extra_patches,
     ) -> SimpleNamespace:
         message = message if message is not None else _message()
@@ -184,7 +185,7 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
         )
         moderation = SimpleNamespace(
             is_user_exempt=AsyncMock(return_value=False),
-            evaluate=AsyncMock(return_value=verdict),
+            evaluate=evaluate if evaluate is not None else AsyncMock(return_value=verdict),
             is_high_confidence=(
                 lambda candidate: bool(candidate.conclusive)
                 and float(candidate.confidence) >= 0.9
@@ -541,6 +542,125 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(QUOTED_AUTHOR_ID, store.users())
         quoted.delete.assert_not_awaited()
+
+    # ------------------------------------------------------------------
+    # F-001：追溯原作者之前必须确认**引文正文本身**单独也违规
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _test_rule() -> SimpleNamespace:
+        return SimpleNamespace(id=6, action="ban", rule_type="regex", pattern="招募|加V")
+
+    def _violated(self, *, match_source: str = "semantic") -> ModerationVerdict:
+        return ModerationVerdict(
+            violated=True,
+            reason="命中群规",
+            rule=self._test_rule(),
+            conclusive=True,
+            confidence=0.97,
+            match_source=match_source,
+        )
+
+    @staticmethod
+    def _innocent() -> ModerationVerdict:
+        return ModerationVerdict(
+            violated=False,
+            reason="",
+            rule=None,
+            conclusive=True,
+            confidence=0.0,
+        )
+
+    @staticmethod
+    def _reply_context_patch(reply_text: str) -> dict:
+        return {
+            "reply_context": patch(
+                "bot.handlers.group._build_reply_context_for_llm",
+                new=AsyncMock(return_value=reply_text),
+            )
+        }
+
+    async def test_own_text_violation_does_not_punish_the_quoted_member(self) -> None:
+        """F-001：自己正文违规 + 引用无辜群友 → 只有自己挨罚。
+
+        旧守卫 ``match_source != "own"`` 对语义规则恒为真（evaluate 里语义判定
+        的 match_source 恒为 "semantic"），被引用的第三方照样被删消息、记违规、
+        禁言质询。这里把"引文正文单独送审"的答案设成不违规，第三方必须毫发无伤。
+        """
+
+        store = _ViolationStore()
+        quoted = _quoted_message(text="今晚排位赛有人一起吗")
+        begin = AsyncMock(return_value=True)
+        outer = self._violated(match_source="semantic")
+
+        async def _evaluate(session, group_id, text, **kwargs):
+            # 带引用标记的"转发者送审文本"命中；引文正文（无标记）单独送审不命中
+            return outer if "[reply_to" in str(text) else self._innocent()
+
+        await self._run(
+            store,
+            message=_message(text="招募 加V", quoted=quoted),
+            verdict=outer,
+            evaluate=AsyncMock(side_effect=_evaluate),
+            begin=begin,
+            **self._reply_context_patch("[reply_to:text] 今晚排位赛有人一起吗"),
+        )
+
+        self.assertNotIn(
+            QUOTED_AUTHOR_ID,
+            store.users(),
+            "引文正文无辜时，被引用者不能被连坐",
+        )
+        quoted.delete.assert_not_awaited()
+        self.assertIn(FORWARDER_ID, store.users(), "转发者自己照旧要被处置")
+
+    async def test_quote_violation_is_still_punished_with_semantic_verdict(self) -> None:
+        """F-001 的另一边：引文正文单独复核确实违规时，追溯路径必须照常生效。"""
+
+        store = _ViolationStore()
+        quoted = _quoted_message(text="探花招募族 加V 私聊")
+        begin = AsyncMock(return_value=True)
+        outer = self._violated(match_source="semantic")
+        evaluate = AsyncMock(return_value=outer)
+
+        await self._run(
+            store,
+            message=_message(text="v", quoted=quoted),
+            verdict=outer,
+            evaluate=evaluate,
+            begin=begin,
+            **self._reply_context_patch("[reply_to:text] 探花招募族 加V 私聊"),
+        )
+
+        self.assertIn(QUOTED_AUTHOR_ID, store.users())
+        quoted.delete.assert_awaited_once()
+        self.assertEqual(evaluate.await_count, 2, "引文正文必须被单独复核一次")
+
+    async def test_confirmation_failure_is_fail_closed(self) -> None:
+        """复核本身失败（模型/DB 异常）时按"没确认"处理，绝不凭猜测禁言第三方。"""
+
+        store = _ViolationStore()
+        quoted = _quoted_message(text="今晚排位赛有人一起吗")
+        begin = AsyncMock(return_value=True)
+        outer = self._violated(match_source="semantic")
+
+        async def _evaluate(session, group_id, text, **kwargs):
+            if "[reply_to" in str(text):
+                return outer
+            raise RuntimeError("moderation backend down")
+
+        await self._run(
+            store,
+            message=_message(text="招募 加V", quoted=quoted),
+            verdict=outer,
+            evaluate=AsyncMock(side_effect=_evaluate),
+            begin=begin,
+            **self._reply_context_patch("[reply_to:text] 今晚排位赛有人一起吗"),
+        )
+
+        self.assertNotIn(QUOTED_AUTHOR_ID, store.users())
+        quoted.delete.assert_not_awaited()
+        self.assertIn(FORWARDER_ID, store.users())
 
 
 if __name__ == "__main__":  # pragma: no cover

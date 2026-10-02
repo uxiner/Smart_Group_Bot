@@ -391,6 +391,25 @@ async def refund_points(
 # 生效中的权益（member_entitlements）
 # ---------------------------------------------------------------------------
 
+#: 同一个人同一类权益的购买锁。余额检查、续费时长计算和随后的事务性写入必须
+#: 是一个整体：两个并发的 /top 都会在各自事务里看到"还没有生效中的置顶"。
+_PURCHASE_LOCKS: dict[tuple[int, int, str], asyncio.Lock] = {}
+
+
+def _purchase_lock(*, group_id: int, user_id: int, kind: str) -> asyncio.Lock:
+    """取"这个人这类权益"的购买锁（进程内；同一个群同一个人串行购买）。
+
+    锁覆盖"读旧状态 → 扣分 → 落权益 → 提交"全程，所以第二个请求进来时看到的是
+    第一个请求已经提交的结果（生效中的置顶 / 已经延长的到期时间）。
+    """
+
+    key = (int(group_id), int(user_id), str(kind))
+    lock = _PURCHASE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PURCHASE_LOCKS[key] = lock
+    return lock
+
 
 async def active_entitlement(
     session: AsyncSession,
@@ -452,7 +471,13 @@ async def upsert_entitlement(
     expires_at: datetime,
     now: datetime,
 ) -> None:
-    """写入/更新一条生效中的权益（一人一项，靠唯一索引兜底）。"""
+    """写入/更新一条生效中的权益（一人一项，靠唯一索引兜底）。
+
+    到期时间**只允许往前走**：续费时长已经付过钱，任何以竞态前状态算出来的旧值
+    都不许把它覆盖回去（F-006）。调用方的"读旧到期时间 → 算新到期时间 → 写回"
+    由 :func:`_purchase_lock` 串行化；这里再做一层单调保护，保证晚到的写入不会
+    缩短已付费的有效期。
+    """
 
     row = await active_entitlement(
         session, group_id=group_id, user_id=user_id, kind=kind
@@ -473,7 +498,7 @@ async def upsert_entitlement(
                 )
             return
         except IntegrityError:
-            # 并发插入（同一瞬间两个人各买一次是不可能的，但代码要能扛）
+            # 并发插入（同一个人的两次购买本该被 _purchase_lock 串行化，这里兜底）
             row = await active_entitlement(
                 session, group_id=group_id, user_id=user_id, kind=kind
             )
@@ -481,7 +506,9 @@ async def upsert_entitlement(
         return
     row.payload = str(payload)[:255]
     row.ref = str(ref)[:64]
-    row.expires_at = expires_at
+    current = row.expires_at
+    if current is None or expires_at >= current:
+        row.expires_at = expires_at
 
 
 async def next_expiry(
@@ -642,7 +669,33 @@ async def buy_member_tag(
     raw_text: object,
     now: datetime | None = None,
 ) -> ShopReply:
-    """``/tag <文字>``：校验 → 扣分 → 设头衔 → 记到期时间；Telegram 失败就退款。"""
+    """``/tag <文字>``：校验 → 扣分 → 设头衔 → 记到期时间；Telegram 失败就退款。
+
+    同一个人同一时刻只允许一笔头衔购买在跑：否则两个并发请求都会基于"竞态前的
+    到期时间"算续费时长，第二笔买到的天数会被第一笔的写入覆盖掉（F-006）。
+    """
+
+    async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_TAG):
+        return await _buy_member_tag_locked(
+            session,
+            bot=bot,
+            group_id=group_id,
+            user_id=user_id,
+            raw_text=raw_text,
+            now=now,
+        )
+
+
+async def _buy_member_tag_locked(
+    session: AsyncSession,
+    *,
+    bot: object,
+    group_id: int,
+    user_id: int,
+    raw_text: object,
+    now: datetime | None = None,
+) -> ShopReply:
+    """``buy_member_tag`` 的加锁实现体（调用方必须已经持有购买锁）。"""
 
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
     gid, uid = int(group_id), int(user_id)
@@ -858,7 +911,33 @@ async def buy_pin(
     target: PinTarget,
     now: datetime | None = None,
 ) -> ShopReply:
-    """``/top``：把自己的一条消息置顶 6 小时；失败退款。"""
+    """``/top``：把自己的一条消息置顶 6 小时；失败退款。
+
+    同一个人同一时刻只允许一笔置顶购买在跑：否则两个并发请求（双击 /top）都会
+    看到"还没有生效中的置顶"，各自扣一次 20 分，只得到一个置顶（F-006）。
+    """
+
+    async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_PIN):
+        return await _buy_pin_locked(
+            session,
+            bot=bot,
+            group_id=group_id,
+            user_id=user_id,
+            target=target,
+            now=now,
+        )
+
+
+async def _buy_pin_locked(
+    session: AsyncSession,
+    *,
+    bot: object,
+    group_id: int,
+    user_id: int,
+    target: PinTarget,
+    now: datetime | None = None,
+) -> ShopReply:
+    """``buy_pin`` 的加锁实现体（调用方必须已经持有购买锁）。"""
 
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
     gid, uid = int(group_id), int(user_id)
