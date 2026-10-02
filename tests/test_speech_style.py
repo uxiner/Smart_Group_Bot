@@ -298,6 +298,23 @@ class StylePromptInjectionTests(unittest.TestCase):
 
         self.assertIn("[BOT_PROJECT_INFO]", context)
 
+    def test_project_info_anchor_publishes_the_deployment_fork(self) -> None:
+        from bot.services.casual import CasualService
+        from bot.utils.project_info import PROJECT_REPOSITORY_URL, PROJECT_UPSTREAM_URL
+
+        service = CasualService(self._llm_stub(), settings=None)
+        payload = service.build_prompt_payload("你是谁开发的")
+        anchor = next(
+            m["content"]
+            for m in payload["messages"]
+            if m["content"].startswith("[BOT_PROJECT_INFO]\n")
+        )
+
+        self.assertIn(PROJECT_REPOSITORY_URL, anchor)
+        self.assertIn(f"upstream_repository: {PROJECT_UPSTREAM_URL}", anchor)
+        self.assertNotIn("@Sanite_Ava", anchor)
+        self.assertNotIn("@Sanite_Ava_Private_ChatBot", anchor)
+
     def test_casual_prompt_without_profile_has_no_block(self) -> None:
         from bot.services.casual import CasualService
 
