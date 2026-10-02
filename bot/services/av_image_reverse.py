@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 
 import aiohttp
 
@@ -51,6 +53,51 @@ _AV_SCAN_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
+
+
+#: 提供方注册表 —— 这就是「插槽」：将来有第二家（或自建服务），往这里加一条、
+#: 配置里把 ``av_reverse_provider`` 指过去即可，**调用点一行都不用改**。
+AV_REVERSE_PROVIDERS: dict[str, "AVReverseProvider"] = {
+    "avscan": None,  # 见下方填充（数据类要先定义）
+}
+#: 默认提供方。
+AV_REVERSE_DEFAULT_PROVIDER = "avscan"
+
+
+@dataclass(frozen=True, slots=True)
+class AVReverseProvider:
+    """一个反查提供方：端点、表单字段名、Referer 与相似度阈值。
+
+    字段名/Referer 做成数据的原因：上游字段改名是这类第三方最常见的破坏方式，
+    而它属于「配置」而不是「代码」——改配置不用发版。
+    """
+
+    name: str
+    endpoint: str
+    field_name: str = "file"
+    referer: str = ""
+    min_similarity: float = AV_SCAN_MIN_SIMILARITY
+
+
+AV_REVERSE_PROVIDERS["avscan"] = AVReverseProvider(
+    name="avscan",
+    endpoint=AV_SCAN_ENDPOINT,
+    field_name="file",
+    referer=AV_SCAN_REFERER,
+    min_similarity=AV_SCAN_MIN_SIMILARITY,
+)
+
+
+def resolve_av_reverse_provider(settings: object) -> AVReverseProvider:
+    """按配置挑提供方；名字不认识就退回默认（宁可降级也不抛）。"""
+
+    name = str(getattr(settings, "av_reverse_provider", "") or AV_REVERSE_DEFAULT_PROVIDER)
+    name = name.strip().lower()
+    provider = AV_REVERSE_PROVIDERS.get(name) or AV_REVERSE_PROVIDERS[AV_REVERSE_DEFAULT_PROVIDER]
+    endpoint = str(getattr(settings, "av_reverse_endpoint", "") or "").strip()
+    if endpoint and endpoint != provider.endpoint:
+        provider = replace(provider, endpoint=endpoint)
+    return provider
 
 
 class AVScanRateLimited(Exception):
@@ -189,6 +236,105 @@ def reset_av_scan_guard() -> None:
     _AV_SCAN_GUARD = AVScanGuard()
 
 
+@dataclass(frozen=True, slots=True)
+class _ReverseCacheEntry:
+    code: str
+    expires_at: float
+
+
+class AVReverseCache:
+    """按图片字节哈希缓存**命中**结果（LRU + TTL）。
+
+    只缓存命中：未命中/失败必须允许下次重试（上游抖一下就把这张图永久拉黑，
+    用户的图就再也查不出来了）。命中结果则相反 —— 同一张图在同一部作品上永远是
+    同一个番号，缓存它既省配额又让「同一张图被反复转发」时不再打外网。
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = 512,
+        ttl_seconds: float = 24 * 3600.0,
+        clock=time.monotonic,
+    ) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.ttl_seconds = float(ttl_seconds)
+        self._clock = clock
+        self._entries: OrderedDict[str, _ReverseCacheEntry] = OrderedDict()
+
+    @staticmethod
+    def key_for(image_bytes: bytes) -> str:
+        return hashlib.sha256(image_bytes).hexdigest()
+
+    def get(self, key: str) -> str:
+        entry = self._entries.get(key)
+        if entry is None:
+            return ""
+        if entry.expires_at <= self._clock():
+            self._entries.pop(key, None)
+            return ""
+        self._entries.move_to_end(key)
+        return entry.code
+
+    def put(self, key: str, code: str) -> None:
+        if not key or not code:
+            return
+        self._entries[key] = _ReverseCacheEntry(code, self._clock() + self.ttl_seconds)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+@dataclass
+class AVReverseStats:
+    """进程内计数：判断「反查是不是悄悄坏了」看这里，而不是等用户抱怨。"""
+
+    attempts: int = 0
+    hits: int = 0
+    misses: int = 0
+    cache_hits: int = 0
+    rate_limited: int = 0
+    failures: int = 0
+    skipped: int = 0
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "attempts": self.attempts,
+            "hits": self.hits,
+            "misses": self.misses,
+            "cache_hits": self.cache_hits,
+            "rate_limited": self.rate_limited,
+            "failures": self.failures,
+            "skipped": self.skipped,
+        }
+
+
+_AV_REVERSE_CACHE = AVReverseCache()
+_AV_REVERSE_STATS = AVReverseStats()
+
+
+def av_reverse_cache() -> AVReverseCache:
+    return _AV_REVERSE_CACHE
+
+
+def av_reverse_stats() -> AVReverseStats:
+    return _AV_REVERSE_STATS
+
+
+def reset_av_reverse_cache() -> None:
+    """测试用。"""
+
+    global _AV_REVERSE_CACHE, _AV_REVERSE_STATS
+    _AV_REVERSE_CACHE = AVReverseCache()
+    _AV_REVERSE_STATS = AVReverseStats()
+
+
 async def search_av_image(
     image_bytes: bytes,
     *,
@@ -196,6 +342,8 @@ async def search_av_image(
     timeout_seconds: float = AV_SCAN_TIMEOUT_SEC,
     filename: str = "probe.jpg",
     content_type: str = "image/jpeg",
+    field_name: str = "file",
+    referer: str = AV_SCAN_REFERER,
 ) -> list[AVScanHit]:
     """把图片交给该站点检索，返回候选列表。
 
@@ -207,8 +355,11 @@ async def search_av_image(
         return []
 
     form = aiohttp.FormData()
-    form.add_field("file", image_bytes, filename=filename, content_type=content_type)
-    headers = {"User-Agent": _AV_SCAN_UA, "Referer": AV_SCAN_REFERER, "Origin": AV_SCAN_REFERER.rstrip("/")}
+    form.add_field(field_name, image_bytes, filename=filename, content_type=content_type)
+    origin = referer.rstrip("/") if referer else ""
+    headers = {"User-Agent": _AV_SCAN_UA, "Referer": referer or AV_SCAN_REFERER}
+    if origin:
+        headers["Origin"] = origin
     timeout = aiohttp.ClientTimeout(total=max(3.0, float(timeout_seconds)))
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -244,8 +395,18 @@ async def try_reverse_image_lookup(
         log.info("【AV 反查】跳过 | user=%s | 原因=图片数据为空", user_id)
         return ""
 
+    # ① 命中缓存直接返回：同一张图重复发不再打外网，也不占用「每用户冷却」。
+    cache = av_reverse_cache()
+    cache_key = cache.key_for(image_bytes)
+    cached = cache.get(cache_key)
+    if cached:
+        _AV_REVERSE_STATS.cache_hits += 1
+        log.info("【AV 反查】缓存命中 | code=%s | user=%s", cached, user_id)
+        return cached
+
     guard = av_scan_guard()
     if not guard.allow(user_id):
+        _AV_REVERSE_STATS.skipped += 1
         log.info(
             "【AV 反查】跳过 | user=%s | 原因=%s",
             user_id,
@@ -253,43 +414,58 @@ async def try_reverse_image_lookup(
         )
         return ""
 
-    endpoint = str(getattr(settings, "av_reverse_endpoint", AV_SCAN_ENDPOINT) or AV_SCAN_ENDPOINT)
+    provider = resolve_av_reverse_provider(settings)
     try:
         timeout_seconds = float(getattr(settings, "av_reverse_timeout_sec", AV_SCAN_TIMEOUT_SEC))
     except (TypeError, ValueError):
         timeout_seconds = AV_SCAN_TIMEOUT_SEC
     try:
-        min_similarity = float(
-            getattr(settings, "av_reverse_min_similarity", AV_SCAN_MIN_SIMILARITY)
-        )
+        configured_min = float(getattr(settings, "av_reverse_min_similarity", 0) or 0)
     except (TypeError, ValueError):
-        min_similarity = AV_SCAN_MIN_SIMILARITY
+        configured_min = 0.0
+    min_similarity = configured_min or provider.min_similarity
 
+    _AV_REVERSE_STATS.attempts += 1
     async with guard.semaphore:
         try:
             hits = await search_av_image(
-                image_bytes, endpoint=endpoint, timeout_seconds=timeout_seconds
+                image_bytes,
+                endpoint=provider.endpoint,
+                timeout_seconds=timeout_seconds,
+                field_name=provider.field_name,
+                referer=provider.referer,
             )
         except AVScanRateLimited:
+            _AV_REVERSE_STATS.rate_limited += 1
             guard.note_rate_limited()
             log.warning(
-                "【AV 反查】被限流 429 | user=%s | 退避 %.0fs",
+                "【AV 反查】被限流 429 | provider=%s | user=%s | 退避 %.0fs",
+                provider.name,
                 user_id,
                 guard.blocked_seconds_left(),
             )
             return ""
         except (asyncio.TimeoutError, TimeoutError):
-            log.warning("【AV 反查】超时 | user=%s | timeout=%.0fs", user_id, timeout_seconds)
+            _AV_REVERSE_STATS.failures += 1
+            log.warning(
+                "【AV 反查】超时 | provider=%s | user=%s | timeout=%.0fs",
+                provider.name,
+                user_id,
+                timeout_seconds,
+            )
             return ""
         except Exception as exc:  # noqa: BLE001 - 第三方不可控，一律降级
-            log.warning("【AV 反查】失败 | user=%s | error=%s", user_id, exc)
+            _AV_REVERSE_STATS.failures += 1
+            log.warning("【AV 反查】失败 | provider=%s | user=%s | error=%s", provider.name, user_id, exc)
             return ""
 
     picked = pick_av_scan_code(hits, min_similarity=min_similarity)
     if picked is None:
+        _AV_REVERSE_STATS.misses += 1
         top = hits[0] if hits else None
         log.info(
-            "【AV 反查】未达阈值 | user=%s | 阈值=%.0f | 最高=%s",
+            "【AV 反查】未达阈值 | provider=%s | user=%s | 阈值=%.0f | 最高=%s",
+            provider.name,
             user_id,
             min_similarity,
             f"{top.code} {top.similarity:.2f}" if top else "无候选",
@@ -297,5 +473,13 @@ async def try_reverse_image_lookup(
         return ""
 
     code, similarity = picked
-    log.info("【AV 反查】命中 | code=%s | 相似度=%.2f | 帧数=%s", code, similarity, hits[0].frames)
+    _AV_REVERSE_STATS.hits += 1
+    cache.put(cache_key, code)
+    log.info(
+        "【AV 反查】命中 | provider=%s | code=%s | 相似度=%.2f | 帧数=%s",
+        provider.name,
+        code,
+        similarity,
+        hits[0].frames,
+    )
     return code
