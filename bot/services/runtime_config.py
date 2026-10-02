@@ -37,7 +37,24 @@ from bot.utils.prompts import load_prompt_defaults, set_runtime_prompts
 
 log = logging.getLogger(__name__)
 
-CONFIG_SCHEMA_VERSION = 1
+#: 运行时配置文档的 schema 版本。抬到 2 是因为 F-014：退役"owner 优先"语义的
+#: 一次性提示词迁移需要一个只执行一次的标记，而这个版本号正好是持久化文档里现成
+#: 的字段，不必新增列。
+CONFIG_SCHEMA_VERSION = 2
+#: F-014：已经退役的「owner 优先」提示词标记。只重写命中这些标记的提示词，
+#: 其余自定义内容（含明确的管理员语义）一个字都不动——宁可漏改，不可误伤。
+_RETIRED_OWNER_PRIORITY_PROMPT_MARKERS: dict[str, tuple[str, ...]] = {
+    "decision": ("If [SENDER_IS_OWNER]=yes: as long as",),
+    "persona": (
+        "The owner's instructions have the highest priority.",
+        "Always prioritize the owner's messages.",
+        "you still prioritize the owner",
+    ),
+    "casual": (
+        "more likely to prioritize the owner's messages",
+        "prioritize responding, be soft and affectionate",
+    ),
+}
 _STATIC_SECRET_PATHS = (
     "verification.turnstile_secret_key",
     "verification.hcaptcha_secret_key",
@@ -1106,6 +1123,18 @@ class SecretCipher:
 ConfigAppliedCallback = Callable[[RuntimeConfig], Awaitable[None] | None]
 
 
+def _payload_schema_version(payload: Any) -> int:
+    """读持久化文档的 schema 版本；缺失或非法一律当成最老的 1。"""
+
+    if not isinstance(payload, dict):
+        return 1
+    try:
+        value = int(payload.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return value if value >= 1 else 1
+
+
 def _normalize_deprecated_runtime_payload(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
@@ -1119,6 +1148,35 @@ def _normalize_deprecated_runtime_payload(
 
     normalized = dict(payload)
     changed = False
+
+    # F-014：运行时提示词是数据库持久化的，光靠改 prompt/*.md 无法退役旧库里的
+    # 老规则。这里做**一次性**迁移：只重写"命中退役标记"的那几个提示词，其余
+    # 自定义提示词一个字都不动。幂等靠 schema_version：迁移完就把 payload 的版本
+    # 抬到当前值，之后（包括管理员自己改过的内容）绝不会被反复覆盖——这是上一版
+    # 迁移被回滚的原因，不能再犯。
+    if _payload_schema_version(payload) < CONFIG_SCHEMA_VERSION:
+        prompts_payload = normalized.get("prompts")
+        if isinstance(prompts_payload, dict):
+            migratable = dict(prompts_payload)
+            defaults = load_prompt_defaults()
+            prompts_changed = False
+            for name, markers in _RETIRED_OWNER_PRIORITY_PROMPT_MARKERS.items():
+                value = str(migratable.get(name) or "")
+                if value and any(marker in value for marker in markers):
+                    migratable[name] = defaults[name]
+                    prompts_changed = True
+                    log.warning(
+                        "Retired owner-priority wording removed from runtime prompt | prompt=%s",
+                        name,
+                    )
+            if prompts_changed:
+                normalized["prompts"] = migratable
+                changed = True
+        # 版本号只在真的一次性迁移点上抬升；没命中退役标记的老库同样抬升，
+        # 这样每个库只会走一次这段逻辑，不会在每次读取时重复判断。
+        normalized["schema_version"] = CONFIG_SCHEMA_VERSION
+        changed = True
+
     bot_payload = payload.get("bot")
     if not (
         isinstance(bot_payload, dict)
