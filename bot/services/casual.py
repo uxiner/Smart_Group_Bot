@@ -41,10 +41,13 @@ class CasualService:
         *,
         settings: Any | None = None,
         skill_names: Iterable[str] | None = None,
+        content_boundaries_context: str = "",
     ) -> None:
         self.llm = llm
         self.settings = settings
         self.skill_names = [str(name).strip() for name in (skill_names or []) if str(name).strip()]
+        # 按群注入的成人文字放开指令块：只有该群开了 /av 才非空（空串=一个字都不注入）。
+        self.content_boundaries_context = str(content_boundaries_context or "")
 
     _build_sender_context = staticmethod(build_current_sender_context)
 
@@ -167,6 +170,11 @@ class CasualService:
         # recency; its own wording keeps structural safety/identity rules intact.
         if style_profile_context.strip():
             messages.append({"role": "system", "content": style_profile_context.strip()})
+        # 群内开了 /av 才注入的成人文字放开指令块（未开启时为空串，一个字都不加）。
+        if self.content_boundaries_context.strip():
+            messages.append(
+                {"role": "system", "content": self.content_boundaries_context.strip()}
+            )
         # This source-controlled block is deliberately the final system message.
         # Current-turn focus and a cloned persona may contain stale or conflicting
         # project claims, but neither may replace the canonical public facts.

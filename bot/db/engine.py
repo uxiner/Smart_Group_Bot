@@ -362,6 +362,32 @@ async def _sqlite_migrate_violation_rule_fk(conn) -> bool:
         "verdict_reason",
         "verdict_reason VARCHAR(120) DEFAULT ''",
     )
+    # 人工复核（证据投递频道 + 人工放行/收回）：新增列必须与老库平滑升级，
+    # 照 confidence/verdict_reason 同一套 _sqlite_ensure_column 机制加，幂等可重复。
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "log_channel_message_id",
+        "log_channel_message_id BIGINT",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "review_state",
+        "review_state VARCHAR(16) DEFAULT 'none'",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "reviewed_by",
+        "reviewed_by BIGINT",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "reviewed_at",
+        "reviewed_at DATETIME",
+    )
     columns = await _sqlite_table_columns(conn, "violations")
 
     orphan_result = await conn.execute(

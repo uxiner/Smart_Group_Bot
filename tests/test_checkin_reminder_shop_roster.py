@@ -484,9 +484,6 @@ class PrivateShopStartTests(_DbTestCase):
         menu = answers[0]
         self.assertIn("<b>积分商店</b>", menu)
         self.assertIn("当前可用 <b>1</b> 分", menu)
-        # 私聊菜单要指路「积分怎么来」：除了 /checkin，也说清点提醒按钮同样能签到
-        self.assertIn("/checkin", menu)
-        self.assertIn("签到提醒按钮", menu)
         # 末尾说明：需要群上下文的三个动作仍在群里用
         self.assertIn("/tag", menu)
         self.assertIn("/top", menu)

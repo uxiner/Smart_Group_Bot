@@ -444,6 +444,17 @@ class Violation(Base):
     # Notification delivery is a separate retryable stage.  The unavoidable
     # send-success/process-crash-before-commit window is intentionally tiny.
     notice_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 证据卡投递到审核日志频道时，那条频道消息的 message_id（人工放行/收回
+    # 时用来就地编辑状态行）。频道未启用或投递失败时为 NULL（历史行也是 NULL）。
+    log_channel_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # 人工复核状态：none / released / revoked。server_default 不能省：老代码
+    # 会用裸 SQL 插入 violations，NOT NULL 而没有库级默认值会直接撞约束。
+    review_state: Mapped[str] = mapped_column(
+        String(16), default="none", server_default="none"
+    )
+    # 执行人工放行/收回的操作者与时间。历史行为 NULL。
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     group: Mapped[Group] = relationship(back_populates="violations")
