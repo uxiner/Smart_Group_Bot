@@ -3045,18 +3045,75 @@ class RaidGuardService:
                                 # reconciler reports success without touching
                                 # Telegram once the record is gone, so clear the
                                 # restriction directly to avoid stranding them muted.
-                                await restore_member_permissions(
-                                    self.bot,
-                                    group_id,
-                                    suspect.user_id,
-                                )
+                                #
+                                # F-013: this is a Telegram call and it used to be
+                                # the only unguarded one in this batch.  An exception
+                                # here escaped ``asyncio.gather`` and aborted the whole
+                                # chunk (leaving the member muted with no challenge
+                                # and no compensation), so it is now handled exactly
+                                # like the twin branch above: log, then fall back to
+                                # the reconciler, and only then report failure.
+                                try:
+                                    await restore_member_permissions(
+                                        self.bot,
+                                        group_id,
+                                        suspect.user_id,
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception:
+                                    log.exception(
+                                        "[%s] raid mute restore after lost lease failed | user=%s",
+                                        group_id,
+                                        suspect.user_id,
+                                    )
+                                    try:
+                                        await reconcile_stale_verification_restriction(
+                                            self.bot,
+                                            self.session_factory,
+                                            group_id,
+                                            suspect.user_id,
+                                        )
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception:
+                                        log.exception(
+                                            "[%s] raid mute reconcile fallback failed | user=%s",
+                                            group_id,
+                                            suspect.user_id,
+                                        )
                                 return suspect, prepared, False, True
                             await lease_session.commit()
                         return suspect, renewed, True, True
 
+                # F-013: ``return_exceptions=True`` keeps one failed member from
+                # aborting the whole batch through ``asyncio.gather``.  Exceptions
+                # are converted below into "did not mute" results plus an explicit
+                # compensation request, so the failing member is restored instead
+                # of being left muted with neither challenge nor compensation.
                 mute_results = await asyncio.gather(
-                    *(mute_one(suspect, prepared) for suspect, prepared in prepared_pairs)
+                    *(mute_one(suspect, prepared) for suspect, prepared in prepared_pairs),
+                    return_exceptions=True,
                 )
+                normalized_results: list[
+                    tuple[RaidSuspect, PreparedVerification, bool, bool]
+                ] = []
+                failed_verification_ids: set[int] = set()
+                for (suspect, prepared), result in zip(prepared_pairs, mute_results):
+                    if isinstance(result, BaseException):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        log.error(
+                            "[%s] raid mute task crashed; compensating | user=%s",
+                            group_id,
+                            suspect.user_id,
+                            exc_info=result,
+                        )
+                        failed_verification_ids.add(int(prepared.verification_id))
+                        normalized_results.append((suspect, prepared, False, False))
+                        continue
+                    normalized_results.append(result)
+                mute_results = normalized_results
                 muted_pairs = [
                     (suspect, prepared)
                     for suspect, prepared, muted, _authorized in mute_results
@@ -3066,7 +3123,12 @@ class RaidGuardService:
                     muted_ids = {
                         prepared.verification_id for _suspect, prepared in muted_pairs
                     }
-                    await abort_many(prepared_pairs, restore_ids=muted_ids)
+                    # Restore every member we know was muted, plus the ones whose
+                    # mute task crashed (their mute state is unknown).
+                    await abort_many(
+                        prepared_pairs,
+                        restore_ids=muted_ids | failed_verification_ids,
+                    )
                     return enforced
             except asyncio.CancelledError:
                 # The mute may have reached Telegram before cancellation was
