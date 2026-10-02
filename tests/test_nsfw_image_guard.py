@@ -1577,20 +1577,19 @@ class BotNeverPostsNsfwMediaTests(unittest.IsolatedAsyncioTestCase):
 
 class NsfwGuardConfigTests(unittest.TestCase):
     def test_runtime_config_exposes_the_switch_and_defaults_to_off(self) -> None:
-        """F-024：这是对用户可见的执法开关，默认必须 opt-in（关闭）。
+        """NSFW 图片守卫必须默认开启（用户底线：任何群都不许发 NSFW 图片/视频）。
 
-        旧断言是 ``assertTrue``（默认全开）。改这一条的理由：默认全开等于
-        "升级即静默改变线上执法行为"，与"行为变化必须可见/由运维显式选择"
-        冲突；现在默认关闭，生效状态由 bot/config.py
-        ``log_enforcement_switch_state`` 在启动日志里列出。
+        交付方一度把这里改成 ``assertFalse``（opt-in 关闭）。已改回：底线不能靠
+        "默认值"关掉，运维想关必须显式去关；"行为可见"由 bot/config.py 的
+        ``log_enforcement_switch_state`` 在启动日志里逐条列出，两者不冲突。
         """
 
         from bot.services.runtime_config import ModerationSettingsConfig, RuntimeConfig
 
-        self.assertFalse(ModerationSettingsConfig().nsfw_image_guard_enabled)
+        self.assertTrue(ModerationSettingsConfig().nsfw_image_guard_enabled)
 
         config = RuntimeConfig()
-        self.assertFalse(config.moderation.nsfw_image_guard_enabled)
+        self.assertTrue(config.moderation.nsfw_image_guard_enabled)
 
         settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
         config.moderation.nsfw_image_guard_enabled = True
@@ -1599,8 +1598,8 @@ class NsfwGuardConfigTests(unittest.TestCase):
 
     def test_settings_default_keeps_the_guard_off_until_opted_in(self) -> None:
         settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
-        # F-024：默认关闭（旧断言为 assertTrue），理由同上一条。
-        self.assertFalse(settings.moderation.nsfw_image_guard_enabled)
+        # 默认开启：底线开关不允许默认关闭（理由见上一条用例）。
+        self.assertTrue(settings.moderation.nsfw_image_guard_enabled)
         self.assertIsInstance(settings.bot.main_model, ModelConfig)
 
 
