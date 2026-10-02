@@ -336,6 +336,8 @@ class Settings(BaseSettings):
     #: 相似度阈值：实测真命中 ≥90%、假候选 ≤77%。
     av_reverse_min_similarity: float = 85.0
     av_reverse_timeout_sec: float = 12.0
+    #: 反查提供方名（见 services/av_image_reverse.py 的注册表；将来加第二家改这里即可）。
+    av_reverse_provider: str = "avscan"
 
     # 入群验证：新成员先全员禁言，私聊 bot 获取链接并通过
     # 通过所选真人验证服务后恢复权限。

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 from bot.config import ModelConfig, Settings
 from bot.handlers import commands
 from bot.services import av_image_reverse as rev
+from bot.tools import av_reverse_canary as canary
 from bot.services.av_image_reverse import (
     AV_SCAN_BACKOFF_SEC,
     AV_SCAN_COOLDOWN_SEC,
@@ -221,6 +222,7 @@ class SearchTests(unittest.TestCase):
 class LookupTests(unittest.TestCase):
     def setUp(self) -> None:
         rev.reset_av_scan_guard()
+        rev.reset_av_reverse_cache()
 
     def test_disabled_never_calls_upstream(self) -> None:
         settings = _settings(av_reverse_enabled=False)
@@ -269,7 +271,10 @@ class LookupTests(unittest.TestCase):
         calls, patcher = _patch_session(200, json.dumps(payload).encode())
         with patcher:
             first = asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID))
-            second = asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID))
+            # 故意换一张图：否则第二次会走缓存命中（那是另一条路径，测不到冷却）
+            second = asyncio.run(
+                try_reverse_image_lookup(_data_uri(b"another-image"), settings, user_id=USER_ID)
+            )
         self.assertEqual(first, "SONE-666")
         self.assertEqual(second, "")
         self.assertEqual(len(calls), 1)
@@ -358,6 +363,136 @@ class WiringTests(unittest.TestCase):
         sent_uri = reverse.await_args.args[0]
         self.assertTrue(sent_uri.startswith("data:image/"))
         self.assertEqual(reverse.await_args.kwargs.get("user_id"), USER_ID)
+
+
+class CacheTests(unittest.TestCase):
+    """命中缓存：同一张图第二次不再打外网；未命中不缓存（必须允许重试）。"""
+
+    def setUp(self) -> None:
+        self.now = 1000.0
+        self.cache = rev.AVReverseCache(clock=lambda: self.now, max_entries=2, ttl_seconds=60.0)
+
+    def test_key_depends_on_bytes(self) -> None:
+        self.assertEqual(
+            self.cache.key_for(b"same"), rev.AVReverseCache.key_for(b"same")
+        )
+        self.assertNotEqual(self.cache.key_for(b"a"), self.cache.key_for(b"b"))
+
+    def test_roundtrip_and_len(self) -> None:
+        key = self.cache.key_for(b"img")
+        self.assertEqual(self.cache.get(key), "")
+        self.cache.put(key, "SONE-666")
+        self.assertEqual(self.cache.get(key), "SONE-666")
+        self.assertEqual(len(self.cache), 1)
+
+    def test_expiry(self) -> None:
+        key = self.cache.key_for(b"img")
+        self.cache.put(key, "SONE-666")
+        self.now += 61.0
+        self.assertEqual(self.cache.get(key), "")
+        self.assertEqual(len(self.cache), 0, "过期项应当被顺手清掉")
+
+    def test_lru_evicts_oldest(self) -> None:
+        for i in range(3):
+            self.cache.put(self.cache.key_for(f"img{i}".encode()), f"CODE-{i}")
+        self.assertEqual(len(self.cache), 2)
+        self.assertEqual(self.cache.get(self.cache.key_for(b"img0")), "")
+        self.assertEqual(self.cache.get(self.cache.key_for(b"img2")), "CODE-2")
+
+    def test_empty_values_are_ignored(self) -> None:
+        self.cache.put("", "X-1")
+        self.cache.put(self.cache.key_for(b"img"), "")
+        self.assertEqual(len(self.cache), 0)
+
+
+class ProviderTests(unittest.TestCase):
+    """提供方插槽：默认 avscan；名字不认识要退回默认；端点可被配置覆盖。"""
+
+    def test_default_provider(self) -> None:
+        provider = rev.resolve_av_reverse_provider(_settings())
+        self.assertEqual(provider.name, "avscan")
+        self.assertEqual(provider.endpoint, rev.AV_SCAN_ENDPOINT)
+        self.assertEqual(provider.field_name, "file")
+
+    def test_unknown_name_falls_back_to_default(self) -> None:
+        provider = rev.resolve_av_reverse_provider(_settings(av_reverse_provider="nope"))
+        self.assertEqual(provider.name, "avscan")
+
+    def test_endpoint_override(self) -> None:
+        provider = rev.resolve_av_reverse_provider(
+            _settings(av_reverse_endpoint="https://mirror.example/search")
+        )
+        self.assertEqual(provider.endpoint, "https://mirror.example/search")
+        self.assertEqual(provider.field_name, "file", "覆盖端点不该丢掉字段名")
+
+
+class CacheIntegrationTests(unittest.TestCase):
+    """走生产入口验证缓存与统计。"""
+
+    def setUp(self) -> None:
+        rev.reset_av_scan_guard()
+        rev.reset_av_reverse_cache()
+
+    def test_same_image_second_time_does_not_call_upstream(self) -> None:
+        settings = _settings()
+        payload = {"results": [{"video_code": "SONE-666", "best_similarity": 95.0, "frames": [{}]}]}
+        calls, patcher = _patch_session(200, json.dumps(payload).encode())
+        with patcher:
+            first = asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID))
+            second = asyncio.run(
+                try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID + 1)
+            )
+        self.assertEqual(first, "SONE-666")
+        self.assertEqual(second, "SONE-666", "缓存命中要直接给答案")
+        self.assertEqual(len(calls), 1, "同一张图不该打第二次外网")
+
+    def test_miss_is_not_cached_so_it_can_retry(self) -> None:
+        settings = _settings()
+        payload = {"results": [{"video_code": "REAL-195", "best_similarity": 69.42, "frames": []}]}
+        calls, patcher = _patch_session(200, json.dumps(payload).encode())
+        with patcher:
+            for user in (USER_ID, USER_ID + 1):
+                self.assertEqual(
+                    asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=user)), ""
+                )
+        self.assertEqual(len(calls), 2, "未命中不能缓存，否则上游抖动一次这张图就废了")
+
+    def test_stats_snapshot_counts_each_outcome(self) -> None:
+        settings = _settings()
+        payload = {"results": [{"video_code": "SONE-666", "best_similarity": 95.0, "frames": []}]}
+        _calls, patcher = _patch_session(200, json.dumps(payload).encode())
+        with patcher:
+            asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID))
+            asyncio.run(try_reverse_image_lookup(_data_uri(), settings, user_id=USER_ID + 1))
+        stats = rev.av_reverse_stats().snapshot()
+        self.assertEqual(stats["attempts"], 1)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["cache_hits"], 1)
+        self.assertEqual(stats["failures"], 0)
+
+
+class CanaryTests(unittest.TestCase):
+    """金丝雀的判定：认对且相似度够才算健康。"""
+
+    def test_healthy(self) -> None:
+        ok, detail = canary.evaluate_canary([AVScanHit("REAL-195", 98.91, 4)])
+        self.assertTrue(ok)
+        self.assertIn("REAL-195", detail)
+
+    def test_wrong_code(self) -> None:
+        ok, detail = canary.evaluate_canary([AVScanHit("SSIS-698", 99.0, 1)])
+        self.assertFalse(ok)
+        self.assertIn("认错", detail)
+
+    def test_degraded_similarity(self) -> None:
+        ok, detail = canary.evaluate_canary([AVScanHit("REAL-195", 84.0, 1)])
+        self.assertFalse(ok)
+        self.assertIn("退化", detail)
+
+    def test_empty_hits(self) -> None:
+        ok, detail = canary.evaluate_canary([])
+        self.assertFalse(ok)
+        self.assertIn("没返回", detail)
 
 
 if __name__ == "__main__":
