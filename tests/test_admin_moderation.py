@@ -609,7 +609,8 @@ class AdminModerationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         challenge = AsyncMock(return_value=True)
-        vision_text = "NSFW_YES 画面中出现裸露的性器官。"
+        # F-040：判定改成末尾独立一行的结构化字段。
+        vision_text = '画面中出现裸露的性器官。\nNSFW_DECISION: {"nsfw":"yes"}'
 
         patches = [
             patch(
