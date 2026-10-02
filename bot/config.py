@@ -330,6 +330,12 @@ class Settings(BaseSettings):
     av_madouqu_base_url: str = "https://madouqu.com"
     av_dmm_base_url: str = "https://www.dmm.co.jp"
     av_fc2_base_url: str = "https://adult.contents.fc2.com"
+    #: 识图之前先用第三方**帧级**索引反查番号（画面截图命中率高；封面仍旧走读文字）。
+    av_reverse_enabled: bool = True
+    av_reverse_endpoint: str = "https://avscan.cc/search"
+    #: 相似度阈值：实测真命中 ≥90%、假候选 ≤77%。
+    av_reverse_min_similarity: float = 85.0
+    av_reverse_timeout_sec: float = 12.0
 
     # 入群验证：新成员先全员禁言，私聊 bot 获取链接并通过
     # 通过所选真人验证服务后恢复权限。

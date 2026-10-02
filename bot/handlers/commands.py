@@ -68,6 +68,7 @@ from bot.services.av_search import (
     AVSearchService,
     is_av_code_query,
 )
+from bot.services.av_image_reverse import try_reverse_image_lookup
 from bot.services.av_image_lookup import (
     AV_NO_IMAGE_MARKER,
     AV_PHOTO_RETRY_MAX_BYTES,
@@ -2574,6 +2575,18 @@ async def _av_image_vision_with_escalation(
             "【识图】档位=%dKB 图片下载失败 → 不重试 | user=%s", primary_kb, user_id
         )
         return _AVImageVisionOutcome(primary_kb, 0, "", False, False)
+
+    # 识图之前先试一次「用图反查番号」：帧级索引对画面截图比读文字准得多，
+    # 命中就省掉两次视觉调用；未命中/被限流/出错一律静默落到下面的老路。
+    reverse_code = await try_reverse_image_lookup(data_uri, settings, user_id=user_id)
+    if reverse_code:
+        log.info(
+            "【识图】档位=%dKB 反查命中编号 | code=%s | user=%s",
+            primary_kb,
+            reverse_code,
+            user_id,
+        )
+        return _AVImageVisionOutcome(primary_kb, 0, reverse_code, False, False)
 
     log.info("【识图】档位=%dKB 首次识图 | user=%s", primary_kb, user_id)
 
