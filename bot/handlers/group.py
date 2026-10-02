@@ -4341,14 +4341,14 @@ def _is_group_av_image_message(message: Message) -> bool:
 
 
 def _nsfw_image_guard_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.nsfw_image_guard_enabled``（F-024 起默认关闭）。
+    """运行时可开关：``moderation.nsfw_image_guard_enabled``（默认开启）。
 
     审核总开关关闭时本功能同样不生效——质询本身就依赖审核与真人验证配置。
     """
     moderation = getattr(settings, "moderation", None)
     if moderation is None or not bool(getattr(moderation, "enabled", False)):
         return False
-    return bool(getattr(moderation, "nsfw_image_guard_enabled", False))
+    return bool(getattr(moderation, "nsfw_image_guard_enabled", True))
 
 
 def _nsfw_image_guard_applies(
@@ -7120,10 +7120,10 @@ _QUOTE_WARNING_MARKERS = (
 
 
 def _punish_quoted_author_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.punish_quoted_author_enabled``（F-024 起默认关闭）。"""
+    """运行时可开关：``moderation.punish_quoted_author_enabled``（默认开启）。"""
 
     moderation = getattr(settings, "moderation", None)
-    return bool(getattr(moderation, "punish_quoted_author_enabled", False))
+    return bool(getattr(moderation, "punish_quoted_author_enabled", True))
 
 
 def _quoted_author_max_age_seconds(settings: Settings) -> int:
@@ -7520,10 +7520,10 @@ class _AdminViolationEvidence:
 
 
 def _admin_moderation_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.admin_moderation_enabled``（F-024 起默认关闭）。"""
+    """运行时可开关：``moderation.admin_moderation_enabled``（默认开启）。"""
 
     moderation = getattr(settings, "moderation", None)
-    return bool(getattr(moderation, "admin_moderation_enabled", False))
+    return bool(getattr(moderation, "admin_moderation_enabled", True))
 
 
 def _admin_alert_enabled(settings: Settings) -> bool:

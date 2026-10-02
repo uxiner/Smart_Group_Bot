@@ -62,6 +62,13 @@ async def _verdict_reason_column(path: str) -> tuple:
     raise AssertionError("verdict_reason column missing")
 
 
+def _as_datetime(value: object) -> datetime:
+    """把库里读出来的时间戳文本解析成 datetime（容忍带/不带微秒）。"""
+
+    text = str(value).strip().replace(" ", "T")
+    return datetime.fromisoformat(text)
+
+
 class VerdictReasonSchemaDriftTests(unittest.IsolatedAsyncioTestCase):
     def test_orm_declares_the_column_nullable_with_a_server_default(self) -> None:
         column = Violation.__table__.c.verdict_reason
@@ -298,9 +305,11 @@ class LegacyLedgerClockMigrationTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
         # message_vectors 已经是本地时间：v1 迁移不许重跑
-        self.assertEqual(first["message_vectors"], "2026-01-01 08:30:00")
+        self.assertEqual(_as_datetime(first["message_vectors"]),
+                         datetime(2026, 1, 1, 8, 30, 0))
         # 台账存量行（UTC）被 +8 小时成本地
-        self.assertEqual(first["member_checkins"], "2026-01-01 08:30:00")
+        self.assertEqual(_as_datetime(first["member_checkins"]),
+                         datetime(2026, 1, 1, 8, 30, 0))
         # 幂等：再启动一次不变
         self.assertEqual(second, first)
         self.assertEqual(second["user_version"], _SQLITE_SCHEMA_VERSION)

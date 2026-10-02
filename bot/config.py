@@ -174,19 +174,22 @@ class ModerationConfig(BaseModel):
     # F-024：默认**关闭**（opt-in）。这是对用户可见的执法行为，必须由运维显式
     # 开启；开启状态会在启动日志里列出。关闭后不做判定（提示词里也不加 NSFW
     # 要求）也不做任何处置——即旧版本行为。
-    nsfw_image_guard_enabled: bool = False
+    # 默认开启：NSFW 图片/视频是任何群的底线，不允许因"默认值"被关掉。
+    nsfw_image_guard_enabled: bool = True
     # 广告经「引用/转发」再次传播时，被引用那条消息的原作者同样按规则处置
     # （删除其消息 + 记违规 + 既有质询/禁言流程）。
     # F-024：默认**关闭**（opt-in）。默认开启等于升级后静默扩大执法范围（最长
     # 7 天禁言），所以改为由运维显式选择；关闭后行为与旧版完全一致。
-    punish_quoted_author_enabled: bool = False
+    # 默认开启：引用/转发广告连坐原作者，是防绕过的必需项（F-001）。
+    punish_quoted_author_enabled: bool = True
     # 被引用消息超过该时长（秒）就不再追溯原作者，只记日志。默认 7 天。
     quoted_author_max_age_seconds: int = 7 * 24 * 60 * 60
     # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 + 记违规，
     # 不质询/不封禁/不禁言/不累计警告。
     # F-024：默认**关闭**（opt-in，即回到"整段跳过"的旧行为）——对管理员/群主
     # 开始执法属于可见的策略变更，应由运维显式决定。
-    admin_moderation_enabled: bool = False
+    # 默认开启：管理员命中犯规同样走审核 + 证据卡人工放行。
+    admin_moderation_enabled: bool = True
     # 管理员命中违规时，私聊最高管理员一份完整证据（best-effort，不刷屏）。默认开启。
     admin_alert_super_admin_enabled: bool = True
     # 审核命中证据投递到「审核日志」频道（取代私聊最高管理员）：群里所有被处置
