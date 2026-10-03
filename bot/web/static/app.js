@@ -945,6 +945,8 @@
             ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
             ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；按预算从新到旧装配私聊历史" })}
             ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期行由后台巡检清理" })}
+            ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；群聊回复按预算从群归档装配历史" })}
+            ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768；留给系统提示词/人设/本轮消息/召回/回复预留。历史 + 余量必须 ≤ 最大上下文 Token" })}
             ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>

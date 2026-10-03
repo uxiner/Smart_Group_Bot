@@ -49,7 +49,7 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.revision, 1)
         self.assertEqual(self.settings.bot.main_model.model, "gemini/gemini-2.0-flash")
         self.assertEqual(self.settings.bot.main_model.max_tokens, 2048)
-        self.assertEqual(self.settings.bot.max_context_tokens, 256000)
+        self.assertEqual(self.settings.bot.max_context_tokens, 278528)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
         self.assertEqual(self.settings.bot.memory_recent_messages, 500)
         self.assertEqual(self.settings.bot.memory_retention_days, 7)

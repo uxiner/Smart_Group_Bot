@@ -314,7 +314,7 @@ class BotBehaviorConfig(StrictModel):
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
     decision_context_items: int = Field(default=5, ge=0, le=20)
-    max_context_tokens: int = Field(default=256000, ge=1024, le=2_000_000)
+    max_context_tokens: int = Field(default=278528, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
     memory_recent_messages: int = Field(default=500, ge=50, le=2000)
     memory_retention_days: int = Field(default=7, ge=1, le=365)
@@ -334,6 +334,12 @@ class BotBehaviorConfig(StrictModel):
         le=2_000_000,
     )
     private_chat_history_retention_days: int = Field(default=30, ge=1, le=365)
+    # Group-chat history: assembled from the group archive by token budget instead
+    # of "most recent N messages".  ``reserve_tokens`` is the headroom kept for the
+    # fixed prompt parts; assembled history + reserve must stay within
+    # ``max_context_tokens`` (the hard gate lives in bot.services.group_context).
+    group_history_token_budget: int = Field(default=278528, ge=1024, le=2_000_000)
+    group_history_reserve_tokens: int = Field(default=32768, ge=1024, le=1_000_000)
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -973,6 +979,8 @@ class RuntimeConfig(StrictModel):
         settings.bot.private_chat_history_retention_days = (
             bot.private_chat_history_retention_days
         )
+        settings.bot.group_history_token_budget = bot.group_history_token_budget
+        settings.bot.group_history_reserve_tokens = bot.group_history_reserve_tokens
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
         settings.bot.proactive_jitter_minutes = bot.proactive_jitter_minutes
@@ -1757,6 +1765,8 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "memory_recall_max_results",
             "private_chat_history_token_budget",
             "private_chat_history_retention_days",
+            "group_history_token_budget",
+            "group_history_reserve_tokens",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -1967,6 +1977,18 @@ def build_legacy_runtime_config(
                 if "bot_private_chat_history_retention_days"
                 in getattr(settings, "model_fields_set", set())
                 else settings.bot.private_chat_history_retention_days
+            ),
+            group_history_token_budget=(
+                settings.bot_group_history_token_budget
+                if "bot_group_history_token_budget"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.group_history_token_budget
+            ),
+            group_history_reserve_tokens=(
+                settings.bot_group_history_reserve_tokens
+                if "bot_group_history_reserve_tokens"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.group_history_reserve_tokens
             ),
             proactive_default_enabled=settings.bot_proactive_default_enabled,
             proactive_idle_minutes=settings.bot_proactive_idle_minutes,
