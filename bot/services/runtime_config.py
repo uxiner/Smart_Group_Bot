@@ -340,6 +340,17 @@ class BotBehaviorConfig(StrictModel):
     # ``max_context_tokens`` (the hard gate lives in bot.services.group_context).
     group_history_token_budget: int = Field(default=278528, ge=1024, le=2_000_000)
     group_history_reserve_tokens: int = Field(default=32768, ge=1024, le=1_000_000)
+    # 第 3 期：检索结果留档（search_result_records）。
+    # retention 默认 30 天；新鲜窗口默认 价格 24h / 新闻 48h / 事实 7d(=168h)。
+    # 超出窗口的留档在注入时会标注「可能已过期」，怎么用由模型自己判断。
+    search_record_retention_days: int = Field(default=30, ge=1, le=365)
+    search_freshness_price_hours: int = Field(default=24, ge=1, le=8760)
+    search_freshness_news_hours: int = Field(default=48, ge=1, le=8760)
+    search_freshness_fact_hours: int = Field(default=168, ge=1, le=8760)
+    # 第 3 期方向规则：群 → 私聊允许；私聊 → 群**默认禁止**。默认 False 时群聊装配
+    # 上下文的任何路径都不读 ``private_chat_messages``；本期不实现打开后的读取逻辑
+    # （开启需要用户显式授权，届时再补读取器、授权校验与审计）。
+    group_can_read_private_history: bool = False
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -981,6 +992,13 @@ class RuntimeConfig(StrictModel):
         )
         settings.bot.group_history_token_budget = bot.group_history_token_budget
         settings.bot.group_history_reserve_tokens = bot.group_history_reserve_tokens
+        settings.bot.search_record_retention_days = bot.search_record_retention_days
+        settings.bot.search_freshness_price_hours = bot.search_freshness_price_hours
+        settings.bot.search_freshness_news_hours = bot.search_freshness_news_hours
+        settings.bot.search_freshness_fact_hours = bot.search_freshness_fact_hours
+        settings.bot.group_can_read_private_history = (
+            bot.group_can_read_private_history
+        )
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
         settings.bot.proactive_jitter_minutes = bot.proactive_jitter_minutes
@@ -1767,10 +1785,18 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "private_chat_history_retention_days",
             "group_history_token_budget",
             "group_history_reserve_tokens",
+            "search_record_retention_days",
+            "search_freshness_price_hours",
+            "search_freshness_news_hours",
+            "search_freshness_fact_hours",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
-        for key in ("memory_recall_enabled", "memory_automatic_compaction"):
+        for key in (
+            "memory_recall_enabled",
+            "memory_automatic_compaction",
+            "group_can_read_private_history",
+        ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
@@ -1989,6 +2015,36 @@ def build_legacy_runtime_config(
                 if "bot_group_history_reserve_tokens"
                 in getattr(settings, "model_fields_set", set())
                 else settings.bot.group_history_reserve_tokens
+            ),
+            search_record_retention_days=(
+                settings.bot_search_record_retention_days
+                if "bot_search_record_retention_days"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.search_record_retention_days
+            ),
+            search_freshness_price_hours=(
+                settings.bot_search_freshness_price_hours
+                if "bot_search_freshness_price_hours"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.search_freshness_price_hours
+            ),
+            search_freshness_news_hours=(
+                settings.bot_search_freshness_news_hours
+                if "bot_search_freshness_news_hours"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.search_freshness_news_hours
+            ),
+            search_freshness_fact_hours=(
+                settings.bot_search_freshness_fact_hours
+                if "bot_search_freshness_fact_hours"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.search_freshness_fact_hours
+            ),
+            group_can_read_private_history=(
+                settings.bot_group_can_read_private_history
+                if "bot_group_can_read_private_history"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.group_can_read_private_history
             ),
             proactive_default_enabled=settings.bot_proactive_default_enabled,
             proactive_idle_minutes=settings.bot_proactive_idle_minutes,

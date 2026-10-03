@@ -19,6 +19,7 @@ from bot.services.message_templates import render_data_brief
 from bot.services.reply_progress import ProgressCallback, ProgressReference, ProgressUpdate
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
+from bot.services.search_memory import SCOPE_GROUP, record_search_for_result
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.api_model_query import ApiModelQuerySkill
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
@@ -252,6 +253,11 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
 )
 _PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
 _MANDATORY_REFUSAL_ERRORS = frozenset({"starter_quota_exhausted"})
+
+#: 第 3 期：哪些工具的结果要进 ``search_result_records``（scope=group）。
+#: 只收「检索」类工具：参数里有查询词、结果是一批网页/条目。``webfetch`` 是抓单个
+#: URL，不算一次「搜索」，所以不收。
+_SEARCH_RECORD_SKILLS = frozenset({"websearch", "weibo_search", "bilibili_search"})
 _AMBIGUOUS_SIDE_EFFECT_ERROR = "tool_outcome_ambiguous"
 _STATE_MUTATING_TOOL_ACTIONS: dict[str, frozenset[str]] = {
     "memory_manage": frozenset({"add", "replace"}),
@@ -1147,6 +1153,57 @@ class SkillService:
             "error": result.error,
             "payload": result.payload,
         }
+
+    @staticmethod
+    def _search_query_from_arguments(arguments: Any) -> str:
+        """从检索类工具的参数里取查询词（各技能用的键不同，统一在这里收拾）。"""
+
+        if not isinstance(arguments, dict):
+            return ""
+        for key in ("query", "keyword", "q", "search_query"):
+            value = str(arguments.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    async def _record_group_search_result(
+        self,
+        *,
+        name: str,
+        arguments: Any,
+        result: SkillRunResult,
+        context: SkillContext,
+    ) -> None:
+        """群聊检索结果入档（第 3 期 A 项）。
+
+        * 只处理 :data:`_SEARCH_RECORD_SKILLS` 里的检索类技能，且必须有查询词与群 id；
+        * 走 ``record_search_for_result``：**优先用 ``session_factory`` 开一个自己的
+          短会话**（工具循环的 session 可能正被别的写入用着，留档失败的回滚不该牵连
+          别人），没有 factory 才退回 ``context.session``；
+        * 任何异常都在 ``record_search_for_result`` 里被吞掉，这里再兜一层，
+          保证「留档」永远不会影响这一轮回复。
+        """
+
+        if str(name) not in _SEARCH_RECORD_SKILLS:
+            return
+        query = self._search_query_from_arguments(arguments)
+        try:
+            group_id = int(getattr(context, "chat_id", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if not query or group_id == 0:
+            return
+        try:
+            await record_search_for_result(
+                scope=SCOPE_GROUP,
+                scope_id=group_id,
+                query=query,
+                result=result,
+                session=getattr(context, "session", None),
+                session_factory=getattr(context, "session_factory", None),
+            )
+        except Exception:  # pragma: no cover - 记录实现本身已吞异常
+            log.exception("群聊检索留档失败（已忽略） | skill=%s", name)
 
     @staticmethod
     def _mihomo_doc_payload_chars(recent_tool_results: list[dict[str, Any]]) -> int:
@@ -2863,6 +2920,14 @@ class SkillService:
                     }
                 )
                 recent_tool_results = recent_tool_results[-8:]
+                # 第 3 期：群聊检索结果**入档**（scope=group）。只写检索类技能，只写
+                # 本群（context.chat_id），写失败只记日志——绝不影响这一轮回复。
+                await self._record_group_search_result(
+                    name=str(tool_call["name"]),
+                    arguments=args,
+                    result=result,
+                    context=context,
+                )
                 payload = self._tool_result_to_payload(result)
                 messages.append(
                     {
