@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from aiogram import F, Router
-from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.exceptions import (
     TelegramBadRequest,
@@ -2315,12 +2314,6 @@ async def _send_av_query_result(
     if header:
         text = f"{header}\n{text}"
     await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
-
-
-@router.message(
-    F.chat.type == ChatType.PRIVATE,
-    F.photo | F.document.mime_type.startswith("image/"),
-)
 
 
 @router.message(Command("av"))
