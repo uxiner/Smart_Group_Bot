@@ -144,6 +144,23 @@ def member_cache() -> MemberAccessCache:
     return _member_cache
 
 
+#: Telegram 对「不在群里的人」抛的不是 ``status="left"``，而是一个 Bad Request：
+#: ``member not found``（真机实测确认）。这是**明确的否定**，必须与「查不通」分开——
+#: 否则陌生人会永远收到「稍等再试」，而且每条消息都重打一次 API（既误导又白花调用）。
+_NOT_MEMBER_HINTS = (
+    "member not found",
+    "user not found",
+    "participant not found",
+)
+
+
+def _is_definitive_absent(exc: BaseException) -> bool:
+    """这个异常是否等于「确定不在群里」（而不是查询失败）。"""
+
+    detail = str(exc).lower()
+    return any(hint in detail for hint in _NOT_MEMBER_HINTS)
+
+
 def _is_member_status(member: Any) -> bool:
     """``ChatMember`` → 是否算「在群里」。
 
@@ -194,6 +211,12 @@ async def confirm_authorized_group_member(
         try:
             member = await bot.get_chat_member(chat_id=int(row.group_id), user_id=uid)
         except Exception as exc:
+            if _is_definitive_absent(exc):
+                # 「member not found」= 确定不在这个群，继续看别的授权群
+                log.info(
+                    "private chat: 不在授权群内 | group=%s user=%s", row.group_id, uid
+                )
+                continue
             log.warning(
                 "private chat: getChatMember 失败 | group=%s user=%s | error=%s",
                 row.group_id,
