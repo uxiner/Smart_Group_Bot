@@ -221,14 +221,22 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(sm.render_search_record_messages([], now=NOW), [])
 
     def test_messages_split_one_record_per_message(self) -> None:
-        """按条拆开，统一闸门才能从最旧的一条开始裁。"""
+        """按条拆开，统一闸门才能从最旧的一条开始裁；头部说明单独给调用方。"""
 
         messages = sm.render_search_record_messages(self._records(), now=NOW)
-        self.assertEqual(len(messages), 3, "头部说明 + 两条留档")
-        self.assertTrue(messages[0]["content"].startswith(sm.SEARCH_RECORDS_BLOCK))
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("5090 价格", messages[1]["content"])
-        self.assertIn("显卡新闻", messages[2]["content"])
+        self.assertEqual(len(messages), 2, "一条留档一条消息")
+        self.assertTrue(all(item["role"] == "system" for item in messages))
+        self.assertIn("5090 价格", messages[0]["content"])
+        self.assertIn("显卡新闻", messages[1]["content"])
+        # 头部（标记 + 来源声明）由调用方放进永不裁剪的固定层
+        self.assertTrue(
+            sm.SEARCH_RECORDS_HEADER_BLOCK.startswith(sm.SEARCH_RECORDS_BLOCK)
+        )
+        self.assertIn("不可信数据", sm.SEARCH_RECORDS_HEADER_BLOCK)
+        self.assertFalse(
+            any(sm.SEARCH_RECORDS_BLOCK in item["content"] for item in messages),
+            "头部不该混在可裁的条目里（否则会被最优先裁掉）",
+        )
 
     def test_oldest_records_are_dropped_first_when_capped(self) -> None:
         messages = sm.render_search_record_messages(
