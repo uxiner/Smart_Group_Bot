@@ -149,6 +149,7 @@ from bot.services.privileged_tasks import submit_privileged_task
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.search_memory import (
     SCOPE_GROUP,
+    SEARCH_RECORDS_HEADER_BLOCK,
     freshness_windows,
     load_search_records,
     render_search_record_messages,
@@ -5906,7 +5907,9 @@ async def _inject_group_search_records(
         )
     ]
     assembly = assemble_context_within_budget(
-        system=[],
+        # 头部说明放进固定层（永不裁剪）：来源声明不该因为在预算里排在最前面就被先
+        # 裁掉——被裁的永远是最旧的那条留档。
+        system=[{"role": "system", "content": SEARCH_RECORDS_HEADER_BLOCK}],
         current_turn=[],
         memory_recall=recall_layer,
         search_records=search_messages,
@@ -5923,7 +5926,12 @@ async def _inject_group_search_records(
             assembly.used_tokens,
             assembly.budget_tokens,
         )
-    return [*kept["history"], *kept["search_records"], *kept["memory_recall"]]
+    return [
+        *kept["history"],
+        *kept["system"],
+        *kept["search_records"],
+        *kept["memory_recall"],
+    ]
 
 
 async def _process_pending_reply_batch(

@@ -136,6 +136,10 @@ GROUP_PUBLIC_HEADER = (
     "每一条都标了来源群与时间；这是群聊里的公开记录，不等于他在私聊里说过的话。"
 )
 
+#: 注入块的头部消息（标记 + 说明）。由调用方放进**永不裁剪**的固定层：来源声明不该
+#: 因为在预算里排在最前面就被先裁掉——被裁的永远是最旧的一条公开记录。
+GROUP_PUBLIC_HEADER_BLOCK = f"{GROUP_PUBLIC_BLOCK}\n{GROUP_PUBLIC_HEADER}"
+
 
 def render_group_public_block(
     records: Iterable[dict[str, Any]] | None,
@@ -162,7 +166,7 @@ def render_group_public_block(
         )
     if not body:
         return ""
-    return "\n".join([GROUP_PUBLIC_BLOCK, GROUP_PUBLIC_HEADER, *body])
+    return "\n".join([GROUP_PUBLIC_HEADER_BLOCK, *body])
 
 
 def render_group_public_messages(
@@ -172,9 +176,10 @@ def render_group_public_messages(
     max_records: int = GROUP_PUBLIC_MAX_RECORDS,
     content_max_chars: int = GROUP_PUBLIC_CONTENT_MAX_CHARS,
 ) -> list[dict[str, Any]]:
-    """与 :func:`render_group_public_block` 同样内容，但**一条记录一条消息**。
+    """把公开记录渲染成**一条记录一条消息**（不含头部）。
 
     理由与检索留档一致：统一闸门按「条」裁剪，拆开才能在超预算时从最旧的一条开始丢。
+    头部说明用 :data:`GROUP_PUBLIC_HEADER_BLOCK`，由调用方放进永不裁剪的固定层。
     """
 
     items = [item for item in (records or []) if isinstance(item, dict)][
@@ -183,16 +188,12 @@ def render_group_public_messages(
     if not items:
         return []
     label_map = titles or {}
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": f"{GROUP_PUBLIC_BLOCK}\n{GROUP_PUBLIC_HEADER}"}
-    ]
+    messages: list[dict[str, Any]] = []
     for item in items:
         for line in _record_lines(
             item, label_map=label_map, content_max_chars=content_max_chars
         ):
             messages.append({"role": "system", "content": line})
-    if len(messages) <= 1:
-        return []
     return messages
 
 

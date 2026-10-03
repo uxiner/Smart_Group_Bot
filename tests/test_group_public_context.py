@@ -231,11 +231,18 @@ class RenderTests(unittest.TestCase):
             },
         ]
         messages = gpc.render_group_public_messages(records)
-        self.assertEqual(len(messages), 3)
-        self.assertTrue(messages[0]["content"].startswith(gpc.GROUP_PUBLIC_BLOCK))
-        self.assertIn("第一条", messages[1]["content"])
-        self.assertIn("第二条", messages[2]["content"])
+        self.assertEqual(len(messages), 2, "一条记录一条消息")
+        self.assertIn("第一条", messages[0]["content"])
+        self.assertIn("第二条", messages[1]["content"])
         self.assertTrue(all(item["role"] == "system" for item in messages))
+        # 头部（标记 + 来源声明）由调用方放进永不裁剪的固定层
+        self.assertTrue(
+            gpc.GROUP_PUBLIC_HEADER_BLOCK.startswith(gpc.GROUP_PUBLIC_BLOCK)
+        )
+        self.assertFalse(
+            any(gpc.GROUP_PUBLIC_BLOCK in item["content"] for item in messages),
+            "头部不该混在可裁的条目里（否则会被最优先裁掉）",
+        )
 
 
 class LeakGuardTests(unittest.TestCase):

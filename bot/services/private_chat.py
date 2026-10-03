@@ -43,13 +43,19 @@ from bot.services.context_gate import (
     CONTEXT_TOKEN_BUDGET,
     assemble_context_within_budget,
 )
-from bot.services.group_public_context import render_group_public_messages
+from bot.services.group_public_context import (
+    GROUP_PUBLIC_HEADER_BLOCK,
+    render_group_public_messages,
+)
 from bot.services.reply_output import (
     REPLY_OUTPUT_AWARENESS,
     REPLY_OUTPUT_PROTOCOL,
     REPLY_RICH_FORMATTING,
 )
-from bot.services.search_memory import render_search_record_messages
+from bot.services.search_memory import (
+    SEARCH_RECORDS_HEADER_BLOCK,
+    render_search_record_messages,
+)
 from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.conversation_context import (
     build_current_turn_focus_message,
@@ -1290,6 +1296,13 @@ def build_private_chat_messages(
     group_public_messages = render_group_public_messages(
         group_public_records, titles=group_titles
     )
+    # 头部说明（``[SEARCH_RECORDS]`` / ``[群聊公开记录]`` + 来源声明）放进**固定层**：
+    # 它是资料的来源声明，不该因为在预算里排在最前面就被先裁掉——被裁的永远是最旧的
+    # 那一条。它们紧跟在 tail_system 之后、各自条目之前（见下面的返回顺序）。
+    if search_messages:
+        messages.append({"role": "system", "content": SEARCH_RECORDS_HEADER_BLOCK})
+    if group_public_messages:
+        messages.append({"role": "system", "content": GROUP_PUBLIC_HEADER_BLOCK})
     # 统一闸门：三层可裁（历史 → 搜索留档 → 群聊公开记录〔按「记忆召回条数」口径〕），
     # 系统提示词/人设与本轮消息永不裁。不传新层时这里等价于原样返回。
     assembly = assemble_context_within_budget(
@@ -1302,7 +1315,7 @@ def build_private_chat_messages(
     )
     kept = assembly.layers
     head_system = kept["system"][:1]  # 人设/围栏那一段
-    tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/本轮焦点/项目事实
+    tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/焦点/项目事实 + 两个头部
     return [
         *head_system,
         *kept["history"],
