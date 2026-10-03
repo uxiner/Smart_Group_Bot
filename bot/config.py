@@ -144,7 +144,10 @@ class BotConfig(BaseModel):
     # Tool-calling (skills) stage route; ``None`` = reuse ``main_model``.
     skill_model: ModelConfig | None = None
     embed_model: EmbedConfig = EmbedConfig()
-    max_context_tokens: int = 256000
+    # 模型窗口上限：278528 = 272K（全项目统一的深度目标，与主模型实测窗口
+    # 1,000,000 相比仍留了大量余量）。群聊历史按下面的 group_history_* 装配，
+    # 装配结果 + 固定余量必须 ≤ 这个值。
+    max_context_tokens: int = 278528
     max_output_tokens: int = 2048
     # Two-tier group memory: a bounded hot window plus a lossless, per-group
     # archive used by relevance-based recall.  The archive is the source of
@@ -162,6 +165,12 @@ class BotConfig(BaseModel):
     # release).  Retention mirrors ``memory_retention_days`` (1..365).
     private_chat_history_token_budget: int = 278528
     private_chat_history_retention_days: int = 30
+    # 群聊回复的历史：不再按条数（``memory_recent_messages``）取，而是按 token 预算
+    # 从 ``group_message_archive`` 里装配（数据来源与删除/保留策略都没变）。
+    # ``group_history_reserve_tokens`` 是留给「系统提示词/人设 + 本轮消息 + 记忆召回
+    # + 回复预留」的余量：装配历史 + 余量 ≤ max_context_tokens，这是硬闸门。
+    group_history_token_budget: int = 278528
+    group_history_reserve_tokens: int = 32768
 
 
 class ModerationConfig(BaseModel):
@@ -268,7 +277,7 @@ class Settings(BaseSettings):
     llm_retry_backoff_sec: float = 0.8
     llm_retry_timeout_multiplier: float = 1.35
 
-    max_context_tokens: int = 256000
+    max_context_tokens: int = 278528
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
     bot_reply_batch_timeout_seconds: float = 45.0
@@ -290,6 +299,9 @@ class Settings(BaseSettings):
     # Private-chat history (persisted rows + token-budget assembly).
     bot_private_chat_history_token_budget: int = 278528
     bot_private_chat_history_retention_days: int = 30
+    # Group-chat history (archive rows assembled by token budget).
+    bot_group_history_token_budget: int = 278528
+    bot_group_history_reserve_tokens: int = 32768
     bot_proactive_default_enabled: bool = False
     bot_proactive_idle_minutes: int = 180
     bot_proactive_jitter_minutes: int = 60
@@ -859,6 +871,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "memory_recall_max_results",
             "private_chat_history_token_budget",
             "private_chat_history_retention_days",
+            "group_history_token_budget",
+            "group_history_reserve_tokens",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -929,6 +943,14 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.bot.private_chat_history_retention_days = min(
         365, max(1, int(settings.bot_private_chat_history_retention_days))
+    )
+    settings.bot.group_history_token_budget = min(
+        2_000_000,
+        max(1024, int(settings.bot_group_history_token_budget)),
+    )
+    settings.bot.group_history_reserve_tokens = min(
+        1_000_000,
+        max(1024, int(settings.bot_group_history_reserve_tokens)),
     )
     settings.bot.memory_archive_max_messages_per_group = min(
         1_000_000,
