@@ -527,14 +527,12 @@ class NsfwGuardScopeTests(unittest.TestCase):
     def test_av_captioned_images_are_judged_like_any_other(self) -> None:
         """配文带 /av 不再是免检理由（发图识图已作废，2026-10-03 用户口径）。"""
 
-        settings = _guard_settings()
         for caption in ("/av", "/av WANZ-530", "/av@selfbot", " /av  人妻"):
             with self.subTest(caption=caption):
                 message = _photo_message(caption=caption)
                 self.assertTrue(
-                    group._nsfw_image_guard_applies(message, "photo", settings)
+                    group._nsfw_image_guard_applies(message, "photo", _settings())
                 )
-                self.assertTrue(group._nsfw_image_guard_applies(message, "photo", settings))
 
     def test_runtime_switch_disables_scope(self) -> None:
         message = _photo_message()
