@@ -21,6 +21,7 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
+from bot.services.dm_search import answer_with_search
 from bot.services.private_chat import (
     ACCESS_UNKNOWN_NOTICE,
     BUSY_NOTICE,
@@ -265,9 +266,14 @@ async def on_private_message(
     except Exception:
         pass
 
+    llm = _reply_llm(settings)
     try:
-        reply = str(await _reply_llm(settings).chat(messages, stage="dm") or "").strip()
+        answer = await answer_with_search(
+            llm, messages, stage="dm", user_text=text, settings=settings
+        )
+        reply = str(answer.text or "").strip()
     except Exception as exc:
+        await session.rollback()
         log.warning("private chat: 回复失败 | user=%s | error=%s", user.id, exc)
         await _send_notice(message, BUSY_NOTICE, "busy")
         return
@@ -296,3 +302,10 @@ async def on_private_message(
         local_day_key(),
         len(reply),
     )
+    if answer.searches:
+        log.info(
+            "private chat: 本轮联网检索 %d 次 | user=%s | 保险丝已触发=%s",
+            answer.searches,
+            user.id,
+            answer.exhausted,
+        )

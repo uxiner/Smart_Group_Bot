@@ -275,6 +275,15 @@ class PrivateChatModeTests(unittest.TestCase):
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertNotIn("[CLINGY_ATTENDANCE]", blob, "亲密度台词只属于最高管理员")
 
+    def test_dm_forbids_promising_a_capability_it_has_not_used(self) -> None:
+        """私聊真的没接工具：不许先说『我能搜』再收回（截图里就是这个病）。"""
+
+        messages = build_private_chat_messages("帮我查查显卡新闻")
+        blob = "\n".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("Never promise a capability you have not actually used", blob)
+        self.assertIn("do not say you can search the web", blob)
+        self.assertIn("never invent numbers, prices, or news", blob)
+
     def test_private_chat_still_never_injects_the_open_text_block(self) -> None:
         messages = build_private_chat_messages("随便聊聊")
         blob = "\n".join(str(m.get("content") or "") for m in messages)
