@@ -947,6 +947,11 @@
             ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期行由后台巡检清理" })}
             ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；群聊回复按预算从群归档装配历史" })}
             ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768；留给系统提示词/人设/本轮消息/召回/回复预留。历史 + 余量必须 ≤ 最大上下文 Token" })}
+            ${field("bot.search_record_retention_days", "检索留档保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；检索结果留档由后台巡检按此清理" })}
+            ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
+            ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
+            ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
+            ${toggle("bot.group_can_read_private_history", "允许群聊读取私聊历史", "默认关闭（隐私红线：群→私聊允许，私聊→群默认禁止）。本期只保证关闭时绝不读取，打开后的读取逻辑尚未实现")}
             ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>

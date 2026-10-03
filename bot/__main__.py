@@ -52,6 +52,10 @@ from bot.services.resource_health import (
     run_resource_watchdog,
     start_hard_loop_watchdog,
 )
+from bot.services.search_memory import (
+    run_search_record_maintenance,
+    search_record_retention_days,
+)
 from bot.services.runtime_config import (
     RuntimeConfig,
     RuntimeConfigManager,
@@ -741,6 +745,19 @@ async def main() -> None:
                     ),
                 ),
                 name="private-chat-history-maintenance",
+            )
+        )
+        # 第 3 期：检索结果留档也要定期清理（默认 30 天）。保留天数每轮现取，
+        # /settings 里改了下一轮就生效（与上面两个巡检同一套路）。
+        background_tasks.append(
+            asyncio.create_task(
+                run_search_record_maintenance(
+                    session_factory,
+                    retention_days_getter=lambda: search_record_retention_days(
+                        settings
+                    ),
+                ),
+                name="search-record-maintenance",
             )
         )
 

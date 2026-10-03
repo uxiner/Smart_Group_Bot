@@ -1419,6 +1419,72 @@ class MemberPointAward(Base):
     )
 
 
+class SearchResultRecord(Base):
+    """一次联网检索的**入档**记录：一行 = 某个作用域下某次检索的结果摘要。
+
+    第 3 期新增。检索结果以前是「用完即丢」——同一句「5090 现在多少钱」隔半小时
+    再问一次，模型手上既没有上次的结果，也无从知道「上次查到的是什么时间的事」，
+    于是要么重新烧一次检索，要么把三天前的价格当现价说出来。这里把结果留档，
+    再用的时候**带上时间戳与「距今多久」**。
+
+    - ``scope`` / ``scope_id``：``private`` + 真实用户 id，或 ``group`` + 群 id。
+      两个作用域**互不可见**（私聊的记录不会进群聊的 prompt，见 C 项隐私红线）。
+    - ``digest``：结果摘要。**截断保存**（见 ``bot.services.search_memory`` 的上限），
+      整篇塞进上下文既贵又没用。
+    - ``sources``：JSON 数组，每项 ``{"title": ..., "url": ...}``，供带链接引用。
+    - ``kind``：``price`` / ``news`` / ``fact`` / ``unknown``，决定新鲜窗口
+      （价格 24h、新闻 48h、事实 7d），过期记录注入时会标注「可能已过期」。
+    - ``outcome``：``ok`` / ``empty``。空结果也留一行，是为了让「这问题刚问过、
+      当时就是查不到」这件事本身可复用，避免反复搜同一句话。
+    - ``(scope, scope_id, id)`` 复合索引服务「取某作用域最近 N 条」的固定查询；
+      ``created_at`` 独立索引给留存清理（默认 30 天）用；``(scope, scope_id, query,
+      created_at)`` 给幂等窗口内的「同一句问话」查找用。
+    """
+
+    __tablename__ = "search_result_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 'private'（私聊）| 'group'（群聊）
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 私聊 = user_id，群聊 = group_id
+    scope_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: 检索用的查询词（已清理过称呼/客套）
+    query: Mapped[str] = mapped_column(String(512), default="")
+    #: 结果摘要（截断保存）
+    digest: Mapped[str] = mapped_column(Text, default="")
+    #: [{"title": ..., "url": ...}, ...]
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    #: 'price' | 'news' | 'fact' | 'unknown'
+    kind: Mapped[str] = mapped_column(String(16), default="unknown")
+    #: 'ok' | 'empty'
+    outcome: Mapped[str] = mapped_column(String(16), default="empty")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # 「取某个作用域最近 N 条」的驱动索引（scope/scope_id 等值 + id 倒序）
+        Index(
+            "ix_search_result_records_scope_scope_id_id",
+            "scope",
+            "scope_id",
+            "id",
+        ),
+        # 留存清理按时间删
+        Index("ix_search_result_records_created_at", "created_at"),
+        # 幂等窗口内「同一句话」的查找（写入前去重）
+        Index(
+            "ix_search_result_records_scope_query_created",
+            "scope",
+            "scope_id",
+            "query",
+            "created_at",
+        ),
+    )
+
+
 class CheckinReminderPost(Base):
     """签到提醒的发送台账：一行 = 一个群在一个时段发出去的那条提醒。
 
