@@ -43,7 +43,17 @@ def _settings(super_admin_id: int = SUPER_ADMIN) -> SimpleNamespace:
     return SimpleNamespace(super_admin_id=super_admin_id)
 
 
-def _bot(*, statuses=None, raises=None, absent_groups=()) -> MagicMock:
+def _verdict(tier: str = dm.TIER_MEMBER) -> dm.AccessVerdict:
+    """按档位造一个准入结论（handler 现在拿到的是「结论 + 档位」）。"""
+
+    if tier == dm.TIER_NONE:
+        return dm.AccessVerdict(False, tier)
+    if tier == dm.TIER_UNKNOWN:
+        return dm.AccessVerdict(None, tier)
+    return dm.AccessVerdict(True, tier)
+
+
+def _bot(*, statuses=None, raises=None, absent_groups=(), failing_groups=()) -> MagicMock:
     """假 Bot：``get_chat_member`` 按 group_id 返回状态、抛「不在群」或抛通用异常。
 
     ``absent_groups`` 模拟真机行为：对不在群里的人，Telegram 抛的是
@@ -53,11 +63,14 @@ def _bot(*, statuses=None, raises=None, absent_groups=()) -> MagicMock:
     bot = MagicMock()
     mapping = dict(statuses or {})
     absent = {int(g) for g in absent_groups}
+    failing = {int(g) for g in failing_groups}
 
     async def _get_chat_member(chat_id, user_id):
         cid = int(chat_id)
         if cid in absent:
             raise RuntimeError("Telegram server says - Bad Request: member not found")
+        if cid in failing:
+            raise RuntimeError("telegram down")
         if raises:
             raise RuntimeError(raises if isinstance(raises, str) else "telegram down")
         member = MagicMock()
@@ -101,13 +114,13 @@ class MemberAccessCacheTests(unittest.TestCase):
         clock = {"now": 1000.0}
         cache = dm.MemberAccessCache(ttl_seconds=60.0, clock=lambda: clock["now"])
         self.assertIsNone(cache.get(1))
-        cache.put(1, True)
-        self.assertIs(cache.get(1), True)
+        cache.put(1, dm.TIER_MEMBER)
+        self.assertEqual(cache.get(1), dm.TIER_MEMBER)
         clock["now"] += 59.0
-        self.assertIs(cache.get(1), True)
+        self.assertEqual(cache.get(1), dm.TIER_MEMBER)
         clock["now"] += 2.0
         self.assertIsNone(cache.get(1), "过期后必须重新判定")
-        cache.put(2, False)
+        cache.put(2, dm.TIER_NONE)
         self.assertEqual(len(cache), 1)
         cache.clear()
         self.assertEqual(len(cache), 0)
@@ -115,7 +128,7 @@ class MemberAccessCacheTests(unittest.TestCase):
     def test_capacity_evicts_instead_of_growing(self) -> None:
         cache = dm.MemberAccessCache(max_users=16)
         for uid in range(100):
-            cache.put(uid, True)
+            cache.put(uid, dm.TIER_MEMBER)
         self.assertLessEqual(len(cache), 16)
 
 
@@ -272,6 +285,63 @@ class AccessDecisionTests(unittest.IsolatedAsyncioTestCase):
                 False,
             )
 
+    async def test_group_admin_is_recognized_as_admin_tier(self) -> None:
+        """群主与群管理员都算「群管理员」档（500/天）。"""
+
+        for status in ("administrator", "creator"):
+            with self.subTest(status=status):
+                bot = _bot(statuses={GROUP_ID: status})
+                with patch.object(
+                    dm,
+                    "list_authorized_groups",
+                    new=AsyncMock(return_value=[SimpleNamespace(group_id=GROUP_ID)]),
+                ):
+                    verdict = await dm.resolve_access(
+                        bot, AsyncMock(), _settings(), 777, cache=dm.MemberAccessCache()
+                    )
+                self.assertTrue(verdict.allowed)
+                self.assertEqual(verdict.tier, dm.TIER_ADMIN)
+                self.assertTrue(verdict.is_admin)
+                self.assertFalse(verdict.is_super)
+
+    async def test_highest_tier_wins_across_groups(self) -> None:
+        bot = _bot(statuses={GROUP_ID: "member", -100999: "administrator"})
+        with patch.object(
+            dm,
+            "list_authorized_groups",
+            new=AsyncMock(
+                return_value=[
+                    SimpleNamespace(group_id=GROUP_ID),
+                    SimpleNamespace(group_id=-100999),
+                ]
+            ),
+        ):
+            verdict = await dm.resolve_access(
+                bot, AsyncMock(), _settings(), 777, cache=dm.MemberAccessCache()
+            )
+        self.assertTrue(verdict.allowed)
+        self.assertEqual(verdict.tier, dm.TIER_ADMIN, "在一个群是管理员就按管理员档")
+
+    async def test_member_tier_is_not_cached_while_another_lookup_failed(self) -> None:
+        """还有一个群没查成时先放行但不缓存：下次重查可能把他升成管理员。"""
+
+        bot = _bot(statuses={GROUP_ID: "member"}, failing_groups=[-100999])
+        cache = dm.MemberAccessCache()
+        with patch.object(
+            dm,
+            "list_authorized_groups",
+            new=AsyncMock(
+                return_value=[
+                    SimpleNamespace(group_id=-100999),
+                    SimpleNamespace(group_id=GROUP_ID),
+                ]
+            ),
+        ):
+            verdict = await dm.resolve_access(bot, AsyncMock(), _settings(), 777, cache=cache)
+        self.assertTrue(verdict.allowed, "已查到是成员就先放行，不因另一个群查不通而拒绝")
+        self.assertEqual(verdict.tier, dm.TIER_MEMBER)
+        self.assertEqual(len(cache), 0, "结论不完整时不该缓存")
+
 
 # ---------------------------------------------------------------------------
 # 配额（真库）
@@ -309,9 +379,9 @@ class _DbTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class QuotaTests(_DbTestCase):
-    async def test_per_user_limit_blocks_the_21st(self) -> None:
+    async def test_member_limit_blocks_the_101st(self) -> None:
         day = "2026-10-03"
-        for i in range(1, 21):
+        for i in range(1, 101):
             async with self.session_factory() as session:
                 outcome = await dm.consume_daily_quota(session, user_id=777, day=day)
             self.assertTrue(outcome.allowed, f"第 {i} 条应该放行")
@@ -323,14 +393,14 @@ class QuotaTests(_DbTestCase):
 
     async def test_denied_call_leaves_no_dirty_counter(self) -> None:
         day = "2026-10-03"
-        for _ in range(20):
+        for _ in range(100):
             async with self.session_factory() as session:
                 await dm.consume_daily_quota(session, user_id=777, day=day)
         async with self.session_factory() as session:
             await dm.consume_daily_quota(session, user_id=777, day=day)
-        self.assertEqual(await self._stored(777, day), 20, "被拒的那一次必须回滚干净")
+        self.assertEqual(await self._stored(777, day), 100, "被拒的那一次必须回滚干净")
         self.assertEqual(
-            await self._stored(dm.GLOBAL_COUNTER_USER_ID, day), 20, "全局计数同样要回滚"
+            await self._stored(dm.GLOBAL_COUNTER_USER_ID, day), 100, "全局计数同样要回滚"
         )
 
     async def test_global_limit_blocks_other_users(self) -> None:
@@ -350,7 +420,7 @@ class QuotaTests(_DbTestCase):
         self.assertIn("明天", dm.quota_notice(blocked))
 
     async def test_quota_resets_on_the_next_local_day(self) -> None:
-        for _ in range(20):
+        for _ in range(100):
             async with self.session_factory() as session:
                 await dm.consume_daily_quota(session, user_id=777, day="2026-10-03")
         async with self.session_factory() as session:
@@ -374,6 +444,46 @@ class QuotaTests(_DbTestCase):
                 )
             ).scalar_one()
         self.assertEqual(int(rows), 1, "UPSERT 不能留下两行")
+
+    async def test_admin_tier_uses_its_own_limits_and_counter_row(self) -> None:
+        day = "2026-10-03"
+        async with self.session_factory() as session:
+            outcome = await dm.consume_daily_quota(session, user_id=777, is_admin=True, day=day)
+        self.assertTrue(outcome.allowed)
+        self.assertEqual(outcome.tier, dm.TIER_ADMIN)
+        self.assertEqual(outcome.per_user_limit, dm.ADMIN_PER_USER_DAILY_LIMIT)
+        self.assertEqual(outcome.global_limit, dm.ADMIN_GLOBAL_DAILY_LIMIT)
+        self.assertEqual(await self._stored(777, day), 1)
+        self.assertEqual(await self._stored(dm.ADMIN_GLOBAL_COUNTER_USER_ID, day), 1)
+        self.assertEqual(
+            await self._stored(dm.GLOBAL_COUNTER_USER_ID, day),
+            0,
+            "管理员不吃普通成员那本全局账",
+        )
+
+    async def test_member_and_admin_globals_are_independent(self) -> None:
+        day = "2026-10-03"
+        for uid in (1, 2):
+            async with self.session_factory() as session:
+                outcome = await dm.consume_daily_quota(
+                    session, user_id=uid, day=day, global_limit=2
+                )
+            self.assertTrue(outcome.allowed)
+        async with self.session_factory() as session:
+            blocked = await dm.consume_daily_quota(session, user_id=3, day=day, global_limit=2)
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(blocked.reason, "global_limit")
+        async with self.session_factory() as session:
+            admin_ok = await dm.consume_daily_quota(session, user_id=4, is_admin=True, day=day)
+        self.assertTrue(admin_ok.allowed, "普通成员那档满了，管理员那档照常")
+
+    async def test_member_tier_defaults_to_100_per_day(self) -> None:
+        day = "2026-10-03"
+        async with self.session_factory() as session:
+            outcome = await dm.consume_daily_quota(session, user_id=777, day=day)
+        self.assertEqual(outcome.tier, dm.TIER_MEMBER)
+        self.assertEqual(outcome.per_user_limit, 100)
+        self.assertEqual(outcome.global_limit, 20_000)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +566,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_commands_are_left_to_the_command_routers(self) -> None:
         message = _message(text="/av SONE-342")
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)) as access:
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())) as access:
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         message.answer.assert_not_awaited()
         access.assert_not_awaited()
@@ -464,7 +574,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_member_gets_one_notice_and_no_model_call(self) -> None:
         message = _message(text="你好")
         llm = self._fake_llm()
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=False)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(dm.TIER_NONE))), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock()) as quota, \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
@@ -476,7 +586,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_access_asks_the_user_to_retry(self) -> None:
         message = _message(text="你好")
         llm = self._fake_llm()
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=None)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(dm.TIER_UNKNOWN))), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         self.assertEqual(message.answer.await_args.args[0], dm.ACCESS_UNKNOWN_NOTICE)
@@ -493,7 +603,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
             global_used=30,
             global_limit=200,
         )
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=blocked)), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
@@ -511,7 +621,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
             global_used=1,
             global_limit=200,
         )
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
@@ -528,7 +638,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         message.video = SimpleNamespace(file_id="v", file_size=100)
         llm = self._fake_llm()
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
@@ -541,7 +651,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         message.photo = [SimpleNamespace(file_id="p", file_size=1000)]
         llm = self._fake_llm("这是一只猫")
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
              patch.object(dm_handler, "_image_file_info", new=MagicMock(return_value=("p", "image/jpeg", 1000))), \
              patch.object(dm_handler, "_image_description", new=AsyncMock(return_value="一只猫")), \
@@ -557,15 +667,50 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         llm = MagicMock()
         llm.chat = AsyncMock(side_effect=RuntimeError("boom"))
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock(return_value=True)), \
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         self.assertEqual(message.answer.await_args.args[0], dm.BUSY_NOTICE)
 
+    async def test_super_admin_skips_the_quota_entirely(self) -> None:
+        """最高管理员不设限：连计数都不记，别占任何一档的额度。"""
+
+        message = _message(text="你好")
+        llm = self._fake_llm("在的")
+        with patch.object(
+            dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(dm.TIER_SUPER))
+        ), patch.object(dm_handler, "consume_daily_quota", new=AsyncMock()) as quota, patch.object(
+            dm_handler, "_reply_llm", new=MagicMock(return_value=llm)
+        ):
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+        quota.assert_not_awaited()
+        llm.chat.assert_awaited_once()
+        self.assertEqual(message.answer.await_args.args[0], "在的")
+
+    async def test_admin_tier_is_passed_to_the_quota(self) -> None:
+        message = _message(text="你好")
+        llm = self._fake_llm("在的")
+        admin_ok = dm.QuotaOutcome(
+            True,
+            "ok",
+            1,
+            dm.ADMIN_PER_USER_DAILY_LIMIT,
+            1,
+            dm.ADMIN_GLOBAL_DAILY_LIMIT,
+            dm.TIER_ADMIN,
+        )
+        with patch.object(
+            dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(dm.TIER_ADMIN))
+        ), patch.object(
+            dm_handler, "consume_daily_quota", new=AsyncMock(return_value=admin_ok)
+        ) as quota, patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+        self.assertTrue(quota.await_args.kwargs.get("is_admin"), "管理员档要按管理员配额算")
+
     async def test_empty_message_is_ignored(self) -> None:
         message = _message()
-        with patch.object(dm_handler, "confirm_authorized_group_member", new=AsyncMock()) as access:
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock()) as access:
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         access.assert_not_awaited()
         message.answer.assert_not_awaited()

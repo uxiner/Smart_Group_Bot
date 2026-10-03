@@ -4,7 +4,8 @@
 
 1. **准入**：只有「最高管理员授权开通 Smart_Bot 的群组」里的成员能用私聊。
    非成员只回一条固定引导语，**不进模型、不花钱**。最高管理员始终豁免。
-2. **配额**：每人 20 条/天 + 全局 200 条/天（先跑一周看用量再调）。
+2. **配额（阶梯）**：普通成员 100 条/天、群管理员 500 条/天；两组各有自己的全局
+   上限（20000 / 100000 条/天，互不占用）；最高管理员不设限、不计数。
 3. **内容**：私聊不做群规审核，NSFW 也放开——群里那条「任何群都不允许发
    NSFW 图/视频」的底线**只针对群聊通道**，这里一个字都没动。
 4. **不落库**：私聊正文与图片内容不进群归档/记忆/向量；只记「条数」用于配额。
@@ -58,11 +59,21 @@ log = logging.getLogger(__name__)
 
 #: 全局合计行用的哨兵 user_id（真实 Telegram 用户 id 恒为正）
 GLOBAL_COUNTER_USER_ID = 0
+#: 群管理员合计行的哨兵 user_id（真实 Telegram 用户 id 恒为正；本人行也恒为正）
+ADMIN_GLOBAL_COUNTER_USER_ID = -1
 
-#: 每人每天的私聊配额
-DEFAULT_PER_USER_DAILY_LIMIT = 20
-#: 每天所有私聊合计的配额（真正的成本闸门）
-DEFAULT_GLOBAL_DAILY_LIMIT = 200
+#: 阶梯配额（用户口径 2026-10-03）
+DEFAULT_PER_USER_DAILY_LIMIT = 100        # 普通成员：每人每天
+ADMIN_PER_USER_DAILY_LIMIT = 500          # 群管理员：每人每天
+DEFAULT_GLOBAL_DAILY_LIMIT = 20_000       # 普通成员合计
+ADMIN_GLOBAL_DAILY_LIMIT = 100_000        # 群管理员合计
+
+#: 准入档位：档位同时决定配额阶梯
+TIER_SUPER = "super"    # 最高管理员：不设限、不计数
+TIER_ADMIN = "admin"    # 授权群的群主/管理员：500/天
+TIER_MEMBER = "member"  # 授权群的普通成员：100/天
+TIER_NONE = "none"      # 不在任何授权群
+TIER_UNKNOWN = "unknown"  # 查不通，无法下结论
 
 #: 私聊历史的保留轮数（只在内存里，进程重启即空）
 HISTORY_MAX_TURNS = 12
@@ -98,7 +109,11 @@ BUSY_NOTICE = "刚走神了一下，这条没接住，再发一次好吗？"
 
 
 class MemberAccessCache:
-    """``user_id -> 是否授权群成员`` 的 TTL 缓存（纯内存，进程重启即空）。"""
+    """``user_id -> 准入档位`` 的 TTL 缓存（纯内存，进程重启即空）。
+
+    存的是档位字符串而不是布尔值：档位既表示「能不能用」，也表示「配额走哪一档」，
+    一次查询同时拿到两件事，不用为配额再打一次 ``getChatMember``。
+    """
 
     def __init__(
         self,
@@ -110,23 +125,23 @@ class MemberAccessCache:
         self.ttl_seconds = max(1.0, float(ttl_seconds))
         self.max_users = max(16, int(max_users))
         self._clock = clock or time.monotonic
-        self._entries: dict[int, tuple[bool, float]] = {}
+        self._entries: dict[int, tuple[str, float]] = {}
 
-    def get(self, user_id: int) -> bool | None:
+    def get(self, user_id: int) -> str | None:
         entry = self._entries.get(int(user_id))
         if entry is None:
             return None
-        allowed, expires_at = entry
+        tier, expires_at = entry
         if expires_at <= self._clock():
             self._entries.pop(int(user_id), None)
             return None
-        return allowed
+        return tier
 
-    def put(self, user_id: int, allowed: bool) -> None:
+    def put(self, user_id: int, tier: str) -> None:
         if len(self._entries) >= self.max_users and int(user_id) not in self._entries:
             # 容量满了先清最老的一批：准入结果过期即失效，清掉只会多打一次 API
             self._entries.clear()
-        self._entries[int(user_id)] = (bool(allowed), self._clock() + self.ttl_seconds)
+        self._entries[int(user_id)] = (str(tier), self._clock() + self.ttl_seconds)
 
     def clear(self) -> None:
         self._entries.clear()
@@ -161,52 +176,77 @@ def _is_definitive_absent(exc: BaseException) -> bool:
     return any(hint in detail for hint in _NOT_MEMBER_HINTS)
 
 
-def _is_member_status(member: Any) -> bool:
-    """``ChatMember`` → 是否算「在群里」。
+def _member_tier(member: Any) -> str:
+    """``ChatMember`` → 准入档位。
 
-    ``restricted`` 要看 ``is_member``：被禁言但还在群 = 成员；被踢但状态还没
-    刷新成 ``kicked`` 的旧数据不算。
+    群主与群管理员同档（都算「群管理员」，500/天）；``restricted`` 要看
+    ``is_member``：被禁言但还在群 = 普通成员；被踢但状态还没刷新成 ``kicked``
+    的旧数据不算成员。
     """
 
     status = str(getattr(member, "status", "") or "").lower()
-    if status in ("creator", "administrator", "member"):
-        return True
-    if status == "restricted":
-        return bool(getattr(member, "is_member", False))
-    return False
+    if status in ("creator", "administrator"):
+        return TIER_ADMIN
+    if status == "member":
+        return TIER_MEMBER
+    if status == "restricted" and bool(getattr(member, "is_member", False)):
+        return TIER_MEMBER
+    return TIER_NONE
 
 
-async def confirm_authorized_group_member(
+@dataclass(frozen=True)
+class AccessVerdict:
+    """一次私聊准入判定的结果：放行与否 + 档位（档位决定配额阶梯）。"""
+
+    allowed: bool | None  # None = 无法确认
+    tier: str
+    detail: str = ""
+
+    @property
+    def is_super(self) -> bool:
+        return self.tier == TIER_SUPER
+
+    @property
+    def is_admin(self) -> bool:
+        return self.tier == TIER_ADMIN
+
+
+async def resolve_access(
     bot: Any,
     session: Any,
     settings: Any,
     user_id: int,
     *,
     cache: MemberAccessCache | None = None,
-) -> bool | None:
-    """判定「这个私聊用户是不是某个已授权群的成员」。
+) -> AccessVerdict:
+    """判定「这个私聊用户是谁」：最高管理员 / 群管理员 / 普通成员 / 都不是。
 
-    返回 ``True`` / ``False`` / ``None``：``None`` 表示**无法确认**（Telegram
-    侧查询异常），调用方应回一条「稍后再试」，既不进模型也不计配额——按不确定
-    就放行会变成免费代理，按不确定就拒绝会误伤真人，所以单独给一条退路。
+    ``allowed is None`` 表示**无法确认**（Telegram 侧查询异常）：调用方应回一条
+    「稍后再试」，既不进模型也不计配额——按不确定就放行会变成免费代理，按不确定
+    就拒绝会误伤真人，所以单独给一条退路。
+
+    档位取「所有授权群里最高的那个」：在 A 群是普通成员、在 B 群是管理员 → 管理员。
     """
 
     uid = int(user_id)
     if is_super_admin_user_id(uid, settings):
-        return True
+        return AccessVerdict(True, TIER_SUPER)
 
     store = cache if cache is not None else _member_cache
     hit = store.get(uid)
     if hit is not None:
-        return hit
+        if hit == TIER_NONE:
+            return AccessVerdict(False, TIER_NONE)
+        return AccessVerdict(True, hit)
 
     try:
         groups = await list_authorized_groups(session)
     except Exception as exc:  # 数据库异常同样视为「无法确认」
         log.warning("private chat: 授权群查询失败 | user=%s | error=%s", uid, exc)
-        return None
+        return AccessVerdict(None, TIER_UNKNOWN, "authorized group lookup failed")
 
     unknown = False
+    best = TIER_NONE
     for row in groups:
         try:
             member = await bot.get_chat_member(chat_id=int(row.group_id), user_id=uid)
@@ -225,16 +265,38 @@ async def confirm_authorized_group_member(
             )
             unknown = True
             continue
-        if _is_member_status(member):
-            store.put(uid, True)
-            return True
+        tier = _member_tier(member)
+        if tier == TIER_ADMIN:
+            store.put(uid, TIER_ADMIN)
+            return AccessVerdict(True, TIER_ADMIN)
+        if tier == TIER_MEMBER:
+            best = TIER_MEMBER
+
+    if best == TIER_MEMBER:
+        # 还有群没查成时先不缓存：下次重查有可能升档（普通成员 → 管理员）
+        if not unknown:
+            store.put(uid, TIER_MEMBER)
+        return AccessVerdict(True, TIER_MEMBER)
 
     if unknown:
         # 有群没查成 → 不下结论，也不缓存（下一次重试）
-        return None
+        return AccessVerdict(None, TIER_UNKNOWN, "telegram lookup failed")
 
-    store.put(uid, False)
-    return False
+    store.put(uid, TIER_NONE)
+    return AccessVerdict(False, TIER_NONE)
+
+
+async def confirm_authorized_group_member(
+    bot: Any,
+    session: Any,
+    settings: Any,
+    user_id: int,
+    *,
+    cache: MemberAccessCache | None = None,
+) -> bool | None:
+    """兼容包装：只要布尔结论（``None`` = 无法确认）。"""
+
+    return (await resolve_access(bot, session, settings, user_id, cache=cache)).allowed
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +314,7 @@ class QuotaOutcome:
     per_user_limit: int
     global_used: int
     global_limit: int
+    tier: str = ""  # member / admin
 
 
 def local_day_key(now: Any | None = None) -> str:
@@ -287,25 +350,35 @@ async def consume_daily_quota(
     session: Any,
     *,
     user_id: int,
-    per_user_limit: int = DEFAULT_PER_USER_DAILY_LIMIT,
-    global_limit: int = DEFAULT_GLOBAL_DAILY_LIMIT,
+    is_admin: bool = False,
+    per_user_limit: int | None = None,
+    global_limit: int | None = None,
     day: str | None = None,
     stamp: Any | None = None,
 ) -> QuotaOutcome:
     """先扣再用：返回是否放行。
 
-    两道闸门在同一次事务里扣：任何一道超限就整体回滚（这轮不吃配额）。所以
-    「先扣了但没回」不会留下脏计数，也不会出现「用户 A 花掉了全局额度的一半」。
+    档位（普通成员 / 群管理员）同时决定每人上限与**本档的全局上限**——两组各记一个
+    全局计数行，互不占用（管理员花掉额度不影响普通成员）。两道闸门在同一次事务里扣，
+    任何一道超限就整体回滚（这轮不吃配额），不会留下「扣了但没派上用场」的脏计数。
     """
 
     uid = int(user_id)
+    tier = TIER_ADMIN if is_admin else TIER_MEMBER
+    if per_user_limit is None:
+        per_user_limit = (
+            ADMIN_PER_USER_DAILY_LIMIT if is_admin else DEFAULT_PER_USER_DAILY_LIMIT
+        )
+    if global_limit is None:
+        global_limit = (
+            ADMIN_GLOBAL_DAILY_LIMIT if is_admin else DEFAULT_GLOBAL_DAILY_LIMIT
+        )
+    global_row = ADMIN_GLOBAL_COUNTER_USER_ID if is_admin else GLOBAL_COUNTER_USER_ID
     stamp = stamp or now_shanghai_naive()
     key = str(day or local_day_key(stamp))
 
     user_used = await _bump(session, user_id=uid, day=key, stamp=stamp)
-    global_used = await _bump(
-        session, user_id=GLOBAL_COUNTER_USER_ID, day=key, stamp=stamp
-    )
+    global_used = await _bump(session, user_id=global_row, day=key, stamp=stamp)
 
     if user_used > int(per_user_limit):
         await session.rollback()
@@ -316,6 +389,7 @@ async def consume_daily_quota(
             per_user_limit=int(per_user_limit),
             global_used=global_used - 1,
             global_limit=int(global_limit),
+            tier=tier,
         )
     if global_used > int(global_limit):
         await session.rollback()
@@ -326,6 +400,7 @@ async def consume_daily_quota(
             per_user_limit=int(per_user_limit),
             global_used=global_used - 1,
             global_limit=int(global_limit),
+            tier=tier,
         )
 
     await session.commit()
@@ -336,6 +411,7 @@ async def consume_daily_quota(
         per_user_limit=int(per_user_limit),
         global_used=global_used,
         global_limit=int(global_limit),
+        tier=tier,
     )
 
 
