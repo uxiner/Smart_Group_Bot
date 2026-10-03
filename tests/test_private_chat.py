@@ -41,7 +41,12 @@ MEDIA_ATTRS = (
 
 
 def _settings(super_admin_id: int = SUPER_ADMIN) -> SimpleNamespace:
-    return SimpleNamespace(super_admin_id=super_admin_id)
+    # firecrawl_api_key 是顶层字段：检索技能拿的是这个对象本身
+    return SimpleNamespace(
+        super_admin_id=super_admin_id,
+        bot=SimpleNamespace(),
+        firecrawl_api_key="",
+    )
 
 
 def _verdict(tier: str = dm.TIER_MEMBER) -> dm.AccessVerdict:
@@ -678,6 +683,34 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.chat.await_args.kwargs.get("stage"), "dm", "用量看板要能单独看到私聊")
         history = dm.history_store().history(message.from_user.id)
         self.assertEqual([h["role"] for h in history], ["user", "assistant"])
+
+    async def test_reply_goes_through_the_search_path(self) -> None:
+        """私聊回复必须走带搜索的那条路（stage=dm），否则联网能力等于没有。"""
+
+        message = _message(text="帮我查查这两天显卡的新闻")
+        llm = self._fake_llm()
+        ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
+        answer = SimpleNamespace(text="查到啦，亲爱的～", searches=1, exhausted=False)
+        settings = _settings()
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+             patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(
+                 dm_handler, "answer_with_search", new=AsyncMock(return_value=answer)
+             ) as search:
+            await dm_handler.on_private_message(message, AsyncMock(), settings)
+        self.assertEqual(search.await_args.kwargs.get("stage"), "dm")
+        self.assertEqual(
+            search.await_args.kwargs.get("user_text"), "帮我查查这两天显卡的新闻",
+            "要把本轮原话交给搜索判断，不能靠猜历史里的 user 消息",
+        )
+        self.assertIs(
+            search.await_args.kwargs.get("settings"), settings,
+            "必须把顶层设置交给检索技能（key 在顶层），否则 Firecrawl 到不了、只会落到 ddgs",
+        )
+        self.assertEqual(message.answer.await_args.args[0], "查到啦，亲爱的～")
+        llm.chat.assert_not_awaited()
 
     async def test_video_is_answered_without_touching_the_model(self) -> None:
         message = _message()

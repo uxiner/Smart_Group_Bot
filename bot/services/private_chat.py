@@ -673,6 +673,17 @@ def build_private_chat_messages(
                 "- If the matter involves real risk (money, accounts, passwords, privacy, "
                 "health, safety, legal trouble, data loss), drop the playful shell and "
                 "answer seriously and accurately first.\n"
+                "- When a `[WEB_SEARCH_RESULTS]` block is present in this turn, a real web "
+                "search has already run for you: answer from those results and say what you "
+                "found, and how solid it looks. When that block says no usable result came "
+                "back, say plainly that you could not find it — never fill the gap with "
+                "invented news, prices, models, or numbers.\n"
+                "- Never promise a capability you have not actually used in this turn. If no "
+                "retrieval or tool actually ran and returned results, do not say you can search "
+                "the web, do not say you will go look it up, and do not imply a lookup is "
+                "coming. Say plainly that you could not pull it here, then give only what you "
+                "actually know and are sure of — never invent numbers, prices, or news to fill "
+                "the gap.\n"
                 "- Use blank lines only when the content genuinely needs structure."
             ),
         }
