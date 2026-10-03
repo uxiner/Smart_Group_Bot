@@ -351,6 +351,23 @@ class BotBehaviorConfig(StrictModel):
     # 上下文的任何路径都不读 ``private_chat_messages``；本期不实现打开后的读取逻辑
     # （开启需要用户显式授权，届时再补读取器、授权校验与审计）。
     group_can_read_private_history: bool = False
+    # 第 4 期：长期记忆（``user_facts``）——从对话里提炼的稳定事实。
+    # 全部可运行时覆盖；语义见 ``bot.services.long_term_memory`` 与 ``bot/config.py``。
+    memory_facts_enabled: bool = True
+    memory_extract_enabled: bool = True
+    memory_extract_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    memory_extract_min_messages: int = Field(default=20, ge=5, le=500)
+    #: 每天最多提炼次数（0 = 不限，防成本失控）
+    memory_extract_daily_cap: int = Field(default=48, ge=0, le=500)
+    memory_extract_batch_max: int = Field(default=200, ge=20, le=1000)
+    memory_tool_enabled: bool = True
+    #: 每个作用域每天模型主动写（remember 工具）的条数上限（0 = 不限）
+    memory_tool_daily_cap: int = Field(default=30, ge=0, le=200)
+    memory_recall_limit: int = Field(default=8, ge=1, le=20)
+    #: category='event' 的过期天数
+    memory_event_ttl_days: int = Field(default=30, ge=1, le=365)
+    #: 被删除/被替代的事实保留多少天后物理清理
+    memory_deleted_retention_days: int = Field(default=30, ge=1, le=365)
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -999,6 +1016,20 @@ class RuntimeConfig(StrictModel):
         settings.bot.group_can_read_private_history = (
             bot.group_can_read_private_history
         )
+        # 第 4 期：长期记忆（user_facts）
+        settings.bot.memory_facts_enabled = bot.memory_facts_enabled
+        settings.bot.memory_extract_enabled = bot.memory_extract_enabled
+        settings.bot.memory_extract_interval_minutes = (
+            bot.memory_extract_interval_minutes
+        )
+        settings.bot.memory_extract_min_messages = bot.memory_extract_min_messages
+        settings.bot.memory_extract_daily_cap = bot.memory_extract_daily_cap
+        settings.bot.memory_extract_batch_max = bot.memory_extract_batch_max
+        settings.bot.memory_tool_enabled = bot.memory_tool_enabled
+        settings.bot.memory_tool_daily_cap = bot.memory_tool_daily_cap
+        settings.bot.memory_recall_limit = bot.memory_recall_limit
+        settings.bot.memory_event_ttl_days = bot.memory_event_ttl_days
+        settings.bot.memory_deleted_retention_days = bot.memory_deleted_retention_days
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
         settings.bot.proactive_jitter_minutes = bot.proactive_jitter_minutes
@@ -1789,6 +1820,15 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "search_freshness_price_hours",
             "search_freshness_news_hours",
             "search_freshness_fact_hours",
+            # 第 4 期：长期记忆（user_facts）
+            "memory_extract_interval_minutes",
+            "memory_extract_min_messages",
+            "memory_extract_daily_cap",
+            "memory_extract_batch_max",
+            "memory_tool_daily_cap",
+            "memory_recall_limit",
+            "memory_event_ttl_days",
+            "memory_deleted_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -1796,6 +1836,10 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "memory_recall_enabled",
             "memory_automatic_compaction",
             "group_can_read_private_history",
+            # 第 4 期：长期记忆的两个开关
+            "memory_facts_enabled",
+            "memory_extract_enabled",
+            "memory_tool_enabled",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
@@ -2045,6 +2089,73 @@ def build_legacy_runtime_config(
                 if "bot_group_can_read_private_history"
                 in getattr(settings, "model_fields_set", set())
                 else settings.bot.group_can_read_private_history
+            ),
+            # 第 4 期：长期记忆（user_facts）
+            memory_facts_enabled=(
+                settings.bot_memory_facts_enabled
+                if "bot_memory_facts_enabled"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_facts_enabled
+            ),
+            memory_extract_enabled=(
+                settings.bot_memory_extract_enabled
+                if "bot_memory_extract_enabled"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_extract_enabled
+            ),
+            memory_extract_interval_minutes=(
+                settings.bot_memory_extract_interval_minutes
+                if "bot_memory_extract_interval_minutes"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_extract_interval_minutes
+            ),
+            memory_extract_min_messages=(
+                settings.bot_memory_extract_min_messages
+                if "bot_memory_extract_min_messages"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_extract_min_messages
+            ),
+            memory_extract_daily_cap=(
+                settings.bot_memory_extract_daily_cap
+                if "bot_memory_extract_daily_cap"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_extract_daily_cap
+            ),
+            memory_extract_batch_max=(
+                settings.bot_memory_extract_batch_max
+                if "bot_memory_extract_batch_max"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_extract_batch_max
+            ),
+            memory_tool_enabled=(
+                settings.bot_memory_tool_enabled
+                if "bot_memory_tool_enabled"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_tool_enabled
+            ),
+            memory_tool_daily_cap=(
+                settings.bot_memory_tool_daily_cap
+                if "bot_memory_tool_daily_cap"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_tool_daily_cap
+            ),
+            memory_recall_limit=(
+                settings.bot_memory_recall_limit
+                if "bot_memory_recall_limit"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_recall_limit
+            ),
+            memory_event_ttl_days=(
+                settings.bot_memory_event_ttl_days
+                if "bot_memory_event_ttl_days"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_event_ttl_days
+            ),
+            memory_deleted_retention_days=(
+                settings.bot_memory_deleted_retention_days
+                if "bot_memory_deleted_retention_days"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_deleted_retention_days
             ),
             proactive_default_enabled=settings.bot_proactive_default_enabled,
             proactive_idle_minutes=settings.bot_proactive_idle_minutes,
