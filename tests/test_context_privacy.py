@@ -240,6 +240,39 @@ class PrivateToGroupPrivacyTests(unittest.IsolatedAsyncioTestCase):
             _joined(self._casual_prompt(history)), private_markers=[SENTINEL]
         )
 
+    async def test_recall_layer_branch_keeps_sentinel_out(self) -> None:
+        """带记忆召回索引这一分支：拆分「历史 / 召回」两层后拼接，也不能带出私聊内容。
+
+        ``get_history_for_llm`` 把召回索引固定加在尾部（第 2 期口径），这里用一条带
+        ``memory_source="recalled_archive_index"`` 的合成消息显式覆盖该分支。
+        """
+
+        settings = _group_settings()
+        recall = {
+            "role": "user",
+            "content": "[RECALLED_MEMORY_INDEX]\n- 群里以前聊过显卡",
+            "memory_source": "recalled_archive_index",
+        }
+        history = [
+            {"role": "user", "content": "群里的历史消息"},
+            recall,
+        ]
+        merged = await group_handler._inject_group_search_records(
+            history=history,
+            group_id=GROUP_ID,
+            memory=self.memory,
+            settings=settings,
+        )
+        joined = _joined(merged)
+        gpc.assert_no_private_content(joined, private_markers=[SENTINEL])
+        self.assertIn("群里的历史消息", joined)
+        self.assertIn("[RECALLED_MEMORY_INDEX]", joined)
+        self.assertEqual(
+            str(merged[-1].get("memory_source") or ""),
+            "recalled_archive_index",
+            "召回索引仍然固定在尾部（第 2 期口径不变）",
+        )
+
     async def test_turning_the_switch_on_still_reads_nothing(self) -> None:
         """本期不实现打开后的读取：开关为 True 也不会有任何私聊正文进群聊。"""
 
