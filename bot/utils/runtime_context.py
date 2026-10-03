@@ -5,25 +5,37 @@ from datetime import datetime, timezone
 from typing import Any
 
 from bot.utils.command_catalog import build_command_guide_context
+from bot.utils.timezone import now_shanghai
+
+
+_WEEKDAY_CN = ("一", "二", "三", "四", "五", "六", "日")
 
 
 def build_current_time_context() -> str:
-    """Build real-time clock context for LLM prompts."""
-    now_local = datetime.now().astimezone()
-    now_utc = datetime.now(timezone.utc)
-    tz_name = now_local.tzname() or "local"
+    """Build real-time clock context for LLM prompts.
+
+    **本地时间一律按 Asia/Shanghai（UTC+8）给，不看进程/容器的时区**：生产容器跑在
+    UTC 上（``TZ`` 未设），这里原先用 ``datetime.now().astimezone()``，于是把 UTC
+    当成「本地时间」喂给模型——机器人报的「现在/今天」比中国时间早 8 小时。改用
+    ``bot.utils.timezone.now_shanghai()`` 之后，无论容器时区是什么（UTC、还是有人
+    忘了设 TZ），模型看到的都是中国时间。
+
+    ``utc_datetime`` 保留，但它只是换算参照；权威口径是 ``local_datetime``。
+    """
+    now_local = now_shanghai()
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     offset_raw = now_local.strftime("%z")
-    if len(offset_raw) == 5:
-        offset = f"{offset_raw[:3]}:{offset_raw[3:]}"
-    else:
-        offset = offset_raw or "+00:00"
+    offset = f"{offset_raw[:3]}:{offset_raw[3:]}" if len(offset_raw) == 5 else "+08:00"
 
     return (
         "[CURRENT_TIME]\n"
         f"local_datetime: {now_local.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"local_weekday: {now_local.strftime('%A')}\n"
-        f"timezone: {tz_name} (UTC{offset})\n"
+        f"local_weekday_cn: 星期{_WEEKDAY_CN[now_local.weekday()]}\n"
+        f"timezone: Asia/Shanghai (UTC{offset})\n"
         f"utc_datetime: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "local_datetime 是中国时间（Asia/Shanghai，UTC+8），涉及「现在/今天/明天/几点」一律按它算；"
+        "utc_datetime 仅作换算参照。\n"
         "If user asks about current time/date/today/tomorrow, use this block as the authoritative source."
     )
 

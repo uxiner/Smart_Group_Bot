@@ -155,6 +155,7 @@ from bot.utils.prompts import build_content_boundaries_context
 from bot.utils.security import format_history_message_line
 from bot.utils.timezone import (
     format_shanghai_timestamp,
+    now_shanghai,
     now_shanghai_naive,
     to_shanghai_naive,
 )
@@ -4012,7 +4013,8 @@ async def _record_group_activity_cas(
     if session.in_transaction():
         await session.commit()
 
-    activity_at = datetime.now().astimezone()
+    # 活跃/静默窗口按中国时间算：容器时区若是 UTC，原有写法会把「晚上」算成「下午」。
+    activity_at = now_shanghai()
     preview = record_group_activity(stored_settings, settings.bot, at=activity_at)
     _schedule_group_activity_write(
         session_factory=session_factory,

@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata \
     && groupadd --gid "${APP_GID}" app \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home app \
     && rm -rf /var/lib/apt/lists/*
