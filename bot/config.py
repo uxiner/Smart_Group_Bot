@@ -155,6 +155,13 @@ class BotConfig(BaseModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = 8
     memory_automatic_compaction: bool = False
+    # One-to-one private chat history: rows persist in ``private_chat_messages``
+    # and every turn is assembled by token budget.  278528 = 272K is the agreed
+    # depth target for the main model (measured gateway window 1,000,000); it is
+    # deliberately NOT tied to ``max_context_tokens`` (raising that is a later
+    # release).  Retention mirrors ``memory_retention_days`` (1..365).
+    private_chat_history_token_budget: int = 278528
+    private_chat_history_retention_days: int = 30
 
 
 class ModerationConfig(BaseModel):
@@ -280,6 +287,9 @@ class Settings(BaseSettings):
     bot_memory_recall_enabled: bool = True
     bot_memory_recall_max_results: int = 8
     bot_memory_automatic_compaction: bool = False
+    # Private-chat history (persisted rows + token-budget assembly).
+    bot_private_chat_history_token_budget: int = 278528
+    bot_private_chat_history_retention_days: int = 30
     bot_proactive_default_enabled: bool = False
     bot_proactive_idle_minutes: int = 180
     bot_proactive_jitter_minutes: int = 60
@@ -847,6 +857,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "memory_retention_days",
             "memory_archive_max_messages_per_group",
             "memory_recall_max_results",
+            "private_chat_history_token_budget",
+            "private_chat_history_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -910,6 +922,13 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.bot.memory_retention_days = min(
         365, max(1, int(settings.bot_memory_retention_days))
+    )
+    settings.bot.private_chat_history_token_budget = min(
+        2_000_000,
+        max(1024, int(settings.bot_private_chat_history_token_budget)),
+    )
+    settings.bot.private_chat_history_retention_days = min(
+        365, max(1, int(settings.bot_private_chat_history_retention_days))
     )
     settings.bot.memory_archive_max_messages_per_group = min(
         1_000_000,
