@@ -47,6 +47,10 @@ from bot.services.group_public_context import (
     GROUP_PUBLIC_HEADER_BLOCK,
     render_group_public_messages,
 )
+from bot.services.long_term_memory import (
+    LONG_TERM_MEMORY_HEADER_BLOCK,
+    render_facts_block,
+)
 from bot.services.reply_output import (
     REPLY_OUTPUT_AWARENESS,
     REPLY_OUTPUT_PROTOCOL,
@@ -1104,6 +1108,7 @@ def build_private_chat_messages(
     last_contact: str = "",
     search_records: list[dict[str, Any]] | None = None,
     group_public_records: list[dict[str, Any]] | None = None,
+    long_term_facts: list[dict[str, Any]] | None = None,
     group_titles: dict[int, str] | None = None,
     budget_tokens: int = CONTEXT_TOKEN_BUDGET,
 ) -> list[dict[str, Any]]:
@@ -1126,9 +1131,15 @@ def build_private_chat_messages(
     * ``group_public_records``：他在**已授权群里公开**说过/公开讨论过的内容
       （``[群聊公开记录 · 群名/群id]``）——方向只允许「群 → 私聊」。
 
-    两层都按「一条一条」交给统一闸门 :func:`bot.services.context_gate.assemble_context_within_budget`，
+    第 4 期再加一层：
+
+    * ``long_term_facts``：长期记忆（``[长期记忆]``）——**本人 private 事实** 加上
+      「该用户可访问群」里关于他的 group 事实（同样是「群 → 私聊」方向）。取数由
+      ``bot.services.long_term_memory.load_private_chat_facts`` 负责，这里只渲染。
+
+    三层都按「一条一条」交给统一闸门 :func:`bot.services.context_gate.assemble_context_within_budget`，
     超预算时按「最老的历史 → 最旧的搜索记录 → 记忆召回条数」裁剪；系统提示词/人设与
-    本轮消息永远不裁。不传这两层时输出与改造前逐字一致。
+    本轮消息永远不裁。不传这些层时输出与改造前逐字一致。
     """
 
     normalized = clean_multiline_text(str(text or ""), max_len=PRIVATE_INPUT_LIMIT)
@@ -1296,19 +1307,22 @@ def build_private_chat_messages(
     group_public_messages = render_group_public_messages(
         group_public_records, titles=group_titles
     )
-    # 头部说明（``[SEARCH_RECORDS]`` / ``[群聊公开记录]`` + 来源声明）放进**固定层**：
-    # 它是资料的来源声明，不该因为在预算里排在最前面就被先裁掉——被裁的永远是最旧的
-    # 那一条。它们紧跟在 tail_system 之后、各自条目之前（见下面的返回顺序）。
+    fact_messages = render_facts_block(long_term_facts, titles=group_titles)
+    # 头部说明（``[SEARCH_RECORDS]`` / ``[群聊公开记录]`` / ``[长期记忆]`` + 来源声明）
+    # 放进**固定层**：它是资料的来源声明，不该因为在预算里排在最前面就被先裁掉——
+    # 被裁的永远是最旧的那一条。它们紧跟在 tail_system 之后、各自条目之前。
     if search_messages:
         messages.append({"role": "system", "content": SEARCH_RECORDS_HEADER_BLOCK})
     if group_public_messages:
         messages.append({"role": "system", "content": GROUP_PUBLIC_HEADER_BLOCK})
-    # 统一闸门：三层可裁（历史 → 搜索留档 → 群聊公开记录〔按「记忆召回条数」口径〕），
+    if fact_messages:
+        messages.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER_BLOCK})
+    # 统一闸门：三层可裁（历史 → 搜索留档 → 记忆召回〔群聊公开记录 + 长期记忆〕），
     # 系统提示词/人设与本轮消息永不裁。不传新层时这里等价于原样返回。
     assembly = assemble_context_within_budget(
         system=messages,
         current_turn=current_turn,
-        memory_recall=group_public_messages,
+        memory_recall=[*group_public_messages, *fact_messages],
         search_records=search_messages,
         history=history_messages,
         budget_tokens=budget_tokens,

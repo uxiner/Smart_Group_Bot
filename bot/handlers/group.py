@@ -154,6 +154,13 @@ from bot.services.search_memory import (
     load_search_records,
     render_search_record_messages,
 )
+from bot.services.long_term_memory import (
+    LONG_TERM_MEMORY_HEADER_BLOCK,
+    load_relevant_facts,
+    memory_facts_enabled,
+    memory_recall_limit,
+    render_facts_block,
+)
 from bot.services.skills import SkillService
 from bot.services.skills.vote_ban import is_explicit_vote_ban_request
 from bot.services.sticker_library import sticker_library
@@ -5893,6 +5900,10 @@ async def _inject_group_search_records(
     )
     if not search_messages:
         return history
+    # 打上来源标记：第 4 期的长期记忆注入要在**同一次装配**里把这些留档放回
+    # ``search_records`` 层（否则第二次装配会把它们当成「历史」，裁剪优先级就错了）。
+    for item in search_messages:
+        item["memory_source"] = "search_record"
 
     recall_layer = [
         item
@@ -5925,6 +5936,102 @@ async def _inject_group_search_records(
             "[%s] 检索留档注入触发了预算裁剪 | trims=%s | used=%d | budget=%d",
             group_id,
             [(t.layer, t.dropped_messages, t.truncated_messages) for t in assembly.trims],
+            assembly.used_tokens,
+            assembly.budget_tokens,
+        )
+    return [
+        *kept["history"],
+        *kept["system"],
+        *kept["search_records"],
+        *kept["memory_recall"],
+    ]
+
+
+async def _inject_group_long_term_memory(
+    *,
+    history: list[dict],
+    group_id: int,
+    speaker_user_id: int,
+    query: str,
+    memory: Any,
+    settings: Settings,
+) -> list[dict]:
+    """第 4 期：把**本群**的长期记忆接进群聊上下文。
+
+    取两类事实：``subject_user_id=0``（本群整体的公共事实）与**本轮发言者本人**
+    （``speaker_user_id``）的。合并去重由读取层负责。
+
+    * **只读本群**（``scope='group'`` + ``group_id``）：私聊事实在另一个作用域，
+      这里既拿不到、也不会去拿（第 1 验收项红线）。
+    * **相关才注入**：检索无命中就原样返回 ``history``，绝不硬塞。
+    * 注入层语义等同 ``memory_recall``：由统一闸门按**最低**优先级裁剪；头部说明放进
+      永不裁剪的固定层。取不到/读取失败/开关关闭都只是原样返回 ``history``。
+    """
+
+    if not memory_facts_enabled(settings):
+        return history
+    factory = getattr(memory, "session_factory", None)
+    if factory is None:
+        return history
+    topic = " ".join(str(query or "").split())
+    if not topic:
+        return history
+    try:
+        async with factory() as session:
+            records = await load_relevant_facts(
+                session,
+                scope=SCOPE_GROUP,
+                scope_id=int(group_id),
+                subject_user_id=[0, int(speaker_user_id)],
+                query=topic,
+                limit=memory_recall_limit(settings),
+            )
+    except Exception as exc:
+        log.warning(
+            "[%s] 长期记忆读取失败（按没有记忆处理） | error=%s", group_id, exc
+        )
+        return history
+    fact_messages = render_facts_block(records)
+    if not fact_messages:
+        return history
+
+    search_layer: list[dict] = []
+    header_layer: list[dict] = []
+    recall_layer: list[dict] = []
+    history_layer: list[dict] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("memory_source") or "")
+        if source == "search_record":
+            search_layer.append(item)
+        elif source == "recalled_archive_index":
+            recall_layer.append(item)
+        elif str(item.get("content") or "") == SEARCH_RECORDS_HEADER_BLOCK:
+            header_layer.append(item)
+        else:
+            history_layer.append(item)
+    assembly = assemble_context_within_budget(
+        system=[
+            *header_layer,
+            {"role": "system", "content": LONG_TERM_MEMORY_HEADER_BLOCK},
+        ],
+        current_turn=[],
+        memory_recall=[*recall_layer, *fact_messages],
+        search_records=search_layer,
+        history=history_layer,
+        budget_tokens=context_token_budget(settings),
+        reserve_tokens=group_context.group_history_reserve_tokens(settings),
+    )
+    kept = assembly.layers
+    if assembly.trims:
+        log.info(
+            "[%s] 长期记忆注入触发了预算裁剪 | trims=%s | used=%d | budget=%d",
+            group_id,
+            [
+                (trim.layer, trim.dropped_messages, trim.truncated_messages)
+                for trim in assembly.trims
+            ],
             assembly.used_tokens,
             assembly.budget_tokens,
         )
@@ -6180,6 +6287,16 @@ async def _process_pending_reply_batch(
                 history = await _inject_group_search_records(
                     history=history,
                     group_id=group_id,
+                    memory=memory,
+                    settings=settings,
+                )
+                # 第 4 期：本群长期记忆（本群公共事实 + 本轮发言者本人的事实）。
+                # 私聊事实**永远不会**走到这里：读取层按 scope 硬隔离（第 1 验收项）。
+                history = await _inject_group_long_term_memory(
+                    history=history,
+                    group_id=group_id,
+                    speaker_user_id=user_id,
+                    query=merged_input_text,
                     memory=memory,
                     settings=settings,
                 )
