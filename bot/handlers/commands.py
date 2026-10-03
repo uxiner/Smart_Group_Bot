@@ -25,7 +25,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
@@ -41,6 +41,16 @@ from bot.services.authz import (
     is_super_admin_user_id,
 )
 from bot.services import memory_holder
+# 第 4 期：长期记忆（/memory 命令的读写都走这个服务，命令层只做渲染与权限）
+from bot.services.long_term_memory import (
+    clear_optout,
+    list_facts_about_user_in_group,
+    list_facts_for_user,
+    list_group_facts,
+    memory_facts_enabled,
+    set_optout,
+    soft_delete_fact,
+)
 from bot.services.checkin import (
     CHALLENGE_SKIP_COST,
     CHECKIN_CALLBACK_DATA,
@@ -3249,6 +3259,356 @@ async def cmd_find(
         + "</i>"
     )
     await _answer(message, settings, "\n".join(lines), disable_web_page_preview=True)
+
+
+#: /memory 的回执自动删除秒数（照 /checkin 的 2 秒命令删除 + 持久删除队列写法）
+MEMORY_COMMAND_DELETE_SECONDS = 2
+MEMORY_RECEIPT_SECONDS = 20
+#: /memory 列表每页几条
+MEMORY_PAGE_SIZE = 10
+
+_MEMORY_CATEGORY_LABELS = {
+    "identity": "身份",
+    "preference": "偏好",
+    "relationship": "关系",
+    "event": "事件",
+    "taboo": "禁忌",
+    "skill": "技能",
+    "other": "其它",
+}
+
+_MEMORY_SCOPE_LABELS = {"group": "群内", "private": "私聊"}
+
+
+async def _schedule_memory_command_cleanup(message: Message, group_id: int) -> None:
+    """删掉群友发的那条 /memory 命令本身（走 durable 调度器，重启也不丢）。"""
+
+    try:
+        accepted = await schedule_message_auto_delete_durable(
+            message, MEMORY_COMMAND_DELETE_SECONDS
+        )
+    except Exception:
+        log.warning(
+            "[%s] memory command cleanup scheduling failed", group_id, exc_info=True
+        )
+        return
+    if not accepted:
+        log.warning(
+            "[%s] memory command cleanup rejected | message=%s",
+            group_id,
+            getattr(message, "message_id", "?"),
+        )
+
+
+def _memory_record_lines(
+    records: list[dict],
+    *,
+    start_index: int,
+    titles: dict[int, str] | None = None,
+) -> list[str]:
+    """把若干条事实渲染成「编号 + 类别 + 时间 + 确认次数 + 正文」。"""
+
+    lines: list[str] = []
+    label_map = titles or {}
+    for offset, record in enumerate(records):
+        number = start_index + offset
+        category = _MEMORY_CATEGORY_LABELS.get(
+            str(record.get("category") or ""), "其它"
+        )
+        scope = str(record.get("scope") or "group")
+        where = _MEMORY_SCOPE_LABELS.get(scope, "群内")
+        if scope == "group":
+            title = label_map.get(int(record.get("scope_id") or 0))
+            if title:
+                where = f"群 {title}"
+        first_seen = record.get("first_seen_at")
+        when = first_seen.strftime("%Y-%m-%d") if first_seen is not None else "时间未知"
+        body = str(record.get("fact_text") or "")
+        lines.append(
+            f"<b>#{number}</b> · {html.escape(category)} · {html.escape(where)} · "
+            f"{html.escape(when)} · 已确认 {int(record.get('confirm_count') or 1)} 次\n"
+            f"　　{html.escape(body)}"
+        )
+    return lines
+
+
+def _render_memory_receipt(
+    records: list[dict],
+    *,
+    page: int,
+    page_size: int = MEMORY_PAGE_SIZE,
+    header: str = "机器人记得我的事",
+    group_titles: dict[int, str] | None = None,
+) -> str:
+    """``/memory`` 的回执（分页；编号是**全局序号**，跟 /memory forget 对齐）。"""
+
+    total = len(records)
+    pages = max(1, (total + page_size - 1) // page_size)
+    current = min(max(1, int(page)), pages)
+    start = (current - 1) * page_size
+    chunk = records[start : start + page_size]
+    if not records:
+        return (
+            f"<b>{html.escape(header)}</b>\n"
+            "现在还没有关于你的长期记忆。\n"
+            "<i>长期记忆会从群聊/私聊里慢慢积累。你可以用 /memory off 关掉它。</i>"
+        )
+    lines = [
+        f"<b>{html.escape(header)}</b>（第 {current}/{pages} 页，共 {total} 条）",
+        *_memory_record_lines(chunk, start_index=start + 1, titles=group_titles),
+        "",
+        "<i>/memory forget &lt;编号&gt; 删除一条；/memory off 关掉长期记忆。</i>",
+    ]
+    if pages > 1:
+        lines.append(
+            f"<i>翻页：/memory {current + 1 if current < pages else 1}</i>"
+        )
+    return "\n".join(lines)
+
+
+async def _resolve_memory_mention(
+    message: Message, session: AsyncSession, group_id: int
+) -> tuple[int, str]:
+    """解析 ``/memory @某人`` 里的目标：返回 ``(user_id, 显示名)``，解析不到返回 ``(0, "")``。
+
+    ``text_mention`` 实体直接带 user 对象；``@username`` 这种只能拿用户名去本群成员表
+    （``group_members``）里反查——查不到就明说查不到，绝不猜。
+    """
+
+    text = str(getattr(message, "text", "") or "")
+    for entity in list(getattr(message, "entities", None) or []):
+        entity_type = str(getattr(entity.type, "value", entity.type) or "")
+        if entity_type == "text_mention":
+            mentioned = getattr(entity, "user", None)
+            if mentioned is None or bool(getattr(mentioned, "is_bot", False)):
+                continue
+            name = str(getattr(mentioned, "full_name", "") or "")
+            return int(mentioned.id), name
+        if entity_type != "mention":
+            continue
+        offset = int(getattr(entity, "offset", 0) or 0)
+        length = int(getattr(entity, "length", 0) or 0)
+        handle = text[offset : offset + length].lstrip("@").strip()
+        if not handle:
+            continue
+        try:
+            row = (
+                await session.execute(
+                    select(GroupMember.user_id, GroupMember.full_name)
+                    .where(
+                        GroupMember.group_id == int(group_id),
+                        func.lower(GroupMember.username) == handle.lower(),
+                    )
+                    .limit(1)
+                )
+            ).first()
+        except Exception:
+            log.warning("memory: 成员反查失败 | group=%s", group_id, exc_info=True)
+            return 0, ""
+        if row is not None:
+            return int(row[0]), str(row[1] or handle)
+    return 0, ""
+
+
+@router.message(Command("memory"))
+async def cmd_memory(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """``/memory``：查看/删除机器人对我的长期记忆，以及本人级开关。
+
+    子命令（权限口径与 /find、/modstats 一致）：
+
+    * ``/memory [页码]``：本人可见「机器人记得我什么」（本人的 private 事实 +
+      在各群关于本人的 group 事实，分页）；
+    * ``/memory forget <编号>``：软删一条（只能删关于本人的；群管理员可删本群任意一条）；
+    * ``/memory off`` / ``/memory on``：本人级开关（写入 ``memory_optouts``；off 时把
+      本人已入库的 active 事实软删）；
+    * ``/memory @某人``（**仅管理员**）：看本群关于某成员的事实。
+
+    回执一律自动删除（2 秒删命令、20 秒删回执，走持久删除队列），避免群里刷屏。
+    """
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    user = getattr(message, "from_user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return
+    user_id = int(user.id)
+    group_id = int(message.chat.id)
+    if not memory_facts_enabled(settings):
+        await _answer(message, settings, "长期记忆功能当前已关闭。")
+        return
+
+    raw_args = str(message.text or "").partition(" ")[2].strip()
+    action, _, rest = raw_args.partition(" ")
+    action = action.strip().lower()
+    rest = rest.strip()
+
+    if action in ("off", "on"):
+        await _schedule_memory_command_cleanup(message, group_id)
+        if action == "off":
+            removed = await set_optout(session, user_id, reason="/memory off")
+            log.info(
+                "[%s] /memory off | user=%s | soft_deleted=%d",
+                group_id,
+                user_id,
+                removed,
+            )
+            await _answer(
+                message,
+                settings,
+                "<b>已关闭长期记忆</b>\n"
+                f"关于你的 {removed} 条记录已经删除，以后也不会再从你的消息里提炼。\n"
+                "<i>想重新打开用 /memory on（已经删掉的不会恢复）。</i>",
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        restored = await clear_optout(session, user_id)
+        log.info(
+            "[%s] /memory on | user=%s | had_optout=%s",
+            group_id,
+            user_id,
+            restored,
+        )
+        await _answer(
+            message,
+            settings,
+            "<b>已重新打开长期记忆</b>\n"
+            "以后会重新从你的消息里提炼（之前删掉的事实不会恢复）。",
+            auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+        )
+        return
+
+    if action == "forget":
+        await _schedule_memory_command_cleanup(message, group_id)
+        try:
+            number = int(rest)
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0:
+            await _answer(
+                message,
+                settings,
+                "用法：<code>/memory forget &lt;编号&gt;</code>\n"
+                "编号就是 /memory 列表里的 #编号。",
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        mine = await list_facts_for_user(session, user_id=user_id)
+        target = mine[number - 1] if 0 < number <= len(mine) else None
+        if target is None:
+            # 群里没有「本人的第 N 条」时，群管理员可以在本群全部事实里删任意一条。
+            is_admin = is_super_admin_user_id(
+                user_id, settings
+            ) or await is_group_admin_authorized(session, group_id, user_id)
+            if is_admin:
+                group_records = await list_group_facts(session, group_id=group_id)
+                if 0 < number <= len(group_records):
+                    target = group_records[number - 1]
+        if target is None:
+            await _answer(
+                message,
+                settings,
+                "没有找到这个编号（只能删关于你本人的；群管理员可以删本群任意一条）。",
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        deleted = await soft_delete_fact(session, int(target["id"]))
+        log.info(
+            "[%s] /memory forget | user=%s | fact_id=%s | deleted=%s",
+            group_id,
+            user_id,
+            target["id"],
+            deleted,
+        )
+        await _answer(
+            message,
+            settings,
+            "已删除这条长期记忆。" if deleted else "这条记录已经删过了。",
+            auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+        )
+        return
+
+    # /memory @某人（仅管理员）
+    entities = list(getattr(message, "entities", None) or [])
+    has_mention = action.startswith("@") or rest.startswith("@") or any(
+        str(getattr(entity.type, "value", entity.type) or "") == "text_mention"
+        for entity in entities
+    )
+    if has_mention:
+        if not await ensure_group_admin_permission(message, session, settings):
+            return
+        target_id, target_name = await _resolve_memory_mention(
+            message, session, group_id
+        )
+        if target_id <= 0:
+            await _schedule_memory_command_cleanup(message, group_id)
+            await _answer(
+                message,
+                settings,
+                "没认出这是谁（请用 Telegram 的 @ 选择器点人，或让对方在本群发过言）。",
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        records = await list_facts_about_user_in_group(
+            session, group_id=group_id, subject_user_id=target_id
+        )
+        await _schedule_memory_command_cleanup(message, group_id)
+        await _answer(
+            message,
+            settings,
+            _render_memory_receipt(
+                records,
+                page=1,
+                header=f"本群关于 {target_name or target_id} 的记忆",
+            ),
+            auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+        )
+        return
+
+    # /memory [页码]
+    try:
+        page = int(action) if action else 1
+    except (TypeError, ValueError):
+        page = 1
+    records = await list_facts_for_user(session, user_id=user_id)
+    titles: dict[int, str] = {}
+    group_ids = sorted(
+        {
+            int(record.get("scope_id") or 0)
+            for record in records
+            if str(record.get("scope") or "") == "group"
+        }
+        - {0}
+    )
+    if group_ids:
+        try:
+            rows = (
+                await session.execute(
+                    select(Group.id, Group.title).where(Group.id.in_(group_ids))
+                )
+            ).all()
+            titles = {
+                int(row[0]): str(row[1] or "")
+                for row in rows
+                if str(row[1] or "").strip()
+            }
+        except Exception:
+            titles = {}
+    await _schedule_memory_command_cleanup(message, group_id)
+    await _answer(
+        message,
+        settings,
+        _render_memory_receipt(
+            records, page=page, group_titles=titles, header="机器人记得我的事"
+        ),
+        auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+    )
 
 
 @router.message(Command("health"))
