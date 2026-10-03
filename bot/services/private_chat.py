@@ -1329,7 +1329,7 @@ def build_private_chat_messages(
     )
     kept = assembly.layers
     head_system = kept["system"][:1]  # 人设/围栏那一段
-    tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/焦点/项目事实 + 两个头部
+    tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/焦点/项目事实 + 三个头部
     return [
         *head_system,
         *kept["history"],
