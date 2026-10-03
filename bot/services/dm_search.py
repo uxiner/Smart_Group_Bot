@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from bot.services.checkin import local_today
+from bot.services.search_memory import SCOPE_PRIVATE, record_search_for_result
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.websearch import WebSearchSkill
 
@@ -58,6 +59,8 @@ class SearchAnswer:
     text: str
     searches: int = 0
     exhausted: bool = False  # 保险丝是否在这一轮被触发
+    #: 本轮检索结果是否已入档（第 3 期）：0 = 没写 / 写失败，1 = 已留档
+    recorded: int = 0
 
 
 class SearchBudget:
@@ -216,12 +219,19 @@ async def answer_with_search(
     settings: Any = None,
     max_results: int = 5,
     budget: SearchBudget | None = None,
+    session: Any = None,
+    scope_id: int = 0,
 ) -> SearchAnswer:
     """私聊回复：需要时效性信息就先搜再答，否则维持原来的一次调用。
 
     ``user_text`` 是这一轮对方说的话（用来判断要不要搜）；不传就从 messages 末尾取。
     ``settings``（顶层 Settings）用来把 Firecrawl 的 key 交给检索技能。
     ``SearchAnswer.searches`` 是真实发生的检索次数（0 或 1），供用量看板与日志用。
+
+    第 3 期：传了 ``session`` 与 ``scope_id``（= 私聊用户 id）时，**检索结果入档**
+    （``search_result_records``，scope=private）：没查到的空结果也写一行
+    （``outcome='empty'``），这样「这问题刚问过、当时就是没有」也能被后续轮次复用。
+    写失败绝不影响回复（``record_search_for_result`` 自己吞异常）。
     """
 
     limit = search_budget() if budget is None else budget
@@ -235,10 +245,11 @@ async def answer_with_search(
 
     searches = 0
     exhausted = False
+    recorded = 0
     if needs_search(user_text):
+        query = build_search_query(user_text)
         if limit.take():
             searches = 1
-            query = build_search_query(user_text)
             log.info("私聊搜索：触发联网检索 | query=%s", query)
             if not _firecrawl_key_present(settings):
                 log.warning(
@@ -255,12 +266,19 @@ async def answer_with_search(
                 result.error,
                 limit.used,
             )
+            recorded = await _record_private_search(
+                query=query, result=result, session=session, scope_id=scope_id
+            )
             convo.append({"role": "system", "content": render_results_block(result)})
         else:
             # 保险丝断了：也要把「这次没查到」写进对话，别让它凭记忆硬答
             exhausted = True
+            unavailable = unavailable_result()
+            recorded = await _record_private_search(
+                query=query, result=unavailable, session=session, scope_id=scope_id
+            )
             convo.append(
-                {"role": "system", "content": render_results_block(unavailable_result())}
+                {"role": "system", "content": render_results_block(unavailable)}
             )
     else:
         log.info("私聊搜索：这一句不需要联网，按普通回复走")
@@ -270,4 +288,30 @@ async def answer_with_search(
         # 绝不返回空：再兜一次（私聊必回）
         log.warning("私聊搜索：首次回复为空，兜底重试一次")
         text = await _plain_answer(llm, messages, stage=stage)
-    return SearchAnswer(text=text, searches=searches, exhausted=exhausted)
+    return SearchAnswer(
+        text=text, searches=searches, exhausted=exhausted, recorded=recorded
+    )
+
+
+async def _record_private_search(
+    *,
+    query: str,
+    result: SkillRunResult,
+    session: Any,
+    scope_id: int,
+) -> int:
+    """把一次私聊检索入档（拿不到 session / scope_id 就跳过）。"""
+
+    try:
+        uid = int(scope_id or 0)
+    except (TypeError, ValueError):
+        return 0
+    if session is None or uid == 0:
+        return 0
+    return await record_search_for_result(
+        scope=SCOPE_PRIVATE,
+        scope_id=uid,
+        query=query,
+        result=result,
+        session=session,
+    )
