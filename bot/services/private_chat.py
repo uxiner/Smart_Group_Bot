@@ -8,7 +8,8 @@
    上限（20000 / 100000 条/天，互不占用）；最高管理员不设限、不计数。
 3. **内容**：私聊不做群规审核，NSFW 也放开——群里那条「任何群都不允许发
    NSFW 图/视频」的底线**只针对群聊通道**，这里一个字都没动。
-4. **不落库**：私聊正文与图片内容不进群归档/记忆/向量；只记「条数」用于配额。
+4. **历史**：私聊正文只落**私聊自己的表**（``private_chat_messages``），不进群归档/
+   记忆/向量；配额仍只记「条数」。历史按 token 预算装配，机器人重启不失忆。
 
 设计取舍：
 
@@ -16,20 +17,26 @@
   ``main`` 阶段（``LLMService.chat`` 的默认标签）。
 * 准入结果按 TTL 缓存，避免每条消息都打一次 ``getChatMember``。
 * 配额落在 ``private_chat_usage`` 表（进程重启不清零），全局行用 ``user_id=0``。
+* 历史**优先读库**、内存缓冲只做兜底：读库失败时行为退回改造前（最近 12 轮），
+  不会因为存储抖动而整段失忆。
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from bot.db.models import PrivateChatUsage
+from bot.db.models import PrivateChatMessage, PrivateChatUsage
 from bot.services.authz import is_super_admin_user_id, list_authorized_groups
 from bot.services.checkin import local_today
 from bot.services.reply_output import (
@@ -55,6 +62,7 @@ from bot.utils.security import (
     wrap_untrusted_multiline,
 )
 from bot.utils.timezone import now_shanghai_naive
+from bot.utils.tokens import estimate_text_tokens
 
 log = logging.getLogger(__name__)
 
@@ -76,10 +84,42 @@ TIER_MEMBER = "member"  # 授权群的普通成员：100/天
 TIER_NONE = "none"      # 不在任何授权群
 TIER_UNKNOWN = "unknown"  # 查不通，无法下结论
 
-#: 私聊历史的保留轮数（只在内存里，进程重启即空）
+#: 私聊历史的保留轮数（**只用于内存兜底缓冲**，进程重启即空）
 HISTORY_MAX_TURNS = 12
 #: 私聊正文的长度上限（与群聊口径一致）
 PRIVATE_INPUT_LIMIT = 1000
+
+#: 私聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
+#: 主模型实测窗口 1,000,000，本次深度目标 272K，留出系统提示词、本轮消息与
+#: 联网检索结果块的空间。**这不是** ``max_context_tokens``（那是另一期的事）。
+PRIVATE_HISTORY_TOKEN_BUDGET = 278_528
+#: token 预算的夹取范围（与 runtime_config 里该字段的 ge/le 保持一致）
+PRIVATE_HISTORY_TOKEN_BUDGET_MIN = 1024
+PRIVATE_HISTORY_TOKEN_BUDGET_MAX = 2_000_000
+
+#: 私聊历史的轮数安全上限。**上限的理由**：token 预算才是真正的闸门，但预算只在
+#: 「内容本身够长」时才会先咬住——对方连发几万条一个字的消息时，272K 预算能装下
+#: 20 多万行，按用户读库、组装、正则估算就成了每条私聊的固定开销。单轮 = 用户 + 回复
+#: = 2 行，所以单次最多读 ``2 * 500 = 1000`` 行；正常私聊在保留期内远达不到这个数。
+PRIVATE_HISTORY_MAX_TURNS = 500
+
+#: 私聊历史的默认保留天数（与 ``memory_retention_days`` 同样的夹取口径：1..365）
+PRIVATE_HISTORY_RETENTION_DAYS = 30
+PRIVATE_HISTORY_RETENTION_DAYS_MIN = 1
+PRIVATE_HISTORY_RETENTION_DAYS_MAX = 365
+
+#: 每条历史消息在预算里额外占的固定开销（角色、消息分隔等），与群聊同口径（+12）
+_HISTORY_MESSAGE_TOKEN_OVERHEAD = 12
+#: 单条超长消息被截断时补的说明（截断必须留痕，不能让人以为对方只说了这半句）
+HISTORY_TRUNCATION_NOTE = "…（本条过长，已截断）"
+
+#: 注入给模型的**系统资料块**标记：不是对话内容，**一律不落库**。
+#: 目前只有私聊联网检索会注入这个块（见 ``bot/services/dm_search.py``）。
+INJECTED_BLOCK_MARKERS = ("[WEB_SEARCH_RESULTS]",)
+
+#: 私聊历史留存清理的巡检间隔（秒）。一天跑几次足够：过期行早删晚删都不影响
+#: 对话正确性，只要保证库不无限涨。
+_HISTORY_PRUNE_INTERVAL_SECONDS = 6 * 3600
 
 #: 给视觉模型看的私聊版指令：只描述，不出审核结论、不吐 JSON。
 DM_VISION_PROMPT = (
@@ -526,15 +566,19 @@ def notice_throttle() -> NoticeThrottle:
 
 
 # ---------------------------------------------------------------------------
-# 私聊历史（只在内存，不落库）
+# 私聊历史：落库（private_chat_messages）+ 按 token 预算装配
 # ---------------------------------------------------------------------------
 
 
 class PrivateHistoryStore:
-    """每个用户保留最近 ``HISTORY_MAX_TURNS`` 轮的对话文本。
+    """每个用户保留最近 ``HISTORY_MAX_TURNS`` 轮的对话文本（**进程内存兜底**）。
 
-    刻意不落库：私聊内容不进归档/记忆/向量（用户口径 4）。进程重启历史清空，
-    代价是重启后的第一条可能缺上下文，可以接受。
+    落库之后的定位变了：**库是唯一事实来源**，这个内存缓冲只做一件事——读库失败或
+    暂时读不到（这一轮刚写完还没提交、库被锁住）时，私聊能退回改造前的行为：最近
+    12 轮仍在上下文里，而不是整段失忆。
+
+    条数上限刻意保持 12 轮不变：它不再是「私聊能记住多久」的答案（库 + token 预算
+    才是），改动它只会让兜底路径和既有用例的行为一起漂移。
     """
 
     def __init__(self, *, max_users: int = 4096) -> None:
@@ -572,6 +616,409 @@ _history_store = PrivateHistoryStore()
 
 def history_store() -> PrivateHistoryStore:
     return _history_store
+
+
+def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
+    """把配置值夹到 ``[low, high]``；拿不到/不是数字就用默认值。"""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = int(default)
+    return min(int(high), max(int(low), number))
+
+
+def bounded_history_token_budget(value: Any) -> int:
+    """私聊历史 token 预算的夹取口径（与 runtime_config 的字段约束一致）。"""
+
+    return _bounded_int(
+        value,
+        default=PRIVATE_HISTORY_TOKEN_BUDGET,
+        low=PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
+        high=PRIVATE_HISTORY_TOKEN_BUDGET_MAX,
+    )
+
+
+def bounded_history_retention_days(value: Any) -> int:
+    """私聊历史保留天数的夹取口径（与 ``memory_retention_days`` 同为 1..365）。"""
+
+    return _bounded_int(
+        value,
+        default=PRIVATE_HISTORY_RETENTION_DAYS,
+        low=PRIVATE_HISTORY_RETENTION_DAYS_MIN,
+        high=PRIVATE_HISTORY_RETENTION_DAYS_MAX,
+    )
+
+
+def _bot_setting(settings: Any, name: str, default: Any) -> Any:
+    """从 ``settings.bot`` 读一个字段；缺项/``None`` 都退回默认值。
+
+    私聊的准入、配额、回复都不该因为「配置里少了这一项」而 500，所以这里一律
+    宽容读取：拿不到就用默认值（历史装配有安全上限，不会因此失控）。
+    """
+
+    bot = getattr(settings, "bot", None)
+    value = getattr(bot, name, None) if bot is not None else None
+    return default if value is None else value
+
+
+def private_history_token_budget(settings: Any) -> int:
+    """当前生效的私聊历史 token 预算（默认 278528）。"""
+
+    return bounded_history_token_budget(
+        _bot_setting(
+            settings,
+            "private_chat_history_token_budget",
+            PRIVATE_HISTORY_TOKEN_BUDGET,
+        )
+    )
+
+
+def private_history_retention_days(settings: Any) -> int:
+    """当前生效的私聊历史保留天数（默认 30，夹取 1..365）。"""
+
+    return bounded_history_retention_days(
+        _bot_setting(
+            settings,
+            "private_chat_history_retention_days",
+            PRIVATE_HISTORY_RETENTION_DAYS,
+        )
+    )
+
+
+def _int_message_id(value: Any) -> int | None:
+    """Telegram 消息 id 恒为正整数；拿不到整数就返回 None（测试替身也走这条路）。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def history_message_key(message_id: Any, role: str) -> str:
+    """一轮里某一行的幂等键：``u:<message_id>``（用户）/ ``a:<message_id>``（回复）。
+
+    拿不到整数 message_id 时退化成一次性随机键：宁可多写一行，也不能把两条不同的
+    消息当成同一行互相顶掉（那会真的丢对话）。
+    """
+
+    prefix = "a" if str(role or "").strip().lower() == "assistant" else "u"
+    mid = _int_message_id(message_id)
+    if mid is None:
+        return f"{prefix}:{uuid4().hex}"
+    return f"{prefix}:{mid}"
+
+
+def strip_injected_blocks(text: str) -> str:
+    """剔除注入给模型的系统资料块（保留标记之前的正文）。
+
+    写入路径本来就只拿「用户原话 + 机器人回复」，正常不会带检索结果块；这里是
+    防线：即便将来某条路径把整个 convo 正文交过来，也不会让系统资料以「对方说过
+    的话」的身份进历史，并在后续轮次被当成对话重新喂回去。
+    """
+
+    body = str(text or "")
+    if not body:
+        return ""
+    for marker in INJECTED_BLOCK_MARKERS:
+        if marker in body:
+            body = body.split(marker, 1)[0]
+    return body.strip()
+
+
+def _rowcount(result: Any) -> int:
+    """从执行结果里取受影响行数；测试替身（非整数）一律算 0，绝不抛异常。"""
+
+    try:
+        return max(0, int(getattr(result, "rowcount", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _safe_rollback(session: Any) -> None:
+    try:
+        await session.rollback()
+    except Exception:  # pragma: no cover - 回滚都失败就没有补救手段了
+        log.debug("private chat: 历史写入回滚失败（已忽略）")
+
+
+def _selected_rows(result: Any) -> list[Any]:
+    """从查询结果里取出行；拿不到可迭代结果时按「没有历史」处理。
+
+    ``AsyncMock`` 这类测试替身（以及将来某种异步结果包装）的 ``.all()`` 会返回一个
+    协程：这里显式关掉它再当空结果处理——既不会留下「未 await 的协程」告警噪音，
+    也不影响真实 SQLAlchemy ``Result`` 的路径。
+    """
+
+    raw = result.all()
+    if inspect.iscoroutine(raw):  # pragma: no cover - 只有测试替身/异常实现会走到
+        raw.close()
+        return []
+    return list(raw)
+
+
+def _history_role(value: Any) -> str:
+    """库里的 role 只允许 user / assistant；脏值一律当 user（不可信的一侧）。"""
+
+    return "assistant" if str(value or "").strip().lower() == "assistant" else "user"
+
+
+def _cut_text_to_tokens(text: str, limit_tokens: int) -> str:
+    """把文本从尾部硬切到 token 上限内（保留开头）。"""
+
+    if limit_tokens <= 0 or not text:
+        return ""
+    if estimate_text_tokens(text) <= limit_tokens:
+        return text
+    # 非 CJK 字符约 3 字符/token，所以 limit 个 token 最多只需要 3 * limit 个字符。
+    candidate = text[: min(len(text), limit_tokens * 3 + 3)]
+    low, high = 0, len(candidate)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_text_tokens(candidate[:mid]) <= limit_tokens:
+            low = mid
+        else:
+            high = mid - 1
+    return candidate[:low]
+
+
+def _truncate_history_content(text: str, limit_tokens: int) -> str:
+    """截断一条超长历史消息，并在放得下的情况下补一句「已截断」。"""
+
+    body = str(text or "")
+    if limit_tokens <= 0:
+        return ""
+    if estimate_text_tokens(body) <= limit_tokens:
+        return body
+    note = HISTORY_TRUNCATION_NOTE
+    kept = limit_tokens - estimate_text_tokens(note)
+    if kept <= 0:
+        # 预算连说明都放不下：先保住正文，别为了注释把内容全挤掉。
+        return _cut_text_to_tokens(body, limit_tokens)
+    return f"{_cut_text_to_tokens(body, kept)}{note}"
+
+
+def assemble_private_history(
+    rows: list[dict[str, Any]] | None,
+    *,
+    budget_tokens: int = PRIVATE_HISTORY_TOKEN_BUDGET,
+    max_turns: int = PRIVATE_HISTORY_MAX_TURNS,
+) -> list[dict[str, str]]:
+    """按 token 预算**从新到旧**累积装配历史，装不下就停。
+
+    三条硬规则：
+
+    1. **预算优先给最近的内容**：倒着累积，一旦装不下就停——宁可少给早期上下文，
+       也不能让最新的一轮被挤掉。
+    2. **单条超长不整条丢**：某条消息自己就超过整个预算（或它正好是最新的一条）时，
+       截到剩余预算并补一句「已截断」，而不是把这条直接扔掉。
+    3. **轮数安全上限**：最多只看最近 ``2 * max_turns`` 条消息（理由见
+       ``PRIVATE_HISTORY_MAX_TURNS``）。
+
+    返回按时间正序（最老的在前）的 ``[{"role", "content"}, ...]``，与
+    ``PrivateHistoryStore.history()`` 的形状完全一致。
+    """
+
+    items = [item for item in (rows or []) if isinstance(item, dict)]
+    if not items:
+        return []
+    budget = bounded_history_token_budget(budget_tokens)
+    keep = max(1, int(max_turns)) * 2
+    items = items[-keep:]
+
+    selected: list[dict[str, str]] = []
+    used_tokens = 0
+    for item in reversed(items):  # 从新到旧
+        content = str(item.get("content") or "")
+        if not content.strip():
+            continue
+        tokens = estimate_text_tokens(content) + _HISTORY_MESSAGE_TOKEN_OVERHEAD
+        if used_tokens + tokens <= budget:
+            selected.append({"role": _history_role(item.get("role")), "content": content})
+            used_tokens += tokens
+            continue
+        remaining = budget - used_tokens - _HISTORY_MESSAGE_TOKEN_OVERHEAD
+        oversized = estimate_text_tokens(content) > budget
+        if remaining > 0 and (not selected or oversized):
+            # 最近的这条一定留下；单条超过总预算的也只能截断留下。
+            cut = _truncate_history_content(content, remaining)
+            if cut.strip():
+                selected.append({"role": _history_role(item.get("role")), "content": cut})
+        break
+    selected.reverse()
+    return selected
+
+
+async def load_private_history(
+    session: Any,
+    user_id: int,
+    *,
+    budget_tokens: int = PRIVATE_HISTORY_TOKEN_BUDGET,
+    max_turns: int = PRIVATE_HISTORY_MAX_TURNS,
+    fallback: PrivateHistoryStore | None = None,
+) -> list[dict[str, str]]:
+    """这一轮要用的私聊历史：**优先读库**，读不到再退回内存兜底。
+
+    行为与改造前的 ``PrivateHistoryStore.history()`` 一致（同样的返回形状、同样按
+    时间正序），差别只在「能记住多久」：库里有保留期内的全部轮次，再按 token 预算
+    装配；原来的内存实现只有本进程的最近 12 轮。
+    """
+
+    uid = int(user_id)
+    budget = bounded_history_token_budget(budget_tokens)
+    turns = max(1, int(max_turns))
+    rows: list[dict[str, str]] = []
+    try:
+        result = await session.execute(
+            select(PrivateChatMessage.role, PrivateChatMessage.content)
+            .where(PrivateChatMessage.user_id == uid)
+            .order_by(PrivateChatMessage.id.desc())
+            .limit(turns * 2)
+        )
+        rows = [
+            {"role": str(role or ""), "content": str(content or "")}
+            for role, content in _selected_rows(result)
+        ]
+        rows.reverse()  # 倒序取「最近 N 条」，再翻回时间正序
+    except Exception as exc:
+        log.warning(
+            "private chat: 历史读取失败，退回内存兜底 | user=%s | error=%s", uid, exc
+        )
+        rows = []
+    if not rows and fallback is not None:
+        rows = fallback.history(uid)
+    return assemble_private_history(rows, budget_tokens=budget, max_turns=turns)
+
+
+async def record_private_turn(
+    session: Any,
+    *,
+    user_id: int,
+    user_content: str,
+    assistant_content: str,
+    message_id: Any = None,
+    user_message_key: str = "",
+    assistant_message_key: str = "",
+    stamp: Any | None = None,
+) -> int:
+    """把这一轮的两行写进 ``private_chat_messages``，返回**实际新增**的行数。
+
+    * **幂等**：``(user_id, message_key)`` 唯一约束 + ``ON CONFLICT DO NOTHING``，
+      Telegram 重投递同一轮不会写出第二份。
+    * **只存对话**：注入给模型的系统资料块先被 ``strip_injected_blocks`` 剔掉。
+    * **绝不抛异常**：写失败只记日志并回滚——私聊正文落库不能拖垮这一轮回复。
+    """
+
+    uid = int(user_id)
+    user_body = strip_injected_blocks(user_content)
+    assistant_body = strip_injected_blocks(assistant_content)
+    stamp = stamp or now_shanghai_naive()
+    keys = (
+        (
+            "user",
+            user_body,
+            str(user_message_key or "").strip() or history_message_key(message_id, "user"),
+        ),
+        (
+            "assistant",
+            assistant_body,
+            str(assistant_message_key or "").strip()
+            or history_message_key(message_id, "assistant"),
+        ),
+    )
+    written = 0
+    try:
+        for role, content, key in keys:
+            if not content:
+                continue
+            statement = (
+                sqlite_insert(PrivateChatMessage)
+                .values(
+                    user_id=uid,
+                    role=role,
+                    content=content,
+                    message_key=key,
+                    created_at=stamp,
+                )
+                .on_conflict_do_nothing(index_elements=["user_id", "message_key"])
+            )
+            written += _rowcount(await session.execute(statement))
+        await session.commit()
+    except Exception as exc:
+        await _safe_rollback(session)
+        log.warning("private chat: 历史落库失败 | user=%s | error=%s", uid, exc)
+        return 0
+    return written
+
+
+async def prune_private_chat_history(
+    session: Any,
+    *,
+    retention_days: int | None = None,
+    now: Any | None = None,
+) -> int:
+    """删掉超过保留期的私聊历史行，返回删除行数。
+
+    * **按时间删**：``created_at`` 早于 ``now - retention_days`` 的行整行删掉。
+    * **幂等、可重复执行**：再跑一次没有过期行就是 0；删到一半失败也不会有半删状态
+      （单条 DELETE 要么生效要么回滚）。
+    * **不抛异常**：清理失败只是旧行多留一会儿，绝不能把后台巡检或调用方带崩。
+    """
+
+    days = bounded_history_retention_days(retention_days)
+    cutoff = (now or now_shanghai_naive()) - timedelta(days=days)
+    try:
+        result = await session.execute(
+            delete(PrivateChatMessage).where(PrivateChatMessage.created_at < cutoff)
+        )
+        await session.commit()
+    except Exception as exc:
+        await _safe_rollback(session)
+        log.warning("private chat: 历史清理失败 | error=%s", exc)
+        return 0
+    return _rowcount(result)
+
+
+async def run_private_chat_history_maintenance(
+    session_factory: Any,
+    *,
+    retention_days_getter: Callable[[], int] | None = None,
+    interval_seconds: float = _HISTORY_PRUNE_INTERVAL_SECONDS,
+) -> None:
+    """常驻巡检：按保留期清理私聊历史（库不能无限涨）。
+
+    与 ``memory.run_archive_maintenance`` 同一套路：每 ``interval_seconds`` 跑一次，
+    单次失败只记日志、不退出循环；保留天数每次现取（``retention_days_getter``），
+    所以运行时改了配置下一轮就生效。
+    """
+
+    interval = max(60.0, float(interval_seconds))
+    while True:
+        try:
+            days = (
+                retention_days_getter()
+                if retention_days_getter is not None
+                else PRIVATE_HISTORY_RETENTION_DAYS
+            )
+            async with session_factory() as session:
+                removed = await prune_private_chat_history(
+                    session, retention_days=days
+                )
+            if removed:
+                log.info(
+                    "private chat: 历史留存清理完成 | removed=%d | retention_days=%d",
+                    removed,
+                    bounded_history_retention_days(days),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("private chat: 历史留存巡检失败")
+        await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------

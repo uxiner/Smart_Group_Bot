@@ -41,6 +41,7 @@ from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_ta
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
 from bot.services.point_shop import ShopExpiryService
+from bot.services.private_chat import run_private_chat_history_maintenance
 from bot.services.raid_guard import RaidGuardService, init_raid_guard_service
 from bot.services.proactive import ProactiveTopicService
 from bot.services.privileged_tasks import flush_privileged_tasks
@@ -726,6 +727,19 @@ async def main() -> None:
                     name="memory-archive-maintenance",
                 )
             )
+        # 私聊正文落库之后也必须有人定期清理，否则库只涨不减。保留天数每轮现取，
+        # /settings 里改了下一轮就生效（与 memory 归档清理同一套路）。
+        background_tasks.append(
+            asyncio.create_task(
+                run_private_chat_history_maintenance(
+                    session_factory,
+                    retention_days_getter=lambda: private_history_retention_days(
+                        settings
+                    ),
+                ),
+                name="private-chat-history-maintenance",
+            )
+        )
 
         await _run_with_background_supervision(
             run_update_delivery(

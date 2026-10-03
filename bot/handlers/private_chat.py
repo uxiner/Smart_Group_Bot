@@ -2,8 +2,9 @@
 
 用户口径（2026-10-03）：只有已授权群的成员能私聊（普通成员 100 条/天、群管理员
 500 条/天，各自的全局上限 20000 / 100000 条/天，最高管理员不设限）；私聊不做群规
-审核（NSFW 也放开，群里那条底线不受影响）；私聊内容不落库、不进归档/记忆/向量，
-只在内存里保留最近几轮做上下文。
+审核（NSFW 也放开，群里那条底线不受影响）；私聊正文**只落私聊自己的表**
+（``private_chat_messages``，不进群归档/记忆/向量），按 token 预算装配后作为历史，
+所以机器人重启不失忆、也能记住很久以前说过的话。
 
 **注册顺序**：这个 router 必须排在 ``group.router`` **之前**——群消息处理器用的是
 ``F.text | F.photo | ...`` 这种宽泛过滤，且靠函数体里 ``is_group()`` 早退，谁先注册
@@ -34,10 +35,13 @@ from bot.services.private_chat import (
     consume_daily_quota,
     history_store,
     last_contact_record,
+    load_private_history,
     local_day_key,
-    record_contact,
     notice_throttle,
+    private_history_token_budget,
     quota_notice,
+    record_contact,
+    record_private_turn,
     resolve_access,
 )
 
@@ -175,6 +179,21 @@ async def _send_reply(message: Message, text: str) -> None:
         await message.answer(chunk, parse_mode=None)
 
 
+def _stored_user_turn(text: str, image_description: str) -> str:
+    """这一轮用户消息**进历史**的正文（内存缓冲与库共用同一段文字）。
+
+    图片消息存 ``[图片内容] <视觉描述>``——就是这段描述交给模型，历史里也存同一段，
+    这样「读库」和「读内存兜底」装配出来的上下文一字不差。正文与配文都为空时（纯图片
+    且认图没给出描述）留一个 ``[图片]`` 占位，避免这一轮在历史里凭空消失。
+    """
+
+    body = str(text or "").strip() or "[图片]"
+    description = str(image_description or "").strip()
+    if description:
+        return f"{body}\n[图片内容] {description}"
+    return body
+
+
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def on_private_message(
     message: Message,
@@ -246,7 +265,13 @@ async def on_private_message(
             return
 
     # 4) 组装 + 调用（model 走 main 阶段；stage 标签只为用量看板好区分）。
-    history = history_store().history(user.id)
+    #    历史优先读库（重启不失忆），按 token 预算装配；读不到才退回内存兜底。
+    history = await load_private_history(
+        session,
+        user.id,
+        budget_tokens=private_history_token_budget(settings),
+        fallback=history_store(),
+    )
     # 亲密度考勤：只有最高管理员才给这段真实记录（拿不到就是空串）。
     last_contact = ""
     if verdict.is_super:
@@ -288,11 +313,18 @@ async def on_private_message(
         return
 
     store = history_store()
-    user_turn = text or "[图片]"
-    if image_description:
-        user_turn = f"{user_turn}\n[图片内容] {image_description}"
+    user_turn = _stored_user_turn(text, image_description)
     store.append(user.id, "user", user_turn)
     store.append(user.id, "assistant", reply)
+    # 落库：这一轮两行（用户 + 回复）。幂等键来自入站 message_id，Telegram 重投递
+    # 同一轮不会写出第二份；写失败只记日志，绝不影响这次已经发出去的回复。
+    await record_private_turn(
+        session,
+        user_id=user.id,
+        user_content=user_turn,
+        assistant_content=reply,
+        message_id=getattr(message, "message_id", None),
+    )
     log.info(
         "private chat: 已回复 | user=%s | 档=%s | 今日=%s | 本档全局=%s | 日=%s | chars=%d",
         user.id,
