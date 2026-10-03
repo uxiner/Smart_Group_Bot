@@ -855,12 +855,10 @@ class AVSampleGroupImageEntryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(commands, "AVSearchService", return_value=service),
             patch.object(
                 commands,
-                "select_av_image_file",
                 return_value=("photo-1", "image/jpeg", 50000),
             ),
             patch.object(
                 commands,
-                "_av_image_vision_with_escalation",
                 new=AsyncMock(
                     return_value=commands._AVImageVisionOutcome(150, 0, "WANZ-530", False, False)
                 ),

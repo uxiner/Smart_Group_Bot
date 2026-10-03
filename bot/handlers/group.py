@@ -4235,7 +4235,6 @@ _NSFW_GUARD_IMAGE_TYPES = frozenset(
 #: 跟随图片守卫的 ``moderation.nsfw_image_guard_enabled``，与群内 ``av_enabled`` 无关。
 _NSFW_GUARD_VIDEO_TYPES = frozenset({"video", "video_caption", "video_note"})
 #: 群里「/av + 图片」由 commands.py 的「先删图再识图」流程负责，这里跳过，别打架。
-_AV_IMAGE_COMMAND_RE = re.compile(r"^/av(?:@[A-Za-z0-9_]+)?(?:\s|$)", re.IGNORECASE)
 
 #: 群内警告（独立一条、@当事人）保留多久后自动删除；调这里即可改时长。
 _NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS = 120
@@ -4325,21 +4324,6 @@ def _has_guardable_image(message: Message) -> bool:
     return _extract_image_file_info(message) is not None
 
 
-def _is_group_av_image_message(message: Message) -> bool:
-    """配文里带 ``/av`` 的图片消息（``/av`` 写在 caption 上）。
-
-    这些图已由 ``bot/handlers/commands.py`` 的流程处理（先删图再识图、不质询），
-    本功能必须原样放过：不删、不警告、不质询。「回复某条图片 + 裸 /av」那条是
-    纯文本命令消息（没有图片），本来就进不了本功能。
-    """
-    text = str(
-        getattr(message, "caption", None) or getattr(message, "text", None) or ""
-    ).strip()
-    if not _AV_IMAGE_COMMAND_RE.match(text):
-        return False
-    return _has_guardable_image(message)
-
-
 def _nsfw_image_guard_enabled(settings: Settings) -> bool:
     """运行时可开关：``moderation.nsfw_image_guard_enabled``（默认开启）。
 
@@ -4367,7 +4351,8 @@ def _nsfw_image_guard_applies(
         return False
     if not _has_guardable_image(message):
         return False
-    return not _is_group_av_image_message(message)
+    # 群内不允许任何 NSFW 图/视频：不因配文带 /av 而放行（2026-10-03 口径）。
+    return True
 
 
 async def _nsfw_video_thumbnail_vision_text(message: Message, llm: LLMService) -> str:

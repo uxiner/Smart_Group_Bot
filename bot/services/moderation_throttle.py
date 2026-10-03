@@ -29,7 +29,7 @@ pending-reply debounce 只合并出站回复，不合并审核。
   可能被这个闸停住；``WEBHOOK_MAX_CONCURRENT_UPDATES`` 是 8，剩下的继续服务其他
   人——积压不会把通道堵死。等待本身也发生在审核协程里、不额外持有任何锁。
 * 内存：每个 key 只保留一个很小的状态对象，字典到 ``max_keys`` 先清空闲条目
-  （与 ``bot.services.av_image_lookup.AVPrivateRateLimiter`` 同样的做法）。
+  （与 ``bot.services.av_query_limits.AVPrivateRateLimiter`` 同样的做法）。
 * 总调用数**不变**：本批选的是报告允许的"排队/串行整形"方向，把成本从"同一瞬间的
   并发峰值"摊到时间轴上；真正的总量下降要靠"合并送审 + 命中后逐条复核归属"，那需要
   重写群消息的处置归属，风险过高，本批不做（见提交说明，如实标注）。

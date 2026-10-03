@@ -350,17 +350,10 @@ class Settings(BaseSettings):
     av_fc2_base_url: str = "https://adult.contents.fc2.com"
     #: 识图之前先用第三方**帧级**索引反查番号（画面截图命中率高；封面仍旧走读文字）。
     #: F-025：默认**关闭**。开启后每张待识别图片的原始字节都会以 multipart POST
-    #: 发往 ``av_reverse_endpoint`` 指向的**第三方主机**（用户图片离开本服务），
     #: 因此必须由运维显式打开，且必须同时显式配置 endpoint。
-    av_reverse_enabled: bool = False
     #: 第三方反查入口。F-025：不再内置默认值（原来写死 https://avscan.cc/search），
     #: 空 = 未配置 = 不外发；这样"没人做过决定"的部署默认不会泄漏用户图片。
-    av_reverse_endpoint: str = ""
     #: 相似度阈值：实测真命中 ≥90%、假候选 ≤77%。
-    av_reverse_min_similarity: float = 85.0
-    av_reverse_timeout_sec: float = 12.0
-    #: 反查提供方名（见 services/av_image_reverse.py 的注册表；将来加第二家改这里即可）。
-    av_reverse_provider: str = "avscan"
 
     # 入群验证：新成员先全员禁言，私聊 bot 获取链接并通过
     # 通过所选真人验证服务后恢复权限。
@@ -1173,37 +1166,6 @@ def load_bootstrap_settings() -> Settings:
     settings.join_verification_listen_host = listen_host
     settings.join_verification_listen_port = listen_port
     return settings
-
-
-def log_av_reverse_privacy_state(settings: Settings) -> None:
-    """F-025：把「用户图片会离开本服务」这件事写进启动日志。
-
-    - 默认（关闭）：记一行 INFO，说明启用需要哪两个显式配置，避免运维以为
-      "功能在跑"；
-    - 只开了开关但没配 endpoint：WARNING，并说明实际不会外发任何图片；
-    - 真正会外发：WARNING，并把目标主机直接写在日志里，让数据流向可见。
-    """
-
-    enabled = bool(getattr(settings, "av_reverse_enabled", False))
-    endpoint = str(getattr(settings, "av_reverse_endpoint", "") or "").strip()
-    if not enabled:
-        log.info(
-            "AV 图像反查：未启用（默认）。启用后**仅私聊**发图会走反查，"
-            "图片原样发给第三方主机（群聊永不外发）；"
-            "需要同时显式设置 AV_REVERSE_ENABLED=true 与 AV_REVERSE_ENDPOINT=<入口>。"
-        )
-        return
-    if not endpoint:
-        log.warning(
-            "AV 图像反查：已设 AV_REVERSE_ENABLED=true 但未配置 AV_REVERSE_ENDPOINT，"
-            "实际不会外发任何图片（代码里没有内置的第三方地址）。"
-        )
-        return
-    log.warning(
-        "AV 图像反查：已启用（仅私聊；群聊永不外发）—— 私聊待识别图片的原始字节"
-        "会被发送到第三方主机 %s（数据离开本服务）；不需要时请关闭 AV_REVERSE_ENABLED。",
-        endpoint,
-    )
 
 
 def log_enforcement_switch_state(settings: Settings) -> None:
