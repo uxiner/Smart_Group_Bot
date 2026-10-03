@@ -56,6 +56,12 @@ from bot.services.search_memory import (
     run_search_record_maintenance,
     search_record_retention_days,
 )
+# 第 4 期：长期记忆的写入与维护（两条后台巡检 + 留存天数读取）
+from bot.services.long_term_memory import (
+    memory_deleted_retention_days,
+    run_long_term_memory_extraction,
+    run_long_term_memory_maintenance,
+)
 from bot.services.runtime_config import (
     RuntimeConfig,
     RuntimeConfigManager,
@@ -758,6 +764,30 @@ async def main() -> None:
                     ),
                 ),
                 name="search-record-maintenance",
+            )
+        )
+        # 第 4 期：长期记忆（``user_facts``）。两条巡检都只在后台跑——提炼要调模型，
+        # **绝不进回复路径**；维护负责 event 过期标记与 deleted/superseded 留存清理。
+        # 每轮现取配置（改 /settings 下一轮生效），单次失败只记日志、不退出循环。
+        background_tasks.append(
+            asyncio.create_task(
+                run_long_term_memory_extraction(
+                    session_factory,
+                    llm=llm,
+                    settings=settings,
+                ),
+                name="long-term-memory-extract",
+            )
+        )
+        background_tasks.append(
+            asyncio.create_task(
+                run_long_term_memory_maintenance(
+                    session_factory,
+                    retention_days_getter=lambda: memory_deleted_retention_days(
+                        settings
+                    ),
+                ),
+                name="long-term-memory-maintenance",
             )
         )
 
