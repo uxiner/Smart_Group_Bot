@@ -43,17 +43,25 @@ def _settings(super_admin_id: int = SUPER_ADMIN) -> SimpleNamespace:
     return SimpleNamespace(super_admin_id=super_admin_id)
 
 
-def _bot(*, statuses=None, raises=False) -> MagicMock:
-    """假 Bot：``get_chat_member`` 按 group_id 返回给定状态，或直接抛异常。"""
+def _bot(*, statuses=None, raises=None, absent_groups=()) -> MagicMock:
+    """假 Bot：``get_chat_member`` 按 group_id 返回状态、抛「不在群」或抛通用异常。
+
+    ``absent_groups`` 模拟真机行为：对不在群里的人，Telegram 抛的是
+    ``Bad Request: member not found``，**不是** ``status="left"``。
+    """
 
     bot = MagicMock()
     mapping = dict(statuses or {})
+    absent = {int(g) for g in absent_groups}
 
     async def _get_chat_member(chat_id, user_id):
+        cid = int(chat_id)
+        if cid in absent:
+            raise RuntimeError("Telegram server says - Bad Request: member not found")
         if raises:
-            raise RuntimeError("telegram down")
+            raise RuntimeError(raises if isinstance(raises, str) else "telegram down")
         member = MagicMock()
-        member.status = mapping.get(int(chat_id), "left")
+        member.status = mapping.get(cid, "left")
         member.is_member = member.status != "left"
         return member
 
@@ -202,6 +210,41 @@ class AccessDecisionTests(unittest.IsolatedAsyncioTestCase):
                     bot_left, AsyncMock(), _settings(), 777, cache=dm.MemberAccessCache()
                 ),
                 False,
+            )
+
+    async def test_member_not_found_is_a_definitive_no_and_gets_cached(self) -> None:
+        """真机行为：不在群的人返回 ``member not found`` 异常，不是 status=left。"""
+
+        bot = _bot(absent_groups=[GROUP_ID])
+        cache = dm.MemberAccessCache()
+        session = AsyncMock()
+        with patch.object(
+            dm, "list_authorized_groups", new=AsyncMock(return_value=[SimpleNamespace(group_id=GROUP_ID)])
+        ):
+            self.assertIs(
+                await dm.confirm_authorized_group_member(bot, session, _settings(), 777, cache=cache),
+                False,
+                "陌生人必须是明确的「不是成员」，不能退化成「稍等再试」",
+            )
+            self.assertIs(
+                await dm.confirm_authorized_group_member(bot, session, _settings(), 777, cache=cache),
+                False,
+            )
+        self.assertEqual(bot.get_chat_member.await_count, 1, "结论确定，要缓存，别每条都打 API")
+
+    async def test_absent_in_one_group_but_member_of_another(self) -> None:
+        bot = _bot(absent_groups=[GROUP_ID], statuses={-100999: "member"})
+        with patch.object(
+            dm,
+            "list_authorized_groups",
+            new=AsyncMock(return_value=[SimpleNamespace(group_id=GROUP_ID), SimpleNamespace(group_id=-100999)]),
+        ):
+            self.assertIs(
+                await dm.confirm_authorized_group_member(
+                    bot, AsyncMock(), _settings(), 777, cache=dm.MemberAccessCache()
+                ),
+                True,
+                "只要在一个授权群里就是成员",
             )
 
     async def test_unknown_when_telegram_fails_and_result_is_not_cached(self) -> None:
