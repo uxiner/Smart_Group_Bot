@@ -29,6 +29,10 @@ services:
       # MINIAPP_BIND_ADDRESS (loopback unless overridden). An explicit
       # MINIAPP_LISTEN_HOST in .env or the shell still wins.
       MINIAPP_LISTEN_HOST: "${MINIAPP_LISTEN_HOST:-0.0.0.0}"
+      # 容器时区固定为中国时间。代码里大量「本地时间」是用 datetime.now().astimezone()
+      # 取的，容器若是 UTC，静默时段/主动话题排期/日志时间全部按 UTC 走（比真实时间早
+      # 8 小时：半夜活跃、白天装死）。镜像已装 tzdata，这里给死默认值。
+      TZ: "${TZ:-Asia/Shanghai}"
     healthcheck:
       test:
         - CMD
