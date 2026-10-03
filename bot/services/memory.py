@@ -31,6 +31,14 @@ from bot.db.models import (
     Violation,
 )
 from bot.services.ban_audit import build_ban_knowledge_blocks
+from bot.services.group_context import (
+    GROUP_HISTORY_MAX_MESSAGES,
+    GROUP_HISTORY_MESSAGE_TOKEN_OVERHEAD,
+    assemble_group_history,
+    bounded_group_history_reserve_tokens,
+    bounded_group_history_token_budget,
+    effective_group_history_budget,
+)
 from bot.services.llm import LLMService
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.update_completion import (
@@ -68,6 +76,10 @@ _ARCHIVE_RECALL_CONTEXT_RADIUS = 2
 _ARCHIVE_RECALL_INDEX_MAX_CHARS = 1150
 _ARCHIVE_VECTOR_CANDIDATE_LIMIT = 64
 _ARCHIVE_RECALL_RRF_K = 60.0
+#: 群聊历史按预算取数时的读取上限：累计估算 token 到「预算 × 1.5」就停，避免为了
+#: 272K 历史把整个群归档读进内存；分页大小只影响往返次数，不影响正确性。
+_ARCHIVE_READ_SCAN_FACTOR = 1.5
+_ARCHIVE_READ_PAGE_SIZE = 256
 #: F-016：一次 recall 里最多用多少条"已处置"消息去提示排序（best-effort，只影响
 #: 召回质量）；真正的"不返回已删除内容"由 :meth:`MemoryService._removed_message_ids`
 #: 对最终选中的少量行做精确核对来保证，不受这个上限影响。
@@ -1002,6 +1014,8 @@ class MemoryService:
                 1 for task in self._archive_prune_tasks.values() if not task.done()
             ),
             "recent_messages_per_group": self._history_limit(),
+            "group_history_token_budget": self.group_history_token_budget,
+            "group_history_reserve_tokens": self.group_history_reserve_tokens,
             "archive_retention_days": self.memory_retention_days,
             "archive_max_messages_per_group": (
                 self.memory_archive_max_messages_per_group
@@ -1077,6 +1091,16 @@ class MemoryService:
         )
         self.memory_automatic_compaction = bool(
             getattr(config, "memory_automatic_compaction", False)
+        )
+        # 群聊历史装配（第 2 期）：token 预算 + 固定余量必须一起 ≤ 模型窗口
+        # （``self.max_context``）。夹取与硬闸门都在 bot.services.group_context。
+        self.group_history_reserve_tokens = bounded_group_history_reserve_tokens(
+            getattr(config, "group_history_reserve_tokens", None)
+        )
+        self.group_history_token_budget = effective_group_history_budget(
+            configured_budget=getattr(config, "group_history_token_budget", None),
+            reserve_tokens=self.group_history_reserve_tokens,
+            model_window_tokens=self.max_context,
         )
 
     async def bootstrap(self) -> None:
@@ -1723,6 +1747,168 @@ class MemoryService:
 
     def get_history(self, group_id: int) -> list[dict[str, Any]]:
         return list(self._working(group_id))
+
+    def _archive_row_history_item(self, row: GroupMessageArchive) -> dict[str, Any]:
+        """把一行归档还原成与热窗口**同形状**的历史条目。
+
+        形状必须一致：``get_history_for_llm`` 的消费方（提示词渲染、身份快照、
+        去重）只认 ``_history_item`` 产出的字段。``message_key`` 与
+        ``_scoped_message_id`` 同形（``group:message``），所以这里直接当
+        ``message_id`` 用；身份快照只从结构化字段恢复（F-002）。
+        """
+
+        return self._history_item(
+            role=str(row.role or "user"),
+            content=str(row.content or "").strip(),
+            created_at=row.sent_at,
+            sender_id=int(row.sender_id) if row.sender_id is not None else None,
+            sender_name=str(row.sender_display_name or ""),
+            message_type=str(row.message_type or "text"),
+            message_id=str(row.message_key or ""),
+            identity_metadata=_json_dict(row.extra_metadata),
+        )
+
+    async def _read_group_archive_history(
+        self,
+        group_id: int,
+        *,
+        budget_tokens: int,
+        max_messages: int,
+    ) -> list[dict[str, Any]]:
+        """从归档读「够预算的最近 N 条」，按时间正序返回历史条目。
+
+        这里**不是**「先取固定 50 条再装配」：逐页从新到旧读，累计估算 token 达到
+        ``预算 × _ARCHIVE_READ_SCAN_FACTOR``（1.5 倍）就停（在页内逐行累计，所以
+        上限是「1.5 倍预算 + 一行」，不会被大页整页拖走）；同时受 ``max_messages``
+        条数上限约束。所以为了 272K 历史最多只会读 1.5 倍预算的正文进内存。
+
+        过滤口径与现有读归档的路径保持一致：保留期（``memory_retention_days``）
+        之外不读；被审核删除的消息用 ``_removed_message_ids`` 逐条核对后剔除
+        （F-016：已删除内容不再作为历史喂回模型，与 ``recall_archive`` 同一条兜底）。
+        """
+
+        scan_budget = max(1, int(budget_tokens * _ARCHIVE_READ_SCAN_FACTOR))
+        cutoff = now_shanghai_naive() - timedelta(days=self.memory_retention_days)
+        page_size = max(1, min(_ARCHIVE_READ_PAGE_SIZE, int(max_messages)))
+        rows: list[GroupMessageArchive] = []
+        scanned_tokens = 0
+        stop = False
+        async with self._session_factory() as session:
+            offset = 0
+            while not stop and len(rows) < max_messages:
+                batch = list(
+                    (
+                        await session.execute(
+                            select(GroupMessageArchive)
+                            .where(
+                                GroupMessageArchive.group_id == group_id,
+                                GroupMessageArchive.sent_at >= cutoff,
+                            )
+                            .order_by(
+                                GroupMessageArchive.sent_at.desc(),
+                                GroupMessageArchive.id.desc(),
+                            )
+                            .limit(min(page_size, max_messages - len(rows)))
+                            .offset(offset)
+                        )
+                    ).scalars()
+                )
+                if not batch:
+                    break
+                for row in batch:
+                    rows.append(row)
+                    scanned_tokens += (
+                        _estimate_text_tokens(str(row.content or ""))
+                        + GROUP_HISTORY_MESSAGE_TOKEN_OVERHEAD
+                    )
+                    if scanned_tokens >= scan_budget or len(rows) >= max_messages:
+                        stop = True
+                        break
+                offset += len(batch)
+                if len(batch) < page_size:
+                    break
+        if not rows:
+            return []
+        removed_ids = await self._removed_message_ids(
+            group_id,
+            {
+                int(row.telegram_message_id)
+                for row in rows
+                if row.telegram_message_id is not None
+            },
+        )
+        if removed_ids:
+            rows = [
+                row
+                for row in rows
+                if int(row.telegram_message_id or 0) not in removed_ids
+            ]
+        rows.sort(key=lambda row: (row.sent_at, row.id))
+        return [self._archive_row_history_item(row) for row in rows]
+
+    async def load_group_history_by_budget(
+        self,
+        group_id: int,
+        *,
+        budget_tokens: int | None = None,
+        max_messages: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """群聊这一轮要用的历史：从归档按 token 预算装配（时间正序）。
+
+        * ``budget_tokens=None`` 用生效配置（``group_history_token_budget`` 与模型
+          窗口夹取后的结果，见 ``_apply_token_budgets``）；参与判定那一步传
+          ``DECISION_HISTORY_TOKEN_BUDGET`` 的小预算（它只需要尾部几条）。
+        * ``max_messages=None`` 用 ``GROUP_HISTORY_MAX_MESSAGES`` 条数安全上限。
+
+        **行为兼容**：归档为空、预算很小或装配结果为空时，退回改造前的内存热窗口
+        （``_working``，仍由 ``memory_recent_messages`` 兜底），所以「取不到归档历史」
+        绝不会变成「不回复」或报错。读库失败同样只记日志并按没有归档历史处理。
+        """
+
+        normalized_group_id = int(group_id)
+        budget = (
+            self.group_history_token_budget
+            if budget_tokens is None
+            else bounded_group_history_token_budget(budget_tokens)
+        )
+        count_cap = (
+            GROUP_HISTORY_MAX_MESSAGES
+            if max_messages is None
+            else max(1, int(max_messages))
+        )
+        rows: list[Any] = []
+        try:
+            rows = await self._read_group_archive_history(
+                normalized_group_id,
+                budget_tokens=budget,
+                max_messages=count_cap,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "group history archive read failed | group=%s", normalized_group_id
+            )
+            rows = []
+        assembled = assemble_group_history(
+            rows,
+            budget_tokens=budget,
+            max_messages=count_cap,
+        )
+        if assembled:
+            return assembled
+        # 归档/装配为空：回到改造前的热窗口行为（最后一次兜底）。
+        try:
+            await self._ensure_history_loaded(normalized_group_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "group history hot-window fallback failed | group=%s",
+                normalized_group_id,
+            )
+            return []
+        return list(self._working(normalized_group_id))
 
     @staticmethod
     def _archive_row_document(
@@ -4027,7 +4213,16 @@ class MemoryService:
         prompt_payload_builder: PromptPayloadBuilder | None = None,
         recall_query: str = "",
         recall_exclude_message_keys: Iterable[str] | None = None,
+        history_rows: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
+        """系统记忆块 + 原始历史（+ 召回索引），按 prompt 预算裁剪后返回。
+
+        ``history_rows``（第 2 期）：显式指定**原始历史**，取代默认的内存热窗口
+        （``_working``，按条数封顶）。群聊回复链路传 ``load_group_history_by_budget``
+        的结果，于是历史深度由 token 预算决定；不传时的行为与改造前逐字节一致
+        （主动发言链路、既有用例都走这条）。
+        """
+
         await self._ensure_history_loaded(group_id)
         budget_tokens = self._soft_budget_tokens(self._llm_input_budget(reserve_tokens))
         # Foreground replies never wait for compression. Automatic compaction
@@ -4046,7 +4241,10 @@ class MemoryService:
                 # DB issue must not prevent the current turn from being served.
                 log.exception("memory archive recall failed | group=%s", group_id)
         messages = [*await self._format_system_memory_blocks(group_id)]
-        messages.extend(list(self._working(group_id)))
+        if history_rows is None:
+            messages.extend(list(self._working(group_id)))
+        else:
+            messages.extend(dict(item) for item in history_rows)
         # Keep the small disclosure index at the tail so normal token trimming
         # preserves it even when only part of the 500-message hot window fits.
         if recall_index is not None:

@@ -1470,6 +1470,7 @@ async def _run_pending_batch(*, av_enabled: bool, fake_skill: SimpleNamespace) -
     memory = SimpleNamespace(
         session_factory=lambda: session,
         get_history=Mock(return_value=[]),
+        load_group_history_by_budget=AsyncMock(return_value=[]),
         get_history_for_llm=AsyncMock(return_value=[]),
     )
     fake_progress = SimpleNamespace(

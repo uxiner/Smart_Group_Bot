@@ -41,7 +41,7 @@ from bot.db.models import (
     VoteBanSession,
 )
 from bot.db.sqlite_session import is_database_locked_error
-from bot.services import activity, memory_holder
+from bot.services import activity, group_context, memory_holder
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.at_reply import is_at_reply_enabled
 from bot.services.authz import (
@@ -5401,19 +5401,50 @@ def _next_pending_reply_flush_at(
     return target_flush_at
 
 
+def _batch_scoped_message_keys(
+    group_id: int,
+    items: list[_PendingReplyItem],
+) -> list[str]:
+    """本轮批次里带 Telegram message id 的消息键（``group:message`` 形状）。
+
+    历史条目（``message_id``）与召回索引（``message_key``）用的是同一个键，所以
+    「本轮自己的消息」在装配出来的历史里可以按**键**精确剔除。第 2 期之后群历史
+    来自归档，而归档正文是**补充过上下文/图片描述**的版本，和热窗口里的
+    ``[id: …] 正文`` 不完全一致——只按正文内容匹配会漏掉，让本轮消息在提示词里
+    出现两次（历史块 + 当前轮块）。
+    """
+
+    return [
+        f"{group_id}:{int(getattr(item.message, 'message_id', 0) or 0)}"
+        for item in items
+        if int(getattr(item.message, "message_id", 0) or 0) > 0
+    ]
+
+
 def _exclude_batch_messages(
     history: list[dict[str, Any]] | None,
     batch_memory_entries: list[str],
+    *,
+    message_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """剔除「本轮批次自己的消息」：先按键精确剔除，再按正文兜底匹配。
+
+    ``message_keys`` 是可选的第 2 期补充：不传时行为与改造前逐字节一致（只按
+    ``batch_memory_entries`` 的正文匹配）。
+    """
+
     if not history:
         return []
 
+    excluded_keys = {str(key) for key in (message_keys or []) if str(key)}
     pending = Counter(entry for entry in batch_memory_entries if entry)
-    if not pending:
+    if not pending and not excluded_keys:
         return list(history)
 
     kept_reversed: list[dict[str, Any]] = []
     for item in reversed(history):
+        if str(item.get("message_id") or "") in excluded_keys:
+            continue
         role = str(item.get("role", "")).strip().lower()
         content = str(item.get("content", ""))
         if role == "user" and pending.get(content, 0) > 0:
@@ -5929,7 +5960,18 @@ async def _process_pending_reply_batch(
             # reused later if a short DB operation is actually needed.
             await session.close()
 
-            decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
+            # 参与判定只需要「最近几条」的尾部：这里按一个小 token 预算从归档装配，
+            # 而不是取热窗口的最近 N 条——重启后热窗口还是空的时候也能看到上下文。
+            batch_message_keys = _batch_scoped_message_keys(group_id, items)
+            decision_history = _exclude_batch_messages(
+                await memory.load_group_history_by_budget(
+                    group_id,
+                    budget_tokens=group_context.DECISION_HISTORY_TOKEN_BUDGET,
+                    max_messages=group_context.DECISION_HISTORY_MAX_MESSAGES,
+                ),
+                memory_entries,
+                message_keys=batch_message_keys,
+            )
             merged_context = _build_recent_group_message_window(items, recent_history=decision_history)
             decision_started = time.perf_counter()
             # The enqueue-time snapshot is sufficient for reply-routing
@@ -5998,18 +6040,22 @@ async def _process_pending_reply_batch(
                     ),
                 )
                 await progress.start()
+                # 第 2 期：回复用的群历史按 token 预算从归档装配（不再是最近 N 条
+                # 热窗口），深度与私聊/搜索链路对齐；装配为空时该方法内部已经退回
+                # 改造前的热窗口，所以这里的行为与改造前一致。
+                group_history = await memory.load_group_history_by_budget(group_id)
                 history = await memory.get_history_for_llm(
                     group_id,
+                    history_rows=group_history,
                     recall_query=merged_input_text,
-                    recall_exclude_message_keys=[
-                        f"{group_id}:"
-                        f"{int(getattr(item.message, 'message_id', 0) or 0)}"
-                        for item in items
-                        if int(getattr(item.message, "message_id", 0) or 0) > 0
-                    ],
+                    recall_exclude_message_keys=batch_message_keys,
                     prompt_payload_builder=lambda candidate_history: skill.build_answer_prompt_payload(
                         merged_input_text,
-                        history=_exclude_batch_messages(candidate_history, memory_entries),
+                        history=_exclude_batch_messages(
+                            candidate_history,
+                            memory_entries,
+                            message_keys=batch_message_keys,
+                        ),
                         sender_user_id=user_id,
                         sender_username=latest.sender_username,
                         sender_is_owner=latest.sender_is_owner,
@@ -6028,7 +6074,11 @@ async def _process_pending_reply_batch(
                         style_profile_context=style_profile_context,
                     ),
                 )
-                history = _exclude_batch_messages(history, memory_entries)
+                history = _exclude_batch_messages(
+                    history,
+                    memory_entries,
+                    message_keys=batch_message_keys,
+                )
                 log.info(
                     "[%s] pending batch reply generation started | action=%s history=%d",
                     group_id,

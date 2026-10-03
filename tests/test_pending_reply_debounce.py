@@ -194,6 +194,7 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             prompt_payload_builder: object,
             recall_query: str = "",
             recall_exclude_message_keys: list[str] | None = None,
+            history_rows: list[dict[str, str]] | None = None,
         ) -> list[dict[str, str]]:
             nonlocal history_ready
             self.assertEqual(recall_query, message.text)
@@ -214,6 +215,7 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
         memory = SimpleNamespace(
             session_factory=lambda: session,
             get_history=Mock(return_value=[]),
+            load_group_history_by_budget=AsyncMock(return_value=[]),
             get_history_for_llm=AsyncMock(side_effect=get_history_for_llm),
         )
         admin_lookup = AsyncMock(side_effect=lookup_after_history)
@@ -343,6 +345,7 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         memory = SimpleNamespace(
             session_factory=lambda: session,
             get_history=Mock(return_value=[]),
+            load_group_history_by_budget=AsyncMock(return_value=[]),
             get_history_for_llm=AsyncMock(return_value=[]),
             add_message=AsyncMock(side_effect=memory_error),
         )
@@ -608,6 +611,7 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         memory = SimpleNamespace(
             session_factory=lambda: session,
             get_history=Mock(return_value=[]),
+            load_group_history_by_budget=AsyncMock(return_value=[]),
             get_history_for_llm=AsyncMock(return_value=[]),
         )
         fake_skill = SimpleNamespace(
