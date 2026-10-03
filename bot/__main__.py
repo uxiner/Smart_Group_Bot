@@ -41,7 +41,10 @@ from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_ta
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
 from bot.services.point_shop import ShopExpiryService
-from bot.services.private_chat import run_private_chat_history_maintenance
+from bot.services.private_chat import (
+    private_history_retention_days,
+    run_private_chat_history_maintenance,
+)
 from bot.services.raid_guard import RaidGuardService, init_raid_guard_service
 from bot.services.proactive import ProactiveTopicService
 from bot.services.privileged_tasks import flush_privileged_tasks

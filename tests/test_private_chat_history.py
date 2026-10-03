@@ -891,5 +891,33 @@ class ConfigDefaultTests(unittest.TestCase):
         self.assertEqual(imported.bot.private_chat_history_retention_days, 30)
 
 
+class MainWiringTests(unittest.TestCase):
+    """``__main__`` 里的接线必须真的能解析到名字。
+
+    后台清理任务用 ``lambda: private_history_retention_days(settings)`` 每轮现取保留
+    天数，这个 lambda 只有在真跑起来之后才会被调用——单元测试里它被 mock 掉，所以
+    「忘了 import」这种错全量测试是拦不住的（本分支第一次交付就踩了：pyflakes 报
+    ``undefined name 'private_history_retention_days'``）。这里直接断言接线处的名字
+    能解析、并且拿得到正确天数。
+    """
+
+    def test_main_module_exposes_retention_getter(self) -> None:
+        from bot import __main__ as main_module
+
+        self.assertTrue(
+            callable(getattr(main_module, "private_history_retention_days", None)),
+            "__main__ 必须能解析 private_history_retention_days（清理任务每轮要用）",
+        )
+
+    def test_main_module_retention_getter_returns_days(self) -> None:
+        from bot import __main__ as main_module
+        from bot.config import Settings
+
+        settings = Settings(_env_file=None)
+        settings.bot.private_chat_history_retention_days = 45
+
+        self.assertEqual(main_module.private_history_retention_days(settings), 45)
+
+
 if __name__ == "__main__":
     unittest.main()
