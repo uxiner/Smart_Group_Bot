@@ -13,6 +13,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -1278,6 +1279,52 @@ class PrivateChatUsage(Base):
     __table_args__ = (
         # UPSERT 的冲突目标；也是「一个人一天一行」的唯一保证
         Index("ix_private_chat_usage_user_day", "user_id", "usage_date", unique=True),
+    )
+
+
+class PrivateChatMessage(Base):
+    """1 对 1 私聊的对话正文：一行 = 一条 ``user`` 或 ``assistant`` 消息。
+
+    和 ``private_chat_usage``（只记条数、用于配额）是两张表：那张是账本，这张是内容。
+    首版（2026-10-03）私聊正文只在进程内存里留最近 12 轮，机器人一重启就全忘；
+    现在改成落库 + 按 token 预算装配，重启不失忆，也能记住很久以前说过的话。
+
+    - **幂等**：Telegram 会重投递同一条 update（网络抖动、容器重启、webhook 重试），
+      ``(user_id, message_key)`` 上的唯一约束 + ``ON CONFLICT DO NOTHING`` 保证同一轮
+      重复写入不会产生重复行。``message_key`` 形如 ``u:<message_id>``（用户那条消息）
+      和 ``a:<message_id>``（机器人这一轮的回复）：一轮两行共用一个来源 message_id。
+    - **只存对话**：注入给模型的系统资料块（``[WEB_SEARCH_RESULTS]`` 等）不是对话内容，
+      不落库（见 ``bot.services.private_chat`` 的写入路径）。
+    - ``(user_id, id)`` 复合索引服务「按用户取最近 N 条」的固定查询：``user_id`` 等值
+      + ``id`` 倒序，扫索引就能拿到尾巴，不需要给全表排序。
+    - ``created_at`` 有独立索引：留存清理按时间删过期行。
+    """
+
+    __tablename__ = "private_chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 真实 Telegram 用户 id（恒为正；私聊没有群维度）
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    #: 'user' | 'assistant'
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+        index=True,
+    )
+    #: 幂等键（同一轮重投递只落一行）
+    message_key: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "message_key",
+            name="uq_private_chat_messages_user_key",
+        ),
+        # 「取这个用户最近 N 条」的驱动索引（user_id 等值 + id 倒序）
+        Index("ix_private_chat_messages_user_id_desc", "user_id", "id"),
     )
 
 
