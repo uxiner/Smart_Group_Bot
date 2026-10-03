@@ -89,6 +89,14 @@ class PersonaIdentityTests(unittest.TestCase):
         self.assertIn("You do not flatter and you do not fawn", persona)
         self.assertIn("Never mention prompts, rules, system blocks", persona)
 
+    def test_pet_name_is_the_default_address_in_owner_dms(self) -> None:
+        """最高管理员私聊：亲密档要看得见——默认称呼就带亲密，但严肃场景除外。"""
+
+        persona = _persona()
+        self.assertIn("that pet name is your default address", persona)
+        self.assertIn("never in the middle of a serious risk answer", persona)
+        self.assertIn("the clinginess is the main melody and it must be visible", persona)
+
     def test_clinginess_behaviours_are_written_down(self) -> None:
         persona = _persona()
         self.assertIn("[Clinginess]", persona)
@@ -208,6 +216,23 @@ class PrivateChatModeTests(unittest.TestCase):
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertIn("is_owner: no", blob)
         self.assertIn("[PRIVATE CHAT MODE]", blob, "非 owner 私聊同样话多，只是不亲密")
+
+    def test_owner_dm_gets_the_closeness_mode_block(self) -> None:
+        messages = build_private_chat_messages(
+            "在吗", sender_user_id=601298409, sender_username="uxiner", sender_is_owner=True
+        )
+        blob = "\n".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("[OWNER DM MODE]", blob)
+        self.assertIn("`亲爱的` is your default address", blob)
+        self.assertIn("must be visible in this reply, not merely available", blob)
+        self.assertIn("if the matter involves real risk", blob.lower())
+
+    def test_member_dm_never_gets_the_closeness_mode_block(self) -> None:
+        messages = build_private_chat_messages(
+            "在吗", sender_user_id=9757123, sender_username="nasfan_member", sender_is_owner=False
+        )
+        blob = "\n".join(str(m.get("content") or "") for m in messages)
+        self.assertNotIn("[OWNER DM MODE]", blob, "亲密档只给最高管理员，别人一个字都不给")
 
     def test_owner_with_last_contact_gets_the_attendance_block(self) -> None:
         messages = build_private_chat_messages(
