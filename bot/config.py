@@ -1188,7 +1188,8 @@ def log_av_reverse_privacy_state(settings: Settings) -> None:
     endpoint = str(getattr(settings, "av_reverse_endpoint", "") or "").strip()
     if not enabled:
         log.info(
-            "AV 图像反查：未启用（默认）。启用会把用户图片原样发给第三方主机，"
+            "AV 图像反查：未启用（默认）。启用后**仅私聊**发图会走反查，"
+            "图片原样发给第三方主机（群聊永不外发）；"
             "需要同时显式设置 AV_REVERSE_ENABLED=true 与 AV_REVERSE_ENDPOINT=<入口>。"
         )
         return
@@ -1199,8 +1200,8 @@ def log_av_reverse_privacy_state(settings: Settings) -> None:
         )
         return
     log.warning(
-        "AV 图像反查：已启用 —— 待识别图片的原始字节会被发送到第三方主机 %s"
-        "（数据离开本服务）；不需要时请关闭 AV_REVERSE_ENABLED。",
+        "AV 图像反查：已启用（仅私聊；群聊永不外发）—— 私聊待识别图片的原始字节"
+        "会被发送到第三方主机 %s（数据离开本服务）；不需要时请关闭 AV_REVERSE_ENABLED。",
         endpoint,
     )
 

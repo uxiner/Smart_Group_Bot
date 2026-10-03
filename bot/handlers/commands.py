@@ -2567,9 +2567,22 @@ async def _av_image_vision_with_escalation(
         )
         return _AVImageVisionOutcome(primary_kb, 0, "", False, False)
 
-    # 识图之前先试一次「用图反查番号」：帧级索引对画面截图比读文字准得多，
-    # 命中就省掉两次视觉调用；未命中/被限流/出错一律静默落到下面的老路。
-    reverse_code = await try_reverse_image_lookup(data_uri, settings, user_id=user_id)
+    # 反查**仅限私聊**（用户口径 2026-10-03）：群聊的底线是不出现 NSFW 图/视频，
+    # 群成员发的图也不外发第三方；群内只走下面「读图里的文字」那条路，
+    # 一次外发请求都不发（连第三方域名都不出现）。私聊命中则省掉两次视觉调用；
+    # 未命中/被限流/出错一律静默落到老路。
+    chat_type = str(getattr(getattr(image_message, "chat", None), "type", "") or "")
+    if chat_type in ("group", "supergroup"):
+        log.info(
+            "【识图】群内跳过用图反查（仅私聊可用）| 档位=%dKB | user=%s",
+            primary_kb,
+            user_id,
+        )
+        reverse_code = ""
+    else:
+        reverse_code = await try_reverse_image_lookup(
+            data_uri, settings, user_id=user_id
+        )
     if reverse_code:
         log.info(
             "【识图】档位=%dKB 反查命中编号 | code=%s | user=%s",
