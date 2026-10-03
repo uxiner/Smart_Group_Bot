@@ -1,8 +1,9 @@
 """1 对 1 私聊处理器：文字闲聊 + 图片理解。
 
-用户口径（2026-10-03）：只有已授权群的成员能私聊；每人 20 条/天、全局 200 条/天；
-私聊不做群规审核（NSFW 也放开，群里那条底线不受影响）；私聊内容不落库、不进
-归档/记忆/向量，只在内存里保留最近几轮做上下文。
+用户口径（2026-10-03）：只有已授权群的成员能私聊（普通成员 100 条/天、群管理员
+500 条/天，各自的全局上限 20000 / 100000 条/天，最高管理员不设限）；私聊不做群规
+审核（NSFW 也放开，群里那条底线不受影响）；私聊内容不落库、不进归档/记忆/向量，
+只在内存里保留最近几轮做上下文。
 
 **注册顺序**：这个 router 必须排在 ``group.router`` **之前**——群消息处理器用的是
 ``F.text | F.photo | ...`` 这种宽泛过滤，且靠函数体里 ``is_group()`` 早退，谁先注册
@@ -26,13 +27,15 @@ from bot.services.private_chat import (
     DM_VISION_PROMPT,
     MEDIA_UNSUPPORTED_NOTICE,
     NOT_MEMBER_NOTICE,
+    TIER_ADMIN,
+    QuotaOutcome,
     build_private_chat_messages,
-    confirm_authorized_group_member,
     consume_daily_quota,
     history_store,
     local_day_key,
     notice_throttle,
     quota_notice,
+    resolve_access,
 )
 
 log = logging.getLogger(__name__)
@@ -186,36 +189,43 @@ async def on_private_message(
     if not text and not _has_media(message):
         return
 
-    # 1) 准入：只有已授权群的成员能用（超管豁免）。不确定 → 不加钱也不拒绝。
-    allowed = await confirm_authorized_group_member(message.bot, session, settings, user.id)
+    # 1) 准入：只有已授权群的成员能用；档位同时决定配额阶梯。
+    verdict = await resolve_access(message.bot, session, settings, user.id)
     await session.commit()
-    if allowed is None:
+    if verdict.allowed is None:
         await _send_notice(message, ACCESS_UNKNOWN_NOTICE, "access_unknown")
         return
-    if not allowed:
+    if not verdict.allowed:
         await _send_notice(message, NOT_MEMBER_NOTICE, "not_member")
         return
 
-    # 2) 配额：先扣再用（每人 / 全局两道闸门）。
-    try:
-        outcome = await consume_daily_quota(session, user_id=user.id)
-    except Exception as exc:
-        await session.rollback()
-        log.warning("private chat: 配额判定失败 | user=%s | error=%s", user.id, exc)
-        await _send_notice(message, BUSY_NOTICE, "busy")
-        return
-    if not outcome.allowed:
-        log.info(
-            "private chat: 配额用尽 | user=%s | reason=%s | 今日=%s/%s 全局=%s/%s",
-            user.id,
-            outcome.reason,
-            outcome.user_used,
-            outcome.per_user_limit,
-            outcome.global_used,
-            outcome.global_limit,
-        )
-        await _send_notice(message, quota_notice(outcome), "quota")
-        return
+    # 2) 配额：先扣再用（每人 + 本档全局两道闸门）。最高管理员不设限、不计数。
+    outcome: QuotaOutcome | None = None
+    if not verdict.is_super:
+        try:
+            outcome = await consume_daily_quota(
+                session,
+                user_id=user.id,
+                is_admin=verdict.is_admin,
+            )
+        except Exception as exc:
+            await session.rollback()
+            log.warning("private chat: 配额判定失败 | user=%s | error=%s", user.id, exc)
+            await _send_notice(message, BUSY_NOTICE, "busy")
+            return
+        if not outcome.allowed:
+            log.info(
+                "private chat: 配额用尽 | user=%s | 档=%s | reason=%s | 今日=%s/%s 本档全局=%s/%s",
+                user.id,
+                verdict.tier,
+                outcome.reason,
+                outcome.user_used,
+                outcome.per_user_limit,
+                outcome.global_used,
+                outcome.global_limit,
+            )
+            await _send_notice(message, quota_notice(outcome), "quota")
+            return
 
     # 3) 媒体：只处理图片；其它类型回一句说明（不占模型）。
     image_description = ""
@@ -268,12 +278,11 @@ async def on_private_message(
     store.append(user.id, "user", user_turn)
     store.append(user.id, "assistant", reply)
     log.info(
-        "private chat: 已回复 | user=%s | 今日=%s/%s | 全局=%s/%s | 日=%s | chars=%d",
+        "private chat: 已回复 | user=%s | 档=%s | 今日=%s | 本档全局=%s | 日=%s | chars=%d",
         user.id,
-        outcome.user_used,
-        outcome.per_user_limit,
-        outcome.global_used,
-        outcome.global_limit,
+        verdict.tier,
+        f"{outcome.user_used}/{outcome.per_user_limit}" if outcome else "不限",
+        f"{outcome.global_used}/{outcome.global_limit}" if outcome else "不限",
         local_day_key(),
         len(reply),
     )
