@@ -184,6 +184,26 @@ class BotConfig(BaseModel):
     # 这个开关是给「以后用户显式授权」留的位置：默认 False 时群聊装配上下文的任何
     # 路径都不读 ``private_chat_messages``；本期**不实现**打开后的读取逻辑。
     group_can_read_private_history: bool = False
+    # 第 4 期：长期记忆（``user_facts``）。机器人从群聊/私聊里提炼稳定的结构化事实
+    # （身份/偏好/关系/禁忌/技能/事件），去重合并后按需注入。全部可运行时覆盖。
+    # - ``memory_facts_enabled``：总开关（关掉 = 不提炼、不注入、不写）；
+    # - ``memory_extract_*``：后台被动提炼的开关/节奏/每次最小新增条数/每日次数上限/
+    #   单批最大条数（每日上限 0 = 不限）；
+    # - ``memory_tool_*``：模型主动调 ``remember`` 工具的开关与每作用域每日条数上限；
+    # - ``memory_recall_limit``：每次注入最多几条；
+    # - ``memory_event_ttl_days``：``category='event'`` 的过期天数；
+    # - ``memory_deleted_retention_days``：被删除/被替代的事实保留多少天后物理清理。
+    memory_facts_enabled: bool = True
+    memory_extract_enabled: bool = True
+    memory_extract_interval_minutes: int = 30
+    memory_extract_min_messages: int = 20
+    memory_extract_daily_cap: int = 48
+    memory_extract_batch_max: int = 200
+    memory_tool_enabled: bool = True
+    memory_tool_daily_cap: int = 30
+    memory_recall_limit: int = 8
+    memory_event_ttl_days: int = 30
+    memory_deleted_retention_days: int = 30
 
 
 class ModerationConfig(BaseModel):
@@ -321,6 +341,18 @@ class Settings(BaseSettings):
     bot_search_freshness_news_hours: int = 48
     bot_search_freshness_fact_hours: int = 168
     bot_group_can_read_private_history: bool = False
+    # 第 4 期：长期记忆（user_facts）提炼/工具/召回/过期/留存
+    bot_memory_facts_enabled: bool = True
+    bot_memory_extract_enabled: bool = True
+    bot_memory_extract_interval_minutes: int = 30
+    bot_memory_extract_min_messages: int = 20
+    bot_memory_extract_daily_cap: int = 48
+    bot_memory_extract_batch_max: int = 200
+    bot_memory_tool_enabled: bool = True
+    bot_memory_tool_daily_cap: int = 30
+    bot_memory_recall_limit: int = 8
+    bot_memory_event_ttl_days: int = 30
+    bot_memory_deleted_retention_days: int = 30
     bot_proactive_default_enabled: bool = False
     bot_proactive_idle_minutes: int = 180
     bot_proactive_jitter_minutes: int = 60
@@ -896,6 +928,15 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "search_freshness_price_hours",
             "search_freshness_news_hours",
             "search_freshness_fact_hours",
+            # 第 4 期：长期记忆（见 BotConfig 的字段说明）
+            "memory_extract_interval_minutes",
+            "memory_extract_min_messages",
+            "memory_extract_daily_cap",
+            "memory_extract_batch_max",
+            "memory_tool_daily_cap",
+            "memory_recall_limit",
+            "memory_event_ttl_days",
+            "memory_deleted_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -903,6 +944,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "memory_recall_enabled",
             "memory_automatic_compaction",
             "group_can_read_private_history",
+            # 第 4 期：长期记忆的两个开关
+            "memory_facts_enabled",
+            "memory_extract_enabled",
+            "memory_tool_enabled",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
@@ -994,6 +1039,34 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.bot.group_can_read_private_history = bool(
         settings.bot_group_can_read_private_history
+    )
+    # 第 4 期：长期记忆（与 runtime_config 的 ge/le 一致）
+    settings.bot.memory_facts_enabled = bool(settings.bot_memory_facts_enabled)
+    settings.bot.memory_extract_enabled = bool(settings.bot_memory_extract_enabled)
+    settings.bot.memory_tool_enabled = bool(settings.bot_memory_tool_enabled)
+    settings.bot.memory_extract_interval_minutes = min(
+        1440, max(5, int(settings.bot_memory_extract_interval_minutes))
+    )
+    settings.bot.memory_extract_min_messages = min(
+        500, max(5, int(settings.bot_memory_extract_min_messages))
+    )
+    settings.bot.memory_extract_daily_cap = min(
+        500, max(0, int(settings.bot_memory_extract_daily_cap))
+    )
+    settings.bot.memory_extract_batch_max = min(
+        1000, max(20, int(settings.bot_memory_extract_batch_max))
+    )
+    settings.bot.memory_tool_daily_cap = min(
+        200, max(0, int(settings.bot_memory_tool_daily_cap))
+    )
+    settings.bot.memory_recall_limit = min(
+        20, max(1, int(settings.bot_memory_recall_limit))
+    )
+    settings.bot.memory_event_ttl_days = min(
+        365, max(1, int(settings.bot_memory_event_ttl_days))
+    )
+    settings.bot.memory_deleted_retention_days = min(
+        365, max(1, int(settings.bot_memory_deleted_retention_days))
     )
     settings.bot.memory_archive_max_messages_per_group = min(
         1_000_000,
