@@ -29,6 +29,7 @@ from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.mihomo_doc import MihomoDocSkill
 from bot.services.skills.movie_info import MovieInfoSkill
 from bot.services.skills.music_search import MusicSearchSkill
+from bot.services.skills.remember import RememberSkill
 from bot.services.skills.routeros_doc import RouterOSDocSkill
 from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.send_sticker import SendStickerSkill
@@ -299,6 +300,8 @@ class SkillService:
         self.skills: dict[str, Skill] = {}
         self._register(ConversationRecallSkill())
         self._register(MemoryManageSkill())
+        # 第 4 期：模型主动写长期记忆（主语只能是当前说话人本人）。
+        self._register(RememberSkill(settings))
         self._register(RuleManageSkill())
         self._register(SendStickerSkill())
         self._register(MusicSearchSkill(settings))
