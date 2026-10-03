@@ -10,7 +10,6 @@ from typing import Any
 
 from bot.config import (
     load_bootstrap_settings,
-    log_av_reverse_privacy_state,
     log_enforcement_switch_state,
     validate_bootstrap_settings,
 )
@@ -431,7 +430,6 @@ async def main() -> None:
     settings = load_bootstrap_settings()
     validate_bootstrap_settings(settings)
     # F-025：用户图片会不会离开本服务，必须在启动日志里可见（默认不外发）。
-    log_av_reverse_privacy_state(settings)
 
     engine, session_factory = await init_db(settings.database_url)
     try:

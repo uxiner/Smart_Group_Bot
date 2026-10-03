@@ -524,26 +524,17 @@ class NsfwGuardScopeTests(unittest.TestCase):
         self.assertFalse(
             group._nsfw_image_guard_applies(message, "document", _settings())
         )
+    def test_av_captioned_images_are_judged_like_any_other(self) -> None:
+        """配文带 /av 不再是免检理由（发图识图已作废，2026-10-03 用户口径）。"""
 
-    def test_av_images_are_left_to_the_existing_av_flow(self) -> None:
+        settings = _guard_settings()
         for caption in ("/av", "/av WANZ-530", "/av@selfbot", " /av  人妻"):
             with self.subTest(caption=caption):
                 message = _photo_message(caption=caption)
-                self.assertTrue(group._is_group_av_image_message(message))
-                self.assertFalse(
-                    group._nsfw_image_guard_applies(
-                        message, "photo_caption", _settings()
-                    )
+                self.assertTrue(
+                    group._nsfw_image_guard_applies(message, "photo", settings)
                 )
-
-        plain = _photo_message(caption="普通的图片说明")
-        self.assertFalse(group._is_group_av_image_message(plain))
-        self.assertTrue(
-            group._nsfw_image_guard_applies(plain, "photo_caption", _settings())
-        )
-        # /average 不是 /av 命令
-        sneaky = _photo_message(caption="/average 5")
-        self.assertFalse(group._is_group_av_image_message(sneaky))
+                self.assertTrue(group._nsfw_image_guard_applies(message, "photo", settings))
 
     def test_runtime_switch_disables_scope(self) -> None:
         message = _photo_message()
@@ -1255,18 +1246,18 @@ class NsfwGuardWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.conversation, [])
         moderation.record_violation.assert_not_awaited()
         challenge.assert_not_awaited()
+    async def test_av_captioned_nsfw_image_is_still_disposed(self) -> None:
+        """群里带 /av 的 NSFW 图照样走处置（删图 + 警告 + 质询）。
 
-    async def test_av_image_is_never_disposed(self) -> None:
+        发图识图流程已作废，所以「这条图是 /av 请求的」不再让它免于判定。
+        """
+
         message, llm, moderation, _session_mock, challenge = await _run_group_message(
             vision_text=NSFW_YES_TEXT, message=_photo_message(caption="/av WANZ-530")
         )
-
-        # 「/av + 图片」由 commands.py 的先删图再识图流程负责，这里不碰
-        prompt = llm.vision_describe.await_args.args[1]
-        self.assertNotIn("NSFW_YES", prompt)
-        self.assertEqual(message.conversation, [])
-        moderation.record_violation.assert_not_awaited()
-        challenge.assert_not_awaited()
+        message.delete.assert_awaited()
+        begin = challenge
+        self.assertTrue(begin.called or moderation.record_violation.called)
 
     async def test_switch_off_means_no_judgement_and_no_extra_model_call(self) -> None:
         message, llm, moderation, _session_mock, challenge = await _run_group_message(
