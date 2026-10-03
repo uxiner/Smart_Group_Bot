@@ -171,6 +171,19 @@ class BotConfig(BaseModel):
     # + 回复预留」的余量：装配历史 + 余量 ≤ max_context_tokens，这是硬闸门。
     group_history_token_budget: int = 278528
     group_history_reserve_tokens: int = 32768
+    # 第 3 期：检索结果留档（``search_result_records``）。
+    # - ``search_record_retention_days``：留档保留期（默认 30 天，夹取 1..365），
+    #   由后台巡检清理；
+    # - ``search_freshness_*_hours``：各类信息的新鲜窗口（价格 24h / 新闻 48h /
+    #   事实 7d）；再次注入留档时，超出窗口的会标注「可能已过期」。
+    search_record_retention_days: int = 30
+    search_freshness_price_hours: int = 24
+    search_freshness_news_hours: int = 48
+    search_freshness_fact_hours: int = 168
+    # 第 3 期：方向规则（隐私红线）。群 → 私聊允许；私聊 → 群**默认禁止**。
+    # 这个开关是给「以后用户显式授权」留的位置：默认 False 时群聊装配上下文的任何
+    # 路径都不读 ``private_chat_messages``；本期**不实现**打开后的读取逻辑。
+    group_can_read_private_history: bool = False
 
 
 class ModerationConfig(BaseModel):
@@ -302,6 +315,12 @@ class Settings(BaseSettings):
     # Group-chat history (archive rows assembled by token budget).
     bot_group_history_token_budget: int = 278528
     bot_group_history_reserve_tokens: int = 32768
+    # 第 3 期：检索留档保留期 / 各类新鲜窗口 / 私聊→群方向开关（默认关闭）
+    bot_search_record_retention_days: int = 30
+    bot_search_freshness_price_hours: int = 24
+    bot_search_freshness_news_hours: int = 48
+    bot_search_freshness_fact_hours: int = 168
+    bot_group_can_read_private_history: bool = False
     bot_proactive_default_enabled: bool = False
     bot_proactive_idle_minutes: int = 180
     bot_proactive_jitter_minutes: int = 60
@@ -873,10 +892,18 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "private_chat_history_retention_days",
             "group_history_token_budget",
             "group_history_reserve_tokens",
+            "search_record_retention_days",
+            "search_freshness_price_hours",
+            "search_freshness_news_hours",
+            "search_freshness_fact_hours",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
-        for key in ("memory_recall_enabled", "memory_automatic_compaction"):
+        for key in (
+            "memory_recall_enabled",
+            "memory_automatic_compaction",
+            "group_can_read_private_history",
+        ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
 
@@ -951,6 +978,22 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.group_history_reserve_tokens = min(
         1_000_000,
         max(1024, int(settings.bot_group_history_reserve_tokens)),
+    )
+    # 第 3 期：检索留档保留期与新鲜窗口（与 runtime_config 的 ge/le 一致）
+    settings.bot.search_record_retention_days = min(
+        365, max(1, int(settings.bot_search_record_retention_days))
+    )
+    settings.bot.search_freshness_price_hours = min(
+        8760, max(1, int(settings.bot_search_freshness_price_hours))
+    )
+    settings.bot.search_freshness_news_hours = min(
+        8760, max(1, int(settings.bot_search_freshness_news_hours))
+    )
+    settings.bot.search_freshness_fact_hours = min(
+        8760, max(1, int(settings.bot_search_freshness_fact_hours))
+    )
+    settings.bot.group_can_read_private_history = bool(
+        settings.bot_group_can_read_private_history
     )
     settings.bot.memory_archive_max_messages_per_group = min(
         1_000_000,

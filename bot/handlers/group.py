@@ -58,6 +58,10 @@ from bot.services.call_admin import (
     remove_call_admin_resolution_button,
 )
 from bot.services.api_model_query import api_model_query_tool_enabled
+from bot.services.context_gate import (
+    assemble_context_within_budget,
+    context_token_budget,
+)
 from bot.services.group_settings import (
     acquire_group_settings_write_intent,
     is_group_av_enabled,
@@ -143,6 +147,13 @@ from bot.services.reply_progress import ReplyProgressTracker
 from bot.services.proactive import note_group_activity, record_group_activity
 from bot.services.privileged_tasks import submit_privileged_task
 from bot.services.resource_health import register_resource_health_provider
+from bot.services.search_memory import (
+    SCOPE_GROUP,
+    SEARCH_RECORDS_HEADER_BLOCK,
+    freshness_windows,
+    load_search_records,
+    render_search_record_messages,
+)
 from bot.services.skills import SkillService
 from bot.services.skills.vote_ban import is_explicit_vote_ban_request
 from bot.services.sticker_library import sticker_library
@@ -5843,6 +5854,88 @@ def _content_boundaries_context_for_group(group_settings: dict | None) -> str:
     return build_content_boundaries_context()
 
 
+async def _inject_group_search_records(
+    *,
+    history: list[dict],
+    group_id: int,
+    memory: Any,
+    settings: Settings,
+) -> list[dict]:
+    """第 3 期：把**本群**的检索留档（带时效）接进群聊上下文。
+
+    * 只读本群（``scope=group`` + ``group_id``）：私聊留档在另一个作用域，
+      这里拿不到、也不会去拿（C 项隐私红线）。
+    * 用 ``session_factory`` 开一个自己的短会话读留档——调用方的 ``session`` 在这个
+      阶段已经关掉了，而且读留档不该把别人的连接占住。
+    * 取不到 / 读取失败 / 没有留档 → 原样返回 ``history``（行为与第 2 期一致）。
+    * 裁剪走统一闸门：把 ``get_history_for_llm`` 的结果拆成「历史」与「召回索引」两层，
+      与检索留档一起按 **历史 → 检索留档 → 召回** 的优先级裁；余量用第 2 期的
+      ``group_history_reserve_tokens``（系统提示词/人设 + 本轮消息 + 回复预留）。
+    """
+
+    factory = getattr(memory, "session_factory", None)
+    if factory is None:
+        return history
+    try:
+        async with factory() as session:
+            records = await load_search_records(
+                session,
+                scope=SCOPE_GROUP,
+                scope_id=int(group_id),
+            )
+    except Exception as exc:
+        log.warning(
+            "[%s] 检索留档读取失败（按没有留档处理） | error=%s", group_id, exc
+        )
+        return history
+    search_messages = render_search_record_messages(
+        records, windows=freshness_windows(settings)
+    )
+    if not search_messages:
+        return history
+
+    recall_layer = [
+        item
+        for item in history
+        if isinstance(item, dict)
+        and str(item.get("memory_source") or "") == "recalled_archive_index"
+    ]
+    history_layer = [
+        item
+        for item in history
+        if not (
+            isinstance(item, dict)
+            and str(item.get("memory_source") or "") == "recalled_archive_index"
+        )
+    ]
+    assembly = assemble_context_within_budget(
+        # 头部说明放进固定层（永不裁剪）：来源声明不该因为在预算里排在最前面就被先
+        # 裁掉——被裁的永远是最旧的那条留档。
+        system=[{"role": "system", "content": SEARCH_RECORDS_HEADER_BLOCK}],
+        current_turn=[],
+        memory_recall=recall_layer,
+        search_records=search_messages,
+        history=history_layer,
+        budget_tokens=context_token_budget(settings),
+        reserve_tokens=group_context.group_history_reserve_tokens(settings),
+    )
+    kept = assembly.layers
+    if assembly.trims:
+        log.info(
+            "[%s] 检索留档注入触发了预算裁剪 | trims=%s | used=%d | budget=%d",
+            group_id,
+            [(t.layer, t.dropped_messages, t.truncated_messages) for t in assembly.trims],
+            assembly.used_tokens,
+            assembly.budget_tokens,
+        )
+    return [
+        *kept["history"],
+        *kept["system"],
+        *kept["search_records"],
+        *kept["memory_recall"],
+    ]
+
+
 async def _process_pending_reply_batch(
     items: list[_PendingReplyItem],
     settings: Settings,
@@ -6080,6 +6173,15 @@ async def _process_pending_reply_batch(
                     history,
                     memory_entries,
                     message_keys=batch_message_keys,
+                )
+                # 第 3 期：本群检索留档带时效注入（``[SEARCH_RECORDS]``，scope=group）。
+                # 私聊的留档**永远不会**走到这里：``load_search_records`` 按作用域硬隔离
+                # （C 项隐私红线）。取不到就按「没有留档」处理，不做任何猜测。
+                history = await _inject_group_search_records(
+                    history=history,
+                    group_id=group_id,
+                    memory=memory,
+                    settings=settings,
                 )
                 log.info(
                     "[%s] pending batch reply generation started | action=%s history=%d",

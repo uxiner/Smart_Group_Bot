@@ -30,7 +30,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from sqlalchemy import delete, select
@@ -39,10 +39,22 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from bot.db.models import PrivateChatMessage, PrivateChatUsage
 from bot.services.authz import is_super_admin_user_id, list_authorized_groups
 from bot.services.checkin import local_today
+from bot.services.context_gate import (
+    CONTEXT_TOKEN_BUDGET,
+    assemble_context_within_budget,
+)
+from bot.services.group_public_context import (
+    GROUP_PUBLIC_HEADER_BLOCK,
+    render_group_public_messages,
+)
 from bot.services.reply_output import (
     REPLY_OUTPUT_AWARENESS,
     REPLY_OUTPUT_PROTOCOL,
     REPLY_RICH_FORMATTING,
+)
+from bot.services.search_memory import (
+    SEARCH_RECORDS_HEADER_BLOCK,
+    render_search_record_messages,
 )
 from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.conversation_context import (
@@ -114,8 +126,15 @@ _HISTORY_MESSAGE_TOKEN_OVERHEAD = 12
 HISTORY_TRUNCATION_NOTE = "…（本条过长，已截断）"
 
 #: 注入给模型的**系统资料块**标记：不是对话内容，**一律不落库**。
-#: 目前只有私聊联网检索会注入这个块（见 ``bot/services/dm_search.py``）。
-INJECTED_BLOCK_MARKERS = ("[WEB_SEARCH_RESULTS]",)
+#: 目前私聊会注入三种：本轮联网检索（``[WEB_SEARCH_RESULTS]``）、历史检索留档
+#: （``[SEARCH_RECORDS]``，第 3 期）、群聊公开记录参考（``[群聊公开记录]``，第 3 期 B）。
+#: 最后一种虽然是我们自己从归档里取的，但它同样是「群聊里的公开内容」，不是他在私聊里
+#: 说过的话，绝不进私聊历史。
+INJECTED_BLOCK_MARKERS = (
+    "[WEB_SEARCH_RESULTS]",
+    "[SEARCH_RECORDS]",
+    "[群聊公开记录]",
+)
 
 #: 私聊历史留存清理的巡检间隔（秒）。一天跑几次足够：过期行早删晚删都不影响
 #: 对话正确性，只要保证库不无限涨。
@@ -154,6 +173,10 @@ class MemberAccessCache:
 
     存的是档位字符串而不是布尔值：档位既表示「能不能用」，也表示「配额走哪一档」，
     一次查询同时拿到两件事，不用为配额再打一次 ``getChatMember``。
+
+    第 3 期起还顺带缓存**已确认他在里面的授权群 id**：B 项（群 → 私聊参考公开记录）
+    需要「该用户可访问的群」，而准入判定本来就已经对每个授权群打过一次
+    ``getChatMember``——那次查询的命中结果就是可访问群，不缓存就得为每条私聊再打一轮。
     """
 
     def __init__(
@@ -166,23 +189,46 @@ class MemberAccessCache:
         self.ttl_seconds = max(1.0, float(ttl_seconds))
         self.max_users = max(16, int(max_users))
         self._clock = clock or time.monotonic
-        self._entries: dict[int, tuple[str, float]] = {}
+        self._entries: dict[int, tuple[str, float, tuple[int, ...]]] = {}
 
-    def get(self, user_id: int) -> str | None:
+    def _live(self, user_id: int) -> tuple[str, tuple[int, ...]] | None:
         entry = self._entries.get(int(user_id))
         if entry is None:
             return None
-        tier, expires_at = entry
+        tier, expires_at, group_ids = entry
         if expires_at <= self._clock():
             self._entries.pop(int(user_id), None)
             return None
-        return tier
+        return tier, group_ids
 
-    def put(self, user_id: int, tier: str) -> None:
+    def get(self, user_id: int) -> str | None:
+        live = self._live(user_id)
+        return None if live is None else live[0]
+
+    def get_groups(self, user_id: int) -> tuple[int, ...]:
+        """缓存里已确认的「他在里面的授权群」；没缓存/已过期就返回空元组。"""
+
+        live = self._live(user_id)
+        return () if live is None else live[1]
+
+    def put(
+        self,
+        user_id: int,
+        tier: str,
+        group_ids: Iterable[Any] | None = None,
+    ) -> None:
         if len(self._entries) >= self.max_users and int(user_id) not in self._entries:
             # 容量满了先清最老的一批：准入结果过期即失效，清掉只会多打一次 API
             self._entries.clear()
-        self._entries[int(user_id)] = (str(tier), self._clock() + self.ttl_seconds)
+        try:
+            groups = tuple(dict.fromkeys(int(item) for item in (group_ids or [])))
+        except (TypeError, ValueError):
+            groups = ()
+        self._entries[int(user_id)] = (
+            str(tier),
+            self._clock() + self.ttl_seconds,
+            groups,
+        )
 
     def clear(self) -> None:
         self._entries.clear()
@@ -237,11 +283,17 @@ def _member_tier(member: Any) -> str:
 
 @dataclass(frozen=True)
 class AccessVerdict:
-    """一次私聊准入判定的结果：放行与否 + 档位（档位决定配额阶梯）。"""
+    """一次私聊准入判定的结果：放行与否 + 档位（档位决定配额阶梯）。
+
+    ``group_ids`` 是这次判定里**已确认他在里面的授权群**（第 3 期 B 项用）。它是
+    「准入判定的副产品」：判定本来就要对每个授权群打一次 ``getChatMember``，命中
+    的那些群 id 顺手带出来，私聊参考群聊公开记录时就不必再查一遍 Telegram。
+    """
 
     allowed: bool | None  # None = 无法确认
     tier: str
     detail: str = ""
+    group_ids: tuple[int, ...] = ()
 
     @property
     def is_super(self) -> bool:
@@ -267,18 +319,25 @@ async def resolve_access(
     就拒绝会误伤真人，所以单独给一条退路。
 
     档位取「所有授权群里最高的那个」：在 A 群是普通成员、在 B 群是管理员 → 管理员。
+
+    第 3 期起返回值还带上**已确认他在里面的授权群 id**（``AccessVerdict.group_ids``）：
+    B 项（群 → 私聊参考公开记录）只允许读「该用户可访问的群」，而这些群正是这次判定
+    已经逐个确认过的——不额外打 Telegram API，也不靠猜测。
     """
 
     uid = int(user_id)
     if is_super_admin_user_id(uid, settings):
+        # 最高管理员豁免准入，**不打任何额外查询**（既有口径）：他可见的群由调用方
+        # 在真正要用群聊公开记录时再取（全部授权群），准入这条路保持零查询。
         return AccessVerdict(True, TIER_SUPER)
 
     store = cache if cache is not None else _member_cache
     hit = store.get(uid)
     if hit is not None:
+        groups = store.get_groups(uid)
         if hit == TIER_NONE:
-            return AccessVerdict(False, TIER_NONE)
-        return AccessVerdict(True, hit)
+            return AccessVerdict(False, TIER_NONE, group_ids=groups)
+        return AccessVerdict(True, hit, group_ids=groups)
 
     try:
         groups = await list_authorized_groups(session)
@@ -288,9 +347,12 @@ async def resolve_access(
 
     unknown = False
     best = TIER_NONE
+    #: 已确认「他在里面」的授权群（准入判定的副产品，供 B 项读公开记录用）
+    confirmed: list[int] = []
     for row in groups:
+        group_id = int(row.group_id)
         try:
-            member = await bot.get_chat_member(chat_id=int(row.group_id), user_id=uid)
+            member = await bot.get_chat_member(chat_id=group_id, user_id=uid)
         except Exception as exc:
             if _is_definitive_absent(exc):
                 # 「member not found」= 确定不在这个群，继续看别的授权群
@@ -307,23 +369,27 @@ async def resolve_access(
             unknown = True
             continue
         tier = _member_tier(member)
+        if tier in (TIER_ADMIN, TIER_MEMBER):
+            confirmed.append(group_id)
         if tier == TIER_ADMIN:
-            store.put(uid, TIER_ADMIN)
-            return AccessVerdict(True, TIER_ADMIN)
+            store.put(uid, TIER_ADMIN, confirmed)
+            return AccessVerdict(
+                True, TIER_ADMIN, group_ids=tuple(confirmed)
+            )
         if tier == TIER_MEMBER:
             best = TIER_MEMBER
 
     if best == TIER_MEMBER:
         # 还有群没查成时先不缓存：下次重查有可能升档（普通成员 → 管理员）
         if not unknown:
-            store.put(uid, TIER_MEMBER)
-        return AccessVerdict(True, TIER_MEMBER)
+            store.put(uid, TIER_MEMBER, confirmed)
+        return AccessVerdict(True, TIER_MEMBER, group_ids=tuple(confirmed))
 
     if unknown:
         # 有群没查成 → 不下结论，也不缓存（下一次重试）
         return AccessVerdict(None, TIER_UNKNOWN, "telegram lookup failed")
 
-    store.put(uid, TIER_NONE)
+    store.put(uid, TIER_NONE, ())
     return AccessVerdict(False, TIER_NONE)
 
 
@@ -1036,6 +1102,10 @@ def build_private_chat_messages(
     sender_is_tg_admin: bool = False,
     image_description: str = "",
     last_contact: str = "",
+    search_records: list[dict[str, Any]] | None = None,
+    group_public_records: list[dict[str, Any]] | None = None,
+    group_titles: dict[int, str] | None = None,
+    budget_tokens: int = CONTEXT_TOKEN_BUDGET,
 ) -> list[dict[str, Any]]:
     """组装私聊这一轮要送模型的消息。
 
@@ -1048,6 +1118,17 @@ def build_private_chat_messages(
 
     ``sender_is_owner`` 由调用方按 ``settings.super_admin_id`` 传入（最高管理员），
     私聊里同样触发亲密档；成员可控正文一律走 ``user`` 角色 + 不可信围栏。
+
+    第 3 期新增两层的注入（都**只读**、都带来源/时效标注）：
+
+    * ``search_records``：这个人以前搜过的结果留档（``[SEARCH_RECORDS]``，带
+      「搜索于 …，距今 …」，过期会标「可能已过期」）；
+    * ``group_public_records``：他在**已授权群里公开**说过/公开讨论过的内容
+      （``[群聊公开记录 · 群名/群id]``）——方向只允许「群 → 私聊」。
+
+    两层都按「一条一条」交给统一闸门 :func:`bot.services.context_gate.assemble_context_within_budget`，
+    超预算时按「最老的历史 → 最旧的搜索记录 → 记忆召回条数」裁剪；系统提示词/人设与
+    本轮消息永远不裁。不传这两层时输出与改造前逐字一致。
     """
 
     normalized = clean_multiline_text(str(text or ""), max_len=PRIVATE_INPUT_LIMIT)
@@ -1055,17 +1136,22 @@ def build_private_chat_messages(
         str(image_description or ""), max_len=PRIVATE_INPUT_LIMIT
     )
 
+    history_messages: list[dict[str, Any]] = []
+    if history:
+        history_messages.extend(
+            sanitize_history_for_llm(history, max_items=len(history))
+        )
+    recent = format_recent_group_context(history, max_items=8)
+    if recent:
+        # 最近对话摘要属于「历史」这一层：它排在这一层末尾，裁剪时最后才被动到。
+        history_messages.append({"role": "system", "content": recent})
+
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
             "content": build_defended_system(with_persona(get_prompt("casual"))),
         },
     ]
-    if history:
-        messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
-    recent = format_recent_group_context(history, max_items=8)
-    if recent:
-        messages.append({"role": "system", "content": recent})
     messages.append({"role": "system", "content": build_current_time_context()})
     messages.append({"role": "system", "content": REPLY_OUTPUT_PROTOCOL})
     messages.append({"role": "system", "content": REPLY_OUTPUT_AWARENESS})
@@ -1188,21 +1274,53 @@ def build_private_chat_messages(
         body = f"[图片内容]\n{description}"
         if normalized:
             body = f"{body}\n\n[用户配文]\n{normalized}"
-        messages.append(
+        current_turn = [
             {
                 "role": "user",
                 "content": wrap_untrusted_multiline(
                     "user_message", body, max_len=PRIVATE_INPUT_LIMIT * 2
                 ),
             }
-        )
+        ]
     else:
-        messages.append(
+        current_turn = [
             {
                 "role": "user",
                 "content": wrap_untrusted_multiline(
                     "user_message", normalized, max_len=PRIVATE_INPUT_LIMIT
                 ),
             }
-        )
-    return messages
+        ]
+
+    search_messages = render_search_record_messages(search_records)
+    group_public_messages = render_group_public_messages(
+        group_public_records, titles=group_titles
+    )
+    # 头部说明（``[SEARCH_RECORDS]`` / ``[群聊公开记录]`` + 来源声明）放进**固定层**：
+    # 它是资料的来源声明，不该因为在预算里排在最前面就被先裁掉——被裁的永远是最旧的
+    # 那一条。它们紧跟在 tail_system 之后、各自条目之前（见下面的返回顺序）。
+    if search_messages:
+        messages.append({"role": "system", "content": SEARCH_RECORDS_HEADER_BLOCK})
+    if group_public_messages:
+        messages.append({"role": "system", "content": GROUP_PUBLIC_HEADER_BLOCK})
+    # 统一闸门：三层可裁（历史 → 搜索留档 → 群聊公开记录〔按「记忆召回条数」口径〕），
+    # 系统提示词/人设与本轮消息永不裁。不传新层时这里等价于原样返回。
+    assembly = assemble_context_within_budget(
+        system=messages,
+        current_turn=current_turn,
+        memory_recall=group_public_messages,
+        search_records=search_messages,
+        history=history_messages,
+        budget_tokens=budget_tokens,
+    )
+    kept = assembly.layers
+    head_system = kept["system"][:1]  # 人设/围栏那一段
+    tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/焦点/项目事实 + 两个头部
+    return [
+        *head_system,
+        *kept["history"],
+        *tail_system,
+        *kept["search_records"],
+        *kept["memory_recall"],
+        *kept["current_turn"],
+    ]
