@@ -22,7 +22,13 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
+from bot.services.authz import list_authorized_groups
+from bot.services.context_gate import context_token_budget
 from bot.services.dm_search import answer_with_search
+from bot.services.group_public_context import (
+    load_group_titles,
+    load_user_public_group_context,
+)
 from bot.services.private_chat import (
     ACCESS_UNKNOWN_NOTICE,
     BUSY_NOTICE,
@@ -44,6 +50,7 @@ from bot.services.private_chat import (
     record_private_turn,
     resolve_access,
 )
+from bot.services.search_memory import SCOPE_PRIVATE, load_search_records
 
 log = logging.getLogger(__name__)
 
@@ -276,6 +283,36 @@ async def on_private_message(
     last_contact = ""
     if verdict.is_super:
         last_contact = await last_contact_record(session, user_id=user.id)
+
+    # 第 3 期：两层只读的资料注入。
+    # 1) 这个人以前搜过的结果留档（带「搜索于 …，距今 …」，过期会标注）；
+    search_records = await load_search_records(
+        session,
+        scope=SCOPE_PRIVATE,
+        scope_id=user.id,
+    )
+    # 2) 他在**已授权群里公开**说过 / 公开讨论过的内容（方向只允许「群 → 私聊」）。
+    #    准入判定已经逐个 getChatMember 确认过哪些群他在里面，直接用那个结果；
+    #    最高管理员准入豁免（判定过程一个查询都不打），这里按「所有授权群」算。
+    group_ids = verdict.group_ids
+    if verdict.is_super:
+        try:
+            group_ids = tuple(
+                int(row.group_id) for row in await list_authorized_groups(session)
+            )
+        except Exception as exc:  # 拿不到群列表就不注入群聊公开记录
+            log.warning(
+                "private chat: 超管可见群列表查询失败（本次不注入群聊公开记录） | error=%s",
+                exc,
+            )
+            group_ids = ()
+    group_titles = await load_group_titles(session, group_ids)
+    group_public_records = await load_user_public_group_context(
+        query=text,
+        group_ids=group_ids,
+        titles=group_titles,
+    )
+
     messages = build_private_chat_messages(
         text,
         history=history,
@@ -285,6 +322,10 @@ async def on_private_message(
         sender_is_tg_admin=verdict.is_admin,
         image_description=image_description,
         last_contact=last_contact,
+        search_records=search_records,
+        group_public_records=group_public_records,
+        group_titles=group_titles,
+        budget_tokens=context_token_budget(settings),
     )
     try:
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
@@ -294,7 +335,13 @@ async def on_private_message(
     llm = _reply_llm(settings)
     try:
         answer = await answer_with_search(
-            llm, messages, stage="dm", user_text=text, settings=settings
+            llm,
+            messages,
+            stage="dm",
+            user_text=text,
+            settings=settings,
+            session=session,
+            scope_id=user.id,
         )
         reply = str(answer.text or "").strip()
     except Exception as exc:
