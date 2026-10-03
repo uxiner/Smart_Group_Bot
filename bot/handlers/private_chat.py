@@ -29,6 +29,11 @@ from bot.services.group_public_context import (
     load_group_titles,
     load_user_public_group_context,
 )
+from bot.services.long_term_memory import (
+    load_private_chat_facts,
+    memory_facts_enabled,
+    memory_recall_limit,
+)
 from bot.services.private_chat import (
     ACCESS_UNKNOWN_NOTICE,
     BUSY_NOTICE,
@@ -312,6 +317,19 @@ async def on_private_message(
         group_ids=group_ids,
         titles=group_titles,
     )
+    # 3) 第 4 期：长期记忆——本人 private 事实 **加上** 该用户可访问群的 group 事实
+    #    （方向仍只允许「群 → 私聊」；可访问群用的就是上面准入判定确认过的那批）。
+    #    相关才注入：没有命中就返回空，不硬塞。总开关关掉时一个字节都不读。
+    long_term_facts = []
+    if memory_facts_enabled(settings):
+        long_term_facts = await load_private_chat_facts(
+            session,
+            user_id=user.id,
+            group_ids=group_ids,
+            query=text,
+            limit=memory_recall_limit(settings),
+            titles=group_titles,
+        )
 
     messages = build_private_chat_messages(
         text,
@@ -324,6 +342,7 @@ async def on_private_message(
         last_contact=last_contact,
         search_records=search_records,
         group_public_records=group_public_records,
+        long_term_facts=long_term_facts,
         group_titles=group_titles,
         budget_tokens=context_token_budget(settings),
     )
