@@ -1252,6 +1252,35 @@ class MemberActivityDaily(Base):
     )
 
 
+class PrivateChatUsage(Base):
+    """1 对 1 私聊的日用量计数：一行 = 一个用户在一个本地自然日。
+
+    只记**条数**（不记内容），用于「每人每天」和「全局每天」两道配额闸门。
+    全局行用 ``user_id = 0`` 表示（真实 Telegram 用户 id 恒为正，不会撞车）。
+    ``usage_date`` 与 ``member_checkins.checkin_date`` 同口径（本地自然日
+    ``YYYY-MM-DD``），所以跨零点自动换行，不需要额外清理任务。
+    """
+
+    __tablename__ = "private_chat_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 0 = 全局合计行；其余为真实 Telegram 用户 id
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    usage_date: Mapped[str] = mapped_column(String(10))
+    messages: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        onupdate=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # UPSERT 的冲突目标；也是「一个人一天一行」的唯一保证
+        Index("ix_private_chat_usage_user_day", "user_id", "usage_date", unique=True),
+    )
+
+
 class MemberEntitlement(Base):
     """积分商店里"生效中"的权益：一行 = 一个人在一个群里的一件在租商品。
 

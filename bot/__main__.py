@@ -14,7 +14,7 @@ from bot.config import (
     validate_bootstrap_settings,
 )
 from bot.db.engine import init_db
-from bot.handlers import admin, commands, group, membership
+from bot.handlers import admin, commands, group, membership, private_chat
 from bot.loader import create_bot, dp
 from bot.middlewares.command_cleanup import ManagementCommandCleanupMiddleware
 from bot.middlewares.db import DbSessionMiddleware
@@ -459,6 +459,9 @@ async def main() -> None:
     dp.include_router(commands.router)
     dp.include_router(admin.router)
     dp.include_router(membership.router)
+    # 私聊 router 必须排在 group 之前：群处理器用的是宽泛过滤（F.text|F.photo|…）
+    # 并在函数体里 is_group() 早退，谁先注册谁先吃消息，排后面就永远收不到私聊。
+    dp.include_router(private_chat.router)
     dp.include_router(group.router)
 
     try:
