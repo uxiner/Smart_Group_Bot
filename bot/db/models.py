@@ -1526,3 +1526,150 @@ class CheckinReminderPost(Base):
             "message_id",
         ),
     )
+
+
+class UserFact(Base):
+    """第 4 期：从群聊/私聊里提炼出来的**稳定结构化事实**（长期记忆）。
+
+    和 ``GroupPermanentMemory``（后台网页手工维护的永久记忆）是两张表：那张是运维
+    手写的群级备忘，机器人不写不读；这张是机器人自己从对话里提炼、去重、可过期、
+    可被用户自己删除的「关于人」的认识。
+
+    - ``scope`` / ``scope_id``：口径与 ``search_result_records`` 完全一致
+      （``private`` + user_id，或 ``group`` + group_id）。**两个作用域互不可见**：
+      群聊侧的读取路径永远不会读 ``scope='private'`` 的行（第 1 验收项红线）。
+    - ``subject_user_id``：这条事实**关于谁**。``0`` 表示「关于本群整体」的公共事实。
+    - ``fact_text``：归一化后的一句话（上限 200 字符，超长截断）。
+    - ``category``：``identity`` / ``preference`` / ``relationship`` / ``event`` /
+      ``taboo`` / ``skill`` / ``other``。
+    - ``confidence``：0–100 整数（被动提炼默认 60，模型主动写默认 70）。
+    - ``source_kind``：``passive``（后台提炼）| ``tool``（模型主动调 remember）。
+    - ``evidence_excerpt``：原文片段（上限 200 字符，**必填**——没有出处的事实不
+      许入库）。这一列也是「模型编了但输入里没有」时的兜底证据。
+    - ``fingerprint`` = ``sha1(scope|scope_id|subject_user_id|归一化文本)``：同一
+      作用域、同一个人、同一句话只会有一行（靠唯一索引兜底，不靠先查后插的竞态写法）。
+    - ``confirm_count`` / ``last_confirmed_at``：同一事实再次被提炼到就 +1 并刷新时间，
+      **不新增行**。
+    - ``expires_at``：可空。``category='event'`` 默认 ``now + memory_event_ttl_days``
+      天，其余为 NULL（不过期）。到期的 event 由巡检标 ``deleted``（不物理删，用户
+      还能查到「这条过期了」）。
+    - ``status``：``active`` | ``superseded``（被语义互斥的新事实替代）| ``deleted``
+      （用户删除 / 过期）。用户删过的行**不许复活**。
+    """
+
+    __tablename__ = "user_facts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 'private'（私聊）| 'group'（群聊）
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 私聊 = user_id，群聊 = group_id
+    scope_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: 这条事实关于谁；0 = 本群整体的公共事实
+    subject_user_id: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    #: 归一化后的一句话事实（≤ 200 字符）
+    fact_text: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    #: identity | preference | relationship | event | taboo | skill | other
+    category: Mapped[str] = mapped_column(String(16), default="other", nullable=False)
+    confidence: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    #: 'passive'（后台提炼）| 'tool'（模型主动写）
+    source_kind: Mapped[str] = mapped_column(
+        String(16), default="passive", nullable=False
+    )
+    #: 来源群的 telegram_message_id（私聊来源没有这个 id 时为 NULL）
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    #: 原文片段（≤ 200 字符，必填）
+    evidence_excerpt: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    #: sha1(scope|scope_id|subject_user_id|归一化文本)，去重用
+    fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    last_confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    confirm_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    #: 'active' | 'superseded' | 'deleted'
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    #: 替代这条事实的新事实 id（自引用，可空）
+    superseded_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # 幂等键：同一作用域 + 同一个人 + 同一句话只有一行
+        Index(
+            "ix_user_facts_scope_subject_fingerprint",
+            "scope",
+            "scope_id",
+            "subject_user_id",
+            "fingerprint",
+            unique=True,
+        ),
+        # 读取（status='active'）的驱动索引
+        Index(
+            "ix_user_facts_scope_subject_status",
+            "scope",
+            "scope_id",
+            "subject_user_id",
+            "status",
+        ),
+        Index("ix_user_facts_created_at", "created_at"),
+        # 过期清理（event 到期）与留存清理的驱动索引
+        Index("ix_user_facts_expires_at", "expires_at"),
+        Index("ix_user_facts_last_confirmed_at", "last_confirmed_at"),
+    )
+
+
+class MemoryExtractCursor(Base):
+    """第 4 期：每个作用域「被动提炼已经处理到哪一行」的游标。
+
+    一行 = 一个作用域（``scope`` + ``scope_id``）。``last_row_id`` 是已处理到的
+    ``group_message_archive.id`` / ``private_chat_messages.id``：只处理 ``id >
+    last_row_id`` 的行，所以重复跑同一批不会重复提炼，失败时**不前移**就是天然的
+    重试队列（下一轮重试同一批，绝不在一次调用里 while 重试）。
+    """
+
+    __tablename__ = "memory_extract_cursors"
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    scope_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    #: 已处理到的归档/私聊行 id（0 = 还没处理过）
+    last_row_id: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        onupdate=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+
+class MemoryOptout(Base):
+    """第 4 期：用户级的长期记忆开关（``/memory off`` / ``/memory on``）。
+
+    一行 = 一个明确说「别记我」的用户。语义是**双向**的：
+
+    * 不再从 ``user_id`` 发的消息里提炼事实（提炼时按发送者过滤掉）；
+    * 他已经入库的 active 事实**一律不再注入**（``/memory off`` 时软删
+      ``status='deleted'``；读取路径也会按本表再过滤一次，防止漏网）。
+
+    ``reason`` 只用于审计（≤ 60 字符），不参与任何判定。
+    """
+
+    __tablename__ = "memory_optouts"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    reason: Mapped[str] = mapped_column(String(60), default="", nullable=False)

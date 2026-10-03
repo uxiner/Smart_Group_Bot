@@ -62,6 +62,14 @@ _SQLITE_ARCHIVE_EMBEDDING_TRIGGER_NAMES = (
     "trg_group_message_archive_embedding_update",
 )
 
+#: 第 4 期：``user_facts`` 的 FTS5 影子表（列只有 ``fact_text``，rowid = user_facts.id）
+_SQLITE_USER_FACTS_FTS_TABLE = "user_facts_fts"
+_SQLITE_USER_FACTS_FTS_TRIGGER_NAMES = (
+    "trg_user_facts_fts_insert",
+    "trg_user_facts_fts_delete",
+    "trg_user_facts_fts_update",
+)
+
 
 def _sqlite_archive_fts_scope_sql(prefix: str) -> str:
     """Return a stable, tokenizer-safe scope token for one archive row."""
@@ -1141,6 +1149,135 @@ async def _sqlite_ensure_group_message_archive_fts(conn) -> bool:
     return True
 
 
+async def _sqlite_ensure_user_facts_fts(conn) -> bool:
+    """Create and maintain the SQLite FTS5 projection for ``user_facts``.
+
+    形状照 ``group_message_archive_fts`` 的既有先例：普通（自己存内容）的 FTS5 表
+    + 显式触发器维护，``rowid`` 永远是 ``user_facts.id``，源表仍是唯一事实来源。
+    列只有 ``fact_text``；trigram 分词器让中文子串召回不依赖词典。FTS5/trigram
+    不可用时返回 False，读取侧退化成有界的关键词重叠排序（不报错、不注入错东西）。
+    """
+
+    if not await _sqlite_table_exists(conn, "user_facts"):
+        return False
+
+    expected_columns = ("fact_text",)
+    exists = await _sqlite_table_exists(conn, _SQLITE_USER_FACTS_FTS_TABLE)
+    existing_trigger_names = set(
+        (
+            await conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name IN ("
+                    "'trg_user_facts_fts_insert', "
+                    "'trg_user_facts_fts_delete', "
+                    "'trg_user_facts_fts_update'"
+                    ")"
+                )
+            )
+        ).scalars()
+    )
+    projection_may_be_stale = bool(
+        exists and existing_trigger_names != set(_SQLITE_USER_FACTS_FTS_TRIGGER_NAMES)
+    )
+    rebuild = False
+    if exists:
+        actual_columns = tuple(
+            row[1]
+            for row in (
+                await conn.execute(
+                    text(f"PRAGMA table_info({_SQLITE_USER_FACTS_FTS_TABLE})")
+                )
+            ).all()
+        )
+        schema_sql = str(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='table' AND name=:name"
+                    ),
+                    {"name": _SQLITE_USER_FACTS_FTS_TABLE},
+                )
+            ).scalar_one_or_none()
+            or ""
+        ).lower()
+        if actual_columns != expected_columns or "trigram" not in schema_sql:
+            rebuild = True
+
+    if rebuild:
+        for trigger_name in _SQLITE_USER_FACTS_FTS_TRIGGER_NAMES:
+            await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+        await conn.execute(text(f"DROP TABLE {_SQLITE_USER_FACTS_FTS_TABLE}"))
+        exists = False
+
+    if not exists:
+        try:
+            await conn.execute(
+                text(
+                    f"CREATE VIRTUAL TABLE {_SQLITE_USER_FACTS_FTS_TABLE} "
+                    "USING fts5("
+                    "fact_text, tokenize='trigram case_sensitive 0'"
+                    ")"
+                )
+            )
+        except Exception as exc:
+            detail = str(exc).lower()
+            if (
+                "no such module: fts5" not in detail
+                and "no such tokenizer: trigram" not in detail
+            ):
+                raise
+            log.warning(
+                "SQLite FTS5 trigram unavailable; "
+                "long-term memory recall uses the keyword fallback"
+            )
+            return False
+
+    trigger_sql = {
+        "trg_user_facts_fts_insert": (
+            "AFTER INSERT ON user_facts BEGIN "
+            f"INSERT INTO {_SQLITE_USER_FACTS_FTS_TABLE} (rowid, fact_text) "
+            "VALUES (new.id, COALESCE(new.fact_text, '')); END"
+        ),
+        "trg_user_facts_fts_delete": (
+            "AFTER DELETE ON user_facts BEGIN "
+            f"DELETE FROM {_SQLITE_USER_FACTS_FTS_TABLE} WHERE rowid = old.id; END"
+        ),
+        "trg_user_facts_fts_update": (
+            "AFTER UPDATE OF fact_text ON user_facts BEGIN "
+            f"DELETE FROM {_SQLITE_USER_FACTS_FTS_TABLE} WHERE rowid = old.id; "
+            f"INSERT INTO {_SQLITE_USER_FACTS_FTS_TABLE} (rowid, fact_text) "
+            "VALUES (new.id, COALESCE(new.fact_text, '')); END"
+        ),
+    }
+    for trigger_name, body in trigger_sql.items():
+        await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+        await conn.execute(text(f"CREATE TRIGGER {trigger_name} {body}"))
+
+    fact_count = int(
+        (await conn.execute(text("SELECT COUNT(*) FROM user_facts"))).scalar_one() or 0
+    )
+    fts_count = int(
+        (
+            await conn.execute(
+                text(f"SELECT COUNT(*) FROM {_SQLITE_USER_FACTS_FTS_TABLE}")
+            )
+        ).scalar_one()
+        or 0
+    )
+    if not exists or rebuild or projection_may_be_stale or fact_count != fts_count:
+        await conn.execute(text(f"DELETE FROM {_SQLITE_USER_FACTS_FTS_TABLE}"))
+        await conn.execute(
+            text(
+                f"INSERT INTO {_SQLITE_USER_FACTS_FTS_TABLE} (rowid, fact_text) "
+                "SELECT id, COALESCE(fact_text, '') FROM user_facts"
+            )
+        )
+        log.info("Rebuilt user facts FTS5 index: rows=%d", fact_count)
+    return True
+
+
 async def _sqlite_ensure_group_message_archive_embeddings(conn) -> bool:
     """Maintain durable pending jobs for the archive embedding projection.
 
@@ -1840,6 +1977,8 @@ async def init_db(
                 await conn.execute(text(archive_index_sql))
             await _sqlite_backfill_group_message_archive(conn)
             await _sqlite_ensure_group_message_archive_fts(conn)
+            # 第 4 期：长期记忆（``user_facts``）的 FTS5 影子表，建法同上一行。
+            await _sqlite_ensure_user_facts_fts(conn)
             await _sqlite_ensure_group_message_archive_embeddings(conn)
             await _sqlite_migrate_join_verifications(conn)
             await _sqlite_ensure_column(
