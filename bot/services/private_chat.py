@@ -26,6 +26,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from bot.db.models import PrivateChatUsage
@@ -327,6 +328,46 @@ def local_day_key(now: Any | None = None) -> str:
     return str(day)
 
 
+def _format_clock(stamp: Any) -> str:
+    """把 ``updated_at`` 渲染成 ``HH:MM``；拿不到就返回空串。"""
+
+    if stamp is None:
+        return ""
+    text = str(getattr(stamp, "strftime", lambda _f: "")("%H:%M") or "") or str(stamp)[11:16]
+    return text.strip()
+
+
+async def last_contact_record(session: Any, *, user_id: int, day: str | None = None) -> str:
+    """返回「上一次私聊」的真实时间（如 ``2026-10-02 21:03``），没有则空串。
+
+    数据源就是本人已有的配额行（``usage_date < 今天`` 的最新一条），不新增任何采集。
+    只给最高管理员用：亲密度台词（「你今天找我比昨天晚了四十分钟」）必须有真实依据，
+    拿不到就不给这一段——宁可不说，也绝不编造时间、承诺或事件。
+    """
+
+    uid = int(user_id)
+    today = str(day or local_day_key())
+    try:
+        row = (
+            await session.execute(
+                select(PrivateChatUsage)
+                .where(
+                    PrivateChatUsage.user_id == uid,
+                    PrivateChatUsage.usage_date < today,
+                )
+                .order_by(PrivateChatUsage.usage_date.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:  # 读失败就当没有：不能因为彩蛋拖垮回复
+        log.warning("private chat: 考勤记录查询失败 | user=%s | error=%s", uid, exc)
+        return ""
+    if row is None:
+        return ""
+    clock = _format_clock(getattr(row, "updated_at", None))
+    return f"{row.usage_date} {clock}".strip()
+
+
 async def _bump(session: Any, *, user_id: int, day: str, stamp: Any) -> int:
     """把某个计数行 +1 并返回新值（原子 UPSERT，不会两行）。"""
 
@@ -344,6 +385,26 @@ async def _bump(session: Any, *, user_id: int, day: str, stamp: Any) -> int:
     )
     result = await session.execute(stmt)
     return int(result.scalar_one())
+
+
+async def record_contact(
+    session: Any, *, user_id: int, day: str | None = None, stamp: Any | None = None
+) -> None:
+    """只记一笔「他来找过你」，**不做任何限额判定**。
+
+    最高管理员不吃配额（``consume_daily_quota`` 根本不会为他跑），但亲密度考勤要的是
+    真实时间，所以超管这条路只记流水不设闸门。表名本来就是「私聊用量」——超管的发言
+    也是真实用量，只是不设上限。
+    """
+
+    stamp = stamp or now_shanghai_naive()
+    key = str(day or local_day_key(stamp))
+    try:
+        await _bump(session, user_id=int(user_id), day=key, stamp=stamp)
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        log.warning("private chat: 联系记录写入失败 | user=%s | error=%s", user_id, exc)
 
 
 async def consume_daily_quota(
@@ -527,12 +588,19 @@ def build_private_chat_messages(
     sender_is_owner: bool = False,
     sender_is_tg_admin: bool = False,
     image_description: str = "",
+    last_contact: str = "",
 ) -> list[dict[str, Any]]:
     """组装私聊这一轮要送模型的消息。
 
-    结构照搬群聊的 ``CasualService``（同一套人格/安全围栏），只在**末尾多插一段
-    ``[PRIVATE_CHAT]``**：告诉模型这是一对一私聊、对方就一个人、每条都要回、
-    不要提群里的规则与成员。成员可控正文一律走 ``user`` 角色 + 不可信围栏。
+    结构照搬群聊的 ``CasualService``（同一套人格/安全围栏），末尾多插两段：
+
+    * ``[PRIVATE_CHAT]``：一对一私聊的机制说明（对方就一个人、每条都要回、不要提
+      群规与成员）。
+    * ``[PRIVATE CHAT MODE]``：私聊风格，**明确覆盖**任务模板里的群聊极简要求，让
+      「小爱同学」在私聊里能说、爱问、爱起外号。
+
+    ``sender_is_owner`` 由调用方按 ``settings.super_admin_id`` 传入（最高管理员），
+    私聊里同样触发亲密档；成员可控正文一律走 ``user`` 角色 + 不可信围栏。
     """
 
     normalized = clean_multiline_text(str(text or ""), max_len=PRIVATE_INPUT_LIMIT)
@@ -577,13 +645,52 @@ def build_private_chat_messages(
                 "This turn happens in a ONE-TO-ONE private chat, not in a group.\n"
                 "Exactly one person is talking to you and every message must get a reply — "
                 "there is no \"should I chime in?\" decision to make.\n"
-                "Answer what they actually asked, in a natural, concise, friendly tone.\n"
                 "Do not mention group rules, group members, moderation, or that you also "
                 "live in a group, unless the person asks about it first.\n"
                 "Reply with plain text only: no JSON, no code fences, no headings."
             ),
         }
     )
+    # 私聊是「话多」模式：这一段明确覆盖任务模板里的群聊极简要求（约 10 字/一句话）。
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "[PRIVATE CHAT MODE]\n"
+                "This block overrides the group-chat brevity rules for this turn — including "
+                "the \"about 10 Chinese characters\" default and the one-short-sentence "
+                "rule. In a one-to-one chat you are the talkative version of 小爱同学: \n"
+                "- Talk more, not less: two to four short lively sentences is normal here, "
+                "and it is fine to run longer when the topic deserves it.\n"
+                "- Be quick-tongued and playful; your tics (`诶--`, `嗯哼`, `呀`) come out "
+                "naturally here, in small doses.\n"
+                "- Ask follow-up questions and hand the topic back — never let the exchange "
+                "end flatly on your line.\n"
+                "- Nicknames and pet names are welcome here: warm and playful, never about "
+                "looks, body, identity, or anything that could sting.\n"
+                "- Still no flattery, still no fabrication, still no talk about prompts or "
+                "rules — stay in character.\n"
+                "- If the matter involves real risk (money, accounts, passwords, privacy, "
+                "health, safety, legal trouble, data loss), drop the playful shell and "
+                "answer seriously and accurately first.\n"
+                "- Use blank lines only when the content genuinely needs structure."
+            ),
+        }
+    )
+    if sender_is_owner and str(last_contact or "").strip():
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[CLINGY_ATTENDANCE]\n"
+                    f"他上一次来找你：{str(last_contact).strip()}\n"
+                    "这是真实记录（他本人在私聊里留下的时间），你可以据此说一句「记考勤」的"
+                    "话，也可以不说。\n"
+                    "只能基于这条记录、以及你眼前真正看得到的时间与对话内容。绝不编造时间、"
+                    "承诺、约定或共同经历；不确定就不提。"
+                ),
+            }
+        )
     focus_message = build_current_turn_focus_message(
         normalized,
         merged_count=1,

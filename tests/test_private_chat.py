@@ -4,8 +4,9 @@
 
 - **准入四态**：超管豁免 / 是成员 / 不是成员 / **查不通（不确定）**——最后一种既
   不能放行（会变成免费代理）也不能拒绝（会误伤真人），必须单独走一条提示；
-- **配额两道闸门**：每人 20 条/天、全局 200 条/天；超限要**整体回滚**，不能在库里
-  留下"扣了但没用"的脏计数；跨零点自动换行；
+- **配额阶梯**：普通成员 100 条/天（本档全局 20000）、群管理员 500 条/天（本档全局
+  100000）、最高管理员不计数；超限要**整体回滚**，不能在库里留下"扣了但没用"的脏计数；
+  跨零点自动换行；两档各记一本全局账；
 - **私聊正文只走 user 角色 + 不可信围栏**（F-003 的私聊版）：成员可控文本一个字
   都不许出现在 system 消息里；
 - **不落库**：历史只在内存，进程重启即空；
@@ -429,6 +430,51 @@ class QuotaTests(_DbTestCase):
         self.assertEqual(next_day.user_used, 1)
         self.assertEqual(await self._stored(777, "2026-10-04"), 1)
 
+    async def test_record_contact_writes_without_any_limit(self) -> None:
+        async with self.session_factory() as session:
+            for _ in range(150):  # 远超普通成员 100 条上限，也照样记
+                await dm.record_contact(
+                    session, user_id=999, day="2026-10-02", stamp=datetime(2026, 10, 2, 21, 3)
+                )
+        self.assertEqual(await self._stored(999, "2026-10-02"), 150)
+
+    async def test_record_contact_survives_a_broken_session(self) -> None:
+        class _Boom:
+            async def commit(self) -> None:
+                raise RuntimeError("db down")
+
+            async def rollback(self) -> None:
+                return None
+
+        await dm.record_contact(_Boom(), user_id=1, day="2026-10-02")  # 不该抛
+
+    async def test_last_contact_returns_the_previous_day_record(self) -> None:
+        async with self.session_factory() as session:
+            await dm.consume_daily_quota(
+                session,
+                user_id=777,
+                day="2026-10-02",
+                stamp=datetime(2026, 10, 2, 21, 3),
+            )
+        async with self.session_factory() as session:
+            record = await dm.last_contact_record(session, user_id=777, day="2026-10-03")
+        self.assertIn("2026-10-02", record)
+        self.assertIn("21:03", record)
+
+    async def test_last_contact_ignores_today(self) -> None:
+        async with self.session_factory() as session:
+            await dm.consume_daily_quota(
+                session, user_id=777, day="2026-10-03", stamp=datetime(2026, 10, 3, 9, 0)
+            )
+        async with self.session_factory() as session:
+            record = await dm.last_contact_record(session, user_id=777, day="2026-10-03")
+        self.assertEqual(record, "", "今天不算「上一次」，否则每句都变成考勤")
+
+    async def test_last_contact_empty_for_a_stranger(self) -> None:
+        async with self.session_factory() as session:
+            record = await dm.last_contact_record(session, user_id=424242, day="2026-10-03")
+        self.assertEqual(record, "", "没有历史就不给，绝不能让模型自己编时间")
+
     async def test_one_row_per_user_per_day(self) -> None:
         from sqlalchemy import func, select
 
@@ -680,11 +726,17 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         llm = self._fake_llm("在的")
         with patch.object(
             dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(dm.TIER_SUPER))
-        ), patch.object(dm_handler, "consume_daily_quota", new=AsyncMock()) as quota, patch.object(
-            dm_handler, "_reply_llm", new=MagicMock(return_value=llm)
-        ):
+        ), patch.object(
+            dm_handler, "last_contact_record", new=AsyncMock(return_value="2026-10-02 21:03")
+        ) as attendance, patch.object(
+            dm_handler, "record_contact", new=AsyncMock()
+        ) as contact, patch.object(
+            dm_handler, "consume_daily_quota", new=AsyncMock()
+        ) as quota, patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         quota.assert_not_awaited()
+        attendance.assert_awaited_once()
+        contact.assert_awaited_once()
         llm.chat.assert_awaited_once()
         self.assertEqual(message.answer.await_args.args[0], "在的")
 

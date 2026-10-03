@@ -32,7 +32,9 @@ from bot.services.private_chat import (
     build_private_chat_messages,
     consume_daily_quota,
     history_store,
+    last_contact_record,
     local_day_key,
+    record_contact,
     notice_throttle,
     quota_notice,
     resolve_access,
@@ -201,7 +203,10 @@ async def on_private_message(
 
     # 2) 配额：先扣再用（每人 + 本档全局两道闸门）。最高管理员不设限、不计数。
     outcome: QuotaOutcome | None = None
-    if not verdict.is_super:
+    if verdict.is_super:
+        # 超管不设限，但仍记一笔联系：亲密度考勤必须有真实数据（失败不影响回复）
+        await record_contact(session, user_id=user.id)
+    else:
         try:
             outcome = await consume_daily_quota(
                 session,
@@ -241,14 +246,19 @@ async def on_private_message(
 
     # 4) 组装 + 调用（model 走 main 阶段；stage 标签只为用量看板好区分）。
     history = history_store().history(user.id)
+    # 亲密度考勤：只有最高管理员才给这段真实记录（拿不到就是空串）。
+    last_contact = ""
+    if verdict.is_super:
+        last_contact = await last_contact_record(session, user_id=user.id)
     messages = build_private_chat_messages(
         text,
         history=history,
         sender_user_id=user.id,
         sender_username=str(user.username or ""),
-        sender_is_owner=False,
-        sender_is_tg_admin=False,
+        sender_is_owner=verdict.is_super,
+        sender_is_tg_admin=verdict.is_admin,
         image_description=image_description,
+        last_contact=last_contact,
     )
     try:
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
