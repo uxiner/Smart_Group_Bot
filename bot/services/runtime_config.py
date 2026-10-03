@@ -326,6 +326,14 @@ class BotBehaviorConfig(StrictModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = Field(default=8, ge=1, le=20)
     memory_automatic_compaction: bool = False
+    # Private-chat history: 278528 = 272K, the agreed depth target for the main
+    # model.  Independent of max_context_tokens on purpose.
+    private_chat_history_token_budget: int = Field(
+        default=278528,
+        ge=1024,
+        le=2_000_000,
+    )
+    private_chat_history_retention_days: int = Field(default=30, ge=1, le=365)
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -958,6 +966,12 @@ class RuntimeConfig(StrictModel):
         settings.bot.memory_recall_max_results = bot.memory_recall_max_results
         settings.bot.memory_automatic_compaction = (
             bot.memory_automatic_compaction
+        )
+        settings.bot.private_chat_history_token_budget = (
+            bot.private_chat_history_token_budget
+        )
+        settings.bot.private_chat_history_retention_days = (
+            bot.private_chat_history_retention_days
         )
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
@@ -1741,6 +1755,8 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "memory_retention_days",
             "memory_archive_max_messages_per_group",
             "memory_recall_max_results",
+            "private_chat_history_token_budget",
+            "private_chat_history_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
@@ -1939,6 +1955,18 @@ def build_legacy_runtime_config(
                 if "bot_memory_automatic_compaction"
                 in getattr(settings, "model_fields_set", set())
                 else settings.bot.memory_automatic_compaction
+            ),
+            private_chat_history_token_budget=(
+                settings.bot_private_chat_history_token_budget
+                if "bot_private_chat_history_token_budget"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.private_chat_history_token_budget
+            ),
+            private_chat_history_retention_days=(
+                settings.bot_private_chat_history_retention_days
+                if "bot_private_chat_history_retention_days"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.private_chat_history_retention_days
             ),
             proactive_default_enabled=settings.bot_proactive_default_enabled,
             proactive_idle_minutes=settings.bot_proactive_idle_minutes,

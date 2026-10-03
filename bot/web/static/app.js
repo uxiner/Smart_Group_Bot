@@ -943,6 +943,8 @@
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
             ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+            ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；按预算从新到旧装配私聊历史" })}
+            ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期行由后台巡检清理" })}
             ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>
