@@ -40,6 +40,7 @@ from bot.services.update_completion import (
 from bot.utils.prompts import get_prompt
 from bot.utils.security import format_history_message_line
 from bot.utils.timezone import format_shanghai_timestamp, now_shanghai_naive, to_shanghai_naive
+from bot.utils.tokens import estimate_text_tokens
 
 log = logging.getLogger(__name__)
 
@@ -168,25 +169,11 @@ _RECALL_STOP_TERMS = {
     "记得",
 }
 
-# CJK-family codepoints tokenize near one token per character, unlike the
-# ~3 chars/token of ASCII prose. The rough prefilter must not underestimate
-# Chinese chat or proactive compaction never fires before the hard budget.
-_CJK_CHAR_RE = re.compile(
-    "["
-    "\u3000-\u30ff"  # CJK punctuation, hiragana, katakana
-    "\u3400-\u4dbf"  # CJK extension A
-    "\u4e00-\u9fff"  # CJK unified ideographs
-    "\uac00-\ud7af"  # Hangul syllables
-    "\uf900-\ufaff"  # CJK compatibility ideographs
-    "\uff00-\uffef"  # full-width forms
-    "]"
-)
-
-
-def _estimate_text_tokens(text: str) -> int:
-    cjk_chars = len(_CJK_CHAR_RE.findall(text))
-    other_chars = len(text) - cjk_chars
-    return cjk_chars + (other_chars + 2) // 3
+# Token estimation lives in one place now: private-chat history assembly needs
+# the exact same CJK-aware gauge as the group budget, so the implementation
+# moved to ``bot.utils.tokens`` and is re-exported here under its historical
+# private name (every call site in this module keeps working unchanged).
+_estimate_text_tokens = estimate_text_tokens
 
 
 def _bounded_text(value: Any, limit: int) -> str:
