@@ -629,6 +629,39 @@ async def _safe_rollback(session: Any) -> None:
         log.debug("long-term memory: 回滚失败（已忽略）")
 
 
+def _in_transaction(session: Any) -> bool:
+    """这个 session 此刻是否已经在事务里（探不到就当作「在」，保守）。"""
+
+    probe = getattr(session, "in_transaction", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe())
+    except Exception:  # pragma: no cover - 探针本身失败
+        return True
+
+
+async def _begin_savepoint(session: Any) -> Any | None:
+    """在**调用方**的事务里开一个 SAVEPOINT；开不出来就返回 ``None``。"""
+
+    begin = getattr(session, "begin_nested", None)
+    if not callable(begin):
+        return None
+    try:
+        return await begin()
+    except Exception as exc:
+        log.warning("long-term memory: SAVEPOINT 不可用 | error=%s", exc)
+        return None
+
+
+async def _rollback_savepoint(savepoint: Any) -> None:
+    try:
+        if savepoint.is_active:
+            await savepoint.rollback()
+    except Exception as exc:  # pragma: no cover - 回滚都失败就没有补救手段了
+        log.warning("long-term memory: SAVEPOINT 回滚失败 | error=%s", exc)
+
+
 def _rowcount(result: Any) -> int:
     try:
         return max(0, int(getattr(result, "rowcount", 0) or 0))
@@ -677,8 +710,15 @@ async def record_fact(
       （见 :func:`is_conflicting`）标 ``superseded`` 并写 ``superseded_by``。
     * **敏感信息**与**没有出处**的事实一律不入库（返回 0）。
     * 任何异常都吞掉并记日志，绝不影响调用方。
+    * **不越界回滚**（D3-06）：``remember`` 工具在没有 ``session_factory`` 时会把
+      调用方的**共享** session 传进来。此时整体 ``rollback()`` 会把调用方在同一 session
+      上已做的其它写入一并丢掉；这里改用 SAVEPOINT 只回滚本函数自己 flush 的部分。
+      「再次确认」的 ``confidence`` 也改成 SQL 原子表达式，避免并发丢掉一次 bump。
     """
 
+    # D3-06(b)：入口先判断「这笔事务是不是我们自己的」。
+    owns_transaction = not _in_transaction(session)
+    savepoint = None if owns_transaction else await _begin_savepoint(session)
     normalized_scope = normalize_scope(scope)
     try:
         sid = int(scope_id)
@@ -764,7 +804,6 @@ async def record_fact(
         if existing is not None:
             row_id = int(existing[0])
             status = str(existing[1] or STATUS_ACTIVE)
-            old_confidence = int(existing[2] or default_confidence)
             if status != STATUS_ACTIVE:
                 # 用户删过 / 被新事实替代过的行不复活（口径见模块 docstring）。
                 log.debug(
@@ -780,8 +819,14 @@ async def record_fact(
                 .values(
                     confirm_count=UserFact.confirm_count + 1,
                     last_confirmed_at=stamp,
-                    confidence=min(
-                        100, old_confidence + CONFIRMED_CONFIDENCE_BUMP
+                    # D3-06(a)：``confidence`` 必须和 ``confirm_count`` 一样走 SQL 原子
+                    # 表达式。先 SELECT 出来在 Python 里加再加写回是 read-modify-write，
+                    # 后台提炼循环与请求路径上的 ``remember`` 并发命中同一 fingerprint
+                    # 时会丢一次 bump（记忆置信度缓慢漂低）。
+                    confidence=func.min(
+                        100,
+                        func.coalesce(UserFact.confidence, default_confidence)
+                        + CONFIRMED_CONFIDENCE_BUMP,
                     ),
                 )
             )
@@ -849,7 +894,16 @@ async def record_fact(
             )
         await session.commit()
     except Exception as exc:
-        await _safe_rollback(session)
+        if savepoint is not None:
+            # D3-06(b)：只回滚本函数在调用方事务里 flush 的那一段。
+            await _rollback_savepoint(savepoint)
+        elif owns_transaction:
+            await _safe_rollback(session)
+        else:
+            log.warning(
+                "long-term memory: 事务不属于本函数且无 SAVEPOINT，"
+                "跳过回滚以免牵连调用方的写入"
+            )
         log.warning(
             "long-term memory: 事实写入失败（已忽略） | scope=%s | scope_id=%s | "
             "subject=%s | category=%s | error=%s",
@@ -1351,9 +1405,26 @@ async def _extract_with_session(
             await _update_cursor(session, scope, scope_id, max_row_id, now=now)
             return 0
 
+        eligible_before_trim = len(eligible)
         eligible = _trim_input_to_token_limit(
             eligible, token_limit=EXTRACT_INPUT_TOKEN_LIMIT
         )
+        if len(eligible) < eligible_before_trim:
+            # 这里原来完全静默：超预算时最旧的消息被整条丢掉，运维侧毫无信号。
+            log.info(
+                "long-term memory: 提炼输入超 token 预算，最旧的 %d 条没有送进模型 | "
+                "scope=%s | scope_id=%s | kept=%d dropped=%d",
+                eligible_before_trim - len(eligible),
+                scope,
+                scope_id,
+                len(eligible),
+                eligible_before_trim - len(eligible),
+            )
+        # D3-05：游标只能推进到**真正送进模型**的最后一行，而不是未裁剪批次的
+        # ``max_row_id``。批次尾部常见不可提炼的行（机器人自己的回复、非文本、
+        # ``/memory off`` 的人），按 ``max_row_id`` 前移等于把「没提炼过」和
+        # 「提炼过」混为一谈。方向取「宁可重扫也不丢」。
+        cursor_row_id = int(eligible[-1]["row_id"]) if eligible else max_row_id
         model_input, sender_ids = _build_extract_input(eligible)
         try:
             raw = await llm.generate(EXTRACT_SYSTEM_PROMPT, model_input)
@@ -1415,7 +1486,7 @@ async def _extract_with_session(
             )
             if fact_id:
                 written += 1
-        await _update_cursor(session, scope, scope_id, max_row_id, now=now)
+        await _update_cursor(session, scope, scope_id, cursor_row_id, now=now)
         return written
     except asyncio.CancelledError:
         raise
