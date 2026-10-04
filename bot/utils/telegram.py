@@ -878,7 +878,7 @@ async def answer_with_auto_delete(
                 )
         else:
             raise
-    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+    await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
     return sent
 
 
@@ -890,7 +890,7 @@ async def reply_sticker_with_auto_delete(
     **kwargs: object,
 ) -> Message:
     sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+    await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
     return sent
 
 

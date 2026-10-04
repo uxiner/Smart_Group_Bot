@@ -1207,3 +1207,45 @@ class AmbiguousSendIsNotResentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(ok)
         self.assertEqual(bot.send_message.await_count, 1)
+
+
+class DeliveredCleanupIsAlwaysProtectedTests(unittest.IsolatedAsyncioTestCase):
+    """A-13：消息送达之后的清理必须走本文件自己的保护封装。
+
+    :105-107 已经写死了不变量——"Telegram 已接受消息后，回执失败绝不能让调用方
+    重发外部可见的副作用"。``answer_with_auto_delete`` /
+    ``reply_sticker_with_auto_delete`` 却裸调 ``schedule_message_auto_delete_durable``，
+    清理阶段一抛错，调用方看到的就是"这次发送失败"，而消息其实已经在群里。
+    """
+
+    async def test_answer_cleanup_failure_is_swallowed_after_delivery(self) -> None:
+        sent = SimpleNamespace(message_id=301, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(chat=SimpleNamespace(id=-10001), answer=AsyncMock(return_value=sent))
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ) as cleanup:
+            result = await answer_with_auto_delete(message, "已送达", auto_delete_seconds=60)
+
+        self.assertIs(result, sent)
+        message.answer.assert_awaited_once()
+        cleanup.assert_awaited_once_with(sent, 60)
+
+    async def test_reply_sticker_cleanup_failure_is_swallowed_after_delivery(self) -> None:
+        sent = SimpleNamespace(message_id=302, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(reply_sticker=AsyncMock(return_value=sent))
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ) as cleanup:
+            result = await telegram.reply_sticker_with_auto_delete(
+                message,
+                sticker="sticker-file-id",
+                auto_delete_seconds=60,
+            )
+
+        self.assertIs(result, sent)
+        message.reply_sticker.assert_awaited_once()
+        cleanup.assert_awaited_once_with(sent, 60)
