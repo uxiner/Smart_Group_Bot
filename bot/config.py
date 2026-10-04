@@ -90,6 +90,47 @@ class EmbedConfig(EmbedEndpointConfig):
     fallbacks: list[EmbedEndpointConfig] = Field(default_factory=list)
 
 
+#: 顶层（env / 扁平字段）显式设置时覆盖到 ``settings.bot`` 的字段清单。
+TOP_LEVEL_BUDGET_FIELD_NAMES: tuple[str, ...] = (
+    "context_budget_tokens",
+    "context_reserve_tokens",
+    "group_history_max_messages",
+)
+
+
+def apply_top_level_budget_overrides(settings: Any) -> None:
+    """把顶层（env / 扁平配置）里**显式设置过**的预算与摘要字段同步到 ``settings.bot``。
+
+    ``load_settings`` 调用它；单独抽出来是因为"env 种子能不能传到 bot 配置"本身是
+    一条必须在测试里直接锁住的契约（``[bot]`` TOML 路径由 runtime_config 的旧导入覆盖）。
+    """
+
+    explicit = getattr(settings, "model_fields_set", set())
+    for top_level in (*TOP_LEVEL_BUDGET_FIELD_NAMES, *GROUP_SUMMARY_SETTING_NAMES):
+        if top_level in explicit:
+            setattr(settings.bot, top_level, getattr(settings, top_level))
+
+
+#: 第②项后台摘要的顶层/``[bot]`` 字段名（env 种子与 TOML 导入共用一份清单）。
+GROUP_SUMMARY_SETTING_NAMES: tuple[str, ...] = (
+    "group_summary_enabled",
+    "group_summary_recent_raw_messages",
+    "group_summary_max_tokens",
+    "group_summary_batch_max_messages",
+    "group_summary_batch_max_input_tokens",
+    "group_summary_global_concurrency",
+    "group_summary_per_group_concurrency",
+    "group_summary_deadline_seconds",
+    "group_summary_queue_wait_seconds",
+    "group_summary_min_refresh_seconds",
+    "group_summary_failure_backoff_seconds",
+    "group_summary_failure_backoff_max_seconds",
+    "group_summary_pending_capacity",
+    "group_summary_trigger_messages",
+    "group_summary_trigger_budget_ratio",
+)
+
+
 class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
@@ -388,6 +429,8 @@ class Settings(BaseSettings):
     context_reserve_tokens: int = 32768
     group_history_max_messages: int = 1000
     # Group summary knobs (kept in sync with ``bot.*``); the runtime config wins.
+    # ``GROUP_SUMMARY_SETTING_NAMES`` below is the single list used by the
+    # legacy TOML loader and the top-level -> ``bot`` sync.
     group_summary_enabled: bool = False
     group_summary_recent_raw_messages: int = 200
     group_summary_max_tokens: int = 4096
@@ -1376,14 +1419,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     # 的选择，否则 ``[bot] context_window_mode = "fixed"`` 会被默认值无声改回 auto。
     if "context_window_mode" in getattr(settings, "model_fields_set", set()):
         settings.bot.context_window_mode = settings.context_window_mode
-    # 业务预算三项同理：顶层显式设置才覆盖 ``[bot]`` 的值。
-    for top_level, bot_field in (
-        ("context_budget_tokens", "context_budget_tokens"),
-        ("context_reserve_tokens", "context_reserve_tokens"),
-        ("group_history_max_messages", "group_history_max_messages"),
-    ):
-        if top_level in getattr(settings, "model_fields_set", set()):
-            setattr(settings.bot, bot_field, getattr(settings, top_level))
+    # 业务预算三项 + 第②项摘要的全部字段同理：顶层（env）显式设置才覆盖 ``[bot]``。
+    apply_top_level_budget_overrides(settings)
     budget_error = validate_business_budget(
         settings.bot.context_budget_tokens,
         settings.bot.context_reserve_tokens,

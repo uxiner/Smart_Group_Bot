@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -44,11 +45,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import GroupMessageArchive, GroupSummary
 from bot.services.resource_health import register_resource_health_provider
+from bot.services.model_limits import (
+    MESSAGE_TOKEN_OVERHEAD,
+    estimate_messages_tokens,
+)
 from bot.utils.security import (
     clean_multiline_text,
     contains_prompt_injection,
@@ -94,8 +100,32 @@ _FORBIDDEN_OUTPUT_RE = re.compile(
 
 #: 单条快照消息在提示词里的渲染上限（防止一条超长消息吃掉整批预算）。
 _SNAPSHOT_MESSAGE_MAX_CHARS = 600
+#: 辅助 map 的容量兜底：观测用的"最近成功"只保留这么多群（其余是历史噪声）。
+_METRICS_LAST_SUCCESS_LIMIT = 200
+#: 旧摘要失效（覆盖范围内原文被删）时的重建标记：水位可以回退，但版本 CAS 仍然生效。
+REBUILD_REASON_STALE_COVERAGE = "stale_coverage"
 #: 摘要输出超过配置上限时按这个比例硬裁（留截断说明）。
 _TRUNCATION_NOTE = "…（摘要过长已截断）"
+
+
+def _accepts_keyword(callable_obj: Any, name: str) -> bool:
+    """判断可调用对象是否接受某个关键字参数（含 ``**kwargs``）。"""
+
+    if callable_obj is None:
+        return False
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
@@ -375,13 +405,13 @@ class SqlGroupSummaryStore:
         """近期窗口之外、且尚未被摘要覆盖的归档条数（一次 COUNT，索引友好）。"""
 
         async with self._session_factory() as session:
+            # "最近 N 条"与水位**统一用归档行 id 排序**（= 插入顺序，单调且全序）：
+            # 若这里按 sent_at 取最近、水位却按 max(id) 推进，时间乱序/补录的旧行会
+            # 被永久跳过。id 序下"覆盖（≤水位）/ 在途 / 最近 N"是对全表的一个完整划分。
             newest_ids = (
                 select(GroupMessageArchive.id)
                 .where(GroupMessageArchive.group_id == int(group_id))
-                .order_by(
-                    GroupMessageArchive.sent_at.desc(),
-                    GroupMessageArchive.id.desc(),
-                )
+                .order_by(GroupMessageArchive.id.desc())
                 .limit(max(0, int(recent_raw_messages)))
             )
             statement = select(func.count(GroupMessageArchive.id)).where(
@@ -433,13 +463,11 @@ class SqlGroupSummaryStore:
         """
 
         async with self._session_factory() as session:
+            # 与 pending_count/水位同一口径：最近 N 与推进顺序都按 id（插入序）。
             newest_ids = (
                 select(GroupMessageArchive.id)
                 .where(GroupMessageArchive.group_id == int(group_id))
-                .order_by(
-                    GroupMessageArchive.sent_at.desc(),
-                    GroupMessageArchive.id.desc(),
-                )
+                .order_by(GroupMessageArchive.id.desc())
                 .limit(max(0, int(recent_raw_messages)))
             )
             statement = (
@@ -448,10 +476,7 @@ class SqlGroupSummaryStore:
                     GroupMessageArchive.group_id == int(group_id),
                     GroupMessageArchive.id.notin_(newest_ids),
                 )
-                .order_by(
-                    GroupMessageArchive.sent_at.asc(),
-                    GroupMessageArchive.id.asc(),
-                )
+                .order_by(GroupMessageArchive.id.asc())
                 .limit(max(1, int(max_messages)))
             )
             if after_id:
@@ -493,53 +518,139 @@ class SqlGroupSummaryStore:
         source_truncated: bool,
         covered_from_id: int = 0,
         covered_through_id: int = 0,
+        allow_watermark_rewind: bool = False,
+        reset_coverage: bool = False,
     ) -> PublishedSummary | None:
-        """原子发布（CAS）：版本或覆盖水位倒退时**不覆盖**，返回 ``None``。"""
+        """原子发布（条件 UPDATE / INSERT，**真正的 CAS**）。
+
+        并发安全靠数据库，而不是"读出来在 Python 里比一比再写"：
+
+        * ``UPDATE ... WHERE group_id=? AND version=? AND covered_through_id < ?`` —
+          版本与水位条件都在 SQL 里，两个并发发布只有一个能命中（另一个 rowcount=0）；
+        * 行不存在时走 INSERT（主键唯一冲突 = 别人先发布 → 返回 ``None``）；
+        * ``allow_watermark_rewind=True`` 只用于"旧摘要已被删除而失效、需要重建"：
+          水位可以回退，但**版本条件仍然生效**（迟到任务不能覆盖重建结果）。
+        """
 
         normalized = (summary or "").strip()
         if not normalized:
             return None
+        gid = int(group_id)
+        new_through = int(covered_through_id or 0)
+        new_count = max(0, int(covered_count or 0))
+        now = now_shanghai_naive()
         async with self._session_factory() as session:
-            row = await session.get(GroupSummary, int(group_id))
-            if row is None:
-                row = GroupSummary(group_id=int(group_id))
-                session.add(row)
-            current_version = int(row.version or 0)
-            current_through_id = int(row.covered_through_id or 0)
-            if current_version != int(expected_version):
-                # 迟到任务：期间已经发布了更新的版本。
-                return None
-            if current_through_id and int(covered_through_id or 0) <= current_through_id:
-                # 水位没有前进（用归档行 id 比较：单调，不受字符串排序影响）→ 不覆盖。
-                return None
-            row.summary = normalized
-            row.version = current_version + 1
-            # The new body includes the previous summary, so deletion checks
-            # must cover all batches, not just the most recently added one.
-            if not row.covered_from_id:
-                row.covered_from_id = int(covered_from_id or 0)
-                row.covered_from_key = covered_from_key or ""
-            row.covered_through_id = int(covered_through_id or 0) or current_through_id
-            row.covered_through_key = (
-                covered_through_key or str(row.covered_through_key or "")
+            statement = (
+                update(GroupSummary)
+                .where(
+                    GroupSummary.group_id == gid,
+                    GroupSummary.version == int(expected_version),
+                )
+                .values(
+                    summary=normalized,
+                    version=GroupSummary.version + 1,
+                    # 累计覆盖：正文沿用上一次摘要，所以删除检查必须覆盖所有批次。
+                    # ``reset_coverage``（旧摘要失效后的重建）则**重置**范围与计数，
+                    # 因为旧范围里的原文已经不存在了。
+                    covered_from_id=(
+                        int(covered_from_id or 0)
+                        if reset_coverage
+                        else case(
+                            (
+                                GroupSummary.covered_from_id == 0,
+                                int(covered_from_id or 0),
+                            ),
+                            else_=GroupSummary.covered_from_id,
+                        )
+                    ),
+                    covered_from_key=(
+                        str(covered_from_key or "")
+                        if reset_coverage
+                        else case(
+                            (
+                                GroupSummary.covered_from_id == 0,
+                                str(covered_from_key or ""),
+                            ),
+                            else_=GroupSummary.covered_from_key,
+                        )
+                    ),
+                    covered_through_id=case(
+                        (new_through > 0, new_through),
+                        else_=GroupSummary.covered_through_id,
+                    ),
+                    covered_through_key=(
+                        case(
+                            (new_through > 0, str(covered_through_key or "")),
+                            else_=GroupSummary.covered_through_key,
+                        )
+                        if covered_through_key
+                        else GroupSummary.covered_through_key
+                    ),
+                    covered_count=(
+                        new_count
+                        if reset_coverage
+                        else GroupSummary.covered_count + new_count
+                    ),
+                    source_truncated=(
+                        bool(source_truncated)
+                        if reset_coverage
+                        else case(
+                            (GroupSummary.source_truncated.is_(True), True),
+                            (bool(source_truncated), True),
+                            else_=False,
+                        )
+                    ),
+                    prompt_version=GROUP_SUMMARY_PROMPT_VERSION,
+                    generated_at=now,
+                )
             )
-            row.covered_count = int(row.covered_count or 0) + int(covered_count)
-            row.source_truncated = bool(row.source_truncated or source_truncated)
-            row.prompt_version = GROUP_SUMMARY_PROMPT_VERSION
-            row.generated_at = now_shanghai_naive()
-            await session.commit()
-            return PublishedSummary(
-                group_id=int(group_id),
-                summary=normalized,
-                version=row.version,
-                covered_from_key=row.covered_from_key,
-                covered_through_key=row.covered_through_key,
-                covered_from_id=int(row.covered_from_id or 0),
-                covered_through_id=int(row.covered_through_id or 0),
-                covered_count=row.covered_count,
-                source_truncated=row.source_truncated,
-                generated_at=row.generated_at,
-            )
+            if not allow_watermark_rewind and new_through > 0:
+                # 水位必须前进（首次发布时现有水位为 0，条件天然成立）。
+                statement = statement.where(GroupSummary.covered_through_id < new_through)
+            result = await session.execute(statement)
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                # 行还不存在 → 首次发布走 INSERT；主键冲突说明并发者已插入。
+                if int(expected_version) != 0:
+                    await session.rollback()
+                    return None
+                try:
+                    session.add(
+                        GroupSummary(
+                            group_id=gid,
+                            summary=normalized,
+                            version=1,
+                            covered_from_id=int(covered_from_id or 0),
+                            covered_through_id=new_through,
+                            covered_from_key=str(covered_from_key or ""),
+                            covered_through_key=str(covered_through_key or ""),
+                            covered_count=new_count,
+                            source_truncated=bool(source_truncated),
+                            prompt_version=GROUP_SUMMARY_PROMPT_VERSION,
+                            generated_at=now,
+                        )
+                    )
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    return None
+                row = await session.get(GroupSummary, gid)
+            else:
+                await session.commit()
+                row = await session.get(GroupSummary, gid)
+        if row is None:
+            return None
+        return PublishedSummary(
+            group_id=gid,
+            summary=str(row.summary or ""),
+            version=int(row.version or 0),
+            covered_from_key=str(row.covered_from_key or ""),
+            covered_through_key=str(row.covered_through_key or ""),
+            covered_from_id=int(row.covered_from_id or 0),
+            covered_through_id=int(row.covered_through_id or 0),
+            covered_count=int(row.covered_count or 0),
+            source_truncated=bool(row.source_truncated),
+            generated_at=row.generated_at,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -553,8 +664,13 @@ def build_summary_prompt(
     previous: PublishedSummary | None,
     snapshot: Sequence[SummarySnapshotMessage],
     source_truncated: bool,
+    previous_max_tokens: int = 2048,
 ) -> list[dict[str, str]]:
-    """构造摘要提示词：旧摘要（低信任）+ 本批原文，要求只输出摘要正文。"""
+    """构造摘要提示词：旧摘要（低信任）+ 本批原文，要求只输出摘要正文。
+
+    旧摘要只带**有界**的一段（``previous_max_tokens``），原文快照由调用方先按条数
+    上限取好；整条提示词再由 :func:`fit_summary_prompt` 卡进 batch 输入预算。
+    """
 
     system = (
         "你是群聊归档摘要器。只把下面提供的旧聊天记录压缩成简洁、忠实的中文摘要。\n"
@@ -569,7 +685,11 @@ def build_summary_prompt(
     lines: list[str] = [f"[SUMMARY_TASK] group_ref=#{abs(int(group_id)) % 100000}"]
     if previous is not None and previous.summary.strip():
         lines.append("[PREVIOUS_SUMMARY]")
-        lines.append(previous.summary.strip()[: max(200, estimate_text_tokens_to_chars(2048))])
+        lines.append(
+            previous.summary.strip()[
+                : max(200, estimate_text_tokens_to_chars(max(64, int(previous_max_tokens))))
+            ]
+        )
     lines.append("[MESSAGES]")
     for item in snapshot:
         who = item.sender_name or item.role
@@ -586,6 +706,50 @@ def build_summary_prompt(
         {"role": "user", "content": "\n".join(lines)},
     ]
     return messages
+
+
+def fit_summary_prompt(
+    *,
+    group_id: int,
+    previous: PublishedSummary | None,
+    snapshot: Sequence[SummarySnapshotMessage],
+    source_truncated: bool,
+    max_input_tokens: int,
+    previous_max_tokens: int = 2048,
+) -> tuple[list[dict[str, str]], list[SummarySnapshotMessage], bool]:
+    """把「原文 batch + 旧摘要 + 提示词」整体卡进本次 batch 输入预算。
+
+    返回 ``(messages, 保留的快照, 是否截断)``：从**最旧**的一端开始丢原文（宁可少覆盖
+    也不超预算），每丢一轮重新计量；丢过就标记 ``source_truncated``（不许声称完整）。
+    采用与最终请求闸门同一个保守口径（``estimate_messages_tokens``）。
+    """
+
+    items = list(snapshot)
+    truncated = bool(source_truncated)
+    budget = max(256, int(max_input_tokens))
+    while items:
+        messages = build_summary_prompt(
+            group_id=group_id,
+            previous=previous,
+            snapshot=items,
+            source_truncated=truncated,
+            previous_max_tokens=previous_max_tokens,
+        )
+        if estimate_messages_tokens(messages) <= budget or len(items) == 1:
+            return messages, items, truncated
+        per_item = [
+            estimate_text_tokens(item.content) + MESSAGE_TOKEN_OVERHEAD
+            for item in items
+        ]
+        overflow = estimate_messages_tokens(messages) - budget
+        dropped = 0
+        consumed = 0
+        while dropped < len(items) - 1 and consumed < overflow:
+            consumed += per_item[dropped]
+            dropped += 1
+        items = items[max(1, dropped):]
+        truncated = True
+    return [], [], truncated
 
 
 def estimate_text_tokens_to_chars(tokens: int) -> int:
@@ -620,11 +784,24 @@ def truncate_summary_output(text: str, *, max_tokens: int) -> tuple[str, bool]:
 
 @dataclass
 class _PendingGroup:
+    """一个群的合并 pending 状态（每个群只有一份，绝不建第二个字典/任务）。
+
+    ``dirty_since`` 是**真正在等入场**的起点：被有意延后（失败退避、同群最小刷新）时
+    置 ``None``，所以"有意等待"永远不会被算成"排队超期"。``ready_at`` 是下一次可以
+    入场的最早时刻（退避/最小刷新的上界）。
+    """
+
     group_id: int
-    dirty_since: float
+    queued_at: float = 0.0
+    dirty_since: float | None = None
+    ready_at: float = 0.0
     merged: int = 0
     budget_pressure: bool = False
     claimed: bool = False
+    #: 运行期间又被 notify（新消息到了）→ 跑完重新排队。
+    redirty: bool = False
+    #: 成功发布后仍有 backlog → 按最小刷新间隔排到队尾，到点自动继续。
+    requeue: bool = False
 
 
 @dataclass
@@ -638,6 +815,9 @@ class GroupSummaryMetrics:
     failure_total: int = 0
     skipped_not_ready_total: int = 0
     skipped_reply_waiting_total: int = 0
+    requeued_backlog_total: int = 0
+    requeued_redirty_total: int = 0
+    aux_pruned_total: int = 0
     peak_model_concurrency: int = 0
     last_success: dict[int, dict[str, Any]] = field(default_factory=dict)
 
@@ -652,6 +832,9 @@ class GroupSummaryMetrics:
             "failure_total": self.failure_total,
             "skipped_not_ready_total": self.skipped_not_ready_total,
             "skipped_reply_waiting_total": self.skipped_reply_waiting_total,
+            "requeued_backlog_total": self.requeued_backlog_total,
+            "requeued_redirty_total": self.requeued_redirty_total,
+            "aux_pruned_total": self.aux_pruned_total,
             "peak_model_concurrency": self.peak_model_concurrency,
             "last_success": dict(self.last_success),
         }
@@ -677,6 +860,7 @@ class GroupSummaryScheduler:
         config_provider: Callable[[], GroupSummaryConfig],
         gate: Any | None = None,
         slot_waiter: Callable[[], bool] | None = None,
+        background_capacity: Callable[[], int] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -685,8 +869,17 @@ class GroupSummaryScheduler:
         self._config_provider = config_provider
         self._gate = gate
         self._slot_waiter = slot_waiter
+        # 主门禁的真实背景容量：有效并发 = min(配置, 门禁容量)，绝不靠"多排几个任务去
+        # 抢槽位、每个还占满 15 秒 deadline"来实现配置里的数字。
+        self._background_capacity = background_capacity
         self._clock = clock
         self._sleep = sleep
+        self._concurrency_clamp_logged = 0
+        # 只在模型入口真的接受 ``max_tokens`` 时才传（测试替身/旧实现保持兼容）。
+        self._summary_accepts_max_tokens = _accepts_keyword(
+            getattr(llm, "background_summary_completion", None),
+            "max_tokens",
+        )
 
         self._pending: dict[int, _PendingGroup] = {}
         self._order: deque[int] = deque()
@@ -716,12 +909,15 @@ class GroupSummaryScheduler:
             # 配置关闭 = 完全降级：不登记、不排队、不建任务。
             return
         gid = int(group_id)
-        if gid in self._running:
-            return
+        now = self._clock()
         existing = self._pending.get(gid)
         if existing is not None:
+            # 同一个群只保留一份状态；运行期间来的通知标 redirty，跑完再排（公平重排）。
             existing.merged += 1
             existing.budget_pressure = existing.budget_pressure or bool(budget_pressure)
+            existing.redirty = True
+            if not existing.claimed and existing.dirty_since is None and existing.ready_at <= now:
+                existing.dirty_since = now
             self.metrics.merged_total += 1
             self._wake_event.set()
             return
@@ -732,7 +928,8 @@ class GroupSummaryScheduler:
             return
         self._pending[gid] = _PendingGroup(
             group_id=gid,
-            dirty_since=self._clock(),
+            queued_at=now,
+            dirty_since=now,
             budget_pressure=bool(budget_pressure),
         )
         self._order.append(gid)
@@ -757,14 +954,13 @@ class GroupSummaryScheduler:
             await self._cancel_tasks()
 
     async def _wait_for_work(self) -> None:
-        """等下一次该动的时候：新通知、某个任务跑完、或退避到点。
+        """等下一次该动的时候：新通知、某个任务跑完、到点（退避/最小刷新/排队超时）。
 
         三个来源缺一不可：只等通知会让"跑满并发后剩下的 pending 群"永远轮不到
-        （任务完成不会自己发通知）；只等任务会让退避到点的群一直躺着。
+        （任务完成不会自己发通知）；只等任务会让"到点才允许再跑"的群一直躺着。
         """
 
         cfg = self._config_provider()
-        timeout = cfg.retry_poll_seconds if self._backoff_until else None
         self._wake_event.clear()
         notifier: asyncio.Future[Any] = asyncio.ensure_future(self._wake_event.wait())
         waiters: set[asyncio.Future[Any]] = {notifier}
@@ -772,19 +968,76 @@ class GroupSummaryScheduler:
         try:
             await asyncio.wait(
                 waiters,
-                timeout=timeout,
+                timeout=self._next_wake_in(cfg),
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
             if not notifier.done():
                 notifier.cancel()
 
+    def _next_wake_in(self, cfg: GroupSummaryConfig) -> float | None:
+        """到下一个"该动"的时刻还有多久；没有任何等待则 ``None``（睡到有通知）。"""
+
+        now = self._clock()
+        waits: list[float] = []
+        for pending in self._pending.values():
+            if pending.claimed:
+                continue
+            if pending.dirty_since is not None:
+                waits.append(
+                    max(0.0, cfg.queue_wait_seconds - (now - pending.dirty_since))
+                )
+            if pending.ready_at > now:
+                waits.append(pending.ready_at - now)
+        waits = [value for value in waits if value > 0.0]
+        if not waits:
+            return None
+        return min(min(waits), max(1.0, cfg.retry_poll_seconds))
+
+    def _gate_background_capacity(self) -> int:
+        provider = self._background_capacity
+        if not callable(provider):
+            return 0
+        try:
+            return max(0, int(provider() or 0))
+        except Exception:
+            return 0
+
+    def _effective_concurrency(self, cfg: GroupSummaryConfig) -> int:
+        """有效摘要并发 = min(配置, 主门禁背景容量)。
+
+        门禁背景容量固定 2（总 8 / normal 4 / 回复至少 2 不变）。配置调大只意味着
+        "允许到 2"，不会多排 6 个任务去抢槽位、每个还占满 15 秒 deadline。
+        """
+
+        limit = max(1, int(cfg.global_concurrency))
+        provider = self._background_capacity
+        if callable(provider):
+            try:
+                capacity = int(provider() or 0)
+            except Exception:
+                capacity = 0
+            if capacity > 0:
+                limit = min(limit, capacity)
+        if limit < int(cfg.global_concurrency) and not self._concurrency_clamp_logged:
+            self._concurrency_clamp_logged = 1
+            log.warning(
+                "group summary concurrency clamped to the gate background capacity | "
+                "configured=%s | effective=%s",
+                cfg.global_concurrency,
+                limit,
+            )
+        return max(1, limit)
+
     async def _pump(self) -> None:
         self._tasks = {task for task in self._tasks if not task.done()}
         cfg = self._config_provider()
         if not cfg.enabled:
+            self._prune_aux_state(cfg, self._clock())
             return
-        while len(self._tasks) < max(1, cfg.global_concurrency):
+        self._prune_aux_state(cfg, self._clock())
+        limit = self._effective_concurrency(cfg)
+        while len(self._tasks) < limit:
             group_id = self._claim_next(cfg)
             if group_id is None:
                 return
@@ -794,8 +1047,59 @@ class GroupSummaryScheduler:
             )
             self._tasks.add(task)
 
+    def _remove_from_order(self, group_id: int) -> None:
+        try:
+            self._order.remove(int(group_id))
+        except ValueError:
+            pass
+
+    def _reorder_tail(self, group_id: int) -> None:
+        """公平重排：把群放回轮转队列**尾部**（不插队）。"""
+
+        self._remove_from_order(group_id)
+        if int(group_id) in self._pending:
+            self._order.append(int(group_id))
+
+    def _prune_aux_state(self, cfg: GroupSummaryConfig, now: float) -> None:
+        """辅助 map 的清理与容量兜底：绝不随"历史见过多少群"无限增长。"""
+
+        live = set(self._pending) | set(self._running)
+        pruned = 0
+        for group_id, until in list(self._backoff_until.items()):
+            if until <= now and group_id not in live:
+                self._backoff_until.pop(group_id, None)
+                pruned += 1
+        for group_id in list(self._failures):
+            if group_id not in self._backoff_until and group_id not in live:
+                self._failures.pop(group_id, None)
+                pruned += 1
+        stale_after = max(3600.0, cfg.min_refresh_seconds * 10.0)
+        for group_id, at in list(self._last_success_at.items()):
+            if group_id not in live and now - at > stale_after:
+                self._last_success_at.pop(group_id, None)
+                pruned += 1
+        limit = max(256, int(cfg.pending_capacity))
+        for mapping in (self._backoff_until, self._failures, self._last_success_at):
+            if len(mapping) > limit:
+                overflow = len(mapping) - limit
+                for group_id in list(mapping)[:overflow]:
+                    mapping.pop(group_id, None)
+                    pruned += 1
+        if len(self.metrics.last_success) > _METRICS_LAST_SUCCESS_LIMIT:
+            overflow = len(self.metrics.last_success) - _METRICS_LAST_SUCCESS_LIMIT
+            for group_id in list(self.metrics.last_success)[:overflow]:
+                self.metrics.last_success.pop(group_id, None)
+                pruned += 1
+        if pruned:
+            self.metrics.aux_pruned_total += pruned
+
     def _claim_next(self, cfg: GroupSummaryConfig) -> int | None:
-        """按公平轮转挑一个可执行的群；顺手做队满/过期/退避/最小间隔判定。"""
+        """按公平轮转挑一个可执行的群；顺手做队满/过期/退避/最小间隔判定。
+
+        "有意等待"（失败退避、同群最小刷新）只更新 ``ready_at`` 并把 ``dirty_since``
+        清空：它们**不会**被算成排队超期，也不占执行槽；到点由 ``_next_wake_in``
+        自动唤醒继续（不需要群里再发消息）。
+        """
 
         now = self._clock()
         if self._slot_waiter is not None and self._slot_waiter():
@@ -814,25 +1118,31 @@ class GroupSummaryScheduler:
             if pending.claimed:
                 self._order.append(group_id)
                 continue
-            if now - pending.dirty_since > cfg.queue_wait_seconds:
-                # 排队过期：本次跳过 + 退避（不要立刻又排进来反复过期）+ 计数。
-                self._pending.pop(group_id, None)
-                self.metrics.queue_expired_total += 1
-                self._backoff_until[group_id] = now + cfg.failure_backoff_seconds
-                continue
-            if group_id in self._running:
-                self._order.append(group_id)
-                continue
-            if self._backoff_until.get(group_id, 0.0) > now:
-                # 退避中的群不占执行槽，但保留 pending 状态等下一轮。
-                self._order.append(group_id)
-                continue
+            ready_at = pending.ready_at
+            backoff = self._backoff_until.get(group_id, 0.0)
+            if backoff > ready_at:
+                ready_at = backoff
             last = self._last_success_at.get(group_id, 0.0)
-            if last and now - last < cfg.min_refresh_seconds:
-                self._order.append(group_id)
+            if last and last + cfg.min_refresh_seconds > ready_at:
+                ready_at = last + cfg.min_refresh_seconds
+            if ready_at > now:
+                # 有意延后：不算排队超期、不占执行槽，到点自动继续。
+                pending.ready_at = ready_at
+                pending.dirty_since = None
                 self.metrics.skipped_not_ready_total += 1
+                self._order.append(group_id)
+                continue
+            if pending.dirty_since is None:
+                pending.dirty_since = now
+            if now - pending.dirty_since > cfg.queue_wait_seconds:
+                # 真正等了太久（有空间却一直没轮到）：跳过 + 计数 + 退避。
+                self._pending.pop(group_id, None)
+                self._remove_from_order(group_id)
+                self.metrics.queue_expired_total += 1
+                self._register_failure(group_id, cfg)
                 continue
             pending.claimed = True
+            pending.redirty = False
             self._order.append(group_id)
             return group_id
         return None
@@ -840,45 +1150,105 @@ class GroupSummaryScheduler:
     async def run_group(self, group_id: int, cfg: GroupSummaryConfig) -> str:
         """执行一个群的摘要（测试直接调用它）。返回结果标记。"""
 
-        self._running.add(int(group_id))
+        gid = int(group_id)
+        self._running.add(gid)
         outcome = "skipped"
         try:
-            outcome = await self._run_group_inner(int(group_id), cfg)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.metrics.failure_total += 1
-            self._register_failure(group_id, cfg)
-            log.exception("group summary failed | group=%s", group_id)
-            outcome = "failure"
+            try:
+                outcome = await self._run_group_inner(gid, cfg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.metrics.failure_total += 1
+                self._register_failure(gid, cfg)
+                log.exception("group summary failed | group=%s", gid)
+                outcome = "failure"
         finally:
-            self._running.discard(int(group_id))
-            pending = self._pending.get(int(group_id))
-            if pending is not None:
-                self._pending.pop(int(group_id), None)
-                try:
-                    self._order.remove(int(group_id))
-                except ValueError:
-                    pass
+            # 收尾必须同步（取消路径也不能 await），并保证并发计数归零。
+            self._running.discard(gid)
+            self._finish_pending(gid, cfg)
         return outcome
 
+    def _finish_pending(self, group_id: int, cfg: GroupSummaryConfig) -> None:
+        """一次运行收尾（**同步**：绝不在取消路径里 await）。
+
+        保留三种"还要再来一次"的状态，且都只有一份 pending entry：
+
+        * 运行期间 notify 过（``redirty``）→ 立刻公平重排到队尾；
+        * 成功发布后仍有 backlog → 按最小刷新间隔排到队尾，**到点自动继续**
+          （不需要群里再发消息）；
+        * 其它情况 → 从 pending/队列里移除。
+        """
+
+        gid = int(group_id)
+        pending = self._pending.get(gid)
+        if pending is None:
+            return
+        pending.claimed = False
+        now = self._clock()
+        if pending.redirty:
+            pending.redirty = False
+            pending.requeue = False
+            pending.dirty_since = now
+            pending.ready_at = 0.0
+            self.metrics.requeued_redirty_total += 1
+            self._reorder_tail(gid)
+            self._wake_event.set()
+            return
+        if pending.requeue:
+            pending.requeue = False
+            pending.dirty_since = None
+            pending.ready_at = now + max(0.0, cfg.min_refresh_seconds)
+            self._reorder_tail(gid)
+            self._wake_event.set()
+            return
+        self._pending.pop(gid, None)
+        self._remove_from_order(gid)
+
     async def _run_group_inner(self, group_id: int, cfg: GroupSummaryConfig) -> str:
-        previous = await self._store.load(group_id)
+        gid = int(group_id)
+        intact_fn = getattr(self._store, "coverage_intact", None)
+        previous = await self._store.load(gid)
+
+        # 旧摘要的覆盖必须**现在**仍然完整；失效（原文被删/编辑）时绝不把它的正文
+        # 带进提示词——否则会把已删除内容重新合并回摘要里。失效即从零重建。
+        previous_valid = False
+        if previous is not None and previous.usable:
+            previous_valid = True
+            if callable(intact_fn):
+                previous_valid = bool(
+                    await intact_fn(
+                        gid,
+                        covered_from_id=previous.covered_from_id,
+                        covered_through_id=previous.covered_through_id,
+                        covered_count=previous.covered_count,
+                    )
+                )
+                if not previous_valid:
+                    log.warning(
+                        "group summary rebuild: previous coverage lost messages | "
+                        "group=%s | version=%s",
+                        gid,
+                        previous.version,
+                    )
+        prompt_previous = previous if previous_valid else None
+        baseline_id = int(previous.covered_through_id) if previous_valid and previous else 0
+
         pending_count = await self._store.pending_count(
-            group_id,
+            gid,
             recent_raw_messages=cfg.recent_raw_messages,
-            after_id=int(previous.covered_through_id) if previous else 0,
+            after_id=baseline_id,
         )
-        pending = self._pending.get(group_id)
+        pending = self._pending.get(gid)
         pressure = bool(pending and pending.budget_pressure)
         if pending_count < cfg.trigger_messages and not (pressure and pending_count > 0):
             self.metrics.skipped_not_ready_total += 1
             return "not_ready"
 
         snapshot = await self._store.read_snapshot(
-            group_id,
+            gid,
             recent_raw_messages=cfg.recent_raw_messages,
-            after_id=int(previous.covered_through_id) if previous else 0,
+            after_id=baseline_id,
             max_messages=cfg.batch_max_messages,
             max_input_tokens=cfg.batch_max_input_tokens,
         )
@@ -888,19 +1258,31 @@ class GroupSummaryScheduler:
 
         # 有界快照之外还有更多未摘要消息 → 声明"不是完整原文"。
         source_truncated = pending_count > len(snapshot)
-        messages = build_summary_prompt(
-            group_id=group_id,
-            previous=previous,
+        # 原文 batch + 旧摘要 + 提示词**一起**受本次 batch 输入预算约束。
+        messages, snapshot, source_truncated = fit_summary_prompt(
+            group_id=gid,
+            previous=prompt_previous,
             snapshot=snapshot,
             source_truncated=source_truncated,
+            max_input_tokens=cfg.batch_max_input_tokens,
         )
+        if not snapshot:
+            self.metrics.skipped_not_ready_total += 1
+            return "no_messages"
 
         self.metrics.claimed_total += 1
         self._note_model_concurrency(+1, cfg)
         try:
             # 整体硬超时：入场后模型调用 + fallback + 重试合计不超过 deadline。
+            # 输出上限走 **API max_tokens**（不是只靠事后截断）。
             async with asyncio.timeout(cfg.deadline_seconds) as deadline:
-                raw = await self._llm.background_summary_completion(messages)
+                if self._summary_accepts_max_tokens:
+                    raw = await self._llm.background_summary_completion(
+                        messages,
+                        max_tokens=cfg.max_summary_tokens,
+                    )
+                else:
+                    raw = await self._llm.background_summary_completion(messages)
             # A client may swallow cancellation and return a late value.
             if deadline.expired():
                 raise TimeoutError
@@ -910,69 +1292,111 @@ class GroupSummaryScheduler:
         except (TimeoutError, asyncio.TimeoutError):
             self.metrics.deadline_exceeded_total += 1
             self.metrics.failure_total += 1
-            self._register_failure(group_id, cfg)
-            log.warning("group summary deadline exceeded | group=%s", group_id)
+            self._register_failure(gid, cfg)
+            log.warning("group summary deadline exceeded | group=%s", gid)
             return "deadline_exceeded"
         except asyncio.CancelledError:
             raise
         except Exception:
             self.metrics.failure_total += 1
-            self._register_failure(group_id, cfg)
-            log.exception("group summary model call failed | group=%s", group_id)
+            self._register_failure(gid, cfg)
+            log.exception("group summary model call failed | group=%s", gid)
             return "failure"
         finally:
             self._note_model_concurrency(-1, cfg)
 
         body = str(raw or "")
-        valid, reason = is_valid_summary_output(body, group_id=group_id)
+        valid, reason = is_valid_summary_output(body, group_id=gid)
         if not valid:
             self.metrics.failure_total += 1
-            self._register_failure(group_id, cfg)
+            self._register_failure(gid, cfg)
             log.warning(
-                "group summary output rejected | group=%s | reason=%s", group_id, reason
+                "group summary output rejected | group=%s | reason=%s", gid, reason
             )
             return "invalid_output"
 
-        body, truncated = truncate_summary_output(body, max_tokens=cfg.max_summary_tokens)
+        body, truncated = truncate_summary_output(
+            body, max_tokens=cfg.max_summary_tokens
+        )
         covered_keys = [item.message_key for item in snapshot if item.message_key]
         covered_ids = [int(item.message_id) for item in snapshot if item.message_id]
+        covered_from = min(covered_ids) if covered_ids else 0
+        covered_through = max(covered_ids) if covered_ids else 0
+
+        # 发布前**再次**确认依赖源没变（模型调用期间可能删了原文）→ 否则不发布。
+        if covered_ids and callable(intact_fn):
+            still_intact = bool(
+                await intact_fn(
+                    gid,
+                    covered_from_id=covered_from,
+                    covered_through_id=covered_through,
+                    covered_count=len(covered_ids),
+                )
+            )
+            if not still_intact:
+                self.metrics.failure_total += 1
+                self._register_failure(gid, cfg)
+                log.warning(
+                    "group summary source changed during generation | group=%s", gid
+                )
+                return "source_changed"
+
+        rebuilding = previous is not None and not previous_valid
         published = await self._store.publish(
-            group_id,
+            gid,
             summary=body,
             expected_version=int(previous.version) if previous else 0,
             covered_from_key=covered_keys[0] if covered_keys else "",
             covered_through_key=covered_keys[-1] if covered_keys else "",
             covered_count=len(snapshot),
             source_truncated=source_truncated or truncated,
-            covered_from_id=min(covered_ids) if covered_ids else 0,
-            covered_through_id=max(covered_ids) if covered_ids else 0,
+            covered_from_id=covered_from,
+            covered_through_id=covered_through,
+            allow_watermark_rewind=rebuilding,
+            reset_coverage=rebuilding,
         )
         if published is None:
             # 迟到任务：期间已经有更新的摘要发布，直接丢弃（不覆盖）。
-            log.info("group summary publish skipped (stale) | group=%s", group_id)
+            log.info("group summary publish skipped (stale) | group=%s", gid)
             return "stale"
 
         self.metrics.success_total += 1
-        self.metrics.last_success[int(group_id)] = {
+        self.metrics.last_success[gid] = {
             "version": published.version,
             "covered_through": published.covered_through_key,
             "covered_count": published.covered_count,
             "source_truncated": published.source_truncated,
             "at": self._clock(),
         }
-        self._last_success_at[int(group_id)] = self._clock()
-        self._backoff_until.pop(int(group_id), None)
-        self._failures.pop(int(group_id), None)
+        self._last_success_at[gid] = self._clock()
+        self._backoff_until.pop(gid, None)
+        self._failures.pop(gid, None)
         log.info(
             "group summary published | group=%s | version=%s | covered=%s..%s "
-            "(%d messages) | truncated=%s",
-            group_id,
+            "(%d messages) | truncated=%s | rebuilt=%s",
+            gid,
             published.version,
             published.covered_from_key,
             published.covered_through_key,
             published.covered_count,
             published.source_truncated,
+            rebuilding,
         )
+
+        # 成功但还有积压 → 标记队尾重排（到点自动继续，公平推进）。
+        pending = self._pending.get(gid)
+        if pending is not None:
+            try:
+                remaining = await self._store.pending_count(
+                    gid,
+                    recent_raw_messages=cfg.recent_raw_messages,
+                    after_id=published.covered_through_id,
+                )
+            except Exception:
+                remaining = 0
+            if remaining >= cfg.trigger_messages:
+                pending.requeue = True
+                self.metrics.requeued_backlog_total += 1
         return "published"
 
     def _register_failure(self, group_id: int, cfg: GroupSummaryConfig) -> None:
@@ -1026,7 +1450,15 @@ class GroupSummaryScheduler:
             str(gid): {
                 "merged": pending.merged,
                 "budget_pressure": pending.budget_pressure,
-                "queued_seconds": round(max(0.0, now - pending.dirty_since), 3),
+                "queued_seconds": (
+                    round(max(0.0, now - pending.dirty_since), 3)
+                    if pending.dirty_since is not None
+                    else None
+                ),
+                "ready_in_seconds": round(max(0.0, pending.ready_at - now), 3),
+                "claimed": pending.claimed,
+                "redirty": pending.redirty,
+                "requeue": pending.requeue,
                 "waiting_retry": self._backoff_until.get(gid, 0.0) > now,
                 "failures": self._failures.get(gid, 0),
             }
@@ -1039,6 +1471,8 @@ class GroupSummaryScheduler:
             "running": len(self._running),
             "tasks": len([task for task in self._tasks if not task.done()]),
             "global_concurrency": cfg.global_concurrency,
+            "effective_concurrency": self._effective_concurrency(cfg),
+            "gate_background_capacity": self._gate_background_capacity(),
             "per_group_concurrency": cfg.per_group_concurrency,
             "backoff_groups": len(self._backoff_until),
             "next_retry_in_seconds": (
@@ -1062,6 +1496,7 @@ def init_group_summary_scheduler(
     config_provider: Callable[[], GroupSummaryConfig],
     gate: Any | None = None,
     slot_waiter: Callable[[], bool] | None = None,
+    background_capacity: Callable[[], int] | None = None,
 ) -> GroupSummaryScheduler:
     """构造并注册进程级调度器，同时注册资源健康快照。"""
 
@@ -1072,6 +1507,7 @@ def init_group_summary_scheduler(
         config_provider=config_provider,
         gate=gate,
         slot_waiter=slot_waiter,
+        background_capacity=background_capacity,
     )
     GROUP_SUMMARY_SCHEDULER = scheduler
     register_resource_health_provider("group_summary", scheduler.snapshot)

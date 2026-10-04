@@ -97,8 +97,7 @@ _ARCHIVE_READ_SCAN_FACTOR = 1.5
 _ARCHIVE_READ_PAGE_SIZE = 256
 #: 摘要相关的兜底默认（真实值来自运行时可配置的 ``group_summary_*``）。
 _GROUP_SUMMARY_DEFAULT_RECENT_RAW = 200
-#: 前台读取已发布摘要的缓存 TTL（秒）：只有"已发布"的摘要会进这个缓存。
-_GROUP_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_GROUP_SUMMARY_DEFAULT_TRIGGER_MESSAGES = 200
 #: F-016：一次 recall 里最多用多少条"已处置"消息去提示排序（best-effort，只影响
 #: 召回质量）；真正的"不返回已删除内容"由 :meth:`MemoryService._removed_message_ids`
 #: 对最终选中的少量行做精确核对来保证，不受这个上限影响。
@@ -495,7 +494,6 @@ class MemoryService:
         self._vector_recall_provider = vector_recall_provider
         # 第②项：后台群摘要的状态容器必须先于 ``_apply_token_budgets`` 存在
         # （预算应用会把运行时可配置的开关/条数写进来）。
-        self._group_summary_cache: dict[int, tuple[float, Any]] = {}
         self._group_summary_store: Any | None = None
         self._apply_token_budgets(config)
 
@@ -530,7 +528,15 @@ class MemoryService:
         self._pending_write_fatal_error = ""
         self._pending_write_active_started_at = 0.0
         self._authorized_group_ids: set[int] = set()
-        self._llm_reserve_tokens = max(1024, self.max_output // 2)
+        # 与最终请求闸门统一：输入预算按**业务输出/工具预留**扣一次，
+        # 而不是旧的 max_output * 1.5。
+        self._llm_reserve_tokens = max(
+            1024,
+            min(
+                configured_reserve_tokens(config),
+                max(0, self.max_context - 1024),
+            ),
+        )
 
         log.info(
             "Memory service initialized: max_context=%d max_output=%d",
@@ -1087,12 +1093,16 @@ class MemoryService:
         # min(模型真实窗口, 272Ki)。模型宣告 1M/4M 也不会每轮填满；模型比 272Ki 小
         # 就跟着更小；拿不到元数据时用 ``max_context_tokens`` 保守降级（未知 ≠ 无限）。
         measured_window = auto_window_for(config, llm=self.llm)
-        base_context = configured_context
+        business_budget = configured_business_tokens(config)
         if measured_window is not None:
             base_context = business_total_window(
                 measured_window,
-                business_tokens=configured_business_tokens(config),
+                business_tokens=business_budget,
             )
+        else:
+            # 没拿到模型元数据（或 fixed 模式）：业务预算同样是上限，
+            # 不能只拿旧兼容字段 ``max_context_tokens``。
+            base_context = min(configured_context, business_budget)
         if model_input_limit > 0:
             self.max_context = min(
                 base_context,
@@ -1141,6 +1151,17 @@ class MemoryService:
         # 摘要开启时："有效旧摘要 + 近期原文"；近期条数还受条数上限与实际输入余额约束。
         self.group_summary_enabled = bool(
             getattr(config, "group_summary_enabled", False)
+        )
+        self.group_summary_trigger_messages = max(
+            1,
+            int(
+                getattr(
+                    config,
+                    "group_summary_trigger_messages",
+                    _GROUP_SUMMARY_DEFAULT_TRIGGER_MESSAGES,
+                )
+                or _GROUP_SUMMARY_DEFAULT_TRIGGER_MESSAGES
+            ),
         )
         self.group_summary_recent_raw_messages = min(
             self.group_history_max_messages,
@@ -1947,9 +1968,27 @@ class MemoryService:
         if self.group_summary_enabled:
             record = await self.published_group_summary(normalized_group_id)
             if record is not None and record.usable:
-                # 有效旧摘要 + 近期原文：只读最近 N 条（条数上限与 token 预算仍然先到即停，
-                # 覆盖范围与最近原文不重复——水位之外的内容由摘要承载）。
-                count_cap = min(count_cap, self.group_summary_recent_raw_messages)
+                # 有效旧摘要 + 近期原文。摘要**落后**（水位与近期窗口之间还有大量未摘要
+                # 原文）时不要立刻只读最近 N 条：在条数上限/整次预算内尽量多保留未覆盖
+                # 原文；等积压降下来再收敛为配置的 recent N。失败/无摘要时走原滑窗。
+                behind = await self.group_summary_is_behind(normalized_group_id, record)
+                cap = (
+                    self.group_history_max_messages
+                    if behind
+                    else min(
+                        self.group_history_max_messages,
+                        self.group_summary_recent_raw_messages,
+                    )
+                )
+                count_cap = min(count_cap, cap)
+                if behind:
+                    log.info(
+                        "group summary behind, keeping wider raw window | group=%s | "
+                        "version=%s | cap=%d",
+                        normalized_group_id,
+                        record.version,
+                        cap,
+                    )
         rows: list[Any] = []
         try:
             rows = await self._read_group_archive_history(
@@ -3606,8 +3645,20 @@ class MemoryService:
         return max(1024, budget_tokens - margin)
 
     def _llm_input_budget(self, reserve_tokens: int | None = None) -> int:
-        reserve = self._llm_reserve_tokens if reserve_tokens is None else max(0, reserve_tokens)
-        return max(1024, self.max_context - self.max_output - reserve)
+        """可发给模型的输入预算：**与最终请求闸门同一个口径**。
+
+        预留就是业务输出/工具预留（``context_reserve_tokens``，默认 32Ki）——它本来
+        已经包含"回复输出"的空间，所以这里**不再**额外减 ``max_output``（旧实现是
+        ``max_context - max_output - max_output*1.5``，重复扣且与闸门不一致）。
+        调用方显式传 ``reserve_tokens`` 时按它算（仍是一次扣除）。
+        """
+
+        reserve = (
+            self._llm_reserve_tokens
+            if reserve_tokens is None
+            else max(0, int(reserve_tokens))
+        )
+        return max(1024, self.max_context - reserve)
 
     async def _get_summary(self, group_id: int) -> str:
         cached = self._summary_cache.get(group_id)
@@ -3795,6 +3846,33 @@ class MemoryService:
             await session.commit()
             return deleted, created, created_new
 
+    async def group_summary_is_behind(
+        self,
+        group_id: int,
+        record: PublishedSummary,
+    ) -> bool:
+        """摘要是否落后（水位与近期窗口之间还有 ≥ 触发阈值的未摘要原文）。
+
+        一次带索引的 COUNT；查询失败按"不落后"处理（宁可窄窗口也不阻塞回复）。
+        """
+
+        if record.covered_through_id <= 0:
+            return False
+        store = self.group_summary_store()
+        counter = getattr(store, "pending_count", None)
+        if not callable(counter):
+            return False
+        try:
+            remaining = await counter(
+                int(group_id),
+                recent_raw_messages=self.group_summary_recent_raw_messages,
+                after_id=int(record.covered_through_id),
+            )
+        except Exception:
+            log.exception("group summary backlog check failed | group=%s", group_id)
+            return False
+        return int(remaining or 0) >= self.group_summary_trigger_messages
+
     def group_summary_store(self) -> SqlGroupSummaryStore:
         """摘要存储（懒构造；每次操作一个短会话，绝不在模型 await 期间持锁）。"""
 
@@ -3810,15 +3888,13 @@ class MemoryService:
 
         if not self.group_summary_enabled:
             return None
-        now = time.monotonic()
-        cached = self._group_summary_cache.get(int(group_id))
-        if cached is not None and cached[0] > now:
-            return cached[1]
+        # 不做 TTL 缓存短路：完整性**每次**都查（缓存命中也不许继续注入已删除内容）。
         try:
             store = self.group_summary_store()
             record = await store.load(int(group_id))
             if record is not None and record.usable:
-                # 覆盖范围内的原文被删（审核/过期/隐私删除）→ 摘要失效，不注入旧内容。
+                # 覆盖范围内的原文被删/被编辑（审核删除、过期清理、隐私删除同一语义）
+                # → 摘要失效、不注入旧内容（重建由 worker 负责，前台只管不注入）。
                 intact_fn = getattr(store, "coverage_intact", None)
                 if callable(intact_fn):
                     intact = await intact_fn(
@@ -3838,10 +3914,6 @@ class MemoryService:
         except Exception:
             log.exception("group summary load failed | group=%s", group_id)
             record = None
-        self._group_summary_cache[int(group_id)] = (
-            now + _GROUP_SUMMARY_CACHE_TTL_SECONDS,
-            record,
-        )
         return record
 
     async def _format_system_memory_blocks(self, group_id: int) -> list[dict[str, str]]:

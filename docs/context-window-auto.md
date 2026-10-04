@@ -143,6 +143,32 @@ system/人设 + 工具定义 + 记忆召回 + 检索留档 + 群/私聊历史 + 
 * 发布是**原子 CAS**（`version` + 覆盖水位 `covered_through_id`）：迟到任务不得覆盖更新的
   摘要；源被截断时标注 `source_truncated`，前台渲染明确"**不是**完整原文"。
 
+## 机制保证（2026-10-04 收口）
+
+* **真正的原子发布**：`UPDATE ... WHERE group_id=? AND version=? AND covered_through_id<?`
+  （版本与水位条件都在 SQL 里）+ 行不存在时 `INSERT`（主键唯一冲突即失败）；`session.get`
+  读改写只用于展示。旧摘要失效重建走 `allow_watermark_rewind + reset_coverage`：水位可
+  回退但**版本 CAS 仍生效**（迟到任务不能覆盖重建结果）。
+* **失效重建不复活已删除内容**：worker 生成前检查旧摘要覆盖是否仍然完整（原文被删/编辑
+  → 旧正文**绝不进提示词**，从现存原文重建）；发布前**再次**确认本批依赖源未变
+  （模型调用期间被删 → 不发布，`source_changed`）。前台每次读都做完整性检查（不做 TTL
+  缓存短路），失效即不注入、退回预算滑窗。
+* **统一扫描序**：摘要的"最近 N 条"、候选与覆盖水位**全部按归档行 id**（插入序、单调全序）；
+  时间乱序/补录的行会以更大的 id 进来并被覆盖，不会被永久跳过。
+* **调度推进**：运行期间新到的通知标 redirty，跑完公平重排到队尾；成功发布后若仍有
+  backlog，按 `min_refresh` 排到队尾并**到点自动继续**（不需要群里再发消息）；
+  "有意等待"（失败退避/同群最小刷新）只更新 `ready_at`、不算排队超期也不占执行槽
+  （`queue_wait` 默认 30s 与 `min_refresh` 60s 不会互相误伤）。
+* **有界状态**：pending 每群只有一份；`_backoff_until`/`_failures`/`_last_success_at`
+  过期即清、容量兜底 `max(256, pending_capacity)`；观测用的 `last_success` 只留最近 200。
+* **有效并发** = `min(配置, 门禁背景容量)`：门禁背景固定 2（总 8 / normal 4 / 回复 ≥2 不变），
+  配置调大只显示允许到 2 并告警，不会多排任务抢槽位、每个占满 15 秒 deadline。
+* **预算口径**：原文 batch + 旧摘要 + 提示词**一起**卡进 `batch_max_input_tokens`（超了从
+  最旧丢并标记"不是完整原文"）；摘要输出上限走**API `max_tokens`**（不只靠事后截断）；
+  `MemoryService._llm_input_budget` 与最终闸门统一按业务 `context_reserve_tokens`
+  （不再重复扣 `max_output`）。摘要落后于水位时，前台在 1000 条/整次预算内尽量保留
+  未覆盖原文，追平后才收敛到 `recent_raw`；摘要失败/无摘要始终走预算滑窗。
+
 ## 触发
 
 近期原文窗口之外的未摘要旧消息累计达到 `group_summary_trigger_messages`（默认 200），

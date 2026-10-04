@@ -634,6 +634,7 @@ async def main() -> None:
             slot_waiter=lambda: _LLM_PRIORITY_GATE.has_waiting(
                 ExecutionPriority.NORMAL
             ),
+            background_capacity=lambda: _LLM_PRIORITY_GATE.background_capacity,
         )
         if callable(summary_store_factory)
         else None

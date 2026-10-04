@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy as copy_module
 from dataclasses import dataclass
 import hashlib
 import json
@@ -2980,6 +2981,7 @@ class LLMService:
         cfg: ModelConfig | None = None,
         label: str = "group_summary",
         preview_limit: int = 80,
+        max_tokens: int | None = None,
     ) -> str:
         """后台摘要 / 维护专用的一次性对话调用。
 
@@ -2990,6 +2992,18 @@ class LLMService:
         """
 
         target = cfg or self.compress_config
+        if max_tokens is not None and int(max_tokens) > 0:
+            # 摘要输出上限走**API 的 max_tokens**（不是只靠事后截断）。
+            override = int(max_tokens)
+            try:
+                target = target.model_copy(update={"max_tokens": override})
+            except Exception:  # 非 pydantic 替身（测试）时退化为浅拷贝
+                copy = copy_module.copy(target)
+                try:
+                    copy.max_tokens = override
+                except Exception:
+                    pass
+                target = copy
         with execution_priority_scope(ExecutionPriority.BACKGROUND):
             return await self._chat_with_fallbacks(
                 messages=messages,

@@ -83,6 +83,22 @@ class FakeStore:
             older = [row for row in older if row.message_id > int(after_id)]
         return older[: max(1, int(max_messages))]
 
+    async def coverage_intact(
+        self,
+        group_id: int,
+        *,
+        covered_from_id: int,
+        covered_through_id: int,
+        covered_count: int,
+    ) -> bool:
+        rows = self.messages.get(int(group_id), [])
+        present = [
+            row
+            for row in rows
+            if int(covered_from_id) <= int(row.message_id) <= int(covered_through_id)
+        ]
+        return len(present) >= int(covered_count)
+
     async def publish(
         self,
         group_id: int,
@@ -95,6 +111,8 @@ class FakeStore:
         source_truncated: bool,
         covered_from_id: int = 0,
         covered_through_id: int = 0,
+        allow_watermark_rewind: bool = False,
+        reset_coverage: bool = False,
     ):
         from bot.services.group_summary import PublishedSummary
 
@@ -104,20 +122,34 @@ class FakeStore:
         current_through_id = int(current["covered_through_id"]) if current else 0
         if current_version != int(expected_version):
             return None
-        if current_through_id and int(covered_through_id or 0) <= current_through_id:
+        if (
+            not allow_watermark_rewind
+            and current_through_id
+            and int(covered_through_id or 0) <= current_through_id
+        ):
             return None
         from bot.utils.timezone import now_shanghai_naive
 
+        if reset_coverage or current is None:
+            merged_from_id = int(covered_from_id or 0)
+            merged_from_key = covered_from_key
+            merged_count = int(covered_count or 0)
+            merged_truncated = bool(source_truncated)
+        else:
+            merged_from_id = int(current["covered_from_id"])
+            merged_from_key = current["covered_from_key"]
+            merged_count = int(current["covered_count"]) + int(covered_count or 0)
+            merged_truncated = bool(current["source_truncated"] or source_truncated)
         record = {
             "group_id": int(group_id),
             "summary": summary,
             "version": current_version + 1,
-            "covered_from_key": covered_from_key,
-            "covered_through_key": covered_through_key,
-            "covered_count": covered_count,
-            "covered_from_id": int(covered_from_id or 0),
+            "covered_from_key": merged_from_key,
+            "covered_through_key": covered_through_key or (current["covered_through_key"] if current else ""),
+            "covered_count": merged_count,
+            "covered_from_id": merged_from_id,
             "covered_through_id": int(covered_through_id or 0) or current_through_id,
-            "source_truncated": source_truncated,
+            "source_truncated": merged_truncated,
             "generated_at": now_shanghai_naive(),
         }
         self.published[int(group_id)] = record
@@ -996,7 +1028,6 @@ class MemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             await session.commit()
 
-        memory._group_summary_cache.clear()
         blocks = await memory._format_system_memory_blocks(self.GROUP_ID)
         joined = "\n".join(str(block.get("content") or "") for block in blocks)
         self.assertNotIn("包含后来被删除的内容", joined)
