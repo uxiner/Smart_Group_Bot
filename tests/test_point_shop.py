@@ -1218,6 +1218,156 @@ class LedgerRefundTests(_DbTestCase):
 
 
 # ---------------------------------------------------------------------------
+# D2-02：写入必须能被外层 rollback 撤回来（SAVEPOINT 语义）
+# ---------------------------------------------------------------------------
+
+
+class AwardRollbackTests(_DbTestCase):
+    """``award_points`` / ``upsert_entitlement`` 不许用 ``begin_nested()``。
+
+    pysqlite / aiosqlite 只有在第一条 DML 之前才发出 ``BEGIN``；``SAVEPOINT``
+    不是 DML，所以最外层的 ``RELEASE SAVEPOINT`` 按 SQLite 语义**就是 COMMIT**。
+    后果是调用方 ``session.rollback()`` 撤不回这两次写入——退款先落库、权益还原
+    后失败时，用户会同时拿到权益和退款，UI 却写着「退款也失败了」。
+    """
+
+    async def test_award_points_is_withdrawn_by_an_outer_rollback(self) -> None:
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await point_shop.award_points(
+                    session,
+                    group_id=GROUP_ID,
+                    user_id=7,
+                    points=30,
+                    reason=point_shop.AWARD_REASON_REFUND,
+                    ref="shop-refund:shop-tag-7d:x",
+                )
+            )
+            await session.rollback()
+
+        self.assertEqual(
+            await self._awards(7), [], "award_points 提前提交了，rollback 撤不回来"
+        )
+
+    async def test_entitlement_insert_is_withdrawn_by_an_outer_rollback(self) -> None:
+        async with self.session_factory() as session:
+            await point_shop.upsert_entitlement(
+                session,
+                group_id=GROUP_ID,
+                user_id=7,
+                kind=KIND_TAG,
+                payload="摸鱼冠军",
+                ref="shop-tag-7d:x",
+                expires_at=_day(7),
+                now=_day(),
+            )
+            await session.rollback()
+
+        self.assertEqual(
+            await self._entitlements(), [], "upsert_entitlement 提前提交了，撤不回来"
+        )
+
+    async def test_duplicate_ref_still_returns_false_without_touching_the_tx(self) -> None:
+        """换成 ON CONFLICT 之后幂等语义不变：重复 ref 返回 False，不抛异常。"""
+
+        async with self.session_factory() as session:
+            first = await point_shop.award_points(
+                session,
+                group_id=GROUP_ID,
+                user_id=7,
+                points=30,
+                reason=point_shop.AWARD_REASON_REFUND,
+                ref="dup-ref",
+            )
+            await session.commit()
+        async with self.session_factory() as session:
+            second = await point_shop.award_points(
+                session,
+                group_id=GROUP_ID,
+                user_id=7,
+                points=30,
+                reason=point_shop.AWARD_REASON_REFUND,
+                ref="dup-ref",
+            )
+            await session.commit()
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(len(await self._awards(7)), 1)
+
+    async def test_refund_and_entitlement_revert_die_together(self) -> None:
+        """端到端 D2-02：续费时 Telegram 拒绝头衔、权益还原又抛错。
+
+        修前：退款已经被 SAVEPOINT 提交，``rollback()`` 撤不回，权益还原也没做成
+        ——用户白得 7 天头衔**和** 30 分退款，回执却写「退款也失败了」。
+        修后：「退款 + 权益还原」同生共死：两样都没落库，状态退回"这笔续费照旧
+        成立"（扣费和权益本来就在调 Telegram 之前提交了），用户没有被白送。
+        """
+
+        await self._grant_points(7, 200)
+        first = await self._buy_tag(FakeBot(), raw="Tester")
+        self.assertEqual(first.status, "ok")
+        self.assertEqual(await self._balance(7), 170)
+        before_expiry = (await self._entitlements())[0].expires_at
+        # 续费（_day(1)）从旧到期时间 _day(7) 往后延 7 天 = _day(14)
+        self.assertEqual(before_expiry, _day(7))
+
+        failing = FakeBot(tag_error=_bot_error("Bad Request: tag is invalid"))
+        with patch(
+            "bot.services.point_shop.restore_entitlement",
+            new=AsyncMock(side_effect=RuntimeError("database is locked")),
+        ):
+            reply = await self._buy_tag(failing, raw="tester", now=_day(1))
+
+        self.assertEqual(reply.status, "telegram_failed")
+        self.assertFalse(reply.refunded, "退款没落库就不能报成功")
+        self.assertEqual(
+            [row for row in await self._awards(7) if row.reason == "shop_refund"],
+            [],
+            "退款被提前提交了：用户既留着续费的权益又拿回了分（白嫖头衔）",
+        )
+        # 扣费与权益在调 Telegram 之前就已提交，所以这一对的"都没做"表现为：
+        # 续费的 30 分照扣、续期的到期时间照留——与"没有退款行"这件事**自洽**。
+        # 修前这里会是 170（钱退了）**且**到期时间 = _day(14)（权益还在），
+        # 那才是「白嫖 7 天头衔 + 白拿 30 分」的双重收益。
+        self.assertEqual(await self._balance(7), 140, "退款必须随外层事务一起回滚")
+        self.assertEqual(
+            (await self._entitlements())[0].expires_at,
+            _day(14),
+            "退款行不存在时，续费的权益必须自洽地留着，不能出现「已退款 + 权益还在」",
+        )
+
+    async def test_refund_and_revert_still_both_persist_on_success(self) -> None:
+        """对照组：_refund_and_reload 正常时，退款与权益还原必须**都**落库。"""
+
+        await self._grant_points(7, 200)
+        self.assertEqual((await self._buy_tag(FakeBot(), raw="Tester")).status, "ok")
+        before_row = (await self._entitlements())[0]
+        before_values = (before_row.payload, before_row.ref, before_row.expires_at)
+
+        failing = FakeBot(tag_error=_bot_error("Bad Request: tag is invalid"))
+        reply = await self._buy_tag(failing, raw="tester", now=_day(1))
+
+        self.assertEqual(reply.status, "telegram_failed")
+        self.assertTrue(reply.refunded)
+        self.assertEqual(
+            [
+                row.points
+                for row in await self._awards(7)
+                if row.reason == "shop_refund"
+            ],
+            [30],
+        )
+        self.assertEqual(await self._balance(7), 170)
+        after_row = (await self._entitlements())[0]
+        self.assertEqual(
+            (after_row.payload, after_row.ref, after_row.expires_at), before_values
+        )
+
+
+
+
+# ---------------------------------------------------------------------------
 # 到期清理
 # ---------------------------------------------------------------------------
 

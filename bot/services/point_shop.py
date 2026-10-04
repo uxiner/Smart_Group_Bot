@@ -34,7 +34,7 @@ from html import escape
 
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import MemberEntitlement, MemberPointAward, MemberPointSpend
@@ -366,20 +366,31 @@ async def award_points(
     amount = int(points)
     if amount <= 0:
         return False
-    try:
-        async with session.begin_nested():
-            session.add(
-                MemberPointAward(
-                    group_id=int(group_id),
-                    user_id=int(user_id),
-                    points=amount,
-                    reason=str(reason or "")[:64],
-                    ref=str(ref)[:64],
-                )
-            )
-    except IntegrityError:
-        return False
-    return True
+    # 与 spend_points（bot/services/checkin.py）完全同构：原生
+    # ``ON CONFLICT DO NOTHING``，不包 ``begin_nested()``。pysqlite / aiosqlite
+    # 只在第一条 DML 之前才发出 BEGIN，SAVEPOINT 不是 DML，所以最外层的
+    # ``RELEASE SAVEPOINT`` 按 SQLite 语义就是 COMMIT——调用方的
+    # ``session.rollback()`` 撤不回这里的写入（GAP-D1 §3.1 实测）。
+    # 后果：_refund_and_reload 里「退款 + 权益还原」不再是原子的，退款先落库、
+    # 权益还原再抛错时，用户白拿退款还留着权益，UI 却报「退款也失败了」。
+    # 幂等仍由唯一索引 (group_id, user_id, ref) 保证，rowcount==1 才是"真发了"。
+    statement = (
+        sqlite_insert(MemberPointAward)
+        .values(
+            group_id=int(group_id),
+            user_id=int(user_id),
+            points=amount,
+            reason=str(reason or "")[:64],
+            ref=str(ref)[:64],
+            # F-050 同口径：Core 的 INSERT 不会套用 Python 侧列 default，
+            # 而 server_default 在 SQLite 上是 UTC 的 CURRENT_TIMESTAMP，
+            # 所以 created_at 必须显式带上本地（Asia/Shanghai）朴素时间。
+            created_at=now_shanghai_naive(),
+        )
+        .on_conflict_do_nothing(index_elements=["group_id", "user_id", "ref"])
+    )
+    result = await session.execute(statement)
+    return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
 async def refund_points(
@@ -498,25 +509,29 @@ async def upsert_entitlement(
         session, group_id=group_id, user_id=user_id, kind=kind
     )
     if row is None:
-        try:
-            async with session.begin_nested():
-                session.add(
-                    MemberEntitlement(
-                        group_id=int(group_id),
-                        user_id=int(user_id),
-                        kind=str(kind),
-                        payload=str(payload)[:255],
-                        ref=str(ref)[:64],
-                        created_at=now,
-                        expires_at=expires_at,
-                    )
-                )
-            return
-        except IntegrityError:
-            # 并发插入（同一个人的两次购买本该被 _purchase_lock 串行化，这里兜底）
-            row = await active_entitlement(
-                session, group_id=group_id, user_id=user_id, kind=kind
+        # 和 award_points 同理：插入分支不能包 begin_nested()，否则这一行的
+        # INSERT 会被 SAVEPOINT 的 RELEASE 提前提交，调用方 rollback 撤不回来
+        # （"权益已落盘、扣分回滚" = 白送）。ON CONFLICT DO NOTHING 不抛异常、
+        # 不改变事务边界，幂等由唯一索引 (group_id, user_id, kind) 保证。
+        inserted = await session.execute(
+            sqlite_insert(MemberEntitlement)
+            .values(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                kind=str(kind),
+                payload=str(payload)[:255],
+                ref=str(ref)[:64],
+                created_at=now,
+                expires_at=expires_at,
             )
+            .on_conflict_do_nothing(index_elements=["group_id", "user_id", "kind"])
+        )
+        if int(getattr(inserted, "rowcount", 0) or 0) == 1:
+            return
+        # 并发插入（同一个人的两次购买本该被 _purchase_lock 串行化，这里兜底）
+        row = await active_entitlement(
+            session, group_id=group_id, user_id=user_id, kind=kind
+        )
     if row is None:
         return
     row.payload = str(payload)[:255]
