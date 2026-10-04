@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1521,6 +1521,96 @@ async def _revoke(bot: object, row: MemberEntitlement) -> tuple[bool, str]:
     return True, f"未知权益类型 {row.kind}，已跳过"
 
 
+async def _drop_if_unchanged(
+    session: AsyncSession, row: MemberEntitlement, snapshot_expires_at: datetime
+) -> bool:
+    """D2-01：只有当这一行的 ``expires_at`` **仍然等于**扫描读到它时的那个值才删。
+
+    带 ``id`` + ``expires_at`` 谓词，作用域和 :func:`_defer_if_unchanged` 一样，
+    返回 ``False`` 表示"这一行已经不是扫描看到的那一版了"（窗口内被续期或删掉）。
+    """
+
+    result = await session.execute(
+        delete(MemberEntitlement).where(
+            MemberEntitlement.id == int(row.id),
+            MemberEntitlement.expires_at == snapshot_expires_at,
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def _defer_if_unchanged(
+    session: AsyncSession,
+    row: MemberEntitlement,
+    snapshot_expires_at: datetime,
+    retry_at: datetime,
+) -> bool:
+    """D2-01：撤销失败后的"推后重试"同样必须带 ``expires_at`` 谓词。
+
+    原来的 ``row.expires_at = moment + 900s`` 是一次无条件 UPDATE，会把窗口内
+    刚续上的 7 天直接覆写成 15 分钟——用户已经付过钱了。
+    """
+
+    result = await session.execute(
+        update(MemberEntitlement)
+        .where(
+            MemberEntitlement.id == int(row.id),
+            MemberEntitlement.expires_at == snapshot_expires_at,
+        )
+        .values(expires_at=retry_at)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def _reassert_entitlement(
+    bot: object, session: AsyncSession, row: MemberEntitlement
+) -> None:
+    """扫描按陈旧快照把头衔/置顶撤掉了，但这一行其实已经被续期。
+
+    不补这一次写回的话：库里写着"有效期到 7 天后"，Telegram 侧却空着，而扫描
+    下次不会再看到它（``expires_at`` 已经不在到期集合里），用户刚付的钱就凭空
+    消失。按库里**当前**的 payload 重放同一个动作（幂等），失败只记日志。
+    """
+
+    fresh = await active_entitlement(
+        session, group_id=row.group_id, user_id=row.user_id, kind=row.kind
+    )
+    if fresh is None:
+        # 行已经被并发地删掉了（例如另一个扫描实例）：没有可恢复的目标。
+        return
+    try:
+        if str(fresh.kind) == KIND_TAG:
+            await _set_member_tag(
+                bot, int(fresh.group_id), int(fresh.user_id), str(fresh.payload or "")
+            )
+        elif str(fresh.kind) == KIND_PIN:
+            await _pin_message(
+                bot, int(fresh.group_id), int(fresh.payload or 0)
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning(
+            "shop expiry re-assert failed after concurrent renewal | kind=%s "
+            "group=%s user=%s payload=%s",
+            fresh.kind,
+            fresh.group_id,
+            fresh.user_id,
+            fresh.payload,
+            exc_info=True,
+        )
+        return
+    log.warning(
+        "shop expiry skipped a concurrently renewed entitlement | kind=%s group=%s "
+        "user=%s payload=%s expires_at=%s",
+        fresh.kind,
+        fresh.group_id,
+        fresh.user_id,
+        fresh.payload,
+        fresh.expires_at,
+    )
+
+
 async def _notify_expiry(bot: object, item: ExpiredItem) -> bool:
     """先私聊提醒，私聊失败就发到群里；都失败只记日志。"""
 
@@ -1567,6 +1657,16 @@ async def expire_due_entitlements(
     推后一个重试间隔，下次扫描接着撤（F-052）——否则付费头衔会永远留在群里，
     既没有记录也没有重试。进程重启、重复执行、一次处理多条都安全。
     ``dry_run=True`` 时只返回"打算做什么"，不碰 Telegram 也不改数据库。
+
+    **D2-01：删/推后都带 ``expires_at`` 谓词**。一轮扫描的事务边界是"读完到期行
+    → 逐条 Telegram 往返（每条最多 10s 超时，一轮最多 200 条）→ 循环后统一
+    commit"，而 :func:`buy_member_tag` 的续期不在任何锁的保护范围内，窗口内
+    完全可能先写完并 commit。按 ORM 快照做 ``session.delete(row)`` 生成的是
+    ``DELETE ... WHERE id = ?``（没有 ``expires_at``），会把刚付过钱的续期整行
+    删掉；撤销失败分支的 ``row.expires_at = now + 900s`` 更是无条件 UPDATE，
+    把已付的 7 天压成 15 分钟。所以每条都把"读这一行时的到期时间"当 CAS 谓词
+    带下来，只在行确实还是当初读到的那一版时才动它；每条处理完立刻 commit，
+    把陈旧快照的窗口从"整轮"压到"一条"。
     """
 
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
@@ -1584,27 +1684,43 @@ async def expire_due_entitlements(
                 )
             )
             continue
+        # CAS 快照：这一行必须在"到期时间还是刚读到的那个值"时才允许被删/被推后。
+        snapshot_expires_at = row.expires_at
         ok, detail = await _revoke(bot, row)
         if ok:
-            await session.delete(row)
+            removed = await _drop_if_unchanged(session, row, snapshot_expires_at)
+            if not removed:
+                # 窗口内被人续期/改过了：我们刚才那次撤销是基于陈旧快照做的，
+                # 这一行已经不属于我们。不删、不推后、不提醒，并把 Telegram 侧
+                # 按库里**当前**的值补回去（否则用户刚付的钱换来的头衔凭空消失，
+                # 而库里还写着有效期到 7 天后，没有任何东西会再把它设回来）。
+                ok = False
+                detail = "权益在扫描期间被续期或改动，本次未撤销"
+                await _reassert_entitlement(bot, session, row)
         else:
             # 撤不下来就不能删行（F-052）：头衔/置顶还在 Telegram 侧生效，删掉记录
             # 等于既没清干净、也没有任何东西再重试——付费头衔会永远留在群里。
             # 把到期时间往后推一个重试间隔：下次扫描接着撤，同时避免这条记录
             # 每一轮都占住批量的最前面（due_entitlements 按 expires_at 排序）。
-            row.expires_at = moment + timedelta(
-                seconds=_SHOP_EXPIRY_RETRY_SECONDS
+            retry_at = moment + timedelta(seconds=_SHOP_EXPIRY_RETRY_SECONDS)
+            deferred = await _defer_if_unchanged(
+                session, row, snapshot_expires_at, retry_at
             )
-            log.warning(
-                "shop expiry revoke deferred | kind=%s group=%s user=%s payload=%s "
-                "retry_at=%s detail=%s",
-                row.kind,
-                row.group_id,
-                row.user_id,
-                row.payload,
-                row.expires_at,
-                detail,
-            )
+            if not deferred:
+                # 同上：这一行已经被续期，不能拿 900 秒的重试间隔去覆盖已付的时长。
+                ok = False
+                detail = "权益在扫描期间被续期或改动，重试推后未生效"
+            else:
+                log.warning(
+                    "shop expiry revoke deferred | kind=%s group=%s user=%s payload=%s "
+                    "retry_at=%s detail=%s",
+                    row.kind,
+                    row.group_id,
+                    row.user_id,
+                    row.payload,
+                    retry_at,
+                    detail,
+                )
         # 只有真的撤下来了才提醒"已清除"，否则等于骗用户
         notified = await _notify_expiry(bot, item) if (notify and ok) else False
         outcomes.append(
@@ -1616,7 +1732,8 @@ async def expire_due_entitlements(
                 notified=notified,
             )
         )
-    if outcomes and not dry_run:
+        # 每条一次 commit：陈旧快照的窗口压到"一条"，而且后面某条抛异常时，
+        # 前面已经撤干净的结果不会被整批回滚掉。
         await session.commit()
     return outcomes
 

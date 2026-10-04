@@ -1560,6 +1560,176 @@ class ExpirySweepTests(_DbTestCase):
         self.assertEqual(bot.unpin_calls, [(GROUP_ID, 555)])
 
 
+# ---------------------------------------------------------------------------
+# D2-01：到期清理与续期竞争——已付费的续期不能被扫描吃掉
+# ---------------------------------------------------------------------------
+
+
+class _GatedBot(FakeBot):
+    """把扫描的那次"清头衔" Telegram 往返卡住，给测试留出续期的窗口。
+
+    只卡 ``tag=""``（扫描清头衔），续期用的 ``tag="文字"`` 直接放行，所以
+    下面两个用例里的竞态时序是确定的，不靠 sleep 撞运气。
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def set_chat_member_tag(self, *, chat_id: int, user_id: int, tag: str) -> bool:
+        if not tag:
+            self.entered.set()
+            await self.release.wait()
+        return await super().set_chat_member_tag(
+            chat_id=chat_id, user_id=user_id, tag=tag
+        )
+
+
+class ExpiryRenewRaceTests(_DbTestCase):
+    """扫描的事务边界是「读完到期行 → 逐条 Telegram 往返 → 循环后统一 commit」。
+
+    窗口内用户 ``/tag`` 续期成功并 commit，扫描随后对**陈旧的 ORM 快照**执行
+    ``session.delete(row)``——SQLAlchemy 生成的是 ``DELETE ... WHERE id = ?``，
+    没有 ``expires_at`` 谓词，于是把刚付过钱的续期整行删掉；撤销失败的分支更隐蔽：
+    无条件 ``row.expires_at = now + 900s`` 把已付的 7 天压成 15 分钟。
+    """
+
+    async def _expired_tag_for_renewal(self, bot: FakeBot) -> None:
+        """发 200 分 → 买一次头衔并让它刚好过期（余额 170，expires_at = _day(-1)）。"""
+
+        await self._grant_points(7, 200)
+        first = await self._buy_tag(bot, raw="Tester", now=_day(-8))
+        self.assertEqual(first.status, "ok")
+        self.assertEqual(await self._balance(7), 170)
+        self.assertEqual((await self._entitlements())[0].expires_at, _day(-1))
+
+    async def _renew_while_sweep_is_blocked(self, bot: FakeBot, gated: _GatedBot):
+        """在扫描卡住的那次 Telegram 往返里完成一次续期，返回续期结果。"""
+
+        async with AsyncExitStack() as stack:
+            sweep_session = await stack.enter_async_context(self.session_factory())
+            await available_points(
+                sweep_session, group_id=GROUP_ID, user_id=7
+            )  # 预热连接，避免建连耗时把两个请求错开
+            sweep = asyncio.create_task(
+                expire_due_entitlements(
+                    sweep_session, bot=gated, now=_day(), notify=False
+                )
+            )
+            await asyncio.wait_for(gated.entered.wait(), timeout=5.0)
+
+            buy_session = await stack.enter_async_context(self.session_factory())
+            reply = await buy_member_tag(
+                buy_session,
+                bot=bot,
+                group_id=GROUP_ID,
+                user_id=7,
+                raw_text="续费头衔",
+                now=_day(),
+            )
+            gated.release.set()
+            outcomes = await asyncio.wait_for(sweep, timeout=10.0)
+        return reply, outcomes
+
+    async def test_a_renewal_during_a_sweep_is_not_deleted(self) -> None:
+        await self._expired_tag_for_renewal(FakeBot())
+        bot = FakeBot()
+        gated = _GatedBot()
+
+        reply, outcomes = await self._renew_while_sweep_is_blocked(bot, gated)
+
+        self.assertEqual(reply.status, "ok", "续期本身必须成功")
+        self.assertEqual(await self._balance(7), 140, "续期扣了 30 分")
+        rows = await self._entitlements()
+        self.assertEqual(len(rows), 1, "续期刚写进去的权益行被扫描删掉了")
+        self.assertEqual(rows[0].expires_at, _day(7), "续费的 7 天必须保住")
+        self.assertEqual(rows[0].payload, "续费头衔")
+        self.assertFalse(
+            outcomes[0].ok, "行还在就说明删除没生效，扫描必须如实记账而不是报成功"
+        )
+        # 扫描按陈旧快照清掉的那次必须补回去：否则库里写着有效期到 7 天后、
+        # 群里却空着，而且没有任何东西会再把它设回来。
+        self.assertEqual(
+            gated.tag_calls,
+            [(GROUP_ID, 7, ""), (GROUP_ID, 7, "续费头衔")],
+            "被并发续期抢先的这次撤销，必须按库里当前的值重放一次",
+        )
+
+    async def test_a_renewal_during_a_failed_revoke_keeps_the_paid_days(self) -> None:
+        """撤销失败分支：``expires_at = now + 900s`` 不许把已付的 7 天压成 15 分钟。"""
+
+        await self._expired_tag_for_renewal(FakeBot())
+        bot = FakeBot()
+        gated = _GatedBot(tag_error=RuntimeError("telegram down"))
+
+        reply, outcomes = await self._renew_while_sweep_is_blocked(bot, gated)
+
+        self.assertEqual(reply.status, "ok")
+        self.assertEqual(await self._balance(7), 140)
+        rows = await self._entitlements()
+        self.assertEqual(len(rows), 1, "撤销失败本来就不该删行")
+        self.assertEqual(
+            rows[0].expires_at,
+            _day(7),
+            "已付的 7 天被扫描覆写成了 15 分钟重试间隔",
+        )
+        self.assertFalse(outcomes[0].ok)
+
+    async def test_a_renewal_during_a_sweep_is_never_lost_across_many_rows(self) -> None:
+        """批量扫描里别的行不能把这一条也带下水（陈旧快照不是批次的锅）。"""
+
+        await self._expired_tag_for_renewal(FakeBot())
+        for index, user_id in enumerate((8, 9), start=1):
+            await self._grant_points(user_id, 100)
+            await self._seed_entitlement(
+                kind=KIND_TAG,
+                payload=f"路人{index}",
+                expires_at=_day(-1),
+                user_id=user_id,
+            )
+        bot = FakeBot()
+        gated = _GatedBot()
+
+        reply, outcomes = await self._renew_while_sweep_is_blocked(bot, gated)
+
+        self.assertEqual(reply.status, "ok")
+        self.assertEqual(len(outcomes), 3, "三条到期行都处理过了")
+        rows = {row.user_id: row for row in await self._entitlements()}
+        self.assertEqual(sorted(rows), [7], "续期行被删，其余两条到期行照常清掉")
+        self.assertEqual(rows[7].expires_at, _day(7))
+        self.assertEqual(await self._balance(7), 140)
+
+    async def _seed_entitlement(self, **kwargs) -> None:
+        kwargs.setdefault("group_id", GROUP_ID)
+        kwargs.setdefault("ref", "shop-test")
+        async with self.session_factory() as session:
+            session.add(MemberEntitlement(**kwargs))
+            await session.commit()
+
+    async def test_the_sweep_still_deletes_a_row_nobody_touched(self) -> None:
+        """对照：CAS 谓词不能把"正常到期清理"这条老路也堵死。"""
+
+        await self._seed_entitlement(
+            group_id=GROUP_ID,
+            user_id=7,
+            kind=KIND_TAG,
+            payload="摸鱼冠军",
+            ref="shop-test",
+            expires_at=_day(-1),
+        )
+        bot = FakeBot()
+
+        async with self.session_factory() as session:
+            outcomes = await expire_due_entitlements(
+                session, bot=bot, now=_day(), notify=False
+            )
+
+        self.assertTrue(outcomes[0].ok)
+        self.assertEqual(await self._entitlements(), [])
+        self.assertEqual(bot.tag_calls, [(GROUP_ID, 7, "")])
+
+
 class ExpirySchemaTests(unittest.TestCase):
     def test_schema_guards_one_slot_per_member_and_indexes_expiry(self) -> None:
         engine = create_engine("sqlite:///:memory:")
