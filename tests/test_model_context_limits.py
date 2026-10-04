@@ -328,10 +328,125 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         report = await registry.refresh([cfg])
 
         key = "home_work2api|http://gw.internal:8080|home_work2api/not-announced"
-        self.assertEqual(report[key], ml.LIMIT_SOURCE_UNKNOWN)
+        self.assertEqual(report[key], "model_id_missing")
         limits = registry.resolve(cfg, legacy_total_window=278_528)
         self.assertEqual(limits.source, ml.LIMIT_SOURCE_UNKNOWN)
         self.assertEqual(limits.total_window, 278_528)
+
+    async def test_refresh_failure_never_clobbers_a_cached_window(self) -> None:
+        """网关抖动 / /models 只回了部分条目时，**已实测的 1M 绝不能被退回 272K**。"""
+
+        calls = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _catalog_response(
+                    [{"id": "cn:deepseek-v4.1-flash", "context_length": 1_000_000}]
+                )
+            if calls["n"] == 2:
+                return httpx.Response(503)
+            # 第三次：网关回来了，但只列了别的模型（部分列表）。
+            return _catalog_response([{"id": "unrelated", "context_length": 32_000}])
+
+        registry = self._registry(handler)
+        cfg = _endpoint()
+
+        await registry.refresh([cfg])
+        self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
+
+        degraded = await registry.refresh([cfg], force=True)
+        key = "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"
+        self.assertEqual(degraded[key], "gateway_unavailable_keeping_cached")
+        kept = registry.resolve(cfg, legacy_total_window=278_528)
+        self.assertEqual(kept.total_window, 1_000_000)
+        self.assertEqual(kept.source, ml.LIMIT_SOURCE_GATEWAY)
+        self.assertEqual(kept.detail, "expired_cache")
+
+        missing = await registry.refresh([cfg], force=True)
+        self.assertEqual(missing[key], "model_id_missing_keeping_cached")
+        still = registry.resolve(cfg, legacy_total_window=278_528)
+        self.assertEqual(still.total_window, 1_000_000)
+
+    async def test_expired_success_is_refetched(self) -> None:
+        """成功 TTL 到期后必须真的重取（周期刷新才有意义）。"""
+
+        hits = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal hits
+            hits += 1
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 1_000_000 * hits}]
+            )
+
+        registry = ml.ModelLimitRegistry(success_ttl_seconds=0.05, timeout_seconds=1.0)
+        registry._transport = httpx.MockTransport(handler)
+        cfg = _endpoint()
+
+        await registry.refresh([cfg])
+        self.assertEqual(hits, 1)
+        self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
+
+        await asyncio.sleep(0.06)
+        await registry.refresh([cfg])
+
+        self.assertEqual(hits, 2)
+        self.assertEqual(registry.resolve(cfg).total_window, 2_000_000)
+        self.assertNotEqual(registry.resolve(cfg).detail, "expired_cache")
+
+    async def test_expired_negative_cache_is_retried_and_recovers(self) -> None:
+        """负缓存过期后必须再试；网关恢复就立刻拿到真实窗口。"""
+
+        healthy = False
+        hits = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal hits
+            hits += 1
+            if not healthy:
+                return httpx.Response(503)
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 1_000_000}]
+            )
+
+        registry = ml.ModelLimitRegistry(failure_ttl_seconds=0.05, timeout_seconds=1.0)
+        registry._transport = httpx.MockTransport(handler)
+        cfg = _endpoint()
+
+        await registry.refresh([cfg])
+        self.assertEqual(hits, 1)
+        self.assertEqual(registry.resolve(cfg, legacy_total_window=278_528).source, ml.LIMIT_SOURCE_UNKNOWN)
+        # 负缓存 fresh：不重试（这就是"失败短 TTL"而不是"每次消息都查网"）。
+        await registry.refresh([cfg])
+        self.assertEqual(hits, 1)
+
+        await asyncio.sleep(0.06)
+        healthy = True
+        await registry.refresh([cfg])
+
+        self.assertEqual(hits, 2)
+        self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
+
+    async def test_three_million_window_is_not_clamped(self) -> None:
+        """用户口径：按模型自报的上限自动匹配，没有 2M 人为上限。"""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 3_000_000}]
+            )
+
+        registry = self._registry(handler)
+        cfg = _endpoint()
+
+        await registry.refresh([cfg])
+        limits = registry.resolve(cfg)
+
+        self.assertEqual(limits.total_window, 3_000_000)
+        self.assertEqual(limits.context_total_tokens, 3_000_000)
+        self.assertEqual(
+            limits.input_budget_tokens(output_reserve=2_048), 2_997_952
+        )
 
     async def test_unconfigured_endpoints_are_never_probed(self) -> None:
         probed: list[str] = []
@@ -405,6 +520,164 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sk-super-secret", joined)
         self.assertNotIn("sk-super-secret", json.dumps(snapshot))
         self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
+
+
+class PeriodicRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """周期刷新：缓存 fresh 零网络、失败不退出循环、回调拿到新窗口。"""
+
+    def _registry(self, handler) -> ml.ModelLimitRegistry:
+        registry = ml.ModelLimitRegistry(timeout_seconds=1.0)
+        registry._transport = httpx.MockTransport(handler)
+        return registry
+
+    async def test_fresh_cache_means_zero_network_across_ticks(self) -> None:
+        hits = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal hits
+            hits += 1
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 1_000_000}]
+            )
+
+        registry = self._registry(handler)
+        cfg = _endpoint()
+        refresher = ml.PeriodicModelMetadataRefresh(
+            lambda: registry.refresh([cfg]),
+            interval_seconds=0.01,
+        )
+
+        await refresher.refresh_once()
+        self.assertEqual(hits, 1)
+        for _ in range(3):
+            await refresher.refresh_once()
+
+        # 成功 TTL 6h 内：周期轮询一次网络都不发。
+        self.assertEqual(hits, 1)
+        self.assertEqual(refresher.ticks, 4)
+        self.assertEqual(
+            refresher.last_report[
+                "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"
+            ],
+            ml.LIMIT_SOURCE_GATEWAY,
+        )
+
+    async def test_expired_entries_are_refreshed_by_the_periodic_loop(self) -> None:
+        hits = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal hits
+            hits += 1
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 500_000 * hits}]
+            )
+
+        registry = ml.ModelLimitRegistry(success_ttl_seconds=0.01, timeout_seconds=1.0)
+        registry._transport = httpx.MockTransport(handler)
+        cfg = _endpoint()
+        seen: list[int | None] = []
+        refresher = ml.PeriodicModelMetadataRefresh(
+            lambda: registry.refresh([cfg]),
+            interval_seconds=0.02,
+            on_refreshed=lambda _report: seen.append(
+                registry.resolve(cfg).total_window
+            ),
+        )
+
+        task = refresher.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while len(seen) < 2 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertGreaterEqual(hits, 2)
+        self.assertEqual(seen[0], 500_000)
+        self.assertEqual(seen[1], 1_000_000)
+
+    async def test_a_failing_tick_never_kills_the_loop(self) -> None:
+        calls = {"n": 0}
+
+        async def flaky() -> dict:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("gateway down")
+            return {"ok": "source"}
+
+        seen: list[dict] = []
+        refresher = ml.PeriodicModelMetadataRefresh(
+            flaky,
+            interval_seconds=0.01,
+            on_refreshed=seen.append,
+        )
+
+        task = refresher.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while not seen and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertFalse(task.done())
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(seen, [{"ok": "source"}])
+
+    async def test_callback_failure_also_keeps_the_loop_alive(self) -> None:
+        async def refresh() -> dict:
+            return {"ok": "source"}
+
+        def boom(_report: dict) -> None:
+            raise RuntimeError("memory reconfigure blew up")
+
+        refresher = ml.PeriodicModelMetadataRefresh(
+            refresh,
+            interval_seconds=0.01,
+            on_refreshed=boom,
+        )
+
+        task = refresher.start()
+        try:
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+            self.assertGreaterEqual(refresher.ticks, 2)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_async_callback_is_awaited(self) -> None:
+        awaited: list[int] = []
+
+        async def refresh() -> dict:
+            return {"ok": "source"}
+
+        async def on_refreshed(_report: dict) -> None:
+            awaited.append(1)
+
+        refresher = ml.PeriodicModelMetadataRefresh(
+            refresh,
+            interval_seconds=0.01,
+            on_refreshed=on_refreshed,
+        )
+
+        await refresher.refresh_once()
+        # refresh_once 不跑回调（回调在 run 的循环里）；这里直接验证 run 的第一次迭代。
+        task = refresher.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while not awaited and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(awaited, [1])
 
 
 class ConfigReaderTests(unittest.TestCase):

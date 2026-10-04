@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot.services.model_limits import auto_window_for
+from bot.services.model_limits import auto_window_for, loose_budget_tokens
 from bot.utils.tokens import estimate_text_tokens
 
 #: 群聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
@@ -114,8 +114,9 @@ def group_history_token_budget(settings: Any) -> int:
     """当前生效的群聊历史 token 预算。
 
     ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 固定余量`` 装配，
-    **不再**被兼容字段 ``group_history_token_budget``（默认 272K）压住；只有拿不到
-    任何可信窗口时才退回那个保守值（保持迁移前的深度口径）。``fixed`` 仍读配置值。
+    **不再**被兼容字段 ``group_history_token_budget``（默认 272K）或 2M 的兼容上限压住
+    （真实宣告 3M/4M 就装配到 3M/4M）；只有拿不到任何可信窗口时才退回那个保守值
+    （保持迁移前的深度口径）。``fixed`` 仍读配置值。
     """
 
     reserve = group_history_reserve_tokens(settings)
@@ -125,6 +126,7 @@ def group_history_token_budget(settings: Any) -> int:
             configured_budget=window,
             reserve_tokens=reserve,
             model_window_tokens=window,
+            clamp_budget=False,
         )
     return bounded_group_history_token_budget(
         _bot_setting(
@@ -147,11 +149,21 @@ def group_history_reserve_tokens(settings: Any) -> int:
     )
 
 
+def _loose_int(value: Any, *, default: int = GROUP_HISTORY_TOKEN_BUDGET) -> int:
+    """宽容取整：拿不到数字就用默认值（不夹上限，只有调用方决定区间）。"""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def effective_group_history_budget(
     *,
     configured_budget: Any = GROUP_HISTORY_TOKEN_BUDGET,
     reserve_tokens: Any = GROUP_HISTORY_RESERVE_TOKENS,
     model_window_tokens: Any,
+    clamp_budget: bool = True,
 ) -> int:
     """这道硬闸门：**装配出来的历史 + 余量 ≤ 模型窗口**。
 
@@ -162,9 +174,16 @@ def effective_group_history_budget(
 
     传入 ``model_window_tokens`` 的是**模型输入窗口**（``MemoryService.max_context``：
     配置的 ``max_context_tokens`` 与网关自报窗口的较小值）。
+
+    ``clamp_budget=False``（``auto`` + 真实元数据时）：``configured_budget`` 就是
+    **实测窗口**，不再套 2M 的兼容上限——用户口径是"按模型的上限自动匹配"，真实宣告
+    3M/4M 就该装配到 3M/4M。硬闸门本身（历史 + 余量 ≤ 窗口）一点不放松。
     """
 
-    budget = bounded_group_history_token_budget(configured_budget)
+    if clamp_budget:
+        budget = bounded_group_history_token_budget(configured_budget)
+    else:
+        budget = max(GROUP_HISTORY_TOKEN_BUDGET_MIN, _loose_int(configured_budget))
     try:
         window = int(model_window_tokens or 0)
     except (TypeError, ValueError):
@@ -256,7 +275,12 @@ def assemble_group_history(
     items = [item for item in (rows or []) if isinstance(item, dict)]
     if not items:
         return []
-    budget = bounded_group_history_token_budget(budget_tokens)
+    # 调用方算好的预算直接采信（真实窗口可能是 3M/4M）：只保下限，不套 2M。
+    budget = loose_budget_tokens(
+        budget_tokens,
+        default=GROUP_HISTORY_TOKEN_BUDGET,
+        low=GROUP_HISTORY_TOKEN_BUDGET_MIN,
+    )
     keep = max(1, int(max_messages))
     items = items[-keep:]
 

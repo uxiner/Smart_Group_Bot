@@ -206,6 +206,102 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual(_contents(fitted.messages), _contents(messages))
 
 
+class ToolProtocolNeverDroppedTests(unittest.TestCase):
+    """工具协议消息**不依赖调用方标记**：即使被误标成 history 也不整条丢。"""
+
+    def _pair(self, *, layer: str | None) -> list[dict]:
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "websearch", "arguments": '{"query":"x"}'},
+                }
+            ],
+        }
+        tool = {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "websearch",
+            "content": "结果正文" * 10,
+        }
+        if layer is not None:
+            assistant[CTX_LAYER_KEY] = layer
+            tool[CTX_LAYER_KEY] = layer
+        return [assistant, tool]
+
+    def test_history_labelled_pair_survives_a_tight_budget(self) -> None:
+        messages = [
+            _msg("system", "人设"),
+            *self._pair(layer=LAYER_HISTORY),
+            _msg("user", "历史" * 900, LAYER_HISTORY),
+            _msg("user", "现在这条"),
+        ]
+
+        fitted = _fit(messages, budget=200)
+
+        roles = [item["role"] for item in fitted.messages]
+        self.assertIn("assistant", roles)
+        self.assertIn("tool", roles)
+        # 配对仍在、id 仍对应：绝不能出现"有 tool 结果没 assistant 声明"的孤儿。
+        assistant = next(item for item in fitted.messages if item.get("role") == "assistant")
+        tool = next(item for item in fitted.messages if item.get("role") == "tool")
+        self.assertEqual(tool["tool_call_id"], assistant["tool_calls"][0]["id"])
+        # 被裁掉的是那段普通历史。
+        self.assertNotIn("历史" * 900, _contents(fitted.messages))
+
+    def test_any_layer_label_cannot_mark_the_pair_droppable(self) -> None:
+        for layer in (LAYER_HISTORY, LAYER_SEARCH_RECORDS, LAYER_MEMORY_RECALL):
+            with self.subTest(layer=layer):
+                messages = [_msg("system", "人设"), *self._pair(layer=layer), _msg("user", "现在这条")]
+
+                fitted = _fit(messages, budget=1)
+
+                roles = [item["role"] for item in fitted.messages]
+                self.assertIn("assistant", roles)
+                self.assertIn("tool", roles)
+                self.assertTrue(fitted.over_budget)
+
+    def test_labelled_long_tool_result_is_truncated_not_dropped(self) -> None:
+        messages = [
+            _msg("system", "人设"),
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "t", "arguments": "{}"}}],
+                CTX_LAYER_KEY: LAYER_HISTORY,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "很长的工具结果" * 3_000,
+                CTX_LAYER_KEY: LAYER_HISTORY,
+            },
+            _msg("user", "现在这条"),
+        ]
+
+        fitted = _fit(messages, budget=2_000)
+
+        tool = next(item for item in fitted.messages if item["role"] == "tool")
+        self.assertEqual(tool["tool_call_id"], "call-1")
+        self.assertEqual(fitted.truncated_messages, 1)
+        self.assertLess(len(tool["content"]), len("很长的工具结果" * 3_000))
+
+    def test_is_tool_protocol_message_recognises_the_shapes(self) -> None:
+        from bot.services.payload_fit import is_tool_protocol_message
+
+        self.assertTrue(is_tool_protocol_message({"role": "tool", "content": "x"}))
+        self.assertTrue(
+            is_tool_protocol_message({"role": "assistant", "tool_calls": [{"id": "1"}]})
+        )
+        self.assertTrue(is_tool_protocol_message({"role": "user", "tool_call_id": "1"}))
+        self.assertFalse(is_tool_protocol_message({"role": "assistant", "content": "hi"}))
+        self.assertFalse(is_tool_protocol_message({"role": "assistant", "tool_calls": []}))
+        self.assertFalse(is_tool_protocol_message(None))
+
+
 class LayerTaggingTests(unittest.TestCase):
     def test_history_rows_map_to_the_same_layers_as_the_gate(self) -> None:
         self.assertEqual(
@@ -245,6 +341,67 @@ class LayerTaggingTests(unittest.TestCase):
         self.assertEqual(message_context_layer(rendered[0]), LAYER_HISTORY)
         self.assertEqual(message_context_layer(rendered[1]), LAYER_SEARCH_RECORDS)
         self.assertEqual(message_context_layer(rendered[2]), LAYER_MEMORY_RECALL)
+
+    def test_rendering_count_mismatch_falls_back_to_core(self) -> None:
+        """一旦渲染层不再一对一，位置映射就不成立：宁可全标 core（不裁）也不猜。"""
+
+        rows = [
+            {"role": "user", "content": "a", "memory_source": "search_record"},
+            {"role": "user", "content": "b"},
+        ]
+        rendered = [{"role": "user", "content": "only-one"}]
+
+        with self.assertLogs("bot.services.payload_fit", level="WARNING") as captured:
+            tag_rendered_history(rows, rendered)
+
+        self.assertEqual(message_context_layer(rendered[0]), "core")
+        self.assertTrue(any("no longer 1:1" in line for line in captured.output))
+
+    def test_real_sanitizer_is_one_to_one_with_its_input_rows(self) -> None:
+        """核实假设：``sanitize_history_for_llm`` 目前每个输入行恰好产出一条消息。
+
+        它一旦加了过滤/跳过，位置映射就不再等于"原始行来源"，本用例会先炸——
+        提醒实现去走"全标 core"的保守分支，而不是错裁资料层。
+        """
+
+        from bot.utils.security import sanitize_history_for_llm
+
+        rows = [
+            {"role": "system", "content": "头部说明"},
+            {"role": "user", "content": "普通历史", "sender_id": 7, "sender_name": "A"},
+            {
+                "role": "user",
+                "content": "召回索引",
+                "memory_source": "recalled_archive_index",
+                "sender_id": 7,
+                "sender_name": "A",
+            },
+            {
+                "role": "user",
+                "content": "管理员历史",
+                "sender_id": 7,
+                "sender_name": "A",
+                "sender_is_owner": True,
+            },
+            {"role": "user", "content": "", "sender_id": 7, "sender_name": "A"},
+            # system 角色 + 数据来源标记：来源优先（它确实是可裁的检索留档）。
+            {
+                "role": "system",
+                "content": "检索留档",
+                "memory_source": "search_record",
+            },
+        ]
+
+        rendered = sanitize_history_for_llm(rows, max_items=len(rows))
+
+        self.assertEqual(len(rendered), len(rows))
+        tag_rendered_history(rows, rendered)
+        self.assertEqual(message_context_layer(rendered[0]), "core")
+        self.assertEqual(message_context_layer(rendered[1]), LAYER_HISTORY)
+        self.assertEqual(message_context_layer(rendered[2]), LAYER_MEMORY_RECALL)
+        self.assertEqual(message_context_layer(rendered[3]), LAYER_HISTORY)
+        self.assertEqual(message_context_layer(rendered[4]), LAYER_HISTORY)
+        self.assertEqual(message_context_layer(rendered[5]), LAYER_SEARCH_RECORDS)
 
     def test_untagged_messages_are_core(self) -> None:
         self.assertEqual(message_context_layer({"role": "user"}), "core")

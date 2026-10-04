@@ -34,16 +34,16 @@ from bot.services.ban_audit import build_ban_knowledge_blocks
 from bot.services.group_context import (
     GROUP_HISTORY_MAX_MESSAGES,
     GROUP_HISTORY_MESSAGE_TOKEN_OVERHEAD,
+    GROUP_HISTORY_TOKEN_BUDGET,
     assemble_group_history,
     bounded_group_history_reserve_tokens,
-    bounded_group_history_token_budget,
     effective_group_history_budget,
 )
 from bot.services.llm import LLMService
 from bot.services.model_limits import (
-    CONTEXT_WINDOW_MAX as _CONTEXT_WINDOW_MAX,
     CONTEXT_WINDOW_MIN as _CONTEXT_WINDOW_MIN,
     auto_window_for,
+    loose_budget_tokens,
 )
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.update_completion import (
@@ -1059,14 +1059,13 @@ class MemoryService:
         if callable(model_limit_fn):
             model_input_limit = max(0, int(model_limit_fn(self.llm.main) or 0))
         # 自动匹配模型上限（2026-10-04 事故修复）：拿到可信窗口（网关 /models 元数据
-        # 或直连厂商注册表）就用它，``max_context_tokens`` 只作为保守降级值。
+        # 或直连厂商注册表）就**原样**使用——用户口径是"上限不要设置了，根据模型的上限
+        # 自动匹配"，所以真实宣告 3M/4M 时这里不再夹 2M。``max_context_tokens`` 只作为
+        # 查不到任何元数据时的保守降级值。
         measured_window = auto_window_for(config, llm=self.llm)
         base_context = configured_context
         if measured_window is not None:
-            base_context = min(
-                _CONTEXT_WINDOW_MAX,
-                max(_CONTEXT_WINDOW_MIN, int(measured_window)),
-            )
+            base_context = max(_CONTEXT_WINDOW_MIN, int(measured_window))
         if model_input_limit > 0:
             self.max_context = min(
                 base_context,
@@ -1121,6 +1120,7 @@ class MemoryService:
             ),
             reserve_tokens=self.group_history_reserve_tokens,
             model_window_tokens=self.max_context,
+            clamp_budget=measured_window is None,
         )
 
     async def bootstrap(self) -> None:
@@ -1889,7 +1889,11 @@ class MemoryService:
         budget = (
             self.group_history_token_budget
             if budget_tokens is None
-            else bounded_group_history_token_budget(budget_tokens)
+            else loose_budget_tokens(
+                budget_tokens,
+                default=GROUP_HISTORY_TOKEN_BUDGET,
+                low=1,
+            )
         )
         count_cap = (
             GROUP_HISTORY_MAX_MESSAGES

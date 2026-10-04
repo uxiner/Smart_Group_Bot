@@ -51,7 +51,7 @@ from bot.services.long_term_memory import (
     LONG_TERM_MEMORY_HEADER_BLOCK,
     render_facts_block,
 )
-from bot.services.model_limits import auto_window_for
+from bot.services.model_limits import auto_window_for, loose_budget_tokens
 from bot.services.payload_fit import (
     LAYER_HISTORY,
     LAYER_MEMORY_RECALL,
@@ -745,16 +745,15 @@ def private_history_token_budget(settings: Any) -> int:
     """当前生效的私聊历史 token 预算。
 
     ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 本地余量`` 装配，已知主模型
-    不再被旧的 272K 固定值压住；只有拿不到可信窗口时才退回兼容字段（迁移前口径）。
+    不再被旧的 272K 固定值或 2M 兼容上限压住（真实宣告 3M/4M 就装配到 3M/4M）；
+    只有拿不到可信窗口时才退回兼容字段（迁移前口径）。
     """
 
     window = auto_window_for(settings)
     if window is not None:
-        return bounded_history_token_budget(
-            max(
-                PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
-                window - PRIVATE_HISTORY_RESERVE_TOKENS,
-            )
+        return max(
+            PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
+            int(window) - PRIVATE_HISTORY_RESERVE_TOKENS,
         )
     return bounded_history_token_budget(
         _bot_setting(
@@ -917,7 +916,12 @@ def assemble_private_history(
     items = [item for item in (rows or []) if isinstance(item, dict)]
     if not items:
         return []
-    budget = bounded_history_token_budget(budget_tokens)
+    # 调用方算好的预算直接采信（真实窗口可能是 3M/4M）：只保下限，不套 2M。
+    budget = loose_budget_tokens(
+        budget_tokens,
+        default=PRIVATE_HISTORY_TOKEN_BUDGET,
+        low=PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
+    )
     keep = max(1, int(max_turns)) * 2
     items = items[-keep:]
 
@@ -960,7 +964,11 @@ async def load_private_history(
     """
 
     uid = int(user_id)
-    budget = bounded_history_token_budget(budget_tokens)
+    budget = loose_budget_tokens(
+        budget_tokens,
+        default=PRIVATE_HISTORY_TOKEN_BUDGET,
+        low=PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
+    )
     turns = max(1, int(max_turns))
     rows: list[dict[str, str]] = []
     try:

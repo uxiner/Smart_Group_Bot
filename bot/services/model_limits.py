@@ -25,7 +25,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from inspect import isawaitable
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -43,6 +44,9 @@ MODEL_METADATA_FAILURE_TTL_SECONDS = 300.0
 MODEL_METADATA_TIMEOUT_SECONDS = 4.0
 #: 一次 refresh 最多同时打几个网关。
 MODEL_METADATA_MAX_CONCURRENCY = 3
+#: 周期刷新间隔（秒）。**缓存 fresh 时这一轮零网络**；失败的负缓存（短 TTL）到点即重试。
+#: 5 分钟只查"没有/过期"的 endpoint，绝不进回复/审核热路径，也不变成每条消息一次查询。
+MODEL_METADATA_REFRESH_INTERVAL_SECONDS = 300.0
 
 #: 窗口来源（日志/资源健康里会原样出现，便于事后核对）。
 LIMIT_SOURCE_GATEWAY = "gateway_metadata"
@@ -54,7 +58,10 @@ LIMIT_SOURCE_UNKNOWN = "conservative_default"
 #: 未知模型（网关没元数据、litellm 也不认识这个 id）时的保守降级：**不是无限**，
 #: 也不再是"已知模型也被它压住"的全局硬上限——每个 endpoint 各用各的 limit。
 DEFAULT_UNKNOWN_TOTAL_WINDOW = 278_528
-#: 夹取范围与 runtime_config 的 ``max_context_tokens`` 保持一致。
+#: **兼容字段/保守降级**的夹取范围（与 runtime_config 的字段约束一致）。
+#: 注意：``auto`` 模式从网关元数据/注册表拿到的真实窗口**不套这个上限**——用户口径是
+#: "上限不要设置了，根据模型的上限自动匹配"，真实宣告 3M/4M 就按 3M/4M 装配与放行。
+#: 位置：见 :func:`effective_context_window` / :func:`auto_window_for`。
 CONTEXT_WINDOW_MIN = 1024
 CONTEXT_WINDOW_MAX = 2_000_000
 #: 保守降级最少保留的输出余量（token）。
@@ -345,8 +352,11 @@ class ModelLimitRegistry:
         unknown_total_window: int = DEFAULT_UNKNOWN_TOTAL_WINDOW,
         transport: Any | None = None,
     ) -> None:
-        self.success_ttl_seconds = max(1.0, float(success_ttl_seconds))
-        self.failure_ttl_seconds = max(1.0, float(failure_ttl_seconds))
+        # TTL 允许 0（"每次都算过期"）：生产用的是模块常量（6h / 5min），单测要能压到
+        # 亚秒级验证"过期就重取"。refresh 的调用点只有启动/配置变更/周期循环，
+        # 不会因此变成"每条消息一次网络查询"。
+        self.success_ttl_seconds = max(0.0, float(success_ttl_seconds))
+        self.failure_ttl_seconds = max(0.0, float(failure_ttl_seconds))
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.unknown_total_window = _bounded_int(
             unknown_total_window,
@@ -575,6 +585,35 @@ class ModelLimitRegistry:
             return None
         return parsed
 
+    def _degrade_preserving_cache(self, cfg: Any, *, report: dict[str, Any], label: str, reason: str) -> None:
+        """刷新没拿到结论时的收尾：**已有成功记录绝不能被负缓存覆盖**。
+
+        否则一次网关抖动（或者 /models 暂时只返回了部分条目）就会把主模型从实测
+        1,000,000 无条件退化回保守的 272K——那正是要修的毛病。有成功记录 → 保留值
+        （``resolve`` 会照旧用，只标注 ``expired_cache``），同时把有效期提前，让下一轮
+        刷新继续重试；没有成功记录 → 短 TTL 负缓存。
+        """
+
+        key = _endpoint_key(cfg)
+        entry = self._entries.get(key)
+        if entry is not None and entry.limits is not None:
+            self._entries[key] = _CacheEntry(
+                limits=entry.limits,
+                expires_at=time.monotonic() - 1.0,
+            )
+            report[label] = f"{reason}_keeping_cached"
+            log.warning(
+                "model metadata: refresh inconclusive, keeping the cached window | "
+                "reason=%s | model=%s | cached_source=%s | cached_total_window=%s",
+                reason,
+                str(getattr(cfg, "model", "") or ""),
+                entry.limits.source,
+                entry.limits.total_window or "-",
+            )
+            return
+        self.record_negative(cfg)
+        report[label] = reason
+
     async def refresh(
         self,
         endpoints: Iterable[Any],
@@ -584,7 +623,7 @@ class ModelLimitRegistry:
         """为这批 endpoint 预热/刷新窗口元数据。任何失败都只记日志，不抛。
 
         返回一份报告（``{"<provider>|<host>|<model>": "<source>"}``），供启动日志与
-        ``/health`` 之类的诊断读取。
+        ``/health`` 之类的诊断读取。**缓存 fresh 的 endpoint 零网络**。
         """
 
         candidates = [cfg for cfg in (endpoints or []) if getattr(cfg, "model", None)]
@@ -627,11 +666,17 @@ class ModelLimitRegistry:
                     )
                 if catalog is None:
                     for cfg in cfgs:
-                        # 失败短 TTL 负缓存：网关刚挂时不要每次请求都去撞一遍。
-                        self.record_negative(cfg)
-                        report[
-                            f"{provider}|{redact_base(base)}|{str(getattr(cfg, 'model', '') or '')}"
-                        ] = "gateway_unavailable"
+                        label = (
+                            f"{provider}|{redact_base(base)}|"
+                            f"{str(getattr(cfg, 'model', '') or '')}"
+                        )
+                        # 已有成功记录 → 保留（只标注过期、下轮重试）；没有才负缓存。
+                        self._degrade_preserving_cache(
+                            cfg,
+                            report=report,
+                            label=label,
+                            reason="gateway_unavailable",
+                        )
                     return
                 self._catalog[group_key] = catalog
                 for cfg in cfgs:
@@ -639,16 +684,22 @@ class ModelLimitRegistry:
                     label = f"{provider}|{redact_base(base)}|{model}"
                     matched_id, info = self._match_model(catalog, model)
                     if info is None:
-                        self.record_negative(cfg)
-                        report[label] = LIMIT_SOURCE_UNKNOWN
+                        # 网关这次没列这个 id（可能只是返回了部分列表）：绝不拿它把
+                        # 已有的成功记录覆盖成"未知"。
+                        self._degrade_preserving_cache(
+                            cfg,
+                            report=report,
+                            label=label,
+                            reason="model_id_missing",
+                        )
                         log.info(
-                            "model metadata: 原样 id 不在网关 /models 里，保守降级 | "
-                            "provider=%s | host=%s | model=%s | fallback_window=%d | ids=%d",
+                            "model metadata: 原样 id 不在网关 /models 里 | "
+                            "provider=%s | host=%s | model=%s | ids=%d | result=%s",
                             provider,
                             redact_base(base),
                             model,
-                            self.unknown_total_window,
                             len(catalog),
+                            report.get(label, "-"),
                         )
                         continue
                     limits = self.record(
@@ -801,11 +852,27 @@ def resolved_main_window(settings: Any) -> int | None:
     return limits.context_total_tokens
 
 
+def loose_budget_tokens(value: Any, *, default: int, low: int) -> int:
+    """宽容预算：拿不到数字就用默认值、只做**下限**保护。
+
+    用于"调用方已经算好的装配预算"——``auto`` 模式下真实模型窗口可能是 3M/4M，
+    这些入口绝不能再套 :data:`CONTEXT_WINDOW_MAX`（2M）这个人为主导上限。
+    2M 只约束**兼容配置字段与保守降级值**本身（``bounded_*`` 系列 + ``fixed`` 模式）。
+    """
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = int(default)
+    return max(int(low), number)
+
+
 def effective_context_window(settings: Any) -> int:
     """装配链路统一使用的总窗口。
 
-    * ``fixed`` → 配置值（迁移前语义，逃生舱）；
-    * ``auto`` → 网关/注册表里的真实窗口；查不到就退回配置的保守值。
+    * ``fixed`` → 配置值（迁移前语义，逃生舱，按兼容区间夹取）；
+    * ``auto`` + 可信元数据 → **真实窗口原样返回，不套 2M 兼容上限**；
+    * ``auto`` + 查不到 → 配置的保守降级值（同样只作为未知时的兜底）。
     """
 
     legacy = legacy_context_tokens(settings)
@@ -814,12 +881,8 @@ def effective_context_window(settings: Any) -> int:
     resolved = resolved_main_window(settings)
     if not resolved:
         return legacy
-    return _bounded_int(
-        resolved,
-        default=legacy,
-        low=CONTEXT_WINDOW_MIN,
-        high=CONTEXT_WINDOW_MAX,
-    )
+    # 真实宣告多少就是多少：这里只有一个下界保护，没有人为上界。
+    return max(CONTEXT_WINDOW_MIN, int(resolved))
 
 
 def auto_mode_enabled(settings: Any) -> bool:
@@ -909,3 +972,67 @@ def estimate_tools_tokens(tools: Any) -> int:
     if not tools:
         return 0
     return estimate_text_tokens(json.dumps(tools, ensure_ascii=False, default=str))
+
+
+class PeriodicModelMetadataRefresh:
+    """窗口元数据的后台周期刷新（缓存 fresh 时**零网络**）。
+
+    为什么必须有它：启动预取有 6 秒上限、配置变更只是"顺手重取一次"，光靠这两处
+    并不能兑现"成功 TTL 6 小时 / 失败短 TTL 5 分钟"的语义——成功记录过期后没人重取，
+    负缓存过期后也没有重取入口。这里按固定节奏（默认 5 分钟）跑一轮：
+
+    * 缓存 fresh 的 endpoint 一个网络请求都不发（``refresh`` 自己跳过）；
+    * 成功记录过期 → 重取；这样 6 小时 TTL 到期后窗口会自己刷新；
+    * 负缓存过期 → 重取；所以"网关刚起来的那几分钟"最多 5 分钟就能拿到真实窗口；
+    * 刷新拿到结论后回调 ``on_refreshed``（可同步可异步），用于把新窗口套到
+      MemoryService 的预算上——**不重启也要生效**。
+
+    只做元数据，**绝不进回复/审核热路径**；单轮失败只记日志、循环绝不退出
+    （``bot/__main__.py`` 会把后台任务的意外退出当致命错误）。
+    """
+
+    def __init__(
+        self,
+        refresh: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        interval_seconds: float = MODEL_METADATA_REFRESH_INTERVAL_SECONDS,
+        on_refreshed: Callable[[dict[str, Any]], Any] | None = None,
+        name: str = "model-metadata-refresh",
+    ) -> None:
+        self._refresh = refresh
+        self._on_refreshed = on_refreshed
+        # 最小 10ms：防止调用方传 0 把循环打成热转。
+        self.interval_seconds = max(0.01, float(interval_seconds))
+        self.name = name
+        self.ticks = 0
+        self.last_report: dict[str, Any] = {}
+
+    async def refresh_once(self) -> dict[str, Any]:
+        """跑一轮。缓存 fresh 时这一轮不发任何请求（返回缓存来源的报告）。"""
+
+        self.ticks += 1
+        self.last_report = dict(await self._refresh() or {})
+        return self.last_report
+
+    async def run(self) -> None:
+        while True:
+            try:
+                report = await self.refresh_once()
+                callback = self._on_refreshed
+                if callback is not None:
+                    outcome = callback(report)
+                    if isawaitable(outcome):
+                        await outcome
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "periodic model metadata refresh failed; keeping current windows"
+                )
+            await asyncio.sleep(self.interval_seconds)
+
+    def start(self) -> asyncio.Task[Any]:
+        """起一个后台任务（加入应用的 background_tasks 关闭流程）。"""
+
+        loop = asyncio.get_running_loop()
+        return loop.create_task(self.run(), name=self.name)

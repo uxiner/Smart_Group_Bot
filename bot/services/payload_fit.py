@@ -22,10 +22,13 @@ skip。修好计量之后仍然需要最后一道兜底：万一载荷真的超�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 from bot.utils.tokens import cut_text_to_tokens, estimate_text_tokens
+
+log = logging.getLogger(__name__)
 
 #: 层标记的键名。**故意用下划线开头**：它只在进程内传递，不会进模型请求体
 #: （请求构造只挑 role/content/tool_calls/name/tool_call_id 这些字段）。
@@ -96,16 +99,28 @@ def tag_rendered_history(
     source_rows: Iterable[Any],
     rendered_messages: Iterable[Any],
 ) -> list[Any]:
-    """``sanitize_history_for_llm`` 的输出是 1:1 的，按输入行的来源打层标记。
+    """给渲染后的历史消息打层标记。
 
-    两条链路（群聊技能装配、私聊装配）都用同一个映射，裁剪优先级就不会各说各话。
+    ``sanitize_history_for_llm`` 目前**严格一对一**（每个输入行恰好产出一条消息，
+    没有过滤/跳过），所以按位置映射就是原始行来源的映射。这里仍然按"数量必须一致"
+    设防：一旦上游哪天加了过滤，位置映射就不再成立——那时**宁可全部标 core（不裁）**，
+    也不能把另一条链路的资料当成"可以随便丢的历史"错裁掉。
     """
 
     rows = list(source_rows or [])
     rendered = list(rendered_messages or [])
-    offset = max(0, len(rows) - len(rendered))
+    if len(rows) != len(rendered):
+        log.warning(
+            "history rendering is no longer 1:1 (rows=%d rendered=%d); "
+            "tagging every rendered message as core instead of guessing layers",
+            len(rows),
+            len(rendered),
+        )
+        for message in rendered:
+            tag_context_layer(message, LAYER_CORE)
+        return rendered
     for index, message in enumerate(rendered):
-        tag_context_layer(message, context_layer_for_history_row(rows[offset + index]))
+        tag_context_layer(message, context_layer_for_history_row(rows[index]))
     return rendered
 
 
@@ -139,6 +154,27 @@ def strip_internal_message_keys(
             }
         )
     return cleaned
+
+
+def is_tool_protocol_message(message: Any) -> bool:
+    """True = 工具协议消息（assistant ``tool_calls`` / ``tool`` 结果）。
+
+    这类消息**永远不能被整条丢掉**：丢掉 ``assistant(tool_calls)`` 会让后面的 ``tool``
+    结果变成孤儿，丢掉 ``tool`` 结果会让 assistant 的声明悬空——两种都会让 OpenAI 兼容
+    接口直接 400，或者让模型以为工具没跑过而重复执行副作用（"不重复已执行写入"）。
+
+    判定**不依赖调用方有没有打 ``core`` 标记**：只要形状是工具协议，就按协议处理。
+    """
+
+    if not isinstance(message, Mapping):
+        return False
+    role = str(message.get("role") or "").strip().lower()
+    if role == "tool":
+        return True
+    if message.get("tool_call_id"):
+        return True
+    tool_calls = message.get("tool_calls")
+    return bool(tool_calls) and role == "assistant"
 
 
 @dataclass(frozen=True)
@@ -209,6 +245,11 @@ def fit_messages_to_input_budget(
             if total <= budget:
                 break
             if index in dropped or message_context_layer(message) != layer:
+                continue
+            if is_tool_protocol_message(message):
+                # 工具协议消息即使被误标成 history 也**不整条丢**：宁可留下它、
+                # 让后面的截断阶段（``tool`` 正文）或 ``over_budget`` 诚实失败，
+                # 也不能制造 assistant/tool 孤儿。
                 continue
             dropped.add(index)
             total -= costs[index]

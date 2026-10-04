@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Iterable
-from typing import Any
+from typing import Any, Callable
 
 from bot.config import (
     load_bootstrap_settings,
@@ -23,7 +23,7 @@ from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
-from bot.services import llm_metrics, memory_holder
+from bot.services import llm_metrics, memory_holder, model_limits
 from bot.services.archive_vector import SQLiteArchiveVectorRecallProvider
 from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
@@ -295,16 +295,113 @@ def run_bot() -> None:
     run_async_entrypoint(main(), force_exit_watchdog=True)
 
 
-async def _prefetch_model_context_metadata(llm: LLMService) -> None:
+def _observe_model_metadata_refresh(
+    task: asyncio.Task[Any],
+    *,
+    on_refreshed: Callable[[], None] | None = None,
+    label: str = "model context metadata refreshed",
+) -> None:
+    """消费一次元数据刷新任务的结果：只记日志 + 回调，绝不抛。"""
+
+    try:
+        report = task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    if report:
+        log.info("%s | sources=%s", label, report)
+    if on_refreshed is not None:
+        try:
+            on_refreshed()
+        except Exception:
+            log.exception("model metadata refresh callback failed")
+
+
+class _MemoryContextWindowSync:
+    """把"当前可信模型窗口"同步到 ``MemoryService`` 的预算上。
+
+    为什么需要：``MemoryService`` 的预算是**构造时**从元数据缓存取快照算出来的。
+    启动预取有 6 秒上限（超时就转后台），后台周期刷新也会带来新窗口；没有这条线，
+    metadata 晚到或变化后，装配预算就要等重启才生效——那正是事故里"前面认为装得下、
+    最终拒绝"的温床。
+
+    只调既有的 ``memory.reconfigure(bot_config)``：它是幂等的，**不清历史、不改留存**，
+    只重新算 token 预算并把已加载的投影按新上限收敛。
+    """
+
+    def __init__(self, *, settings: Any) -> None:
+        self._settings = settings
+        self._llm: Any | None = None
+        self._memory: Any | None = None
+        self._applied: int | None = None
+        self.applied_count = 0
+
+    @property
+    def applied_window(self) -> int | None:
+        return self._applied
+
+    def bind(self, *, llm: Any, memory: Any) -> None:
+        """接上已构造好的 llm/memory，并用当前缓存**再套一次**预算（幂等）。"""
+
+        self._llm = llm
+        self._memory = memory
+        self._applied = None
+        # 构造期间晚到的元数据可能已经写进缓存，但 memory 是用更早的快照算的预算；
+        # 这里强制对齐一次，把那个窗口闭合掉。
+        self.sync(force=True)
+
+    def sync(self, *_args: Any, force: bool = False) -> None:
+        memory = self._memory
+        if memory is None:
+            # 还在启动过程中（memory 尚未构造）：bind() 会补一次。
+            return
+        resolved = model_limits.auto_window_for(
+            getattr(self._settings, "bot", None),
+            llm=self._llm,
+        )
+        if resolved is None:
+            return
+        resolved = int(resolved)
+        if not force and resolved == self._applied:
+            return
+        previous = self._applied
+        try:
+            reconfigure = getattr(memory, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(getattr(self._settings, "bot", None))
+        except Exception:
+            log.exception(
+                "memory context budget re-apply failed | window=%s", resolved
+            )
+            return
+        self._applied = resolved
+        self.applied_count += 1
+        log.info(
+            "memory context budget re-applied after model window change | %s -> %s",
+            previous if previous is not None else "-",
+            resolved,
+        )
+
+
+async def _prefetch_model_context_metadata(
+    llm: LLMService,
+    *,
+    on_late_refresh: Callable[[], None] | None = None,
+) -> asyncio.Task[Any] | None:
     """启动时预热模型窗口元数据（2026-10-04 事故修复）。
 
     只查**已配置且带认证**的 endpoint（``api_base`` + key），单次查询 4 秒超时、
     最多 3 个并发。启动最多只等 6 秒：等不到就让它继续在后台跑（``shield``），
-    期间主链路按保守降级值工作，拿到后自动生效。日志只打印来源与数值，绝不打印 key。
+    期间主链路按保守降级值工作，拿到后通过 ``on_late_refresh`` 把新窗口套到
+    MemoryService 的预算上。日志只打印来源与数值，绝不打印 key。
+
+    返回**还没跑完**的那个任务（否则 ``None``），交给调用方决定后续观察方式。
     """
 
     loop = asyncio.get_running_loop()
-    task = loop.create_task(llm.refresh_model_limits())
+    refresh_limits = getattr(llm, "refresh_model_limits", None)
+    if not callable(refresh_limits):
+        return None
+    task = loop.create_task(refresh_limits(), name="model-metadata-prefetch")
     try:
         report = await asyncio.wait_for(asyncio.shield(task), timeout=6.0)
     except Exception as exc:  # noqa: BLE001 - 启动不能因为元数据查询失败而失败
@@ -316,25 +413,25 @@ async def _prefetch_model_context_metadata(llm: LLMService) -> None:
         if report:
             log.info("model context metadata prefetch | sources=%s", report)
     if not task.done():
-        task.add_done_callback(_observe_model_metadata_refresh)
-    limits = llm.endpoint_limits(llm.main)
+        task.add_done_callback(
+            lambda done: _observe_model_metadata_refresh(
+                done,
+                on_refreshed=on_late_refresh,
+                label="model context metadata prefetch finished in the background",
+            )
+        )
+    limits_fn = getattr(llm, "endpoint_limits", None)
+    limits = limits_fn(getattr(llm, "main", None)) if callable(limits_fn) else None
     if limits is not None:
         log.info("main chat context window resolved | %s", limits.describe())
-
-
-def _observe_model_metadata_refresh(task: asyncio.Task[Any]) -> None:
-    try:
-        report = task.result()
-    except (asyncio.CancelledError, Exception):
-        return
-    if report:
-        log.info("model context metadata refreshed after config change | sources=%s", report)
+    return None if task.done() else task
 
 
 async def _initialize_runtime_services(
     *,
     settings: Any,
     session_factory: Any,
+    on_late_model_refresh: Callable[[], None] | None = None,
 ) -> tuple[RuntimeConfigManager, LLMService, MemoryService]:
     # 成本看板的记数器只累加在内存里，这里给它会话工厂，
     # 由它自己按 60 秒的节奏落盘（回复路径上不做任何数据库写入）。
@@ -357,7 +454,10 @@ async def _initialize_runtime_services(
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
-    await _prefetch_model_context_metadata(llm)
+    await _prefetch_model_context_metadata(
+        llm,
+        on_late_refresh=on_late_model_refresh,
+    )
     main_candidates = llm._chat_candidates(settings.bot.main_model)
     if main_candidates and all(
         llm.chat_configuration_issue(item) for item in main_candidates
@@ -488,10 +588,15 @@ async def main() -> None:
     # F-025：用户图片会不会离开本服务，必须在启动日志里可见（默认不外发）。
 
     engine, session_factory = await init_db(settings.database_url)
+    # 模型窗口元数据晚到/变化时，把新窗口套到 MemoryService 的预算上（不重启也要生效）。
+    # MemoryService 的预算是构造时的快照：启动预取超时转后台、周期刷新带来新窗口，
+    # 都必须走这一条线才算真的生效。
+    window_sync = _MemoryContextWindowSync(settings=settings)
     try:
         runtime_config, llm, memory = await _initialize_runtime_services(
             settings=settings,
             session_factory=session_factory,
+            on_late_model_refresh=window_sync.sync,
         )
     except BaseException:
         await _await_cleanup_bounded(
@@ -499,6 +604,7 @@ async def main() -> None:
             label="database engine after runtime bootstrap failure",
         )
         raise
+    window_sync.bind(llm=llm, memory=memory)
 
     dp["settings"] = settings
     # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
@@ -639,14 +745,23 @@ async def main() -> None:
                 context_window_mode=getattr(settings.bot, "context_window_mode", None),
             )
             # 路由/模型/上限模式变了：异步重取一次窗口元数据（不阻塞配置应用，
-            # 失败就继续用保守降级值）。
-            try:
-                refresh_task = asyncio.get_running_loop().create_task(
-                    llm.refresh_model_limits(force=True)
-                )
-                refresh_task.add_done_callback(_observe_model_metadata_refresh)
-            except RuntimeError:
-                pass
+            # 失败就继续用保守降级值），拿到新窗口后再套一次 memory 预算。
+            refresh_limits = getattr(llm, "refresh_model_limits", None)
+            if callable(refresh_limits):
+                try:
+                    refresh_task = asyncio.get_running_loop().create_task(
+                        refresh_limits(force=True),
+                        name="model-metadata-refresh-after-config",
+                    )
+                    refresh_task.add_done_callback(
+                        lambda done: _observe_model_metadata_refresh(
+                            done,
+                            on_refreshed=window_sync.sync,
+                            label="model context metadata refreshed after config change",
+                        )
+                    )
+                except RuntimeError:
+                    pass
             archive_policy_before = (
                 getattr(memory, "memory_retention_days", None),
                 getattr(memory, "memory_archive_max_messages_per_group", None),
@@ -805,6 +920,18 @@ async def main() -> None:
                 name="private-chat-history-maintenance",
             )
         )
+        # 模型窗口元数据的**周期刷新**：成功 TTL 6h / 失败负缓存 5min 的语义靠它兑现。
+        # 缓存 fresh 时这一轮零网络；只做元数据，绝不进回复/审核热路径。拿到新窗口后
+        # 通过 window_sync 把 MemoryService 的预算一起更新（不重启也生效）。
+        # 任务是"常驻"的：单轮失败只记日志、循环不退出（否则会被当致命错误）。
+        refresh_limits = getattr(llm, "refresh_model_limits", None)
+        if callable(refresh_limits):
+            background_tasks.append(
+                model_limits.PeriodicModelMetadataRefresh(
+                    refresh_limits,
+                    on_refreshed=window_sync.sync,
+                ).start()
+            )
         # 第 3 期：检索结果留档也要定期清理（默认 30 天）。保留天数每轮现取，
         # /settings 里改了下一轮就生效（与上面两个巡检同一套路）。
         background_tasks.append(

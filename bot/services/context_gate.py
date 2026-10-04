@@ -29,7 +29,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from bot.services.model_limits import effective_context_window
+from bot.services.model_limits import (
+    auto_window_for,
+    effective_context_window,
+    loose_budget_tokens,
+)
 from bot.utils.tokens import estimate_text_tokens
 
 #: 统一闸门的默认预算：272K = 278528（全项目统一用这个精确数字）。
@@ -75,15 +79,19 @@ def bounded_context_token_budget(value: Any) -> int:
 def context_token_budget(settings: Any) -> int:
     """当前生效的统一闸门预算。
 
-    * ``auto``（默认）：主链路实际模型的**总窗口**——优先网关 ``/models`` 元数据，
-      其次直连厂商的模型注册表，都没有才退回兼容字段（保守降级值）。已知主模型
-      （实测 1,000,000）不再被旧的 ``278528`` 固定值压住。
+    * ``auto``（默认）+ 可信元数据：主链路实际模型的**总窗口原样**——用户口径是
+      "上限不要设置了，根据模型的上限自动匹配"，所以真实宣告 3M/4M 就按 3M/4M 装配，
+      **不再套 2M 的兼容上限**（那个上限只约束兼容字段/保守降级值）。
+    * ``auto`` + 查不到：临时兼容字段（保守降级值，按兼容区间夹取）。
     * ``fixed``：兼容模式，仍用 ``bot.max_context_tokens``。
 
     三条链路必须用同一个数字：群聊 / 私聊 / 搜索的资料块都往同一个模型窗口里塞，
     各读各的默认值正是这一期要消掉的分叉。
     """
 
+    measured = auto_window_for(settings)
+    if measured is not None:
+        return max(CONTEXT_TOKEN_BUDGET_MIN, int(measured))
     return bounded_context_token_budget(effective_context_window(settings))
 
 
@@ -186,7 +194,13 @@ def assemble_context_within_budget(
       默认顺序（system → memory_recall → search_records → history → current_turn）。
     """
 
-    budget = bounded_context_token_budget(budget_tokens)
+    # 调用方算好的预算直接采信（真实模型窗口可能是 3M/4M）：这里只保下限，
+    # 不再套 2M 的兼容上限。
+    budget = loose_budget_tokens(
+        budget_tokens,
+        default=CONTEXT_TOKEN_BUDGET,
+        low=CONTEXT_TOKEN_BUDGET_MIN,
+    )
     try:
         reserve = max(0, int(reserve_tokens))
     except (TypeError, ValueError):

@@ -22,7 +22,8 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
 
 from bot.config import BotConfig, ChatEndpointConfig, ModelConfig
 from bot.services import model_limits as ml
@@ -256,6 +257,113 @@ class AutoWindowBudgetTests(unittest.TestCase):
         self.assertEqual(context_gate.context_token_budget(settings), 278_528)
         self.assertEqual(group_context.group_history_token_budget(settings), 278_528)
 
+    def test_multi_million_windows_are_not_clamped_anywhere(self) -> None:
+        """用户口径：按模型自报的上限自动匹配——3M/4M 不许再被 2M 人为上限截断。"""
+
+        for window in (3_000_000, 4_000_000):
+            with self.subTest(window=window):
+                ml.reset_model_limits_for_tests()
+                settings = _settings()
+                ml.MODEL_LIMITS.record(_gateway_model(), total_window=window)
+
+                # 统一闸门 / 群聊历史 / 私聊历史 全部跟真实窗口
+                self.assertEqual(context_gate.context_token_budget(settings), window)
+                self.assertEqual(
+                    group_context.group_history_token_budget(settings),
+                    window - 32_768,
+                )
+                self.assertEqual(
+                    private_chat.private_history_token_budget(settings),
+                    window - 32_768,
+                )
+
+                # MemoryService 的生效预算同样跟真实窗口，硬闸门仍然成立
+                memory = MemoryService(
+                    _bot_config(),
+                    _StubLLM(),  # type: ignore[arg-type]
+                    session_factory=object(),  # type: ignore[arg-type]
+                )
+                self.assertEqual(memory.max_context, window)
+                self.assertEqual(memory.group_history_token_budget, window - 32_768)
+                self.assertLessEqual(
+                    memory.group_history_token_budget
+                    + memory.group_history_reserve_tokens,
+                    memory.max_context,
+                )
+
+    def test_fixed_mode_keeps_the_compat_clamp(self) -> None:
+        """``fixed`` 是兼容逃生舱：仍然按兼容区间夹取（2M），不是"跟着 metadata 无限"。"""
+
+        settings = _settings(context_window_mode="fixed", max_context_tokens=3_000_000)
+        ml.MODEL_LIMITS.record(_gateway_model(), total_window=4_000_000)
+
+        self.assertEqual(context_gate.context_token_budget(settings), 2_000_000)
+
+    def test_unknown_model_still_degrades_to_the_conservative_window(self) -> None:
+        """未知 ≠ 无限：查不到元数据时仍是保守降级值（不是 3M/4M）。"""
+
+        settings = _settings()
+
+        self.assertEqual(ml.auto_window_for(settings), None)
+        self.assertEqual(context_gate.context_token_budget(settings), 278_528)
+
+    def test_assembly_entries_accept_a_multi_million_budget(self) -> None:
+        """装配入口内部也不许再把"算好的预算"夹回 2M（3M/4M 要真的装得下）。"""
+
+        from bot.services.context_gate import assemble_context_within_budget
+        from bot.services.group_context import assemble_group_history
+        from bot.services.private_chat import assemble_private_history
+
+        # ASCII ≈ 3 字符/token ⇒ 7.5M 字符 ≈ 2.5M token：只有预算真的 >2M 才装得下。
+        big = "a" * 7_500_000
+        budget = 3_000_000
+
+        assembly = assemble_context_within_budget(
+            system=[{"role": "system", "content": "人设"}],
+            current_turn=[{"role": "user", "content": "现在这条"}],
+            history=[{"role": "user", "content": big}],
+            budget_tokens=budget,
+        )
+        self.assertEqual(assembly.budget_tokens, budget)
+        self.assertEqual(assembly.trims, ())
+        self.assertFalse(assembly.over_budget)
+        # 自校验：同一份载荷在 2M 预算下**必须**被裁，否则这个用例证明不了任何事。
+        clamped = assemble_context_within_budget(
+            system=[{"role": "system", "content": "人设"}],
+            current_turn=[{"role": "user", "content": "现在这条"}],
+            history=[{"role": "user", "content": big}],
+            budget_tokens=2_000_000,
+        )
+        self.assertTrue(clamped.trims)
+
+        group_row = {"role": "user", "content": big, "created_at": "2026-01-01T00:00:00"}
+        self.assertEqual(
+            assemble_group_history([group_row], budget_tokens=budget)[0]["content"],
+            big,
+        )
+        self.assertLess(
+            len(
+                assemble_group_history(
+                    [group_row], budget_tokens=2_000_000
+                )[0]["content"]
+            ),
+            len(big),
+        )
+
+        private_row = {"role": "user", "content": big}
+        self.assertEqual(
+            assemble_private_history([private_row], budget_tokens=budget)[0]["content"],
+            big,
+        )
+        self.assertLess(
+            len(
+                assemble_private_history(
+                    [private_row], budget_tokens=2_000_000
+                )[0]["content"]
+            ),
+            len(big),
+        )
+
 
 class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -277,6 +385,23 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
         llm = self._llm()
         ml.MODEL_LIMITS.record(_gateway_model(), max_input_tokens=900_000)
         self.assertEqual(llm.input_token_budget(llm._chat_candidates(llm.main)[0]), 900_000)
+
+    def test_multi_million_window_is_not_clamped_for_the_llm_gate(self) -> None:
+        """最终闸门也不许有 2M 人为上限：3M/4M 就按 3M/4M 减去一次输出预留。"""
+
+        for window in (3_000_000, 4_000_000):
+            with self.subTest(window=window):
+                ml.reset_model_limits_for_tests()
+                llm = self._llm()
+                ml.MODEL_LIMITS.record(_gateway_model(), total_window=window)
+
+                candidate = llm._chat_candidates(llm.main)[0]
+
+                self.assertEqual(llm.endpoint_limits(candidate).total_window, window)
+                self.assertEqual(
+                    llm.input_token_budget(candidate),
+                    window - 2_048,
+                )
 
     async def test_incident_shaped_payload_is_sent_to_the_primary_model(self) -> None:
         """事故复现：约 78 万字符、装配装得下 → 必须真的发出 HTTP。"""
@@ -509,6 +634,66 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(str(key).startswith("_") for key in item))
         self.assertEqual(messages, original)
 
+    async def test_history_tagged_tool_pair_is_never_split_across_the_wire(self) -> None:
+        """即使工具协议消息被误标成 history，也不能在最终载荷里被拆散。"""
+
+        llm = self._llm()
+        ml.MODEL_LIMITS.record(_gateway_model(), total_window=30_000)
+        messages = [
+            {"role": "system", "content": "核心人设"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "websearch", "arguments": '{"query":"x"}'},
+                    }
+                ],
+                CTX_LAYER_KEY: LAYER_HISTORY,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "websearch",
+                "content": "工具结果" * 30_000,
+                CTX_LAYER_KEY: LAYER_HISTORY,
+            },
+            {"role": "user", "content": "现在这条"},
+        ]
+
+        mock = AsyncMock(return_value=_chat_resp("paired-ok"))
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock),
+            patch(
+                "bot.services.llm.litellm.token_counter",
+                side_effect=RuntimeError("tokenizer unavailable"),
+            ),
+        ):
+            out = await llm._chat_with_fallbacks(
+                messages=messages,
+                candidates=llm._chat_candidates(llm.main),
+                label="skill",
+                preview_limit=40,
+            )
+
+        self.assertEqual(out, "paired-ok")
+        sent = mock.await_args.kwargs["messages"]
+        assistant = [item for item in sent if item.get("role") == "assistant"]
+        tool_results = [item for item in sent if item.get("role") == "tool"]
+        self.assertTrue(assistant)
+        self.assertTrue(tool_results)
+        declared = {
+            call["id"]
+            for item in assistant
+            for call in (item.get("tool_calls") or [])
+        }
+        self.assertEqual({item["tool_call_id"] for item in tool_results}, declared)
+        # 超长工具结果被截断，而不是整条丢掉。
+        self.assertLess(len(tool_results[0]["content"]), len("工具结果" * 30_000))
+        self.assertTrue(any("现在这条" == item.get("content") for item in sent))
+
     async def test_unknown_window_degrades_with_an_explicit_log(self) -> None:
         llm = self._llm()
         candidate = llm._chat_candidates(llm.main)[0]
@@ -567,6 +752,175 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["ok", "ok", "ok", "ok"])
         self.assertEqual(mock.await_count, 4)
         self.assertLess(time.monotonic() - started, 3.0)
+
+
+class MemoryContextWindowSyncTests(unittest.IsolatedAsyncioTestCase):
+    """晚到/变化的模型窗口必须套到 MemoryService 预算上（不重启也生效）。"""
+
+    def setUp(self) -> None:
+        ml.reset_model_limits_for_tests()
+        self.addCleanup(ml.reset_model_limits_for_tests)
+
+    async def test_late_metadata_reapplies_the_memory_budget(self) -> None:
+        from bot import __main__ as main_module
+
+        settings = _settings()
+        sync = main_module._MemoryContextWindowSync(settings=settings)
+        memory = SimpleNamespace(reconfigure=Mock())
+        llm = SimpleNamespace(main=_gateway_model())
+
+        # 启动时元数据还没回来：bind 不该假装有窗口。
+        sync.bind(llm=llm, memory=memory)
+        memory.reconfigure.assert_not_called()
+        self.assertIsNone(sync.applied_window)
+
+        # 后台预取晚到：套一次预算。
+        ml.MODEL_LIMITS.record(_gateway_model(), total_window=1_000_000)
+        sync.sync()
+        memory.reconfigure.assert_called_once_with(settings.bot)
+        self.assertEqual(sync.applied_window, 1_000_000)
+
+        # 同一个窗口不再重复套（周期刷新每轮都会调它）。
+        sync.sync()
+        sync.sync()
+        self.assertEqual(memory.reconfigure.call_count, 1)
+
+    async def test_window_change_reapplies_and_keeps_history_untouched(self) -> None:
+        from bot import __main__ as main_module
+
+        settings = _settings()
+        memory = MemoryService(
+            _bot_config(),
+            _StubLLM(),  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+        sync = main_module._MemoryContextWindowSync(settings=settings)
+        llm = SimpleNamespace(main=settings.bot.main_model)
+
+        ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=1_000_000)
+        sync.bind(llm=llm, memory=memory)
+        self.assertEqual(memory.max_context, 1_000_000)
+        retention_before = memory.memory_retention_days
+        archive_limit_before = memory.memory_archive_max_messages_per_group
+
+        # 网关改口 3M：不需要重启，预算跟着走。
+        ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=3_000_000)
+        sync.sync()
+
+        self.assertEqual(memory.max_context, 3_000_000)
+        self.assertEqual(sync.applied_window, 3_000_000)
+        # 只改预算：留存策略一个字都不动。
+        self.assertEqual(memory.memory_retention_days, retention_before)
+        self.assertEqual(
+            memory.memory_archive_max_messages_per_group, archive_limit_before
+        )
+
+    async def test_bind_closes_the_race_when_metadata_lands_during_construction(self) -> None:
+        """memory 用旧快照构造、元数据在构造期间到达 → bind 必须对齐一次。"""
+
+        from bot import __main__ as main_module
+
+        settings = _settings()
+        memory = MemoryService(
+            _bot_config(),
+            _StubLLM(),  # type: ignore[arg-type]
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+        self.assertEqual(memory.max_context, 278_528)
+
+        # 构造完成之后、bind 之前，后台预取写进了缓存。
+        ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=1_000_000)
+        sync = main_module._MemoryContextWindowSync(settings=settings)
+        sync.bind(llm=SimpleNamespace(main=settings.bot.main_model), memory=memory)
+
+        self.assertEqual(memory.max_context, 1_000_000)
+        self.assertEqual(sync.applied_window, 1_000_000)
+
+    async def test_reconfigure_failure_is_swallowed_so_the_loop_keeps_going(self) -> None:
+        from bot import __main__ as main_module
+
+        settings = _settings()
+        memory = SimpleNamespace(reconfigure=Mock(side_effect=RuntimeError("boom")))
+        sync = main_module._MemoryContextWindowSync(settings=settings)
+
+        ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=1_000_000)
+        sync.bind(llm=SimpleNamespace(main=settings.bot.main_model), memory=memory)
+
+        # 失败不抛（调用它的是后台循环与任务回调），也不会把窗口记成已生效。
+        self.assertIsNone(sync.applied_window)
+
+    async def test_periodic_refresh_applies_the_window_through_the_sync_hook(self) -> None:
+        from bot import __main__ as main_module
+
+        settings = _settings()
+        memory = SimpleNamespace(reconfigure=Mock())
+        sync = main_module._MemoryContextWindowSync(settings=settings)
+        sync.bind(llm=SimpleNamespace(main=settings.bot.main_model), memory=memory)
+
+        async def refresh() -> dict[str, Any]:
+            # 网关这一轮宣告 3M：周期刷新负责把它写进缓存。
+            ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=3_000_000)
+            return {"home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
+
+        refresher = ml.PeriodicModelMetadataRefresh(
+            refresh,
+            interval_seconds=0.01,
+            on_refreshed=sync.sync,
+        )
+
+        task = refresher.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while sync.applied_window is None and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        # 周期刷新 → on_refreshed → memory 预算跟着新窗口走（不需要重启）。
+        self.assertEqual(sync.applied_window, 3_000_000)
+        memory.reconfigure.assert_called_with(settings.bot)
+
+    async def test_late_prefetch_callback_fires_after_the_bounded_startup_wait(self) -> None:
+        from bot import __main__ as main_module
+
+        release = asyncio.Event()
+        calls: list[int] = []
+
+        async def slow_refresh() -> dict[str, Any]:
+            await release.wait()
+            ml.MODEL_LIMITS.record(_gateway_model(), total_window=1_000_000)
+            return {"home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
+
+        llm = SimpleNamespace(
+            refresh_model_limits=slow_refresh,
+            main=_gateway_model(),
+            endpoint_limits=lambda _cfg: ml.ModelLimits(
+                model="gateway", source=ml.LIMIT_SOURCE_GATEWAY, total_window=1_000_000
+            ),
+        )
+
+        # 6 秒上限内没等到 → 返回仍在跑的任务，并在它落地时回调。
+        real_wait_for = asyncio.wait_for
+
+        async def _short_wait_for(awaitable: Any, timeout: float) -> Any:
+            return await real_wait_for(awaitable, timeout=0.01)
+
+        with patch.object(main_module.asyncio, "wait_for", _short_wait_for):
+            pending = await main_module._prefetch_model_context_metadata(
+                llm,
+                on_late_refresh=lambda: calls.append(1),
+            )
+
+        self.assertIsNotNone(pending)
+        release.set()
+        await asyncio.wait_for(pending, timeout=2.0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(ml.MODEL_LIMITS.resolve(_gateway_model()).total_window, 1_000_000)
 
 
 if __name__ == "__main__":
