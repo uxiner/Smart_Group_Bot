@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import unittest
 
+from bot.db.models import AuthorizedGroup
 from bot.handlers import group
 from bot.services.moderation import ModerationVerdict
 from bot.utils.timezone import now_shanghai_naive
@@ -343,10 +344,21 @@ def _callback(
 
 
 def _review_session(
-    violation: SimpleNamespace, *, exempt: bool = False
+    violation: SimpleNamespace,
+    *,
+    exempt: bool = False,
+    group_authorized: bool = True,
 ) -> SimpleNamespace:
+    # `on_review_action` 现在会复验群授权（`is_group_authorized`），它和取 Violation
+    # 走同一个 `session.get`，所以这里按模型分流；`group_authorized=False` 用来
+    # 覆盖「群已被取消授权」那条路径（见 tests/test_p0_security_b07_*）。
+    async def get(model, ident):
+        if model is AuthorizedGroup:
+            return SimpleNamespace(id=int(ident), bot_present=bool(group_authorized))
+        return violation
+
     return SimpleNamespace(
-        get=AsyncMock(return_value=violation),
+        get=AsyncMock(side_effect=get),
         commit=AsyncMock(),
         rollback=AsyncMock(),
         add=Mock(),
@@ -486,6 +498,23 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         group._ADMIN_ALERT_STATE.clear()
 
     # ---- 权限：只有频道管理员或最高管理员可点 ---------------------------
+    async def test_deauthorized_group_blocks_review_action(self) -> None:
+        """B-07：群被取消授权后，频道管理员不能再对它执行审核处置。"""
+
+        violation = _violation()
+        session = _review_session(violation, group_authorized=False)
+        callback = _callback(
+            data="mrev:ban:99", operator_id=ADMIN_ID, channel_admin_status="administrator"
+        )
+
+        await group.on_review_action(callback, _settings(), session=session)
+
+        self.assertEqual(callback.answered[-1][0], "当前群组未授权，不能执行审核操作")
+        self.assertTrue(callback.answered[-1][1])
+        self.assertIsNone(violation.pending_action)
+        self.assertEqual(violation.review_state, "none")
+        callback.bot.edit_message_text.assert_not_awaited()
+
     async def test_non_channel_member_click_is_denied_without_side_effects(self) -> None:
         violation = _violation()
         session = _review_session(violation)

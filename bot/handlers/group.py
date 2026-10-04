@@ -2997,6 +2997,21 @@ async def on_review_action(
         return
 
     operator_id = int(getattr(callback.from_user, "id", 0) or 0)
+    # 按钮所在会话必须就是配置的审核日志频道（`_build_review_action_keyboard` 只在
+    # `_post_log_channel_evidence` 里、也就是只往这个频道发的那张卡上挂）。
+    # 修前完全不校验会话：`_edit_review_channel_status`（:2560）在 `callback.message`
+    # 缺失时回落到 `_admin_log_channel_id(settings)`，于是在别的会话里按同一个按钮
+    # 会去编辑配置频道里 id 相同的消息（B-07，并入 B-15）。
+    log_channel_id = _admin_log_channel_id(settings)
+    try:
+        message_chat_id = int(
+            getattr(getattr(getattr(callback, "message", None), "chat", None), "id", 0) or 0
+        )
+    except (TypeError, ValueError):
+        message_chat_id = 0
+    if log_channel_id == 0 or message_chat_id != log_channel_id:
+        await callback.answer("该操作只能在审核日志频道中执行", show_alert=True)
+        return
     # 权限：频道管理员或最高管理员；取频道信息失败一律拒绝（放行/封禁都不做）。
     allowed, denial_text = await _review_operator_check(
         callback, settings, operator_id
@@ -3008,6 +3023,13 @@ async def on_review_action(
     violation = await session.get(Violation, violation_id)
     if violation is None:
         await callback.answer("审核事件不存在", show_alert=True)
+        return
+    # 群授权复验（与 `on_moderation_action` 同款三重检查里的第一重，:3114）。
+    # 修前这条路径一项都没有：群被取消授权后，频道管理员仍能对**已退出**的群执行
+    # 「确认封禁」（B-07）。取 violation 之后、任何状态改动之前 fail-closed。
+    if not await is_group_authorized(session, int(getattr(violation, "group_id", 0) or 0)):
+        await session.commit()
+        await callback.answer("当前群组未授权，不能执行审核操作", show_alert=True)
         return
     current_state = str(
         getattr(violation, "review_state", _REVIEW_STATE_NONE) or _REVIEW_STATE_NONE
