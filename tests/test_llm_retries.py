@@ -467,7 +467,9 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch(
                     "bot.services.llm.litellm.get_model_info",
-                    return_value={"max_input_tokens": 8192},
+                    # Keep this tokenizer/concurrency test's mocked model large
+                    # enough for the configured output reservation.
+                    return_value={"max_input_tokens": 8192, "max_output_tokens": 32768},
                 ),
             ):
                 generation = asyncio.create_task(llm.generate("sys", "hi"))
@@ -518,7 +520,9 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch(
                     "bot.services.llm.litellm.get_model_info",
-                    return_value={"max_input_tokens": 8192},
+                    # Keep this tokenizer/concurrency test's mocked model large
+                    # enough for the configured output reservation.
+                    return_value={"max_input_tokens": 8192, "max_output_tokens": 32768},
                 ),
             ):
                 tasks = [
