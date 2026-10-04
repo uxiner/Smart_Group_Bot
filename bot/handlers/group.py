@@ -170,7 +170,7 @@ from bot.services.update_completion import (
     request_current_update_retry,
 )
 from bot.utils.prompts import build_content_boundaries_context
-from bot.utils.security import format_history_message_line
+from bot.utils.security import format_history_message_line, wrap_untrusted_multiline
 from bot.utils.timezone import (
     format_shanghai_timestamp,
     now_shanghai,
@@ -5445,6 +5445,13 @@ def _message_sender_label(message: Message | None) -> str:
     return "unknown"
 
 
+#: ``[REPLY_TARGET_CANDIDATES]`` 块的围栏标签（B-42）：块内含成员可控的显示名与
+#: 正文 / caption 预览，只能当**数据**读。
+REPLY_TARGETS_UNTRUSTED_LABEL = "reply_target_candidates"
+#: 整块的注入上限（字符）。候选条目数 = 批内消息数 × 3 左右，80 字预览 × 数十条。
+REPLY_TARGETS_MAX_CHARS = 4000
+
+
 def _append_reply_target_candidate(
     lines: list[str],
     alias_map: dict[str, int],
@@ -5544,7 +5551,18 @@ def _build_reply_targets_context(items: list[_PendingReplyItem]) -> tuple[str, d
             relation="message that the latest input replies to",
         )
 
-    return "\n".join(lines), alias_map
+    # B-42：整块套不可信围栏。块里的 ``sender``（Telegram 显示名）与 ``preview``
+    # （消息正文 / 图片 caption）都是**成员可控**的，system 身份会把它们抬到指令
+    # 优先级；围栏同时中和成员文本里伪造的闭合标签。调用方以 ``role="user"`` 注入
+    # （``skills/service.py`` / ``casual.py``）。
+    return (
+        wrap_untrusted_multiline(
+            REPLY_TARGETS_UNTRUSTED_LABEL,
+            "\n".join(lines),
+            max_len=REPLY_TARGETS_MAX_CHARS,
+        ),
+        alias_map,
+    )
 
 
 def _resolve_reply_target_message_id(
