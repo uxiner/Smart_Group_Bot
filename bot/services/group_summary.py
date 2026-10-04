@@ -514,14 +514,17 @@ class SqlGroupSummaryStore:
                 return None
             row.summary = normalized
             row.version = current_version + 1
-            row.covered_from_id = int(covered_from_id or 0)
+            # The new body includes the previous summary, so deletion checks
+            # must cover all batches, not just the most recently added one.
+            if not row.covered_from_id:
+                row.covered_from_id = int(covered_from_id or 0)
+                row.covered_from_key = covered_from_key or ""
             row.covered_through_id = int(covered_through_id or 0) or current_through_id
-            row.covered_from_key = covered_from_key or str(row.covered_from_key or "")
             row.covered_through_key = (
                 covered_through_key or str(row.covered_through_key or "")
             )
-            row.covered_count = int(covered_count)
-            row.source_truncated = bool(source_truncated)
+            row.covered_count = int(row.covered_count or 0) + int(covered_count)
+            row.source_truncated = bool(row.source_truncated or source_truncated)
             row.prompt_version = GROUP_SUMMARY_PROMPT_VERSION
             row.generated_at = now_shanghai_naive()
             await session.commit()
@@ -808,6 +811,9 @@ class GroupSummaryScheduler:
             pending = self._pending.get(group_id)
             if pending is None:
                 continue
+            if pending.claimed:
+                self._order.append(group_id)
+                continue
             if now - pending.dirty_since > cfg.queue_wait_seconds:
                 # 排队过期：本次跳过 + 退避（不要立刻又排进来反复过期）+ 计数。
                 self._pending.pop(group_id, None)
@@ -893,8 +899,14 @@ class GroupSummaryScheduler:
         self._note_model_concurrency(+1, cfg)
         try:
             # 整体硬超时：入场后模型调用 + fallback + 重试合计不超过 deadline。
-            async with asyncio.timeout(cfg.deadline_seconds):
+            async with asyncio.timeout(cfg.deadline_seconds) as deadline:
                 raw = await self._llm.background_summary_completion(messages)
+            # A client may swallow cancellation and return a late value.
+            if deadline.expired():
+                raise TimeoutError
+            current_task = asyncio.current_task()
+            if self._closed or (current_task and current_task.cancelling()):
+                raise asyncio.CancelledError
         except (TimeoutError, asyncio.TimeoutError):
             self.metrics.deadline_exceeded_total += 1
             self.metrics.failure_total += 1

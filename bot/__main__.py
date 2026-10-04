@@ -1046,6 +1046,13 @@ async def main() -> None:
         ordered_shutdown_watchdog = _arm_forced_exit_watchdog(
             _ORDERED_SHUTDOWN_HARD_LIMIT_SECONDS
         )
+        # Close the scheduler before cancelling services or disposing the DB:
+        # late clients must not publish during shutdown.
+        if summary_scheduler is not None:
+            await _await_cleanup_bounded(
+                summary_scheduler.shutdown(),
+                label="group summary scheduler",
+            )
         await _cancel_tasks_bounded(
             background_tasks,
             label="background services",

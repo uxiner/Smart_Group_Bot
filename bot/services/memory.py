@@ -754,6 +754,9 @@ class MemoryService:
                     await session.commit()
                 if archive_rows:
                     self._notify_vector_archive_changed()
+                    if self.group_summary_enabled:
+                        for group_id in {int(row["group_id"]) for row in archive_rows}:
+                            notify_group_summary(group_id)
                 self._pending_write_failures = 0
                 self._pending_write_fatal_error = ""
                 return
@@ -766,6 +769,9 @@ class MemoryService:
                         raise RuntimeError(
                             "memory write fallback could not confirm persistence"
                         )
+                if self.group_summary_enabled:
+                    for group_id in {item.group_id for item in batch if item.archive_record is not None}:
+                        notify_group_summary(group_id)
                 self._pending_write_failures = 0
                 self._pending_write_fatal_error = ""
                 return
