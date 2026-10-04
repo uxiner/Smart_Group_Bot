@@ -79,6 +79,32 @@ class D3_42SkillRoleTests(unittest.TestCase):
         self.assertIsNone(RuntimeConfig().models.skill, "留空 = null 是合法状态")
         self.assertIn("skill", RuntimeConfig.model_fields["models"].annotation.model_fields)
 
+    def test_null_role_is_synthesized_by_cloning_main_not_an_empty_shell(self) -> None:
+        """回归：``null`` 在后端等价于 ``models.skill or main``，即**继承主模型的
+        temperature / max_tokens / timeout / 回退链**。若 UI 归一化时造一个
+        ``fallbacks: []`` 的空壳，管理员随手点一次保存就会悄悄丢掉主模型的回退链。
+        """
+
+        body = re.search(
+            r"function normalizeModelRoles\(\) \{[\s\S]*?\n  \}\n", APP_JS
+        )
+        self.assertIsNotNone(body, "找不到 normalizeModelRoles")
+        text = body.group(0)
+        synthesis = text[text.index("if (!role || typeof role") :]
+        self.assertIn(
+            "JSON.parse(JSON.stringify(template))",
+            synthesis,
+            "null 角色必须从主模型（template）整份克隆后只把 provider/model 留空",
+        )
+        literal = synthesis[ synthesis.index("models[roleName] = {") : ][: synthesis[ synthesis.index("models[roleName] = {") : ].index("};") ]
+        self.assertNotIn(
+            "fallbacks",
+            literal,
+            "归一化出来的对象里不得出现 fallbacks（会丢主模型回退链）",
+        )
+        self.assertNotIn("temperature", literal, "同理，temperature 必须来自克隆")
+        self.assertNotIn("total_deadline_sec", literal.replace("total_deadline_sec = ROLE_META[roleName].deadlineDefault", ""))
+
     def test_leaving_the_skill_role_blank_keeps_inheriting_main(self) -> None:
         config = RuntimeConfig.model_validate(
             {"models": {"skill": {"provider": "", "model": ""}}}

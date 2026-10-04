@@ -699,16 +699,18 @@
     for (const roleName of Object.keys(ROLE_META)) {
       const role = models[roleName];
       if (!role || typeof role !== "object") {
+        // 从**主模型**整份克隆再把 provider/model 留空：`null` 在后端等价于
+        // `models.skill or main`，即继承主模型的 temperature / max_tokens /
+        // timeout / 回退链。若这里造一个"空壳"（fallbacks: []、各自的
+        // total_deadline），保存回去就会**悄悄丢掉主模型的回退链**。
         models[roleName] = {
+          ...JSON.parse(JSON.stringify(template)),
           provider: "",
           model: "",
-          timeout_sec: template.timeout_sec,
-          total_deadline_sec: ROLE_META[roleName].deadlineDefault,
-          temperature: template.temperature,
-          max_tokens: template.max_tokens,
-          request_params: {},
-          fallbacks: [],
         };
+        if (models[roleName].total_deadline_sec == null) {
+          models[roleName].total_deadline_sec = ROLE_META[roleName].deadlineDefault;
+        }
       } else {
         if (role.provider == null) role.provider = "";
         if (role.model == null) role.model = "";
