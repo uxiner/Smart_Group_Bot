@@ -31,6 +31,7 @@ from bot.handlers import commands
 from bot.services.checkin import (
     VIOLATION_WINDOW_DAYS,
     build_rank_board,
+    local_today,
     member_profile,
     record_checkin,
     spend_points,
@@ -38,13 +39,21 @@ from bot.services.checkin import (
 
 
 def _day(offset: int = 0) -> datetime:
-    """以 2026-09-29（周二）12:00 为基准的第 offset 天，测试里通过 now= 注入。
+    """以「**当前**上海自然日所在周的周二」12:00 为基准的第 offset 天，测试里通过 now= 注入。
 
-    因此 -1 = 2026-09-28（本周一，本周内），-2 = 2026-09-27（上周日，上周），
-    -4 = 2026-09-25（上周五，上周）。
+    基准必须跟着当前周走：``build_rank_board(week=True)`` 在调用方不传 ``now=`` 时用
+    真实时钟算本周一，基准一旦写死日期，跨周之后三个 ``/rank week`` 用例会**永久**
+    失败（pending 的 dirty_since 全在上一周，本周榜永远是空的）。
+
+    锚点选周二，因此相对关系与原来完全一致：
+    -1 = 本周一（本周内），-2 = 上周日（上周），-4 = 上周五（上周），
+    -8 = 上周一 —— 即断言里"上周一到周五连签"的那一段。
     """
 
-    return datetime(2026, 9, 29, 12, 0, 0) + timedelta(days=offset)
+    today = local_today()
+    monday = today - timedelta(days=today.weekday())
+    tuesday = monday + timedelta(days=1)
+    return datetime(tuesday.year, tuesday.month, tuesday.day, 12, 0, 0) + timedelta(days=offset)
 
 
 def _utc(offset_days: float) -> datetime:
