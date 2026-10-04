@@ -143,6 +143,11 @@ EXTRACT_BATCH_MAX_MAX = 1000
 TOOL_DAILY_CAP = 30
 TOOL_DAILY_CAP_MIN = 0
 TOOL_DAILY_CAP_MAX = 200
+#: 群聊里**单个成员**每天最多能用 ``remember`` 写几条（B-34）。``TOOL_DAILY_CAP``
+#: 仍然是整群总额度（管理员统一帮大家记的用法不变），但没有这道 per-subject 闸门时
+#: 任何**普通成员**都能独自把全群额度用光，让当天其他人再也记不住任何事。
+#: 只作用于 ``scope='group'``；私聊作用域本身就是「一个人一个额度」，口径不变。
+TOOL_SUBJECT_DAILY_CAP = 5
 RECALL_LIMIT_MIN = 1
 RECALL_LIMIT_MAX = 20
 EVENT_TTL_DAYS = 30
@@ -1832,22 +1837,32 @@ def _local_day_start(stamp: datetime) -> datetime:
 
 
 async def count_tool_facts_today(
-    session: Any, *, scope: str, scope_id: int, now: Any | None = None
+    session: Any,
+    *,
+    scope: str,
+    scope_id: int,
+    subject_user_id: int | None = None,
+    now: Any | None = None,
 ) -> int:
-    """本作用域今天由 ``remember`` 工具写了几条（护栏用；读失败按 0 处理）。"""
+    """本作用域今天由 ``remember`` 工具写了几条（护栏用；读失败按 0 处理）。
+
+    ``subject_user_id`` 给了就**只数这个主语**的写入（B-34 的 per-subject 闸门）：
+    没有它，计数维度里没有主语，任何普通成员都能独自吃光整群额度。
+    """
 
     try:
         start = _local_day_start(now or now_shanghai_naive())
+        conditions = [
+            UserFact.scope == normalize_scope(scope),
+            UserFact.scope_id == int(scope_id),
+            UserFact.source_kind == SOURCE_TOOL,
+            UserFact.created_at >= start,
+        ]
+        if subject_user_id is not None:
+            conditions.append(UserFact.subject_user_id == int(subject_user_id))
         value = (
             await session.execute(
-                select(func.count())
-                .select_from(UserFact)
-                .where(
-                    UserFact.scope == normalize_scope(scope),
-                    UserFact.scope_id == int(scope_id),
-                    UserFact.source_kind == SOURCE_TOOL,
-                    UserFact.created_at >= start,
-                )
+                select(func.count()).select_from(UserFact).where(*conditions)
             )
         ).scalar_one()
     except Exception as exc:
