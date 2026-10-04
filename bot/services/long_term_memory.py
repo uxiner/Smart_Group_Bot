@@ -110,7 +110,10 @@ DEFAULT_TOOL_CONFIDENCE = 70
 CONFIRMED_CONFIDENCE_BUMP = 5
 
 #: 一次提炼最多采信模型返回的前几条
-MAX_FACTS_PER_EXTRACTION = 10
+#: 单次提炼最多采纳的事实条数。**别调大**：该阶段输出上限是 2048 token，
+#: 实测 10 条 + 每条 200 字证据会把 JSON 截断（`raw_chars=534` 断在 evidence 中间），
+#: 解析失败则整批丢弃。6 条 × 约 150 token ≈ 900 token，留足余量。
+MAX_FACTS_PER_EXTRACTION = 6
 #: 单次送进模型的输入上限（token，用 ``estimate_text_tokens`` 估算；超了从最旧端截）
 EXTRACT_INPUT_TOKEN_LIMIT = 12000
 #: 每轮最多遍历多少个作用域（群 + 私聊各自上限）
@@ -177,8 +180,9 @@ EXTRACT_SYSTEM_PROMPT = (
     "- 能从积分/头衔/群成员表直接查到的数据（积分、头衔、级别）；\n"
     "- 任何口令/令牌/密码/证件号/银行卡/精确住址/手机号；\n"
     "- 关于第三方且未经其本人公开的隐私。\n"
-    "每条都要带 category、confidence（0-100）和 evidence（原文片段，≤ 200 字，"
-    "必须逐字来自输入）。\n"
+    "每条都要带 category、confidence（0-100）和 evidence（原文片段，**≤ 60 字**，"
+    "逐字来自输入，只取能证明这条事实的那一小段，不要整段照抄）。\n"
+    "一次最多给 6 条，挑最稳的那几条；输出总长要短。\n"
     "拿不准就不记：宁可少记。同一批里同一个人同一类别的内容合并成一条。\n"
     "只输出严格的 JSON 数组，元素形如 "
     '{"subject_user_id": 123, "fact": "…", "category": "preference", '
@@ -1137,8 +1141,55 @@ def _trim_input_to_token_limit(
     return kept
 
 
+def _salvage_fact_objects(text: str) -> list[dict[str, Any]]:
+    """从**被截断**的 JSON 文本里抢救出完整的对象。
+
+    模型输出撞上 ``max_tokens`` 时会断在某个对象中间（实测断在 ``evidence`` 里），
+    整段 ``json.loads`` 必失败——但前面那些完整对象是好的。这里按引号/转义感知的
+    大括号扫描取出「已经闭合的顶层对象」，逐个解析，能解析的都留下。
+    宁可少记，也不要把整批丢掉（``parse_fact_items`` 的调用方据此决定游标是否前移）。
+    """
+
+    items: list[dict[str, Any]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        parsed = json.loads(text[start : index + 1])
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        items.append(parsed)
+                    start = -1
+    return items
+
+
 def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
-    """解析模型返回的 JSON 数组；解析不出来返回 ``None``（游标不前移的信号）。"""
+    """解析模型返回的 JSON 数组；解析不出来返回 ``None``（游标不前移的信号）。
+
+    先按严格路径取「第一个 ``[`` 到最后一个 ``]``」；不成（含**被截断**的情形）
+    就退回 :func:`_salvage_fact_objects` 抢救完整对象。两条路都拿不到东西才返回 ``None``。
+    """
 
     body = str(raw or "").strip()
     if not body:
@@ -1148,15 +1199,15 @@ def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
         body = fenced.group(1).strip()
     start = body.find("[")
     end = body.rfind("]")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(body[start : end + 1])
-    except Exception:
-        return None
-    if not isinstance(parsed, list):
-        return None
-    return [item for item in parsed if isinstance(item, dict)]
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(body[start : end + 1])
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    salvaged = _salvage_fact_objects(body)
+    return salvaged or None
 
 
 def _evidence_is_grounded(evidence: str, source_text: str) -> bool:

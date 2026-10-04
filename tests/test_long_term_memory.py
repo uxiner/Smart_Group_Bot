@@ -339,6 +339,47 @@ class PureFunctionTests(unittest.TestCase):
             ltm.parse_fact_items('前缀 [{"fact": "x"}] 后缀'), [{"fact": "x"}]
         )
 
+    def test_parse_fact_items_salvages_truncated_json(self) -> None:
+        """输出撞 max_tokens 被截断时，抢救出已闭合的完整对象（别整批丢）。"""
+
+        truncated = (
+            '[{"subject_user_id": 1, "fact": "喜欢咖啡", "category": "preference", '
+            '"confidence": 70, "evidence": "我爱喝咖啡"}, '
+            '{"subject_user_id": 2, "fact": "住在上海", "category": "identity", '
+            '"confidence": 80, "evidence": "我在上海工作"}, '
+            '{"subject_user_id": 3, "fact": "养了一只猫", "category": "relatio'
+        )
+        salvaged = ltm.parse_fact_items(truncated)
+        self.assertIsNotNone(salvaged, "截断也要能抢救，不能整批丢")
+        assert salvaged is not None
+        self.assertEqual([item["fact"] for item in salvaged], ["喜欢咖啡", "住在上海"])
+
+    def test_parse_fact_items_salvage_ignores_string_braces(self) -> None:
+        """证据文本里出现花括号/引号/转义也不能让扫描错位。"""
+
+        raw = (
+            '[{"fact": "写代码时会用到 {config}", "evidence": "他说 \\"用 {a} 就行\\""}, '
+            '{"fact": "最近在学 Go", "evidence": "我最近在学'
+        )
+        salvaged = ltm.parse_fact_items(raw)
+        self.assertIsNotNone(salvaged)
+        assert salvaged is not None
+        self.assertEqual(salvaged[0]["fact"], "写代码时会用到 {config}")
+
+    def test_parse_fact_items_returns_none_for_unusable_output(self) -> None:
+        """既没有完整数组、也抢不出对象 → None（游标不前移的信号）。"""
+
+        for bad in ("抱歉，我无法完成。", "", "```json\n[{半截", "[{半截", "没有数组也没有对象"):
+            with self.subTest(raw=bad):
+                self.assertIsNone(ltm.parse_fact_items(bad))
+
+    def test_parse_fact_items_accepts_an_empty_array(self) -> None:
+        """空数组 / 数组里没有对象 = 这批没有可记的事实（与「解析失败」区分开）。"""
+
+        self.assertEqual(ltm.parse_fact_items("[]"), [])
+        self.assertEqual(ltm.parse_fact_items("```json\n[]\n```"), [])
+        self.assertEqual(ltm.parse_fact_items("[1, 2, 3]"), [])
+
     def test_config_getters_default_and_clamp(self) -> None:
         empty = _settings(
             memory_extract_min_messages=1,
