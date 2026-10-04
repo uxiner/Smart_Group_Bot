@@ -42,14 +42,20 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
-from sqlalchemy import case, func, insert, literal, select, update
+from sqlalchemy import case, delete as sql_delete, func, insert, literal, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from bot.db.models import GroupArchiveState, GroupMessageArchive, GroupSummary
+from bot.db.models import (
+    GroupArchiveState,
+    GroupMessageArchive,
+    GroupSummary,
+    GroupSummaryFailureState,
+)
 from bot.services.request_priority import ExecutionPriority
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.model_limits import (
@@ -426,6 +432,83 @@ class SqlGroupSummaryStore:
                 )
             ).scalar_one_or_none()
         return int(value or 0)
+
+    async def load_failure_states(self) -> list[tuple[int, int, datetime]]:
+        """读回持久化的退避台账（``[(group_id, failure_count, backoff_until)]``）。
+
+        供调度器在启动时恢复：以前退避只活在进程内存里，重启即清零，容器滚动重启
+        等于给所有持续失败的群一次「立即重试」（B-25）。读失败按空列表处理。
+        """
+
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            GroupSummaryFailureState.group_id,
+                            GroupSummaryFailureState.failure_count,
+                            GroupSummaryFailureState.backoff_until,
+                        )
+                    )
+                ).all()
+        except Exception as exc:
+            log.warning("group summary: 退避台账读取失败（按无退避处理） | error=%s", exc)
+            return []
+        return [
+            (int(row[0]), max(0, int(row[1] or 0)), row[2])
+            for row in rows
+            if row[2] is not None
+        ]
+
+    async def save_failure_state(
+        self, group_id: int, *, failure_count: int, backoff_until: datetime
+    ) -> None:
+        """落一条退避台账（UPSERT）。写失败只记日志——退避丢失只是退回旧行为。"""
+
+        gid = int(group_id)
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    sqlite_insert(GroupSummaryFailureState)
+                    .values(
+                        group_id=gid,
+                        failure_count=max(0, int(failure_count)),
+                        backoff_until=backoff_until,
+                        updated_at=now_shanghai_naive(),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[
+                            GroupSummaryFailureState.group_id,
+                        ],
+                        set_={
+                            "failure_count": max(0, int(failure_count)),
+                            "backoff_until": backoff_until,
+                            "updated_at": now_shanghai_naive(),
+                        },
+                    )
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(
+                "group summary: 退避台账写入失败 | group=%s | error=%s", gid, exc
+            )
+
+    async def clear_failure_state(self, group_id: int) -> None:
+        """发布成功：删掉退避台账（否则重启后又从旧阶梯继续）。"""
+
+        gid = int(group_id)
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    sql_delete(GroupSummaryFailureState).where(
+                        GroupSummaryFailureState.group_id == gid
+                    )
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(
+                "group summary: 退避台账清理失败 | group=%s | error=%s", gid, exc
+            )
 
     async def pending_count(
         self,
@@ -1136,6 +1219,7 @@ class GroupSummaryScheduler:
     async def run(self) -> None:
         """常驻后台循环：有活干活，没活等通知（失败只记日志，不退出）。"""
 
+        await self._restore_failure_states()
         try:
             while not self._closed:
                 try:
@@ -1718,6 +1802,10 @@ class GroupSummaryScheduler:
         self._last_success_at[gid] = self._clock()
         self._backoff_until.pop(gid, None)
         self._failures.pop(gid, None)
+        # B-25：发布成功要**清掉落库的台账**，否则下次重启又把旧阶梯恢复回来。
+        clear_fn = getattr(self._store, "clear_failure_state", None)
+        if callable(clear_fn):
+            self._spawn(clear_fn(gid), label="clear_failure_state")
         log.info(
             "group summary published | group=%s | version=%s | covered=%s..%s "
             "(%d messages) | truncated=%s | rebuilt=%s",
@@ -1747,13 +1835,79 @@ class GroupSummaryScheduler:
         return "published"
 
     def _register_failure(self, group_id: int, cfg: GroupSummaryConfig) -> None:
+        """记一次失败并推进退避阶梯（**同步**：调用点包括 ``_claim_next``）。
+
+        B-25：阶梯与「退避到什么时候」同时落库（墙钟），否则容器每次滚动重启都
+        相当于给所有持续失败的群发一次「立即重试」，永远爬不到上限。落库是
+        fire-and-forget：退避台账写失败只退回旧行为，绝不阻塞调度。
+        """
+
         attempts = self._failures.get(int(group_id), 0) + 1
         self._failures[int(group_id)] = attempts
         delay = min(
             cfg.failure_backoff_max_seconds,
             cfg.failure_backoff_seconds * (2 ** max(0, attempts - 1)),
         )
-        self._backoff_until[int(group_id)] = self._clock() + delay
+        deadline = self._clock() + delay
+        self._backoff_until[int(group_id)] = deadline
+        # 退避台账是**可选**能力：测试替身 / 旧实现没有这几个方法时照旧走内存口径。
+        save_fn = getattr(self._store, "save_failure_state", None)
+        if callable(save_fn):
+            self._spawn(
+                save_fn(
+                    int(group_id),
+                    failure_count=attempts,
+                    backoff_until=now_shanghai_naive() + timedelta(seconds=delay),
+                ),
+                label="save_failure_state",
+            )
+
+    async def _restore_failure_states(self) -> None:
+        """启动时把落库的退避台账读回内存（B-25）。读不到就当没有退避。"""
+
+        loader = getattr(self._store, "load_failure_states", None)
+        if not callable(loader):
+            return
+        try:
+            states = await loader()
+        except Exception as exc:
+            log.warning("group summary: 退避台账恢复失败（按无退避处理） | error=%s", exc)
+            return
+        now_wall = now_shanghai_naive()
+        for group_id, failure_count, backoff_until in states or []:
+            remaining = (backoff_until - now_wall).total_seconds()
+            if remaining <= 0:
+                # 退避早就到期了：保留失败计数（阶梯继续往上爬），但立刻可重试。
+                self._failures[int(group_id)] = max(0, int(failure_count))
+                continue
+            self._failures[int(group_id)] = max(0, int(failure_count))
+            self._backoff_until[int(group_id)] = self._clock() + remaining
+        if states:
+            log.info(
+                "group summary: 已恢复 %d 个群的失败退避台账 | still_backing_off=%d",
+                len(states),
+                len(self._backoff_until),
+            )
+
+    def _spawn(self, coro: Awaitable[Any], *, label: str) -> None:
+        """跑一个**不阻塞调度**的后台协程（失败只记日志，绝不影响主流程）。"""
+
+        try:
+            task = asyncio.ensure_future(coro)
+        except RuntimeError:  # pragma: no cover - 没有运行中的事件循环
+            log.debug("group summary: no loop; dropped %s", label)
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+        def _done(finished: asyncio.Future[Any]) -> None:
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                log.warning("group summary background task failed | task=%s | %s", label, exc)
+
+        task.add_done_callback(_done)
 
     def _note_model_concurrency(self, delta: int, cfg: GroupSummaryConfig) -> None:
         del cfg

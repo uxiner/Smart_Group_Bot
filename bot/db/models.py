@@ -135,6 +135,34 @@ class GroupSummary(Base):
     )
 
 
+class GroupSummaryFailureState(Base):
+    """摘要调度器的**失败退避台账**（B-25）。
+
+    退避阶梯（``failure_backoff_seconds * 2**(k-1)``，封顶
+    ``failure_backoff_max_seconds``）与「退避到什么时候」以前只活在
+    ``GroupSummaryScheduler`` 的两个进程内 dict 里，于是**每次重启都从
+    ``failure_backoff_seconds`` 重新爬阶梯**——容器滚动重启等于给所有持续失败的群
+    发一次「立即重试」，永远到不了上限。
+
+    ``backoff_until`` 存的是**墙钟**时间（不是 ``time.monotonic``）：进程重启之后
+    仍然可以和 ``now_shanghai_naive()`` 比较。成功发布后对应行被删除。
+    """
+
+    __tablename__ = "group_summary_failure_states"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    backoff_until: Mapped[datetime] = mapped_column(
+        DateTime, default=now_shanghai_naive
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GroupPermanentMemory(Base):
     __tablename__ = "group_permanent_memories"
 
