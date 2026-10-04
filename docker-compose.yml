@@ -1,9 +1,13 @@
 services:
   bot:
     build: .
-    # Preserve the historical bind-mount owner used by existing deployments.
-    # Fresh hosts may set APP_UID/APP_GID=10001 to match the image account.
-    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    # C3-01：这里过去是 "${APP_UID:-1000}:${APP_GID:-1000}"，**覆盖掉**了
+    # Dockerfile 的 `USER app:app`，使「镜像非 root」这条不变量在默认部署路径上不成立；
+    # 而 README 建议的 APP_UID="$(id -u)" 在 root 宿主上就是 0，容器于是以 root
+    # 运行，且没有任何断言或告警。
+    # 改成「必须显式给出」：未设置/为空时 compose 直接报错，而不是静默回落 0/1000。
+    # 想与镜像内账号一致就显式写 APP_UID=10001 APP_GID=10001。
+    user: "${APP_UID:?set APP_UID to the owner id of ./data, e.g. APP_UID=\"$(id -u)\"}:${APP_GID:?set APP_GID to the group id of ./data, e.g. APP_GID=\"$(id -g)\"}"
     init: true
     env_file: .env
     volumes:

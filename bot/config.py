@@ -1486,6 +1486,30 @@ def load_bootstrap_settings() -> Settings:
     return settings
 
 
+def log_process_identity() -> None:
+    """C3-01：把进程实际以谁的身份运行写进启动日志，root 时明确告警。
+
+    ``Dockerfile`` 写了 ``USER app:app``，但 compose 的 ``user:`` 会覆盖它，而
+    README 建议的 ``APP_UID="$(id -u)"`` 在 root 宿主上就是 0。compose 侧已改成
+    「必须显式给出」（空值直接报错），但非零的 uid 也可能不是部署者想要的，所以
+    这里始终打印一次实际身份。
+    """
+
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    uid = int(getuid()) if callable(getuid) else -1
+    gid = int(getgid()) if callable(getgid) else -1
+    if uid == 0:
+        log.warning(
+            "进程以 **root**(uid=0/gid=%d) 运行：镜像里的 `USER app:app` 被覆盖了"
+            "（compose 的 user: 或容器运行参数）。容器内 root + 可写的 ./data 绑定卷"
+            "+ 对外端口，请确认这是有意为之，否则显式设置 APP_UID/APP_GID。",
+            gid,
+        )
+        return
+    log.info("进程身份：uid=%d gid=%d（非 root）", uid, gid)
+
+
 def log_enforcement_switch_state(settings: Settings) -> None:
     """F-024：把「对用户可见的执法开关」的生效状态写进启动日志。
 

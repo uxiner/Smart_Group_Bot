@@ -11,6 +11,7 @@ from typing import Any, Callable
 from bot.config import (
     load_bootstrap_settings,
     log_enforcement_switch_state,
+    log_process_identity,
     validate_bootstrap_settings,
 )
 from bot.db.engine import init_db
@@ -645,6 +646,8 @@ async def main() -> None:
     )
 
     dp["settings"] = settings
+    # C3-01：把实际运行身份写进启动日志（root 时 WARNING）。
+    log_process_identity()
     # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
     # 状态写进启动日志（opt-in 默认关闭；只要有开启就 WARNING 列出）。
     log_enforcement_switch_state(settings)
