@@ -4645,6 +4645,41 @@ _NSFW_IMAGE_WARNING_REASON = "检测到裸露/色情图片或视频，已删除�
 _NSFW_IMAGE_CHALLENGE_REASON = "检测到在群内公开发布裸露/色情图片或视频（内容已删除）"
 
 
+#: 视觉描述的**代码级**长度上限（B-12）。提示词里「30 字以内」只是软约束：一张
+#: 文字密集的截图可以让 OCR 描述膨胀到几万个字符，而这段文本会直接进入审核文本、
+#: 决策上下文与 ``group_message_archive`` 归档（``record_violation`` 侧另有 [:500]
+#: 截断，归档侧没有）。日志之外的**所有**下游只喂截断版。
+VISION_TEXT_MAX_CHARS = 800
+
+
+def _cap_vision_text(value: Any) -> str:
+    """把视觉描述硬截断到 :data:`VISION_TEXT_MAX_CHARS`（保留末尾判定行）。
+
+    NSFW 守卫那一路要求判定 JSON 在**最后一行**，所以不能一刀切在末尾截断——
+    那会把 ``NSFW_DECISION {"nsfw": "yes"}`` 砍成半行，判定直接失效（宁可漏判）。
+    这里保留最后一行不动，只截断它前面的正文。
+    """
+
+    text = str(value or "").strip()
+    if len(text) <= VISION_TEXT_MAX_CHARS:
+        return text
+    lines = text.splitlines()
+    if len(lines) > 1 and _NSFW_DECISION_LINE_RE.match(lines[-1]):
+        tail = lines[-1]
+        head = "\n".join(lines[:-1])
+        head_budget = max(0, VISION_TEXT_MAX_CHARS - len(tail) - 1)
+        if head_budget < len(head):
+            log.warning(
+                "【视觉】描述超长，已截断正文（保留末尾判定行）| chars=%d",
+                len(text),
+            )
+            return "\n".join([head[:head_budget].rstrip(), tail])
+    log.warning(
+        "【视觉】描述超长，已截断 | chars=%d -> %d", len(text), VISION_TEXT_MAX_CHARS
+    )
+    return text[:VISION_TEXT_MAX_CHARS].rstrip() + " ..."
+
+
 def _nsfw_decision_payload(vision_text: str) -> dict[str, Any] | None:
     """取末尾那行结构化判定并严格解析；形状不对返回 ``None``。
 
@@ -4790,7 +4825,8 @@ async def _nsfw_video_thumbnail_vision_text(message: Message, llm: LLMService) -
 
     if vision_text == "NO_VALID_IMAGE_CONTENT":
         return ""
-    return vision_text
+    # B-12：代码级长度上限。日志之外的所有下游（审核 / 决策 / 归档）只喂截断版。
+    return _cap_vision_text(vision_text)
 
 
 async def _guard_nsfw_video_only_message(
@@ -5198,6 +5234,11 @@ async def _append_image_context(
     if not vision_text:
         log.info("【视觉】识别为空")
         return text, ""
+
+    # B-12：提示词里的「30 字以内」只是软约束，这里做代码级硬截断。此后
+    # ``input_text``（关键词/正则扫描、决策上下文）、``group_message_archive``
+    # 归档、NSFW 判定拿到的都只有截断版；日志仍打完整前 80 字。
+    vision_text = _cap_vision_text(vision_text)
 
     log.info("【视觉】识别结果 | %s", vision_text[:80])
     if not nsfw_guard:
