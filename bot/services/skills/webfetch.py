@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import os
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -13,6 +13,7 @@ from bot.services.skills.platform_common import (
     UnsupportedContentTypeError,
     fetch_text,
     parse_html_summary,
+    resolve_public_http_url,
 )
 from bot.utils.security import clean_multiline_text, clean_text
 
@@ -30,6 +31,35 @@ class WebFetchSkill:
         "required": ["url"],
         "additionalProperties": False,
     }
+
+    def __init__(self, settings: object | None = None) -> None:
+        # Firecrawl 的接入参数一律从配置系统读（与 ``WebSearchSkill`` 同口径）。
+        # 修前这里是 ``os.environ["FIRECRAWL_API_KEY"]``：``service.py`` 注册的是
+        # ``WebFetchSkill()``（不传 settings），所以 ``config.py:545-548`` 里那套
+        # ``firecrawl_*`` 字段对 webfetch 完全不生效——运维只有手写一个文档里没有
+        # 的环境变量才能启用它（B-03）。
+        self._api_key = ""
+        self._base = "https://api.firecrawl.dev"
+        self._timeout = 20.0
+        if settings is not None:
+            self._api_key = clean_text(
+                str(getattr(settings, "firecrawl_api_key", "") or ""), max_len=512
+            )
+            base = clean_text(
+                str(getattr(settings, "firecrawl_api_base", "") or ""), max_len=2048
+            ).rstrip("/")
+            if base:
+                self._base = base
+            try:
+                self._timeout = float(
+                    getattr(settings, "firecrawl_timeout_sec", 20.0) or 20.0
+                )
+            except Exception:
+                self._timeout = 20.0
+
+    @property
+    def firecrawl_available(self) -> bool:
+        return bool(self._api_key)
 
     @staticmethod
     def _valid_url(url: str) -> bool:
@@ -59,7 +89,7 @@ class WebFetchSkill:
     def _fetch_via_firecrawl(self, url: str, api_key: str) -> tuple[str, str] | None:
         try:
             req = Request(
-                "https://api.firecrawl.dev/v1/scrape",
+                f"{self._base}/v1/scrape",
                 data=json.dumps({"url": url, "formats": ["markdown"]}).encode("utf-8"),
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -67,7 +97,7 @@ class WebFetchSkill:
                     "User-Agent": "SmartGroupBot/1.0",
                 },
             )
-            with urlopen(req, timeout=20.0) as resp:
+            with urlopen(req, timeout=self._timeout) as resp:
                 if resp.status != 200:
                     return None
                 data = json.loads(resp.read().decode("utf-8"))
@@ -90,10 +120,26 @@ class WebFetchSkill:
             return SkillRunResult(ok=False, skill=self.name, summary="URL 非法", error="invalid_url")
 
         # 1. 优先尝试使用 Firecrawl 引擎提取网页（过反爬、JS渲染、输出清晰 Markdown）
-        firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
-        if firecrawl_key:
-            import asyncio
-            result = await asyncio.to_thread(self._fetch_via_firecrawl, u, firecrawl_key)
+        #
+        #    但 Firecrawl 是**第三方代抓**：它会去访问我们给的这个 URL，所以项目
+        #    自己的 SSRF 策略对它同样成立。修前这里只过了 `_valid_url` 的语法校验就
+        #    POST 出去，于是 `http://169.254.169.254/…`、`http://127.0.0.1:8480/…`
+        #    这些原生路径会用 `non_public_host` / `non_public_address` 拒掉的地址
+        #    被照发不误——同一站点两条路径两套口径，内部主机名/端口还会泄漏给第三方
+        #    （B-03）。所以先过一遍 `resolve_public_http_url`：语法 + DNS 解析 +
+        #    私网/回环/链路本地 IP 拒绝，与原生路径完全一致。
+        if self.firecrawl_available:
+            try:
+                await resolve_public_http_url(u)
+            except UnsafeUrlError as exc:
+                log.warning("webfetch rejected unsafe URL before firecrawl: %s", exc)
+                return SkillRunResult(
+                    ok=False,
+                    skill=self.name,
+                    summary="该地址不可安全访问",
+                    error=str(exc) or "unsafe_url",
+                )
+            result = await asyncio.to_thread(self._fetch_via_firecrawl, u, self._api_key)
             if result and result[1]:
                 title, content = result
                 log.info("Successfully fetched %s via Firecrawl", u)

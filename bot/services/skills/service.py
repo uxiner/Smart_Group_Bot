@@ -307,7 +307,7 @@ class SkillService:
         self._register(SendStickerSkill())
         self._register(MusicSearchSkill(settings))
         self._register(WebSearchSkill(settings))
-        self._register(WebFetchSkill())
+        self._register(WebFetchSkill(settings))
         self._register(MihomoDocSkill())
         self._register(RouterOSDocSkill())
         self._register(BilibiliSearchSkill())
