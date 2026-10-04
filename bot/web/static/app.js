@@ -92,6 +92,10 @@
     moderation: { label: "审核模型", icon: "shield-alert", parent: "继承决策模型", embed: false, deadlineDefault: 35 },
     compress: { label: "压缩模型", icon: "minimize-2", parent: "继承主模型", embed: false, deadlineDefault: 90 },
     embed: { label: "向量模型", icon: "binary", parent: "继承主模型", embed: true, deadlineDefault: 60 },
+    // D3-42：skill 角色后端完整支持（rc 用 `models.skill or main` 建 settings.bot.skill_model，
+    // __main__ 传给 llm.reconfigure(skill=...)），但 ROLE_META 里缺席 → 模型页、供应商校验、
+    // 回退重命名里全都看不到它，运维只能手改 DB payload。deadlineDefault 对齐 llm.py 的 120 秒。
+    skill: { label: "技能模型", icon: "sparkles", parent: "继承主模型", embed: false, deadlineDefault: 120 },
   };
 
   const PROMPT_META = {
@@ -685,6 +689,35 @@
       </div>`;
   }
 
+  // D3-42：`models.skill` 允许是 `null`（后端 `models.skill or main` = 继承主模型）。
+  // 渲染循环与供应商校验都直接读 `state.config.models[role].provider`，所以先把
+  // 缺失/null 的角色补成一个"留空 = 继承"的空壳，UI 才不会炸、校验也不会误报。
+  function normalizeModelRoles() {
+    const models = state.config?.models;
+    if (!models) return;
+    const template = models.main || {};
+    for (const roleName of Object.keys(ROLE_META)) {
+      const role = models[roleName];
+      if (!role || typeof role !== "object") {
+        models[roleName] = {
+          provider: "",
+          model: "",
+          timeout_sec: template.timeout_sec,
+          total_deadline_sec: ROLE_META[roleName].deadlineDefault,
+          temperature: template.temperature,
+          max_tokens: template.max_tokens,
+          request_params: {},
+          fallbacks: [],
+        };
+      } else {
+        if (role.provider == null) role.provider = "";
+        if (role.model == null) role.model = "";
+        if (role.request_params == null) role.request_params = {};
+        if (role.fallbacks == null) role.fallbacks = [];
+      }
+    }
+  }
+
   function providerOptions(selected, allowInherit = true, inheritLabel = "继承主模型") {
     const providers = state.config.models.providers || [];
     const options = [];
@@ -958,6 +991,7 @@
             ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动发现模型窗口（默认）" }, { value: "fixed", label: "固定模型侧上限（兼容旧配置）" }], hint: "每轮业务预算固定为 272Ki（输入上限 245760，含人设/工具定义/记忆/历史/本轮/工具结果/输出预留）。auto：再自动发现模型真实窗口，只在模型更小时进一步收紧；fixed：不查元数据，用右侧固定值当模型侧上限" })}
             ${field("bot.max_context_tokens", "固定上限 Token（仅 fixed 生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。auto 模式下它只作为“查不到任何模型元数据”时的保守降级值，不再压住已知模型" })}
             ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
+            ${toggle("bot.enable_rich_messages", "启用富文本排版", "D3-40：此前该开关既无 UI、又无 env、又无 DB 路径（load_settings() 从不被调用），getattr(..., False) 恒真，等于没有关")}
             ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
@@ -970,8 +1004,24 @@
             ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
             ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
-            ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
+            ${toggle("bot.memory_recall_enabled", "启用记忆召回（第 3 期）", "按当前问题从本群**原始档案**里检索相关消息。⚠️ 它**不是**长期记忆（第 4 期）的总开关——关掉它，第 4 期照样写库提炼，见下一节「长期记忆（第 4 期）」")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
+          </div>
+        </section>
+        <section class="settings-section">
+          ${sectionHead("长期记忆（第 ④ 期）", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定…）。D3-39：这一整块 11 个开关此前可 PUT、可落库、有 revision 保护，但 Mini App 完全无入口——其中 memory_facts_enabled / memory_tool_enabled 是真·总开关，关不掉。")}
+          <div class="field-grid three">
+            ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "D3-39：**总开关**。关掉 = 不提炼、不注入、不写入（群聊注入 / 私聊召回 / /memory 命令都先判它）。关闭后已写入的事实不再注入，库里的行保留")}
+            ${toggle("bot.memory_extract_enabled", "启用后台提炼", "从群聊/私聊原文里被动提炼事实；关掉后不再有新的提炼，已有事实仍会被召回注入")}
+            ${field("bot.memory_extract_interval_minutes", "提炼巡检间隔（分钟）", { type: "number", min: 5, max: 1440, step: 1, required: true, hint: "默认 30" })}
+            ${field("bot.memory_extract_min_messages", "触发提炼所需最少新消息", { type: "number", min: 5, max: 500, step: 1, required: true, hint: "默认 20；未达到就跳过这一轮（游标不前移）" })}
+            ${field("bot.memory_extract_daily_cap", "每天最多提炼次数", { type: "number", min: 0, max: 500, step: 1, required: true, hint: "默认 48；0 = 不限。防成本失控" })}
+            ${field("bot.memory_extract_batch_max", "单批最大条数", { type: "number", min: 20, max: 1000, step: 10, required: true, hint: "默认 200；超 token 预算时从最旧一端整条丢弃（会留日志）" })}
+            ${toggle("bot.memory_tool_enabled", "启用模型主动记忆（remember 工具）", "D3-39：模型可以主动写一条关于**当前说话人本人**的稳定事实。关掉后 remember 工具不写库（仍可被调用，只是不落库）")}
+            ${field("bot.memory_tool_daily_cap", "remember 工具每日上限", { type: "number", min: 0, max: 200, step: 1, required: true, hint: "默认 30（每作用域每天，0 = 不限）。群作用域另有一道「每个成员每天」的闸，普通成员不能独占全群额度（B-34）" })}
+            ${field("bot.memory_recall_limit", "注入条数上限", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "默认 8；每轮注入的事实条数与字符数都不超它" })}
+            ${field("bot.memory_event_ttl_days", "有期限事实的保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；category=event 的事实到期后不再注入并标删除" })}
+            ${field("bot.memory_deleted_retention_days", "已删除事实保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；被 /memory off 或被新事实替代的行，保留这么多天后才物理清理" })}
           </div>
         </section>
         <section class="settings-section">
@@ -2770,6 +2820,7 @@
   function applySettingsDocument(document) {
     state.document = document;
     state.config = clone(document.config);
+    normalizeModelRoles();
     if (state.config?.bot?.auto_delete_seconds == null && state.config?.bot?.auto_delete_minutes != null) {
       state.config.bot.auto_delete_seconds = Number(state.config.bot.auto_delete_minutes || 0) * 60;
     }

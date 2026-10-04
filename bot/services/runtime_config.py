@@ -288,6 +288,12 @@ class BotBehaviorConfig(StrictModel):
     inbound_debounce_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
     reply_batch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=120.0)
     enable_typing: bool = True
+    # D3-40：富文本（粗体/斜体/代码块等）渲染总开关。此前它只存在于
+    # ``bot/config.py`` 的 ``load_settings()`` 里，而那个函数**全仓无生产调用点**，
+    # 于是它既无 env 生效路径、又不在 schema 里，``getattr(..., False)`` 恒真——
+    # 唯一一个「既无 UI、又无 env、又无 DB」的行为开关。这里补齐三方接线
+    # （schema + apply + Mini App），**不**去把 ``load_settings()`` 改成被调用。
+    enable_rich_messages: bool = True
     enable_streaming: bool = True
     stream_chunk_size: int = Field(default=36, ge=8, le=4096)
     stream_edit_interval_sec: float = Field(default=1.0, ge=0.3, le=30.0)
@@ -1079,6 +1085,7 @@ class RuntimeConfig(StrictModel):
         settings.bot.inbound_debounce_seconds = bot.inbound_debounce_seconds
         settings.bot.reply_batch_timeout_seconds = bot.reply_batch_timeout_seconds
         settings.bot.enable_typing = bot.enable_typing
+        settings.bot.enable_rich_messages = bot.enable_rich_messages
         settings.bot.enable_streaming = bot.enable_streaming
         settings.bot.stream_chunk_size = bot.stream_chunk_size
         settings.bot.stream_edit_interval_sec = bot.stream_edit_interval_sec
@@ -1988,6 +1995,7 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
         for key in (
+            "enable_rich_messages",
             "memory_recall_enabled",
             "memory_automatic_compaction",
             # 第 4 期：长期记忆的两个开关
@@ -2170,6 +2178,11 @@ def build_legacy_runtime_config(
                 else settings.bot.reply_batch_timeout_seconds
             ),
             enable_typing=settings.bot_enable_typing,
+            enable_rich_messages=(
+                settings.bot_enable_rich_messages
+                if "bot_enable_rich_messages" in getattr(settings, "model_fields_set", set())
+                else settings.bot.enable_rich_messages
+            ),
             enable_streaming=settings.bot_enable_streaming,
             stream_chunk_size=settings.bot_stream_chunk_size,
             stream_edit_interval_sec=settings.bot_stream_edit_interval_sec,
