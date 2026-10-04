@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiohttp import ClientConnectionError
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from bot.services.message_templates import render_data_brief
@@ -1075,3 +1076,134 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("name: @literal", body)
         self.assertIn("<pre><code", body)
         self.assertNotIn("&lt;code&gt;", body)
+
+
+class AmbiguousSendIsNotResentTests(unittest.IsolatedAsyncioTestCase):
+    """A-03：非幂等 ``sendMessage`` 的网络层失败不是"确定没送达"。
+
+    ``sendMessage`` 没有幂等键。连接断开 / 超时只说明回执没收到，Telegram 可能
+    早就收下了这条消息；同文件 ``_safe_overlay_edit``（:2006-2011）早已把这条
+    路径按 ambiguous 处理、绝不重发，整条 ``_safe_send`` 却还在按确定失败重试，
+    ``retries=3`` 意味着最多投递 4 次完全相同的内容。
+    """
+
+    @staticmethod
+    def _message(reply_error: BaseException) -> SimpleNamespace:
+        return SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(side_effect=reply_error),
+            answer=AsyncMock(side_effect=reply_error),
+        )
+
+    async def test_network_error_is_not_resent(self) -> None:
+        message = self._message(
+            TelegramNetworkError(
+                method=SimpleNamespace(),
+                message="Request timeout error",
+            )
+        )
+        on_ambiguous = Mock()
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_reply(
+                message,
+                "同一条正文",
+                on_ambiguous=on_ambiguous,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(message.reply.await_count, 1)
+        on_ambiguous.assert_called_once_with()
+
+    async def test_aiohttp_client_error_is_not_resent(self) -> None:
+        message = self._message(ClientConnectionError("connection lost"))
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_reply(message, "同一条正文")
+
+        self.assertFalse(ok)
+        self.assertEqual(message.reply.await_count, 1)
+
+    async def test_unexpected_error_is_not_resent(self) -> None:
+        message = self._message(RuntimeError("receipt deserialization failed"))
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_reply(message, "同一条正文")
+
+        self.assertFalse(ok)
+        self.assertEqual(message.reply.await_count, 1)
+
+    async def test_ambiguous_send_marks_overlay_outcome(self) -> None:
+        progress_sent = SimpleNamespace(
+            message_id=88,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=SimpleNamespace(),
+                    message="Bad Request: can't parse entities",
+                )
+            ),
+        )
+        message = self._message(
+            TelegramNetworkError(
+                method=SimpleNamespace(),
+                message="Request timeout error",
+            )
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_reply(message, "最终正文", overlay=overlay)
+
+        self.assertFalse(ok)
+        self.assertEqual(overlay.outcome, "ambiguous")
+        self.assertEqual(message.reply.await_count, 1)
+
+    async def test_definite_bad_request_still_recovers_without_resending(self) -> None:
+        sent = SimpleNamespace(message_id=93, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(
+                side_effect=[
+                    TelegramBadRequest(
+                        method=SimpleNamespace(),
+                        message="message to be replied not found",
+                    ),
+                    sent,
+                ]
+            ),
+            answer=AsyncMock(),
+        )
+
+        ok = await send_reply(message, "同一条正文")
+
+        self.assertTrue(ok)
+        self.assertEqual(message.reply.await_count, 2)
+        self.assertNotIn(
+            "reply_to_message_id", message.reply.await_args_list[1].kwargs
+        )
+
+    async def test_scheduled_chat_message_network_error_is_not_resent(self) -> None:
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                side_effect=TelegramNetworkError(
+                    method=SimpleNamespace(),
+                    message="Request timeout error",
+                )
+            )
+        )
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_chat_message(bot, -10001, "同一条正文")
+
+        self.assertFalse(ok)
+        self.assertEqual(bot.send_message.await_count, 1)

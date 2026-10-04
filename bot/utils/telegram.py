@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Literal
 
+from aiohttp import ClientError
 from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
@@ -1819,7 +1820,14 @@ async def send_reply(
         and str(overlay.status_html or "").strip()
     )
 
+    # Set once a delivery attempt ended in an unknown state.  A body that may
+    # already be in the chat must never be sent again in another rendering
+    # (A-03), so the HTML -> plain-text fallback is skipped from here on.
+    send_ambiguous = False
+
     def _mark_overlay_ambiguous() -> None:
+        nonlocal send_ambiguous
+        send_ambiguous = True
         if overlay is not None:
             overlay.outcome = "ambiguous"
         if on_ambiguous is None:
@@ -1923,16 +1931,27 @@ async def send_reply(
                     return None
                 attempt += 1
                 await asyncio.sleep(retry_delay * attempt)
+            except (TelegramNetworkError, asyncio.TimeoutError, ClientError):
+                # ``sendMessage`` 没有幂等键：连接断开 / 超时只说明我们没收到
+                # 回执，Telegram 可能早就收下了这条消息。把它当"确定失败"重发
+                # 整条内容，用户就会收到 2~4 条一模一样的回复。同文件
+                # ``_safe_overlay_edit`` 走的就是"标记 ambiguous、不重发"这条路
+                # （A-03）。
+                _mark_overlay_ambiguous()
+                log.exception(
+                    "send outcome ambiguous chat_id=%s; not resending",
+                    message.chat.id,
+                )
+                return None
             except Exception:
-                if attempt >= retries:
-                    log.exception(
-                        "send failed chat_id=%s retries=%d",
-                        message.chat.id,
-                        retries,
-                    )
-                    return None
-                attempt += 1
-                await asyncio.sleep(retry_delay * attempt)
+                # 同理：请求已经飞出去了，任何非确定性的异常都不构成"未被接收"
+                # 的证明，只能按不确定结果上报，由上层的 ambiguous 兜底接管。
+                _mark_overlay_ambiguous()
+                log.exception(
+                    "send failed chat_id=%s; not resending",
+                    message.chat.id,
+                )
+                return None
         return None
 
     async def _safe_edit(
@@ -2409,10 +2428,13 @@ async def send_reply(
                         if sent is not None:
                             _record_delivered_message(sent)
                             continue
-                        if overlay.outcome == "ambiguous":
+                        if overlay.outcome == "ambiguous" or send_ambiguous:
                             return False
+                    ambiguous_before = send_ambiguous
                     sent = await _safe_send(html_body, parse_mode="HTML", retries=3)
-                    if not sent:
+                    if not sent and not (send_ambiguous and not ambiguous_before):
+                        # Re-sending the same body without formatting is only safe
+                        # when Telegram definitely rejected the HTML variant.
                         sent = await _safe_send(plain_body, parse_mode=None, retries=2)
                     ok = ok and bool(sent)
                 return ok
@@ -2520,6 +2542,10 @@ async def send_chat_message(
         else {}
     )
 
+    # Mirrors send_reply: once one attempt ended in an unknown state the same
+    # body must not be delivered again in another rendering (A-03).
+    send_ambiguous = False
+
     async def _safe_send(
         body: str,
         *,
@@ -2528,6 +2554,7 @@ async def send_chat_message(
         retries: int = 1,
         retry_delay: float = 0.8,
     ) -> Message | None:
+        nonlocal send_ambiguous
         attempt = 0
         current_reply_id = reply_id
         current_body = body
@@ -2571,12 +2598,22 @@ async def send_chat_message(
                     return None
                 attempt += 1
                 await asyncio.sleep(retry_delay * attempt)
+            except (TelegramNetworkError, asyncio.TimeoutError, ClientError):
+                # 和 send_reply._safe_send 同理：非幂等 sendMessage 在网络层
+                # 失败不等于"没送达"，重发会直接产生重复消息（A-03）。
+                send_ambiguous = True
+                log.exception(
+                    "scheduled send outcome ambiguous chat_id=%s; not resending",
+                    chat_id,
+                )
+                return None
             except Exception:
-                if attempt >= retries:
-                    log.exception("scheduled send failed chat_id=%s retries=%d", chat_id, retries)
-                    return None
-                attempt += 1
-                await asyncio.sleep(retry_delay * attempt)
+                send_ambiguous = True
+                log.exception(
+                    "scheduled send failed chat_id=%s; not resending",
+                    chat_id,
+                )
+                return None
         return None
 
     semaphore = _SEND_SEMAPHORES.setdefault(
@@ -2589,13 +2626,14 @@ async def send_chat_message(
                 ok = True
                 for part in _split_for_telegram(payload, limit=TG_MESSAGE_LIMIT):
                     html_body = md_to_html(part)
+                    ambiguous_before = send_ambiguous
                     sent = await _safe_send(
                         html_body,
                         parse_mode="HTML",
                         reply_id=reply_to_message_id,
                         retries=3,
                     )
-                    if not sent:
+                    if not sent and not (send_ambiguous and not ambiguous_before):
                         sent = await _safe_send(
                             _plain_fallback_for_part(part),
                             parse_mode=None,
