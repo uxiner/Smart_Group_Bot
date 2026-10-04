@@ -4012,7 +4012,14 @@ async def cmd_cost(
 async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_group_admin_permission(message, session, settings):
+    # D3-48：/mute 能对**任何人**下手，必须向 Telegram 交叉校验「你现在还是不是
+    # 管理员」——本地 admins 表没有任何自动回收路径（与 D3-18 的 Web 侧同一根因）。
+    if not await ensure_group_admin_permission(
+        message,
+        session,
+        settings,
+        revalidate_telegram=True,
+    ):
         return
 
     args = (message.text or "").partition(" ")[2].strip().lower()
@@ -4209,7 +4216,13 @@ async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings
 async def cmd_proactive(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_group_admin_permission(message, session, settings):
+    # D3-48：/proactive 能改主动话题排期，同样要向 Telegram 交叉校验管理员身份。
+    if not await ensure_group_admin_permission(
+        message,
+        session,
+        settings,
+        revalidate_telegram=True,
+    ):
         return
 
     args = (message.text or "").partition(" ")[2].strip().lower()
