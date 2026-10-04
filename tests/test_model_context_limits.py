@@ -569,7 +569,14 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(registry.resolve(healthy).total_window, 1_000_000, "好端点必须照常刷新")
         self.assertEqual(
-            sorted(report), ["broken||broken/model", "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"]
+            sorted(report),
+            sorted(
+                [
+                    # 坏端口只让**它自己**的标签少了 host，其余 endpoint 的续期不受影响
+                    "home_work2api||broken/model",
+                    "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash",
+                ]
+            ),
         )
 
 
