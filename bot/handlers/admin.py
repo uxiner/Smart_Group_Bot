@@ -3270,8 +3270,22 @@ async def cmd_raidguard(
         )
     except Exception as exc:
         log.exception("manual raid enable failed | group=%s", group_id)
-        detail = str(exc) if isinstance(exc, RuntimeError) else "手动爆破防护状态保存失败，请稍后重试"
-        await _answer(message, settings, html.escape(detail))
+        # D3-47：``enable_manual_lockdown`` 是**先落库 + 武装、后发 Telegram**
+        # （raid_guard.py:2103-2122）。RuntimeError 只在"状态没能落库"时抛，那是真的
+        # 没生效；而 flood-wait / 网络错（TelegramRetryAfter / TelegramNetworkError）
+        # 来自后面的 ``_publish_lockdown_status``——此时锁定**已经生效**（内存 + DB
+        # 都写了），只是带"关闭"按钮的状态消息没发出去。两种情况混成同一句
+        # "保存失败"会让管理员以为没生效、实际进群全被拒，重试 /raidguard on 还会把
+        # 截止时间推后。这里按异常类型区分，不回滚已生效的锁定。
+        if isinstance(exc, RuntimeError):
+            await _answer(message, settings, html.escape(str(exc)))
+            return
+        await _answer(
+            message,
+            settings,
+            "爆破防护**已开启**（状态已保存），但状态消息发布失败，群里看不到那条"
+            "带「关闭」按钮的提示。如需立即解除，请发送 /raidguard off。",
+        )
         return
     # The service has already posted the persistent state-change notice. The
     # command acknowledgement follows the normal management retention policy.
