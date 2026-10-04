@@ -4241,12 +4241,18 @@ class _PendingGroupActivityWrite:
 
 
 _GROUP_ACTIVITY_DEBOUNCE_SECONDS = 1.0
+#: 群活动写入的最大重试次数。退避封顶 30s，所以 8 次约等于两分钟的持续重试：
+#: 足够覆盖 SQLite 写锁争用这类瞬时故障；再往上只可能是确定性失败（约束冲突、
+#: 超长标题、连接被永久拒绝），继续重试只会让每个"坏群"常驻一个 task + 连接池
+#: churn 到进程退出，pending 条目也永远清不掉（A-11）。
+_GROUP_ACTIVITY_MAX_ATTEMPTS = 8
 _GROUP_ACTIVITY_PENDING: dict[int, _PendingGroupActivityWrite] = {}
 _GROUP_ACTIVITY_WRITE_SEMAPHORE = asyncio.Semaphore(1)
 
 
 async def _run_group_activity_writer(group_id: int) -> None:
     retry_delay = 0.5
+    attempts = 0
     try:
         await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
         while True:
@@ -4268,6 +4274,19 @@ async def _run_group_activity_writer(group_id: int) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                attempts += 1
+                if attempts >= _GROUP_ACTIVITY_MAX_ATTEMPTS:
+                    log.error(
+                        "[%s] deferred group activity flush abandoned after %d attempts",
+                        group_id,
+                        attempts,
+                        exc_info=True,
+                    )
+                    # 只摘掉自己这一条：期间到来的新消息会重新入队走正常路径。
+                    current = _GROUP_ACTIVITY_PENDING.get(group_id)
+                    if current is pending:
+                        _GROUP_ACTIVITY_PENDING.pop(group_id, None)
+                    return
                 log.exception("[%s] deferred group activity flush failed", group_id)
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(30.0, retry_delay * 2.0)
@@ -4278,6 +4297,7 @@ async def _run_group_activity_writer(group_id: int) -> None:
                 _GROUP_ACTIVITY_PENDING.pop(group_id, None)
                 return
             retry_delay = 0.5
+            attempts = 0
             await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
     finally:
         current = _GROUP_ACTIVITY_PENDING.get(group_id)
