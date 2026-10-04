@@ -72,6 +72,9 @@ _LLM_PRIORITY_GATE = ReservedCapacityGate(
     # margin below the gateway's measured concurrency knee (~24 in flight;
     # beyond that it answers 503 no_healthy_account).
     normal_capacity=4,
+    # 背景摘要单独至多 2 个，并且**与回复共享** normal=4：回复 + 摘要 ≤ 4，
+    # 摘要 ≤ 2 ⇒ 普通回复永远至少保留 2 个名额。总数 8 与审核保留边界不变。
+    background_capacity=2,
 )
 # Moderation is safety critical: a missed audit is worse than a late reply,
 # so audits are admitted at HIGH priority (one slot beyond the two NORMAL
@@ -97,6 +100,8 @@ _LLM_STAGE_DEADLINES = {
     "skill": 120.0,
     # /av 的可选 AI 题材概述：附加项，宁可拿不到也不能拖住查询。
     "synopsis": 20.0,
+    # 后台群摘要：入场后（含 fallback 与重试）整个模型调用最多 15 秒。
+    "group_summary": 15.0,
 }
 _LLM_CIRCUIT_FAILURE_THRESHOLD = 3
 _LLM_CIRCUIT_COOLDOWN_SECONDS = 30.0
@@ -2957,6 +2962,31 @@ class LLMService:
             return await self._chat_with_fallbacks(
                 messages=messages,
                 candidates=self._chat_candidates(cfg),
+                label=label,
+                preview_limit=preview_limit,
+            )
+
+    async def background_summary_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        cfg: ModelConfig | None = None,
+        label: str = "group_summary",
+        preview_limit: int = 80,
+    ) -> str:
+        """后台摘要 / 维护专用的一次性对话调用。
+
+        与普通回复的差别只有**调度类**：整个调用（含 fallback 与重试）跑在
+        ``BACKGROUND`` 优先级下，因此走 :data:`_LLM_PRIORITY_GATE` 的背景容量
+        （≤2、与回复共享 normal=4、不碰 HIGH/CRITICAL 的保留名额）。**整体硬超时
+        由调用方（摘要调度器）用 ``asyncio.timeout`` 施加**，排队时间不计入模型时限。
+        """
+
+        target = cfg or self.compress_config
+        with execution_priority_scope(ExecutionPriority.BACKGROUND):
+            return await self._chat_with_fallbacks(
+                messages=messages,
+                candidates=self._chat_candidates(target),
                 label=label,
                 preview_limit=preview_limit,
             )

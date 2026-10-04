@@ -18,11 +18,19 @@ from typing import Final
 
 
 class ExecutionPriority(IntEnum):
-    """Lower numeric values represent more urgent work."""
+    """Lower numeric values represent more urgent work.
+
+    ``BACKGROUND`` (2026-10-04) is a genuinely lower class than ``NORMAL``: summary /
+    maintenance LLM work must never compete with ordinary replies, moderation or
+    permission changes.  It has its own capacity ceiling *and* shares the ordinary
+    class ceiling, so replies always keep a reserved share (see
+    :class:`ReservedCapacityGate`).
+    """
 
     CRITICAL = 0
     HIGH = 10
     NORMAL = 100
+    BACKGROUND = 1000
 
 
 _CURRENT_PRIORITY: ContextVar[ExecutionPriority] = ContextVar(
@@ -112,16 +120,29 @@ class ReservedCapacityGate:
         total_capacity: int,
         noncritical_capacity: int,
         normal_capacity: int,
+        background_capacity: int = 0,
     ) -> None:
         total = max(1, int(total_capacity))
         noncritical = max(1, min(total, int(noncritical_capacity)))
         normal = max(1, min(noncritical, int(normal_capacity)))
+        # 背景类（摘要/维护）单独设上限，并且**与普通回复共享** normal 上限：
+        # 于是"回复 + 摘要 ≤ normal"且"摘要 ≤ background"，普通回复天然保留
+        # ``normal - background`` 个名额（要求：至少 2 个留给回复）。
+        background = max(0, min(normal, int(background_capacity)))
+        if background and normal - background < 2:
+            raise ValueError(
+                "background_capacity must leave at least 2 normal slots for replies"
+            )
         self.total_capacity: Final[int] = total
         self.noncritical_capacity: Final[int] = noncritical
         self.normal_capacity: Final[int] = normal
+        self.background_capacity: Final[int] = background
         self._total = _PriorityCapacitySemaphore(total)
         self._noncritical = asyncio.Semaphore(noncritical)
         self._normal = asyncio.Semaphore(normal)
+        self._background = (
+            asyncio.Semaphore(background) if background > 0 else None
+        )
         self._active = {priority: 0 for priority in ExecutionPriority}
         self._waiting = {priority: 0 for priority in ExecutionPriority}
 
@@ -163,6 +184,9 @@ class ReservedCapacityGate:
         try:
             # Acquire from the most restrictive class to the shared total.  On
             # cancellation/timeout, already acquired permits are rolled back.
+            if selected >= ExecutionPriority.BACKGROUND and self._background is not None:
+                await self._acquire(self._background, remaining())
+                acquired.append(self._background)
             if selected >= ExecutionPriority.NORMAL:
                 await self._acquire(self._normal, remaining())
                 acquired.append(self._normal)
@@ -186,15 +210,23 @@ class ReservedCapacityGate:
             for semaphore in reversed(acquired):
                 semaphore.release()
 
+    def has_waiting(self, priority: ExecutionPriority) -> bool:
+        """该优先级是否有任务在等待入场（摘要据此让路给正在排队的回复）。"""
+
+        return self._waiting[ExecutionPriority(priority)] > 0
+
     def snapshot(self) -> dict[str, int]:
         return {
             "total_capacity": self.total_capacity,
             "noncritical_capacity": self.noncritical_capacity,
             "normal_capacity": self.normal_capacity,
+            "background_capacity": self.background_capacity,
             "active_critical": self._active[ExecutionPriority.CRITICAL],
             "active_high": self._active[ExecutionPriority.HIGH],
             "active_normal": self._active[ExecutionPriority.NORMAL],
+            "active_background": self._active[ExecutionPriority.BACKGROUND],
             "waiting_critical": self._waiting[ExecutionPriority.CRITICAL],
             "waiting_high": self._waiting[ExecutionPriority.HIGH],
             "waiting_normal": self._waiting[ExecutionPriority.NORMAL],
+            "waiting_background": self._waiting[ExecutionPriority.BACKGROUND],
         }

@@ -52,6 +52,25 @@ log = logging.getLogger(__name__)
 #: 一次性提示词迁移需要一个只执行一次的标记，而这个版本号正好是持久化文档里现成
 #: 的字段，不必新增列。
 CONFIG_SCHEMA_VERSION = 2
+
+#: 第②项后台摘要的全部运行时字段名（apply / legacy 导入 / 顶层同步共用一份清单）。
+_GROUP_SUMMARY_FIELD_NAMES: tuple[str, ...] = (
+    "group_summary_enabled",
+    "group_summary_recent_raw_messages",
+    "group_summary_max_tokens",
+    "group_summary_batch_max_messages",
+    "group_summary_batch_max_input_tokens",
+    "group_summary_global_concurrency",
+    "group_summary_per_group_concurrency",
+    "group_summary_deadline_seconds",
+    "group_summary_queue_wait_seconds",
+    "group_summary_min_refresh_seconds",
+    "group_summary_failure_backoff_seconds",
+    "group_summary_failure_backoff_max_seconds",
+    "group_summary_pending_capacity",
+    "group_summary_trigger_messages",
+    "group_summary_trigger_budget_ratio",
+)
 #: F-014：已经退役的「owner 优先」提示词标记。只重写命中这些标记的提示词，
 #: 其余自定义内容（含明确的管理员语义）一个字都不动——宁可漏改，不可误伤。
 _RETIRED_OWNER_PRIORITY_PROMPT_MARKERS: dict[str, tuple[str, ...]] = {
@@ -360,6 +379,34 @@ class BotBehaviorConfig(StrictModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = Field(default=8, ge=1, le=20)
     memory_automatic_compaction: bool = False
+    # 第②项：后台群摘要（默认关闭；验收后可显式开启；与 legacy 热压缩独立）。
+    group_summary_enabled: bool = False
+    group_summary_recent_raw_messages: int = Field(default=200, ge=20, le=10_000)
+    group_summary_max_tokens: int = Field(default=4096, ge=256, le=32_768)
+    group_summary_batch_max_messages: int = Field(default=200, ge=10, le=2_000)
+    group_summary_batch_max_input_tokens: int = Field(
+        default=16_384, ge=1_024, le=1_000_000
+    )
+    group_summary_global_concurrency: int = Field(default=2, ge=1, le=8)
+    # 每群并发是硬安全约束：只能 1。
+    group_summary_per_group_concurrency: int = Field(default=1, ge=1, le=1)
+    group_summary_deadline_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
+    group_summary_queue_wait_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
+    group_summary_min_refresh_seconds: float = Field(
+        default=60.0, ge=0.0, le=86_400.0
+    )
+    group_summary_failure_backoff_seconds: float = Field(
+        default=60.0, ge=1.0, le=86_400.0
+    )
+    group_summary_failure_backoff_max_seconds: float = Field(
+        default=3600.0, ge=1.0, le=86_400.0
+    )
+    group_summary_pending_capacity: int = Field(default=1000, ge=1, le=100_000)
+    group_summary_trigger_messages: int = Field(default=200, ge=1, le=100_000)
+    group_summary_trigger_budget_ratio: float = Field(
+        default=0.85, ge=0.1, le=1.0
+    )
+
     @model_validator(mode="after")
     def _validate_business_budget(self) -> "BotBehaviorConfig":
         """显式校验：预留必须小于业务总预算、条数在合法区间，0 不能关闭门禁。"""
@@ -370,6 +417,11 @@ class BotBehaviorConfig(StrictModel):
         ) or validate_group_history_max_messages(self.group_history_max_messages)
         if error:
             raise ValueError(error)
+        if (
+            self.group_summary_failure_backoff_max_seconds
+            < self.group_summary_failure_backoff_seconds
+        ):
+            raise ValueError("摘要失败退避上限必须不小于起点")
         return self
 
     # Private-chat history: 278528 = 272K legacy depth target and the per-turn
@@ -1043,6 +1095,8 @@ class RuntimeConfig(StrictModel):
         settings.bot.context_budget_tokens = bot.context_budget_tokens
         settings.bot.context_reserve_tokens = bot.context_reserve_tokens
         settings.bot.group_history_max_messages = bot.group_history_max_messages
+        for _name in _GROUP_SUMMARY_FIELD_NAMES:
+            setattr(settings.bot, _name, getattr(bot, _name))
         settings.bot.max_output_tokens = bot.max_output_tokens
         settings.bot.memory_recent_messages = bot.memory_recent_messages
         settings.bot.memory_retention_days = bot.memory_retention_days
@@ -1095,6 +1149,8 @@ class RuntimeConfig(StrictModel):
         settings.context_budget_tokens = bot.context_budget_tokens
         settings.context_reserve_tokens = bot.context_reserve_tokens
         settings.group_history_max_messages = bot.group_history_max_messages
+        for _name in _GROUP_SUMMARY_FIELD_NAMES:
+            setattr(settings, _name, getattr(bot, _name))
         settings.max_output_tokens = bot.max_output_tokens
 
         settings.moderation = ModerationConfig(**self.moderation.model_dump())
@@ -1936,9 +1992,32 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             "context_budget_tokens",
             "context_reserve_tokens",
             "group_history_max_messages",
+            "group_summary_recent_raw_messages",
+            "group_summary_max_tokens",
+            "group_summary_batch_max_messages",
+            "group_summary_batch_max_input_tokens",
+            "group_summary_global_concurrency",
+            "group_summary_per_group_concurrency",
+            "group_summary_pending_capacity",
+            "group_summary_trigger_messages",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
+        for key in (
+            "group_summary_enabled",
+        ):
+            if key in bot_data:
+                setattr(settings.bot, key, bool(bot_data[key]))
+        for key in (
+            "group_summary_deadline_seconds",
+            "group_summary_queue_wait_seconds",
+            "group_summary_min_refresh_seconds",
+            "group_summary_failure_backoff_seconds",
+            "group_summary_failure_backoff_max_seconds",
+            "group_summary_trigger_budget_ratio",
+        ):
+            if key in bot_data:
+                setattr(settings.bot, key, float(bot_data[key]))
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
     if isinstance(moderation_data, dict):
         settings.moderation = ModerationConfig(**moderation_data)
@@ -2099,6 +2178,10 @@ def build_legacy_runtime_config(
             context_budget_tokens=settings.bot.context_budget_tokens,
             context_reserve_tokens=settings.bot.context_reserve_tokens,
             group_history_max_messages=settings.bot.group_history_max_messages,
+            **{
+                _name: getattr(settings.bot, _name)
+                for _name in _GROUP_SUMMARY_FIELD_NAMES
+            },
             max_output_tokens=settings.max_output_tokens,
             memory_recent_messages=(
                 settings.bot_memory_recent_messages

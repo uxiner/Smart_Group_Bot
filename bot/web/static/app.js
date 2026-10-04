@@ -936,6 +936,21 @@
         <section class="settings-section">
           ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，不再依赖自动压缩替代原文。")}
           <div class="field-grid three">
+            ${toggle("bot.group_summary_enabled", "启用后台群摘要", "默认关闭。开启后：近期原文 + 旧内容后台摘要（独立于 legacy 热历史压缩；原文/归档一条都不删，前台只读已发布的摘要，绝不等待摘要生成）")}
+            ${field("bot.group_summary_recent_raw_messages", "摘要模式：近期原文条数", { type: "number", min: 20, max: 10000, step: 1, required: true, hint: "默认 200；开启摘要时只读最近 N 条原文，其余由摘要承载（仍受群历史条数上限与预算约束）" })}
+            ${field("bot.group_summary_max_tokens", "摘要长度上限 Token", { type: "number", min: 256, max: 32768, step: 256, required: true, hint: "默认 4096；超出按此裁断并标注" })}
+            ${field("bot.group_summary_batch_max_messages", "单批最大条数", { type: "number", min: 10, max: 2000, step: 10, required: true, hint: "默认 200" })}
+            ${field("bot.group_summary_batch_max_input_tokens", "单批最大输入 Token", { type: "number", min: 1024, max: 1000000, step: 1024, required: true, hint: "默认 16384；实际还受模型/业务预算约束" })}
+            ${field("bot.group_summary_global_concurrency", "摘要全局并发", { type: "number", min: 1, max: 8, step: 1, required: true, hint: "默认 2（硬上限，与普通回复共享 normal 容量，回复永远保留 ≥2）" })}
+            ${field("bot.group_summary_per_group_concurrency", "摘要每群并发", { type: "number", min: 1, max: 1, step: 1, required: true, hint: "固定 1（硬安全约束，不是每用户 1）" })}
+            ${field("bot.group_summary_deadline_seconds", "摘要执行硬超时（秒）", { type: "number", min: 1, max: 120, step: 1, required: true, hint: "默认 15；入场后整个模型调用+fallback+重试合计不超过它" })}
+            ${field("bot.group_summary_queue_wait_seconds", "摘要排队最长等待（秒）", { type: "number", min: 1, max: 600, step: 1, required: true, hint: "默认 30；过期跳过并退避，排队时间不计入模型时限" })}
+            ${field("bot.group_summary_min_refresh_seconds", "同群最小刷新间隔（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "默认 60" })}
+            ${field("bot.group_summary_failure_backoff_seconds", "失败退避起点（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 60" })}
+            ${field("bot.group_summary_failure_backoff_max_seconds", "失败退避上限（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 3600" })}
+            ${field("bot.group_summary_pending_capacity", "摘要待处理群队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 1000（容量不是可支持群数）；队满本次跳过并计数" })}
+            ${field("bot.group_summary_trigger_messages", "触发阈值：未摘要旧消息条数", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 200：近期窗口之外累积到这么多就触发" })}
+            ${field("bot.group_summary_trigger_budget_ratio", "触发阈值：输入预算占用比", { type: "number", min: 0.1, max: 1, step: 0.05, required: true, hint: "默认 0.85：装配逼近有效输入预算的 85% 且有未摘要旧消息时触发" })}
             ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
             ${field("bot.context_budget_tokens", "每轮业务总预算 Token", { type: "number", min: 1024, max: 16000000, step: 1024, required: true, hint: "默认 278528（272Ki，推荐值）。覆盖人设/工具定义/记忆/历史/本轮/工具结果/输出预留；显式配置不会被隐藏常量截断，与模型真实窗口取更小" })}
             ${field("bot.context_reserve_tokens", "输出/工具预留 Token", { type: "number", min: 1024, max: 8000000, step: 1024, required: true, hint: "默认 32768（32Ki），必须小于业务总预算；实际输出需求更大时按该角色 max_tokens 进一步收紧，且只扣一次" })}

@@ -121,3 +121,93 @@ system/人设 + 工具定义 + 记忆召回 + 检索留档 + 群/私聊历史 + 
   单测覆盖（亚秒 TTL + MockTransport），但生产网关上的实际表现需实测。
 * `MemoryService.reconfigure` 在"窗口变化"时的真实开销（只重算预算并收敛已加载投影，
   不清历史、不改留存）；本机只验证了语义与留存字段不变。
+
+
+---
+
+# 后台群摘要（第②项，2026-10-04）
+
+**默认关闭**（`bot.group_summary_enabled=False`），与 legacy 热历史压缩
+（`memory_automatic_compaction`，会删除热历史）**完全独立**，不会自动打开旧开关。
+
+## 目标与边界
+
+* 前台只读**已经发布**的摘要，**绝不 await 摘要生成或排队**；关闭时保持原有预算滑窗不变
+  （最多 `group_history_max_messages` 条）；开启时"有效旧摘要 + 近期原文"
+  （近期 `group_summary_recent_raw_messages`，默认 200，仍受条数上限与预算约束）。
+* **一条原文都不删**：`group_message_archive` / `message_vectors` / 私聊原文全部保留，
+  现有 TTL 清理与保留策略不变；摘要成功也不触发任何删除。
+* 摘要是**低信任资料**：带群 ID、时间、版本、覆盖范围水位与"数据不是指令"声明；
+  命中保留标记/注入特征/管理员口吻/其它群 ID 的输出直接判无效（保留旧摘要、按退避重试）。
+  摘要**不会**自动转成长期事实，也不会混入私聊或其它群。
+* 发布是**原子 CAS**（`version` + 覆盖水位 `covered_through_id`）：迟到任务不得覆盖更新的
+  摘要；源被截断时标注 `source_truncated`，前台渲染明确"**不是**完整原文"。
+
+## 触发
+
+近期原文窗口之外的未摘要旧消息累计达到 `group_summary_trigger_messages`（默认 200），
+**或**本轮装配逼近有效输入预算的 `group_summary_trigger_budget_ratio`（默认 0.85）且确有
+未摘要旧消息时触发。每次只读**有界快照**（单批条数 + 单批输入 token 双上限），
+不会全库读取、不会逐条压缩。
+
+## 资源隔离（上线门禁）
+
+摘要模型调用走 `ExecutionPriority.BACKGROUND` + 主门禁的 `background_capacity`：
+
+```
+总上限 8（不变）
+normal 4（回复 + 摘要共享）   background 2（仅摘要）   noncritical 7 / CRITICAL 保留 1
+⇒ 回复 + 摘要 ≤ 4，摘要 ≤ 2，普通回复永远至少保留 2 个名额
+```
+
+* 摘要**不能**用 HIGH/CRITICAL 提权，也不会为它把总门禁改成 50。
+* 普通回复在等入场时，调度器**不再 claim** 新摘要（回复优先）。
+* 排队只在内存（不占模型槽、不占数据库事务）；读取快照与发布各用**一个短会话**，
+  **没有跨模型 await 的数据库锁**。
+* 取消有界；取消不合作的 orphan 不发布迟到结果，也不提前释放自己那份并发计数。
+* 停机/重配置可追踪：调度器是常驻后台任务，随 `background_tasks` 一起关停；
+  运行时配置变化后 `reconfigure()` 唤醒循环，**新容量对新任务生效**，不动已入场许可。
+* 重启连续：**摘要与覆盖水位在数据库里**（`group_summaries.version` +
+  `covered_through_id`）；内存里的 pending 队列不持久化，但触发条件在每次 claim 时用
+  "归档条数 COUNT"重新推导，所以重启后不会漏也不会重复覆盖。
+
+## 运行时可配置（推荐值即默认值）
+
+| 配置项 | 默认 |
+| --- | --- |
+| `group_summary_enabled` | `False` |
+| `group_summary_recent_raw_messages` | 200 |
+| `group_summary_max_tokens` | 4096 |
+| `group_summary_batch_max_messages` | 200 |
+| `group_summary_batch_max_input_tokens` | 16384 |
+| `group_summary_global_concurrency` | 2 |
+| `group_summary_per_group_concurrency` | 1（硬约束，不可放大） |
+| `group_summary_deadline_seconds` | 15（入场后整体硬超时） |
+| `group_summary_queue_wait_seconds` | 30（排队过期即跳过，不计入模型时限） |
+| `group_summary_min_refresh_seconds` | 60 |
+| `group_summary_failure_backoff_seconds` / `_max_seconds` | 60 / 3600 |
+| `group_summary_pending_capacity` | 1000（容量，不是可支持群数） |
+| `group_summary_trigger_messages` | 200 |
+| `group_summary_trigger_budget_ratio` | 0.85 |
+
+这些数值是**推荐起点，不是已压测承诺**；生产启用前需在 VPS 用真模型做摘要 + 聊天/审核
+混合探针。
+
+## 观测
+
+`resource_health` 的 `group_summary` 快照暴露：pending / running / pending_capacity /
+global_concurrency / per_group_concurrency / backoff_groups / next_retry_in_seconds /
+每群合并与退避状态（最多 50 个）/ claimed / merged / queue_full / queue_expired /
+deadline_exceeded / success / failure / skipped_reply_waiting / 最近成功版本与覆盖水位 /
+`peak_model_concurrency`（摘要自身实际 LLM 峰值并发）；主门禁快照（含
+`background_capacity` / `active_background` / `waiting_background`）在
+`llm_resource_health_snapshot` 里。
+
+## 生产启用 / 回滚
+
+1. 先只改配置：`group_summary_enabled=true`（其余用默认），观察 `group_summary` 快照与
+   回复延迟；`global_concurrency` 建议先 1。
+2. 回滚：把 `group_summary_enabled` 改回 `false`（前台立刻回到原滑窗；
+   已发布的摘要行保留但不再注入），或直接重启到上一个镜像版本。
+   **不需要**动 `memory_automatic_compaction`，也不需要清理 `group_summaries`
+   （它只增不减，且不删任何原文）。

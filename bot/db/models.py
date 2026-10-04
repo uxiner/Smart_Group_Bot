@@ -73,6 +73,41 @@ class GroupContextSummary(Base):
     group: Mapped[Group] = relationship(back_populates="context_summary")
 
 
+class GroupSummary(Base):
+    """后台群摘要（2026-10-04 第②项）：只加不改，与旧的热历史压缩完全独立。
+
+    ``group_context_summaries`` 是第 2 期 legacy compaction 的表（会删除热历史），
+    本表是**新方案**：原文/归档/私聊原文一条都不删，摘要只是"旧内容的低信任资料"，
+    由前台按需读取。
+
+    ``version`` 与 ``covered_through_key`` 一起做**原子发布**（CAS）：迟到任务的
+    ``version`` 更小或覆盖水位更旧时不得覆盖新摘要；前台只读已发布的这一行。
+    """
+
+    __tablename__ = "group_summaries"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("groups.id"), primary_key=True
+    )
+    summary: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    #: 覆盖的归档消息范围：**行 id** 水位（单调、比较安全），key 只作人类可读展示。
+    covered_from_id: Mapped[int] = mapped_column(Integer, default=0)
+    covered_through_id: Mapped[int] = mapped_column(Integer, default=0)
+    covered_from_key: Mapped[str] = mapped_column(String(128), default="")
+    covered_through_key: Mapped[str] = mapped_column(String(128), default="")
+    covered_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: 源在被截断时不许声称"完整原文"（前台据此加免责声明）。
+    source_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), default="")
+    generated_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GroupPermanentMemory(Base):
     __tablename__ = "group_permanent_memories"
 

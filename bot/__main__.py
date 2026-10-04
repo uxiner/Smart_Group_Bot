@@ -33,6 +33,13 @@ from bot.services.join_verification import (
     verification_service_ready,
     warn_if_bot_cannot_verify,
 )
+from bot.services.group_summary import (
+    GROUP_SUMMARY_SCHEDULER,
+    group_summary_config,
+    init_group_summary_scheduler,
+)
+from bot.services.llm import _LLM_PRIORITY_GATE
+from bot.services.request_priority import ExecutionPriority
 from bot.services.group_permissions import (
     GroupPermissionService,
     init_group_permission_service,
@@ -616,6 +623,22 @@ async def main() -> None:
         raise
     window_sync.bind(llm=llm, memory=memory)
 
+    # 第②项：后台群摘要调度器（进程级单例）。前台只登记、只读已发布摘要；
+    # 真正的模型调用走 BACKGROUND 优先级与独立容量（≤2、与回复共享 normal=4）。
+    summary_store_factory = getattr(memory, "group_summary_store", None)
+    summary_scheduler = (
+        init_group_summary_scheduler(
+            llm=llm,
+            store=summary_store_factory(),
+            config_provider=lambda: group_summary_config(settings.bot),
+            slot_waiter=lambda: _LLM_PRIORITY_GATE.has_waiting(
+                ExecutionPriority.NORMAL
+            ),
+        )
+        if callable(summary_store_factory)
+        else None
+    )
+
     dp["settings"] = settings
     # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
     # 状态写进启动日志（opt-in 默认关闭；只要有开启就 WARNING 列出）。
@@ -774,6 +797,10 @@ async def main() -> None:
                     )
                 except RuntimeError:
                     pass
+            # 摘要相关配置变化：唤醒后台循环（新容量对**新任务**生效，不动已入场许可）。
+            summary_scheduler = GROUP_SUMMARY_SCHEDULER
+            if summary_scheduler is not None:
+                summary_scheduler.reconfigure()
             archive_policy_before = (
                 getattr(memory, "memory_retention_days", None),
                 getattr(memory, "memory_archive_max_messages_per_group", None),
@@ -936,6 +963,14 @@ async def main() -> None:
         # 缓存 fresh 时这一轮零网络；只做元数据，绝不进回复/审核热路径。拿到新窗口后
         # 通过 window_sync 把 MemoryService 的预算一起更新（不重启也生效）。
         # 任务是"常驻"的：单轮失败只记日志、循环不退出（否则会被当致命错误）。
+        # 后台群摘要：常驻任务（单轮失败只记日志、绝不退出），随应用一起关停。
+        if summary_scheduler is not None:
+            background_tasks.append(
+                asyncio.create_task(
+                    summary_scheduler.run(),
+                    name="group-summary-scheduler",
+                )
+            )
         refresh_limits = getattr(llm, "refresh_model_limits", None)
         if callable(refresh_limits):
             background_tasks.append(

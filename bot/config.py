@@ -224,6 +224,35 @@ class BotConfig(BaseModel):
     memory_event_ttl_days: int = 30
     memory_deleted_retention_days: int = 30
 
+    # 第②项：后台群摘要（默认关闭；与 legacy 热历史压缩完全独立，不会自动打开旧开关）。
+    # 原文/归档/私聊一条都不删，摘要只是"旧内容的低信任资料"，前台只读已发布的摘要。
+    group_summary_enabled: bool = False
+    group_summary_recent_raw_messages: int = Field(default=200, ge=20, le=10_000)
+    group_summary_max_tokens: int = Field(default=4096, ge=256, le=32_768)
+    group_summary_batch_max_messages: int = Field(default=200, ge=10, le=2_000)
+    group_summary_batch_max_input_tokens: int = Field(
+        default=16_384, ge=1_024, le=1_000_000
+    )
+    group_summary_global_concurrency: int = Field(default=2, ge=1, le=8)
+    # 每群并发是**硬安全约束**：只能是 1（不是"每用户 1"）。
+    group_summary_per_group_concurrency: int = Field(default=1, ge=1, le=1)
+    group_summary_deadline_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
+    group_summary_queue_wait_seconds: float = Field(default=30.0, ge=1.0, le=600.0)
+    group_summary_min_refresh_seconds: float = Field(
+        default=60.0, ge=0.0, le=86_400.0
+    )
+    group_summary_failure_backoff_seconds: float = Field(
+        default=60.0, ge=1.0, le=86_400.0
+    )
+    group_summary_failure_backoff_max_seconds: float = Field(
+        default=3600.0, ge=1.0, le=86_400.0
+    )
+    group_summary_pending_capacity: int = Field(default=1000, ge=1, le=100_000)
+    group_summary_trigger_messages: int = Field(default=200, ge=1, le=100_000)
+    group_summary_trigger_budget_ratio: float = Field(
+        default=0.85, ge=0.1, le=1.0
+    )
+
     @model_validator(mode="after")
     def _validate_business_budget(self) -> "BotConfig":
         """业务预算的显式校验：预留必须小于总预算，0 不能关闭门禁。"""
@@ -234,6 +263,14 @@ class BotConfig(BaseModel):
         )
         if error:
             raise ValueError(error)
+        if (
+            self.group_summary_failure_backoff_max_seconds
+            < self.group_summary_failure_backoff_seconds
+        ):
+            raise ValueError(
+                "摘要失败退避上限必须不小于起点"
+                "（group_summary_failure_backoff_max_seconds）"
+            )
         return self
 
 
@@ -350,6 +387,22 @@ class Settings(BaseSettings):
     context_budget_tokens: int = 278528
     context_reserve_tokens: int = 32768
     group_history_max_messages: int = 1000
+    # Group summary knobs (kept in sync with ``bot.*``); the runtime config wins.
+    group_summary_enabled: bool = False
+    group_summary_recent_raw_messages: int = 200
+    group_summary_max_tokens: int = 4096
+    group_summary_batch_max_messages: int = 200
+    group_summary_batch_max_input_tokens: int = 16_384
+    group_summary_global_concurrency: int = 2
+    group_summary_per_group_concurrency: int = 1
+    group_summary_deadline_seconds: float = 15.0
+    group_summary_queue_wait_seconds: float = 30.0
+    group_summary_min_refresh_seconds: float = 60.0
+    group_summary_failure_backoff_seconds: float = 60.0
+    group_summary_failure_backoff_max_seconds: float = 3600.0
+    group_summary_pending_capacity: int = 1000
+    group_summary_trigger_messages: int = 200
+    group_summary_trigger_budget_ratio: float = 0.85
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
     bot_reply_batch_timeout_seconds: float = 45.0
