@@ -44,6 +44,7 @@ from bot.services.private_chat import (
     QuotaOutcome,
     build_private_chat_messages,
     consume_daily_quota,
+    refund_daily_quota,
     history_store,
     last_contact_record,
     load_private_history,
@@ -267,15 +268,34 @@ async def on_private_message(
             await _send_notice(message, quota_notice(outcome), "quota")
             return
 
+    # B-04：配额是"先扣再用"，而扣减在 consume_daily_quota 内部就 commit 了，
+    # 后面的 rollback() 撤不回来。真正回上话才算"用掉"，下面每一条没能回上话的
+    # 出口都要显式退还，否则模型故障期间用户会白白耗光当日配额。
+    async def give_the_quota_back(reason: str) -> None:
+        if outcome is None or not outcome.allowed:
+            return  # 超限分支 consume_daily_quota 自己回滚过；超管根本不计数
+        log.info(
+            "private chat: 本轮没回上话，退还配额 | user=%s | reason=%s",
+            user.id,
+            reason,
+        )
+        await refund_daily_quota(
+            session,
+            user_id=user.id,
+            is_admin=verdict.is_admin,
+        )
+
     # 3) 媒体：只处理图片；其它类型回一句说明（不占模型）。
     image_description = ""
     if _has_media(message):
         if _image_file_info(message) is None:
+            await give_the_quota_back("unsupported_media")
             await _send_notice(message, MEDIA_UNSUPPORTED_NOTICE, "media")
             return
         llm = _reply_llm(settings)
         image_description = await _image_description(message, llm)
         if not image_description and not text:
+            await give_the_quota_back("no_image_description")
             await _send_notice(message, BUSY_NOTICE, "busy")
             return
 
@@ -369,9 +389,11 @@ async def on_private_message(
     except Exception as exc:
         await session.rollback()
         log.warning("private chat: 回复失败 | user=%s | error=%s", user.id, exc)
+        await give_the_quota_back("model_failed")
         await _send_notice(message, BUSY_NOTICE, "busy")
         return
     if not reply:
+        await give_the_quota_back("empty_reply")
         await _send_notice(message, BUSY_NOTICE, "busy")
         return
 
@@ -379,6 +401,7 @@ async def on_private_message(
         await _send_reply(message, reply)
     except Exception as exc:
         log.warning("private chat: 发送失败 | user=%s | error=%s", user.id, exc)
+        await give_the_quota_back("send_failed")
         return
 
     store = history_store()

@@ -435,6 +435,67 @@ class QuotaTests(_DbTestCase):
         self.assertEqual(next_day.user_used, 1)
         self.assertEqual(await self._stored(777, "2026-10-04"), 1)
 
+    async def test_refund_daily_quota_gives_the_count_back(self) -> None:
+        day = "2026-10-03"
+        async with self.session_factory() as session:
+            await dm.consume_daily_quota(session, user_id=777, day=day)
+            await dm.consume_daily_quota(session, user_id=777, day=day)
+        self.assertEqual(await self._stored(777, day), 2)
+
+        async with self.session_factory() as session:
+            left = await dm.refund_daily_quota(session, user_id=777, day=day)
+
+        self.assertEqual(left, 1)
+        self.assertEqual(await self._stored(777, day), 1, "本人计数没退回去")
+        self.assertEqual(
+            await self._stored(dm.GLOBAL_COUNTER_USER_ID, day), 1, "本档全局计数也要退"
+        )
+
+    async def test_refund_daily_quota_never_goes_below_zero(self) -> None:
+        """退过头不能把计数压成负数——负数会让每日上限凭空多出额度。"""
+
+        day = "2026-10-03"
+        async with self.session_factory() as session:
+            await dm.consume_daily_quota(session, user_id=777, day=day)
+        for _ in range(3):
+            async with self.session_factory() as session:
+                await dm.refund_daily_quota(session, user_id=777, day=day)
+
+        self.assertEqual(await self._stored(777, day), 0)
+        self.assertEqual(await self._stored(dm.GLOBAL_COUNTER_USER_ID, day), 0)
+
+    async def test_refund_daily_quota_uses_the_admin_counter_row(self) -> None:
+        day = "2026-10-03"
+        async with self.session_factory() as session:
+            await dm.consume_daily_quota(session, user_id=777, is_admin=True, day=day)
+            await dm.refund_daily_quota(session, user_id=777, is_admin=True, day=day)
+
+        self.assertEqual(await self._stored(777, day), 0)
+        self.assertEqual(await self._stored(dm.ADMIN_GLOBAL_COUNTER_USER_ID, day), 0)
+        self.assertEqual(
+            await self._stored(dm.GLOBAL_COUNTER_USER_ID, day),
+            0,
+            "管理员档不能退到普通成员那本账上",
+        )
+
+    async def test_a_refunded_slot_can_be_used_again(self) -> None:
+        """退回来的额度必须真的能用：上限就是靠这个计数判的。"""
+
+        day = "2026-10-03"
+        for _ in range(dm.DEFAULT_PER_USER_DAILY_LIMIT):
+            async with self.session_factory() as session:
+                outcome = await dm.consume_daily_quota(session, user_id=777, day=day)
+            self.assertTrue(outcome.allowed)
+        async with self.session_factory() as session:
+            blocked = await dm.consume_daily_quota(session, user_id=777, day=day)
+        self.assertFalse(blocked.allowed)
+
+        async with self.session_factory() as session:
+            await dm.refund_daily_quota(session, user_id=777, day=day)
+        async with self.session_factory() as session:
+            again = await dm.consume_daily_quota(session, user_id=777, day=day)
+        self.assertTrue(again.allowed, "退回来的那一条额度没被还回去")
+
     async def test_record_contact_writes_without_any_limit(self) -> None:
         async with self.session_factory() as session:
             for _ in range(150):  # 远超普通成员 100 条上限，也照样记
@@ -674,6 +735,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+              patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         message.answer.assert_awaited_once()
@@ -683,6 +745,111 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.chat.await_args.kwargs.get("stage"), "dm", "用量看板要能单独看到私聊")
         history = dm.history_store().history(message.from_user.id)
         self.assertEqual([h["role"] for h in history], ["user", "assistant"])
+
+    async def test_a_failed_turn_gives_the_daily_quota_back(self) -> None:
+        """B-04：模型调用失败时必须退还当日配额。
+
+        ``consume_daily_quota`` 在函数内部就 ``commit()``，handler 后面那句
+        ``rollback()`` 撤不回这次扣减——修前用户白白耗掉一条配额，界面上只看到
+        「稍后再试」，模型故障期间配额会被白耗光。
+        """
+
+        message = _message(text="你好")
+        llm = self._fake_llm()
+        ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
+        session = AsyncMock()
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+             patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(
+                 dm_handler,
+                 "answer_with_search",
+                 new=AsyncMock(side_effect=RuntimeError("upstream 503")),
+             ), \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, session, _settings())
+
+        refund.assert_awaited_once()
+        self.assertEqual(refund.await_args.kwargs["user_id"], message.from_user.id)
+        self.assertEqual(message.answer.await_args.args[0], dm.BUSY_NOTICE)
+
+    async def test_an_empty_reply_gives_the_daily_quota_back(self) -> None:
+        message = _message(text="你好")
+        llm = self._fake_llm()
+        ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
+        blank = SimpleNamespace(text="   ", searches=0, exhausted=False)
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+             patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(dm_handler, "answer_with_search", new=AsyncMock(return_value=blank)), \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+
+        refund.assert_awaited_once()
+        self.assertEqual(message.answer.await_args.args[0], dm.BUSY_NOTICE)
+
+    async def test_a_failed_send_gives_the_daily_quota_back(self) -> None:
+        message = _message(text="你好")
+        llm = self._fake_llm()
+        ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
+        answer = SimpleNamespace(text="在的", searches=0, exhausted=False)
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+             patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(dm_handler, "answer_with_search", new=AsyncMock(return_value=answer)), \
+             patch.object(
+                 dm_handler, "_send_reply", new=AsyncMock(side_effect=RuntimeError("network"))
+             ), \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+
+        refund.assert_awaited_once()
+
+    async def test_a_successful_turn_keeps_the_quota_charged(self) -> None:
+        """对照组：真的回上话了就不能退。"""
+
+        message = _message(text="你好")
+        llm = self._fake_llm("在的，怎么了？")
+        ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+
+        refund.assert_not_awaited()
+
+    async def test_a_blocked_turn_is_not_refunded(self) -> None:
+        """超限分支 ``consume_daily_quota`` 自己回滚过，不能再退一次。"""
+
+        message = _message(text="你好")
+        llm = self._fake_llm()
+        blocked = dm.QuotaOutcome(False, "user_limit", 20, 20, 30, 200)
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=blocked)), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+
+        refund.assert_not_awaited()
+
+    async def test_the_super_admin_tier_never_consumes_or_refunds(self) -> None:
+        message = _message(text="你好")
+        llm = self._fake_llm()
+        with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict(tier=dm.TIER_SUPER))), \
+             patch.object(dm_handler, "record_contact", new=AsyncMock()), \
+             patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
+             patch.object(dm_handler, "list_authorized_groups", new=AsyncMock(return_value=[])), \
+             patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
+             patch.object(dm_handler, "consume_daily_quota", new=AsyncMock()) as consume, \
+             patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()) as refund:
+            await dm_handler.on_private_message(message, AsyncMock(), _settings())
+
+        consume.assert_not_awaited()
+        refund.assert_not_awaited()
 
     async def test_reply_goes_through_the_search_path(self) -> None:
         """私聊回复必须走带搜索的那条路（stage=dm），否则联网能力等于没有。"""
@@ -694,6 +861,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         settings = _settings()
         with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+              patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()), \
              patch.object(dm_handler, "last_contact_record", new=AsyncMock(return_value="")), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)), \
              patch.object(
@@ -719,6 +887,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
         with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+              patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         self.assertEqual(message.answer.await_args.args[0], dm.MEDIA_UNSUPPORTED_NOTICE)
@@ -732,6 +901,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
         with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+              patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()), \
              patch.object(dm_handler, "_image_file_info", new=MagicMock(return_value=("p", "image/jpeg", 1000))), \
              patch.object(dm_handler, "_image_description", new=AsyncMock(return_value="一只猫")), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
@@ -748,6 +918,7 @@ class HandlerBranchTests(unittest.IsolatedAsyncioTestCase):
         ok = dm.QuotaOutcome(True, "ok", 1, 20, 1, 200)
         with patch.object(dm_handler, "resolve_access", new=AsyncMock(return_value=_verdict())), \
              patch.object(dm_handler, "consume_daily_quota", new=AsyncMock(return_value=ok)), \
+              patch.object(dm_handler, "refund_daily_quota", new=AsyncMock()), \
              patch.object(dm_handler, "_reply_llm", new=MagicMock(return_value=llm)):
             await dm_handler.on_private_message(message, AsyncMock(), _settings())
         self.assertEqual(message.answer.await_args.args[0], dm.BUSY_NOTICE)
