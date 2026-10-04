@@ -43,6 +43,7 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
             group_ids = await authorized_group_ids(session)
             texts: dict[int, str] = {}
             boards: dict[int, list[str]] = {}
+            failed_groups: set[int] = set()
             for group_id in group_ids:
                 # 结算与发奖必须发生在渲染之前：榜单要显示本周实际到账的分。
                 # --dry-run 只渲染不发（连积分也不动），验证文案时不会改任何人的钱包。
@@ -57,27 +58,39 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
                     await session.rollback()
                     log.exception("weekly activity settle failed | group=%s", group_id)
                     boards[group_id] = []
-                texts[group_id] = await render_group_quality(
-                    session,
-                    group_id=group_id,
-                    days=days,
-                    activity_lines=boards[group_id],
-                )
+                # F-026：渲染块过去**没有** try/except，于是任何一个群渲染失败就
+                # 带着整个循环（以及所有群）一起炸掉，所有群都收不到周报。
+                # 与上面的结算块对齐：单群失败只跳过该群并如实记录。
+                try:
+                    texts[group_id] = await render_group_quality(
+                        session,
+                        group_id=group_id,
+                        days=days,
+                        activity_lines=boards[group_id],
+                    )
+                except Exception:
+                    await session.rollback()
+                    log.exception("weekly quality render failed | group=%s", group_id)
+                    failed_groups.add(group_id)
             cost_text = await render_cost_digest(session, days=days)
         if not group_ids:
             print("没有授权群，跳过")
             return 0
+        deliverable = [gid for gid in group_ids if gid not in failed_groups]
         if dry_run:
             # 只渲染不发送：验证文案/HTML 正确性时用它，别拿真群当试验场
-            for group_id in group_ids:
+            for group_id in deliverable:
                 print(f"---- dry-run | group={group_id} ----")
                 print(texts[group_id].replace("审核质量 · 近", "群健康周报 · 近", 1))
+            for group_id in sorted(failed_groups):
+                print(f"---- dry-run | group={group_id} ----")
+                print("（本群渲染失败，已跳过；详见日志）")
             print("---- dry-run | 成本摘要（私发超管）----")
             print(cost_text)
             return 0
         bot = Bot(token)
         try:
-            for group_id in group_ids:
+            for group_id in deliverable:
                 text = texts[group_id].replace(
                     "审核质量 · 近", "群健康周报 · 近", 1
                 )
