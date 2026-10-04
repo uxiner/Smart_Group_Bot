@@ -54,6 +54,10 @@ _counters: dict[tuple[str, str], dict[str, int]] = {}
 _session_factory: Any = None
 _last_flush = 0.0
 _flushing = False
+#: 落盘任务的**强引用**。asyncio 事件循环只持弱引用，不留这一份的话，
+#: ``loop.create_task(flush())`` 排出去的任务可能在执行到一半时被 GC 回收，
+#: 那批计数就永远不落盘（成本看板系统性少报）。
+_flush_task: Any = None
 
 
 def configure(session_factory: Any) -> None:
@@ -148,9 +152,17 @@ def _prune_locked() -> None:
             _counters.pop(key, None)
 
 
+def _clear_flush_task(task: Any) -> None:
+    """落盘任务收尾：放掉强引用，让下一轮还能再排。"""
+
+    global _flush_task
+    if _flush_task is task:
+        _flush_task = None
+
+
 def _maybe_schedule_flush() -> None:
     """到期就在事件循环里排一次落盘（没有循环就等下一轮）。"""
-    global _last_flush, _flushing
+    global _last_flush, _flushing, _flush_task
     if _session_factory is None or _flushing:
         return
     if time.monotonic() - _last_flush < FLUSH_INTERVAL_SECONDS:
@@ -161,8 +173,10 @@ def _maybe_schedule_flush() -> None:
         return
     _flushing = True
     try:
-        loop.create_task(flush())
+        _flush_task = loop.create_task(flush())
+        _flush_task.add_done_callback(_clear_flush_task)
     except Exception:  # pragma: no cover
+        _flush_task = None
         _flushing = False
 
 

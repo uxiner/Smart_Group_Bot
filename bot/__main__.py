@@ -1144,6 +1144,12 @@ async def main() -> None:
             bot.session.close(),
             label="Bot HTTP session",
         )
+        # 用量计数平时靠 60 秒惰性落盘，重启/优雅关停会丢掉最后不足 60 秒的那一批
+        # （成本看板与周报成本摘要系统性少报）。flush 幂等，且必须排在 engine.dispose() 之前。
+        await _await_cleanup_bounded(
+            llm_metrics.flush(force=True),
+            label="llm usage counters",
+        )
         await _await_cleanup_bounded(
             engine.dispose(),
             label="database engine",
