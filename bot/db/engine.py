@@ -2204,6 +2204,11 @@ async def init_db(
                 # 在这里用幂等语句建，老库启动即生效。
                 "CREATE INDEX IF NOT EXISTS ix_member_checkins_group_day "
                 "ON member_checkins (group_id, checkin_date)",
+                # F-032：violations 原来只有 (group_id, user_id, ban_enforced) 与
+                # (group_id, source_message_id) 两个索引，审核质量报表按时间窗口统计
+                # 时每次都全表扫。和 F-030 同理，create_all 不会给已存在的表补索引。
+                "CREATE INDEX IF NOT EXISTS ix_violations_group_created_at "
+                "ON violations (group_id, created_at)",
             ):
                 await conn.execute(text(index_sql))
             # 审核规则的扫描范围：列存在性 + 老数据默认值 + 生产规则的一次性升级。

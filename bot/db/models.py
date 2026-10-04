@@ -546,6 +546,13 @@ class Violation(Base):
             "source_message_id",
             unique=True,
         ),
+        # F-032：审核质量报表的每群 8 次窗口查询都按 (群, created_at) 过滤，
+        # 而这张表原来只有上面两个索引 —— 每次窗口统计都是全表扫。
+        Index(
+            "ix_violations_group_created_at",
+            "group_id",
+            "created_at",
+        ),
     )
 
 
