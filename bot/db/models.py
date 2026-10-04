@@ -523,6 +523,12 @@ class Violation(Base):
     # 执行人工放行/收回的操作者与时间。历史行为 NULL。
     reviewed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 双击确认状态机：第一次点「人工放行 / 确认封禁」只把意图落库（pending_action
+    # 存 "rel"/"ban"，pending_at 存点击时间），第二次同键且在
+    # moderation.review_confirm_seconds 窗口内才执行；切换按钮会改写为新的
+    # pending，仍需它自己的第二次点击。执行/拒绝/失败后清空。历史行为 NULL。
+    pending_action: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    pending_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     group: Mapped[Group] = relationship(back_populates="violations")

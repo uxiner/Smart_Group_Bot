@@ -2602,11 +2602,13 @@ async def _send_review_handover(
     violation: object,
     header: str,
     extra_lines: tuple[str, ...] = (),
+    mention_tail: str | None = None,
 ) -> int | None:
     """在频道里新发一条交接消息（第一行逐字为 ``header``），@ 上规则调整用的 bot。
 
     正文以 **mention 实体**（不是纯文本）指向 ``@Ming_GPT_bot``，让 Telegram 认成
-    对该用户的 mention。best-effort：失败只记日志、返回 None。
+    对该用户的 mention。``mention_tail`` 可覆盖结尾那句（封禁场景要写「无需调整规则」）。
+    best-effort：失败只记日志、返回 None。
     """
 
     bot = getattr(callback, "bot", None)
@@ -2664,7 +2666,11 @@ async def _send_review_handover(
         if str(extra).strip():
             lines.append(str(extra))
     lines.append("")
-    lines.append(f"请 {_REVIEW_HANDOVER_MENTION} 处理规则调整。")
+    lines.append(
+        str(mention_tail)
+        if mention_tail
+        else f"请 {_REVIEW_HANDOVER_MENTION} 处理规则调整。"
+    )
     text = "\n".join(lines)
     mention_index = text.rfind(_REVIEW_HANDOVER_MENTION)
     entities = None
@@ -2702,94 +2708,100 @@ async def _send_review_handover(
         return None
 
 
-@router.callback_query(F.data.startswith(f"{_REVIEW_CALLBACK_PREFIX}:"))
-async def on_review_action(
-    callback: CallbackQuery,
-    settings: Settings,
-    session: AsyncSession | None = None,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
-) -> None:
-    """证据卡上的「人工放行 / 放行收回」。只有最高管理员（settings.super_admin_id）可点。"""
+def _review_confirm_window_seconds(settings: Settings) -> float:
+    """双击确认窗口（秒）：``moderation.review_confirm_seconds``，缺失/非法时取默认 300。"""
 
-    if session is None:
-        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
-        return
-    if not callback.data:
-        await callback.answer("操作参数无效", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3 or parts[0] != _REVIEW_CALLBACK_PREFIX:
-        await callback.answer("操作参数无效", show_alert=True)
-        return
-    action = parts[1]
-    if action not in {"rel", "rev"}:
-        await callback.answer("不支持的审核操作", show_alert=True)
-        return
+    moderation = getattr(settings, "moderation", None)
     try:
-        violation_id = int(parts[2])
+        value = float(
+            getattr(
+                moderation, "review_confirm_seconds", _REVIEW_CONFIRM_DEFAULT_SECONDS
+            )
+        )
     except (TypeError, ValueError):
-        violation_id = 0
-    if violation_id <= 0:
-        await callback.answer("审核事件无效", show_alert=True)
-        return
+        value = float(_REVIEW_CONFIRM_DEFAULT_SECONDS)
+    if value <= 0:
+        value = float(_REVIEW_CONFIRM_DEFAULT_SECONDS)
+    return value
 
-    operator_id = int(getattr(callback.from_user, "id", 0) or 0)
+
+def _review_pending_is_armed(
+    violation: object, action: str, *, now: datetime, window_seconds: float
+) -> bool:
+    """该 case 是否已在窗口内为**同一个**动作按过一次（= 可以执行）。"""
+
+    if str(getattr(violation, "pending_action", "") or "").strip().lower() != action:
+        return False
+    pending_at = getattr(violation, "pending_at", None)
+    if not isinstance(pending_at, datetime):
+        return False
+    try:
+        age = (now - pending_at).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= age <= float(window_seconds)
+
+
+async def _review_operator_check(
+    callback: CallbackQuery, settings: Settings, operator_id: int
+) -> tuple[bool, str]:
+    """返回 (是否允许操作, 拒绝时的提示)。
+
+    - ``settings.super_admin_id``（最高管理员）**始终允许**，不依赖他恰好是频道管理员；
+    - 否则要求操作者是审核日志频道（``moderation.log_channel_id``）的管理员/群主；
+    - 取频道管理员信息失败（异常/洪水）→ 返回 False + 稍后重试提示，**绝不放行**。
+    """
+
     try:
         super_admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
     except (TypeError, ValueError):
         super_admin_id = 0
-    # 只有最高管理员本人可点：其他人只弹提示，不改状态、不调 Telegram 管理接口。
-    if super_admin_id <= 0 or operator_id != super_admin_id:
-        await callback.answer("无权限", show_alert=True)
-        return
-
-    violation = await session.get(Violation, violation_id)
-    if violation is None:
-        await callback.answer("审核事件不存在", show_alert=True)
-        return
-    current_state = str(
-        getattr(violation, "review_state", _REVIEW_STATE_NONE) or _REVIEW_STATE_NONE
-    ).strip().lower()
-
-    if action == "rev":
-        if current_state != _REVIEW_STATE_RELEASED:
-            await callback.answer("这条没有放行过，不需要调整", show_alert=True)
-            return
-        violation.review_state = _REVIEW_STATE_REVOKED
-        violation.reviewed_by = operator_id
-        violation.reviewed_at = now_shanghai_naive()
-        await session.commit()
-        # 收回：撤回「规则调整请求」，并按该 case 的**原始处置**把限制重新施加回去
-        # （challenge → 重新禁言 + 重新质询；ban_applied/ban → 重新封禁；
-        #  delete/warn → 无限制可恢复）。原始处置的恢复失败/结果都会被 catch 住并
-        # 写进频道消息与状态行；频道通知失败也绝不影响群内状态。
-        restriction_note = await _reapply_restriction_for_review(
-            bot=getattr(callback, "bot", None),
-            settings=settings,
-            session=session,
-            violation=violation,
-            card_text=getattr(getattr(callback, "message", None), "html_text", "") or "",
-            session_factory=session_factory,
+    if super_admin_id > 0 and int(operator_id or 0) == super_admin_id:
+        return True, ""
+    channel_id = _admin_log_channel_id(settings)
+    bot = getattr(callback, "bot", None)
+    get_member = getattr(bot, "get_chat_member", None)
+    if channel_id == 0 or not callable(get_member):
+        return False, _REVIEW_OPERATOR_LOOKUP_FAILED
+    try:
+        member = await get_member(channel_id, int(operator_id or 0))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning(
+            "review operator lookup failed | channel=%s user=%s",
+            channel_id,
+            operator_id,
+            exc_info=True,
         )
-        await _edit_review_channel_status(
-            callback,
-            settings,
-            violation,
-            line=f"🔴 已收回放行申请 · 规则无需调整 · 限制恢复：{restriction_note}",
-        )
-        await _send_review_handover(
-            callback=callback,
-            settings=settings,
-            violation=violation,
-            header=_REVIEW_REVOKE_HEADER,
-            extra_lines=(f"限制恢复：{restriction_note}",),
-        )
-        await callback.answer("已收回放行申请，正在恢复该成员的原始处置")
-        return
+        return False, _REVIEW_OPERATOR_LOOKUP_FAILED
+    status = str(getattr(member, "status", "") or "").strip().lower()
+    if status in _REVIEW_CHANNEL_ADMIN_STATUSES:
+        return True, ""
+    return False, _REVIEW_OPERATOR_DENIED
 
-    if current_state == _REVIEW_STATE_RELEASED:
-        await callback.answer("这条已经放行过了", show_alert=True)
-        return
+
+def _review_extract_ban_failure(result_text: object) -> str:
+    """从 ``_render_ban_result`` 的 HTML 结果里抠出一句失败原因（给频道看）。"""
+
+    plain = re.sub(r"<[^>]+>", " ", str(result_text or ""))
+    plain = re.sub(r"\s+", " ", plain).strip()
+    plain = plain.replace("本群封禁未完成", "").strip()
+    if not plain:
+        return "封禁未生效"
+    return _truncate_text(plain, 200)
+
+
+async def _review_do_release(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession,
+    violation: object,
+    operator_id: int,
+) -> None:
+    """第二次点击「人工放行」后立即执行：落库 released + 立即解除限制（不加永久豁免）。"""
+
+    violation_id = int(getattr(violation, "id", 0) or 0)
     violation.review_state = _REVIEW_STATE_RELEASED
     violation.reviewed_by = operator_id
     violation.reviewed_at = now_shanghai_naive()
@@ -2810,6 +2822,7 @@ async def on_review_action(
         settings=settings,
         violation=violation,
         header=_REVIEW_RELEASE_HEADER,
+        extra_lines=("说明：已删除的群内消息不补回。",),
     )
     log.info(
         "manual review released | violation=%s operator=%s unbanned=%s",
@@ -2818,6 +2831,237 @@ async def on_review_action(
         released,
     )
     await callback.answer("已放行，正在交接给规则调整")
+
+
+async def _review_do_ban(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession,
+    violation: object,
+    operator_id: int,
+) -> None:
+    """第二次点击「确认封禁」后立即执行（语义=判定准确）。
+
+    复用既有 `/ban` 路径 ``_perform_group_ban``（含 ``_ban_target_rejection`` 的
+    owner / 本群管理员拒绝、``lease_join_verification_for_unban`` +
+    ``complete_leased_join_verification`` + 删提示 + 关私聊质询），不再另写一套封禁
+    逻辑——作废该 pending 的 moderation 质询，等价「管理员在群内点拒绝质询直接封禁」。
+    失败（权限不足 / 目标已退群 / PARTICIPANT_ID_INVALID …）写进状态行与交接消息，
+    pending 已清空、review_state 绝不谎报。
+    """
+
+    violation_id = int(getattr(violation, "id", 0) or 0)
+    try:
+        group_id = int(getattr(violation, "group_id", 0) or 0)
+        target_id = int(getattr(violation, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        group_id = 0
+        target_id = 0
+    bot = getattr(callback, "bot", None)
+    # 复用 /ban 的底层实现（避免另写一套封禁逻辑）。
+    from bot.handlers.admin import _ban_target_rejection, _perform_group_ban
+
+    fake_message = SimpleNamespace(
+        chat=SimpleNamespace(id=group_id),
+        bot=bot,
+        from_user=SimpleNamespace(id=operator_id, full_name="频道管理员"),
+        reply_to_message=None,
+    )
+    try:
+        rejection = await _ban_target_rejection(fake_message, settings, target_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "review confirm-ban target check failed | violation=%s", violation_id
+        )
+        rejection = "暂时无法确认目标身份；为避免误封，请稍后重试。"
+    if rejection:
+        # 拒绝：状态不变（review_state 不写），pending 已清空。
+        await session.commit()
+        await _edit_review_channel_status(
+            callback,
+            settings,
+            violation,
+            line=f"🔴 确认封禁被拒绝：{rejection}（状态不变）",
+        )
+        await callback.answer(rejection, show_alert=True)
+        return
+
+    failure = ""
+    result_text = ""
+    try:
+        result_text = await _perform_group_ban(
+            fake_message,
+            session,
+            settings,
+            target_id=target_id,
+            reason="频道管理员在审核证据卡确认封禁（判定准确）",
+            operator_id=operator_id,
+            operator_display="频道管理员",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("review confirm-ban failed | violation=%s", violation_id)
+        failure = f"{type(exc).__name__}: {_truncate_text(str(exc), 120)}"
+    if not failure and "本群封禁未完成" in str(result_text or ""):
+        failure = _review_extract_ban_failure(result_text)
+
+    if failure:
+        # 失败绝不静默：写进状态行 + 交接消息；pending 已清空、review_state 保持原值。
+        await session.commit()
+        await _edit_review_channel_status(
+            callback,
+            settings,
+            violation,
+            line=f"🔴 确认封禁 · 判定准确，但封禁未完成：{failure}",
+        )
+        await _send_review_handover(
+            callback=callback,
+            settings=settings,
+            violation=violation,
+            header=_REVIEW_BAN_HEADER,
+            extra_lines=(f"⚠️ 封禁未完成：{failure}", "无需调整规则。"),
+            mention_tail=f"请 {_REVIEW_HANDOVER_MENTION} 登记：无需调整规则。",
+        )
+        await callback.answer(f"封禁未完成：{failure}", show_alert=True)
+        return
+
+    violation.review_state = _REVIEW_STATE_BANNED
+    violation.reviewed_by = operator_id
+    violation.reviewed_at = now_shanghai_naive()
+    await session.commit()
+    await _edit_review_channel_status(
+        callback,
+        settings,
+        violation,
+        line="🔴 确认封禁 · 判定准确，已立即封禁",
+    )
+    await _send_review_handover(
+        callback=callback,
+        settings=settings,
+        violation=violation,
+        header=_REVIEW_BAN_HEADER,
+        extra_lines=("已封禁并作废该成员的质询资格；无需调整规则。",),
+        mention_tail=f"请 {_REVIEW_HANDOVER_MENTION} 登记：无需调整规则。",
+    )
+    log.info(
+        "manual review confirmed ban | violation=%s operator=%s target=%s",
+        violation_id,
+        operator_id,
+        target_id,
+    )
+    await callback.answer("已确认封禁，判定准确")
+
+
+@router.callback_query(F.data.startswith(f"{_REVIEW_CALLBACK_PREFIX}:"))
+async def on_review_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """审核证据卡上的「人工放行 / 确认封禁」（都需按两次）。
+
+    - 只有审核日志频道的管理员（或 ``settings.super_admin_id``）可点；
+    - 第一次点击只 arm（落库 pending_action/pending_at + 追加待确认状态行）；
+    - 第二次点**同一个**按钮、且在 ``moderation.review_confirm_seconds`` 窗口内才执行；
+    - 旧版 ``mrev:rev:`` 按钮已下线：只提示、不执行任何动作、状态不变。
+    """
+
+    if session is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[0] != _REVIEW_CALLBACK_PREFIX:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    action = parts[1]
+    # 旧版「放行收回」按钮：只提示，绝不执行任何动作、不改状态。
+    if action == "rev":
+        await callback.answer(_REVIEW_LEGACY_NOTICE)
+        return
+    if action not in _REVIEW_ACTION_LABELS:
+        await callback.answer("不支持的审核操作", show_alert=True)
+        return
+    try:
+        violation_id = int(parts[2])
+    except (TypeError, ValueError):
+        violation_id = 0
+    if violation_id <= 0:
+        await callback.answer("审核事件无效", show_alert=True)
+        return
+
+    operator_id = int(getattr(callback.from_user, "id", 0) or 0)
+    # 权限：频道管理员或最高管理员；取频道信息失败一律拒绝（放行/封禁都不做）。
+    allowed, denial_text = await _review_operator_check(
+        callback, settings, operator_id
+    )
+    if not allowed:
+        await callback.answer(denial_text, show_alert=True)
+        return
+
+    violation = await session.get(Violation, violation_id)
+    if violation is None:
+        await callback.answer("审核事件不存在", show_alert=True)
+        return
+    current_state = str(
+        getattr(violation, "review_state", _REVIEW_STATE_NONE) or _REVIEW_STATE_NONE
+    ).strip().lower()
+    if current_state in _REVIEW_TERMINAL_STATES:
+        await callback.answer(_REVIEW_ALREADY_DONE, show_alert=True)
+        return
+
+    now = now_shanghai_naive()
+    window_seconds = _review_confirm_window_seconds(settings)
+    if not _review_pending_is_armed(
+        violation, action, now=now, window_seconds=window_seconds
+    ):
+        # 第一次点击（或窗口已过期、或切换了动作）：只 arm，不执行任何处置。
+        try:
+            violation.pending_action = action
+            violation.pending_at = now
+            await session.commit()
+        except Exception:
+            log.exception(
+                "review pending persist failed | violation=%s action=%s",
+                violation_id,
+                action,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            await callback.answer("确认状态保存失败，请稍后重试", show_alert=True)
+            return
+        await _edit_review_channel_status(
+            callback,
+            settings,
+            violation,
+            line=f"⏳ 待确认：再按一次「{_REVIEW_ACTION_LABELS[action]}」",
+        )
+        await callback.answer(_REVIEW_CONFIRM_HINT)
+        return
+
+    # 第二次点击（同一个按钮、窗口内）：清空 pending 后执行。
+    violation.pending_action = None
+    violation.pending_at = None
+    try:
+        await session.commit()
+    except Exception:
+        log.exception("review pending clear failed | violation=%s", violation_id)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+    if action == "rel":
+        await _review_do_release(callback, settings, session, violation, operator_id)
+    else:
+        await _review_do_ban(callback, settings, session, violation, operator_id)
 
 
 @router.callback_query(F.data.startswith(f"{_MODERATION_ACTION_CALLBACK_PREFIX}:"))
@@ -7833,10 +8077,34 @@ _EVIDENCE_TITLE_MEMBER = "审核命中 · 证据"
 _EVIDENCE_TITLE_ADMIN = "管理员违规 · 证据"
 _REVIEW_RELEASE_HEADER = "🟢 人工放行 · 待调整规则"
 _REVIEW_REVOKE_HEADER = "🔴 放行收回 · 无需调整"
+_REVIEW_BAN_HEADER = "🔴 确认封禁 · 判定准确"
 _REVIEW_HANDOVER_MENTION = "@Ming_GPT_bot"
 _REVIEW_STATE_NONE = "none"
 _REVIEW_STATE_RELEASED = "released"
 _REVIEW_STATE_REVOKED = "revoked"
+_REVIEW_STATE_BANNED = "banned"
+# 双击确认状态机：动作键 → 按钮文案
+_REVIEW_ACTION_LABELS = {"rel": "人工放行", "ban": "确认封禁"}
+# 旧版按钮（mrev:rev:）已下线：只提示，不执行任何动作、不改状态。
+_REVIEW_LEGACY_NOTICE = "按钮已更新，请使用新版按钮"
+_REVIEW_CONFIRM_HINT = "再按一次确认"
+_REVIEW_ALREADY_DONE = "已经处理过了"
+_REVIEW_OPERATOR_DENIED = "仅频道管理员可操作"
+_REVIEW_OPERATOR_LOOKUP_FAILED = "暂时无法确认频道管理员身份，请稍后重试"
+_REVIEW_CONFIRM_DEFAULT_SECONDS = 300
+# 终态：已放行 / 已确认封禁的 case 不再接受操作。
+_REVIEW_TERMINAL_STATES = frozenset(
+    {_REVIEW_STATE_RELEASED, _REVIEW_STATE_BANNED}
+)
+# 频道管理员身份（aiogram 有的是枚举，str() 后是 ChatMemberStatus.X，两种写法都收）。
+_REVIEW_CHANNEL_ADMIN_STATUSES = frozenset(
+    {
+        "administrator",
+        "creator",
+        "chatmemberstatus.administrator",
+        "chatmemberstatus.creator",
+    }
+)
 
 
 def _log_channel_enabled(settings: Settings) -> bool:
@@ -7870,8 +8138,8 @@ def _build_review_action_keyboard(violation_id: int) -> InlineKeyboardMarkup:
                     callback_data=f"{prefix}:rel:{int(violation_id)}",
                 ),
                 InlineKeyboardButton(
-                    text="放行收回",
-                    callback_data=f"{prefix}:rev:{int(violation_id)}",
+                    text="确认封禁",
+                    callback_data=f"{prefix}:ban:{int(violation_id)}",
                 ),
             ]
         ]

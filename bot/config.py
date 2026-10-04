@@ -356,6 +356,10 @@ class ModerationConfig(BaseModel):
     log_channel_enabled: bool = True
     # 证据频道 id；0 表示未配置（此时频道投递不可用，回退私聊老路径）。
     log_channel_id: int = -1004337744233
+    # 证据卡上的「人工放行 / 确认封禁」必须**按两次**才生效：两次点击的间隔必须
+    # <= 该窗口（秒），第一次点击只 arm（落库 pending_action/pending_at），第二次
+    # 同键点击才真正执行。窗口过期后重新按两次。默认 300 秒。
+    review_confirm_seconds: int = 300
 
 
 class Settings(BaseSettings):
@@ -1119,6 +1123,9 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.moderation.log_channel_id = int(
         settings.moderation.log_channel_id or 0
+    )
+    settings.moderation.review_confirm_seconds = max(
+        1, int(settings.moderation.review_confirm_seconds)
     )
 
     settings.bot.token = settings.bot_token

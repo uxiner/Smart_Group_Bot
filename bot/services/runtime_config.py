@@ -534,6 +534,9 @@ class ModerationSettingsConfig(StrictModel):
     log_channel_enabled: bool = True
     # 证据频道 id；0 表示未配置（频道投递不可用，回退私聊老路径）。
     log_channel_id: int = -1004337744233
+    # 「人工放行 / 确认封禁」双击确认窗口（秒）：第一次点击只 arm，第二次同键
+    # 点击且间隔 <= 该窗口才真正执行。默认 300。
+    review_confirm_seconds: int = Field(default=300, ge=1, le=86400)
 
 
 class PatrolSettingsConfig(StrictModel):

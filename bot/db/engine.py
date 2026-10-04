@@ -444,6 +444,21 @@ async def _sqlite_migrate_violation_rule_fk(conn) -> bool:
         "reviewed_at",
         "reviewed_at DATETIME",
     )
+    # 双击确认状态机（「人工放行 / 确认封禁」必须按两次）：pending_action 存
+    # "rel"/"ban"，pending_at 存第一次点击时间。同样用 _sqlite_ensure_column，
+    # 幂等、可重复执行，老库平滑升级。
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "pending_action",
+        "pending_action VARCHAR(16)",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "violations",
+        "pending_at",
+        "pending_at DATETIME",
+    )
     columns = await _sqlite_table_columns(conn, "violations")
 
     orphan_result = await conn.execute(
