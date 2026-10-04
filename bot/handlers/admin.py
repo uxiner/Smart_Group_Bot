@@ -333,6 +333,8 @@ def _build_skill_service(settings: Settings) -> SkillService:
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )
     sticker_pool = [
         x.strip()

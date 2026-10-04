@@ -220,7 +220,8 @@ class LongTermMemoryPrivacyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(GROUP_FACT, _joined(self._casual_prompt(history)))
 
     async def test_sentinel_absent_even_when_the_budget_forces_trimming(self) -> None:
-        settings = _group_settings(max_context_tokens=1024, reserve=1024)
+        # 预算必须真的触发裁剪：业务总预算 1025、预留 1024（合法且几乎不留输入空间）。
+        settings = _group_settings(max_context_tokens=1025, reserve=1024)
         observed: list[object] = []
         real_assemble = group_handler.assemble_context_within_budget
 

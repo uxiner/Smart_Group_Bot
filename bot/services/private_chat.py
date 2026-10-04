@@ -54,6 +54,8 @@ from bot.services.long_term_memory import (
 from bot.services.model_limits import (
     auto_window_for,
     business_total_window,
+    configured_business_tokens,
+    configured_reserve_tokens,
     loose_budget_tokens,
 )
 from bot.services.payload_fit import (
@@ -755,9 +757,14 @@ def private_history_token_budget(settings: Any) -> int:
 
     window = auto_window_for(settings)
     if window is not None:
+        business = business_total_window(
+            window,
+            business_tokens=configured_business_tokens(settings),
+        )
+        reserve = configured_reserve_tokens(settings)
         return max(
             PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
-            business_total_window(window) - PRIVATE_HISTORY_RESERVE_TOKENS,
+            business - min(reserve, max(0, business - PRIVATE_HISTORY_TOKEN_BUDGET_MIN)),
         )
     return bounded_history_token_budget(
         _bot_setting(

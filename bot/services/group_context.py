@@ -23,6 +23,9 @@ from typing import Any
 from bot.services.model_limits import (
     auto_window_for,
     business_total_window,
+    configured_business_tokens,
+    configured_group_history_max_messages,
+    configured_reserve_tokens,
     loose_budget_tokens,
 )
 from bot.utils.tokens import estimate_text_tokens
@@ -127,7 +130,10 @@ def group_history_token_budget(settings: Any) -> int:
     reserve = group_history_reserve_tokens(settings)
     window = auto_window_for(settings)
     if window is not None:
-        business = business_total_window(window)
+        business = business_total_window(
+            window,
+            business_tokens=configured_business_tokens(settings),
+        )
         return effective_group_history_budget(
             configured_budget=business,
             reserve_tokens=reserve,
@@ -144,15 +150,19 @@ def group_history_token_budget(settings: Any) -> int:
 
 
 def group_history_reserve_tokens(settings: Any) -> int:
-    """当前生效的群聊历史余量（默认 32768）。"""
+    """当前生效的群聊历史余量：运行时可配置（``context_reserve_tokens``，默认 32Ki）。
 
-    return bounded_group_history_reserve_tokens(
-        _bot_setting(
-            settings,
-            "group_history_reserve_tokens",
-            GROUP_HISTORY_RESERVE_TOKENS,
-        )
-    )
+    兼容旧字段 ``group_history_reserve_tokens``（旧库只配了它时以它为准）；非法配置
+    （≥ 业务总预算）收紧到留 1024 输入，而不是关掉门禁。
+    """
+
+    return configured_reserve_tokens(settings)
+
+
+def group_history_max_messages(settings: Any) -> int:
+    """当前生效的群历史单次读取条数（``group_history_max_messages``，默认 1000）。"""
+
+    return configured_group_history_max_messages(settings)
 
 
 def _loose_int(value: Any, *, default: int = GROUP_HISTORY_TOKEN_BUDGET) -> int:

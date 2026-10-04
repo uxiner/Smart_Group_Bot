@@ -88,7 +88,12 @@ def context_token_budget(settings: Any) -> int:
     各读各的默认值正是要消掉的分叉。
     """
 
-    return bounded_context_token_budget(effective_context_window(settings))
+    # 显式配置的业务预算不被隐藏常量截断：只保下限。
+    return loose_budget_tokens(
+        effective_context_window(settings),
+        default=CONTEXT_TOKEN_BUDGET,
+        low=CONTEXT_TOKEN_BUDGET_MIN,
+    )
 
 
 def _message_tokens(message: Any) -> int:

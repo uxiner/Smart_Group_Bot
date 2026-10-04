@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from bot.utils import budget as _budget
 from bot.utils.tokens import estimate_text_tokens
 
 log = logging.getLogger(__name__)
@@ -69,16 +70,20 @@ MIN_OUTPUT_RESERVE_TOKENS = 1024
 # ---------------------------------------------------------------------------
 # 业务预算（用户口径，2026-10-04 最终确认）
 # ---------------------------------------------------------------------------
-#: 每一轮的**业务总窗口**：272Ki = 278528。它覆盖 system/人设 + 工具定义 + 记忆召回
-#: + 检索留档 + 群/私聊历史 + 本轮消息 + 工具结果 + 输出预留——**不是**只限制历史。
-#: 模型真实窗口比它大也不会填满（不做"每轮灌满百万窗口"）；比它小就按模型更小的窗口。
-BUSINESS_CONTEXT_WINDOW_TOKENS = 272 * 1024
-#: 业务预算里留给输出的部分：32Ki = 32768（输入上限因此不超过 245760）。
-BUSINESS_OUTPUT_RESERVE_TOKENS = 32 * 1024
-#: 业务输入硬上限 = 272Ki − 32Ki = 245760。
-BUSINESS_INPUT_BUDGET_TOKENS = (
-    BUSINESS_CONTEXT_WINDOW_TOKENS - BUSINESS_OUTPUT_RESERVE_TOKENS
-)
+# ---------------------------------------------------------------------------
+# 业务预算（运行时可配置；常量只是默认值，见 bot/utils/budget.py）
+# ---------------------------------------------------------------------------
+BUSINESS_CONTEXT_WINDOW_TOKENS = _budget.BUSINESS_CONTEXT_WINDOW_TOKENS
+BUSINESS_OUTPUT_RESERVE_TOKENS = _budget.BUSINESS_OUTPUT_RESERVE_TOKENS
+BUSINESS_INPUT_BUDGET_TOKENS = _budget.BUSINESS_INPUT_BUDGET_TOKENS
+BUSINESS_CONTEXT_TOKENS_MIN = _budget.BUSINESS_CONTEXT_TOKENS_MIN
+BUSINESS_CONTEXT_TOKENS_MAX = _budget.BUSINESS_CONTEXT_TOKENS_MAX
+CONTEXT_RESERVE_TOKENS_MIN = _budget.CONTEXT_RESERVE_TOKENS_MIN
+CONTEXT_RESERVE_TOKENS_MAX = _budget.CONTEXT_RESERVE_TOKENS_MAX
+DEFAULT_GROUP_HISTORY_MAX_MESSAGES = _budget.DEFAULT_GROUP_HISTORY_MAX_MESSAGES
+GROUP_HISTORY_MAX_MESSAGES_MIN = _budget.GROUP_HISTORY_MAX_MESSAGES_MIN
+GROUP_HISTORY_MAX_MESSAGES_MAX = _budget.GROUP_HISTORY_MAX_MESSAGES_MAX
+MIN_INPUT_ALLOWANCE_TOKENS = _budget.MIN_INPUT_ALLOWANCE_TOKENS
 
 #: 上下文模式：``auto`` = 自动**发现**模型真实窗口（默认；发现值只用于比业务预算更紧，
 #: 不会放松 272Ki）；``fixed`` = 不查元数据，``max_context_tokens`` 即模型侧上限
@@ -217,30 +222,54 @@ class ModelLimits:
             reserve = max(1, total // 8)
         return max(1, total - reserve)
 
-    def business_input_budget(self, *, output_reserve: int) -> int:
+    def business_input_budget(
+        self,
+        *,
+        output_reserve: int,
+        business_tokens: Any = None,
+        reserve_tokens: Any = None,
+    ) -> int:
         """**业务**输入上限（最终闸门真正用的那个数）。
 
-        取 ``min(模型可用输入, 272Ki − 预留)``，预留不小于 32Ki：
+        ``min(模型可用输入, 配置业务预算 − 预留)``，预留 = ``max(配置预留, 本次输出需求)``：
 
-        * 正常情况：``278528 − 32768 = 245760``（输入上限恒不超过 245760）；
-        * 模型更小（例如 128K 窗口）→ 跟着更小；
-        * 本次实际输出需求更大（``max_tokens > 32Ki``）→ 预留取它，进一步收紧；
-        * 元数据给了显式输入上限 → 那条上限本身已经排除了输出，与 245760 取小即可。
+        * 默认配置：``278528 − 32768 = 245760``；
+        * 运维把业务预算配小/配大 → 跟着变（配置是权威，不被隐藏常量截断）；
+        * 模型更小（例如 128K 窗口）→ 与模型窗口取小，跟着更小；
+        * 本次实际输出需求更大（``max_tokens > 配置预留``）→ 预留取它，进一步收紧；
+        * 元数据给了显式输入上限 → 那条上限本身已经排除了输出，与业务输入上限取小即可；
+        * 预留**只在这里扣一次**（调用方不得再扣），非法配置收紧而不是关掉门禁。
         """
 
+        business = _bounded_int(
+            business_tokens,
+            default=BUSINESS_CONTEXT_WINDOW_TOKENS,
+            low=BUSINESS_CONTEXT_TOKENS_MIN,
+            high=BUSINESS_CONTEXT_TOKENS_MAX,
+        )
         reserve = max(
-            BUSINESS_OUTPUT_RESERVE_TOKENS,
+            _bounded_int(
+                reserve_tokens,
+                default=BUSINESS_OUTPUT_RESERVE_TOKENS,
+                low=CONTEXT_RESERVE_TOKENS_MIN,
+                high=CONTEXT_RESERVE_TOKENS_MAX,
+            ),
             max(0, int(output_reserve or 0)),
         )
-        ceiling = max(1, BUSINESS_CONTEXT_WINDOW_TOKENS - reserve)
+        if reserve >= business:
+            # 配置非法：收紧而不是关掉门禁。
+            reserve = max(1, business - MIN_INPUT_ALLOWANCE_TOKENS)
+        ceiling = max(1, business - reserve)
         if self.max_input_tokens:
+            # 显式输入上限本身已排除输出：与业务输入上限取小，不再重复减。
             return max(1, min(int(self.max_input_tokens), ceiling))
         total = int(self.total_window or 0)
         if total <= 0:
-            total = BUSINESS_CONTEXT_WINDOW_TOKENS
-        total = min(total, BUSINESS_CONTEXT_WINDOW_TOKENS)
+            total = business
+        total = min(total, business)
         if reserve >= total:
-            reserve = max(1, total // 8)
+            # 模型总窗口比预留还小（小模型）：给它留最小的输入空间，而不是压成 0/1。
+            reserve = max(1, total - MIN_INPUT_ALLOWANCE_TOKENS)
         return max(1, total - reserve)
 
     def describe(self) -> str:
@@ -910,7 +939,77 @@ def loose_budget_tokens(value: Any, *, default: int, low: int) -> int:
     return max(int(low), number)
 
 
-def business_total_window(model_total_window: Any) -> int:
+validate_business_budget = _budget.validate_business_budget
+validate_group_history_max_messages = _budget.validate_group_history_max_messages
+
+
+def configured_business_tokens(settings: Any) -> int:
+    """运行时可读写的业务总预算（``bot.context_budget_tokens``，默认 272Ki）。
+
+    显式配置**不被隐藏常量截断**：只做正数与下界的合法性保护；上界交给配置校验
+    （``BUSINESS_CONTEXT_TOKENS_MAX``）与模型窗口取小。
+    """
+
+    view = _config_view(settings)
+    value = _positive_int(getattr(view, "context_budget_tokens", None))
+    if value is None:
+        # 只有**正的**模型侧兼容值才参与兜底；0/缺项一律用推荐默认值
+        # （绝不能让"没配业务预算"变成 1024 或 0-关闭门禁）。
+        value = _positive_int(getattr(view, "max_context_tokens", None))
+    return _bounded_int(
+        value,
+        default=BUSINESS_CONTEXT_WINDOW_TOKENS,
+        low=BUSINESS_CONTEXT_TOKENS_MIN,
+        high=BUSINESS_CONTEXT_TOKENS_MAX,
+    )
+
+
+def configured_reserve_tokens(settings: Any) -> int:
+    """运行时可读写的输出/工具预留（``bot.context_reserve_tokens``，默认 32Ki）。
+
+    非法（≥ 总预算）时**收紧**到 ``总预算 − 1024``：宁可少留余量，也不能把业务门禁关掉。
+    兼容旧字段 ``group_history_reserve_tokens``（旧库只配了它时以它为准）。
+    """
+
+    view = _config_view(settings)
+    value = getattr(view, "context_reserve_tokens", None)
+    legacy = getattr(view, "group_history_reserve_tokens", None)
+    if value is None or (
+        # 新字段还是默认值、而旧字段被显式配过 → 以旧字段为准（显式配置必须保留）。
+        _positive_int(value) == BUSINESS_OUTPUT_RESERVE_TOKENS
+        and _positive_int(legacy) not in (None, BUSINESS_OUTPUT_RESERVE_TOKENS)
+    ):
+        value = legacy
+    reserve = _bounded_int(
+        value,
+        default=BUSINESS_OUTPUT_RESERVE_TOKENS,
+        low=CONTEXT_RESERVE_TOKENS_MIN,
+        high=CONTEXT_RESERVE_TOKENS_MAX,
+    )
+    budget = configured_business_tokens(settings)
+    if reserve >= budget:
+        # 配置非法：不能"0 关闭门禁"，收紧到留 1024 输入。
+        reserve = max(1, budget - MIN_INPUT_ALLOWANCE_TOKENS)
+    return reserve
+
+
+def configured_group_history_max_messages(settings: Any) -> int:
+    """群历史单次读取安全条数（``bot.group_history_max_messages``，默认 1000）。"""
+
+    view = _config_view(settings)
+    return _bounded_int(
+        getattr(view, "group_history_max_messages", None),
+        default=DEFAULT_GROUP_HISTORY_MAX_MESSAGES,
+        low=GROUP_HISTORY_MAX_MESSAGES_MIN,
+        high=GROUP_HISTORY_MAX_MESSAGES_MAX,
+    )
+
+
+def business_total_window(
+    model_total_window: Any,
+    *,
+    business_tokens: Any = None,
+) -> int:
     """每轮**业务总窗口** = min(模型有效窗口, 272Ki)。
 
     用户最终口径（2026-10-04 确认，覆盖之前"不设上限"的说法）：
@@ -920,10 +1019,20 @@ def business_total_window(model_total_window: Any) -> int:
     * 模型未知 → 保守降级值参与同一个 min（未知 ≠ 无限）。
     """
 
+    ceiling = (
+        BUSINESS_CONTEXT_WINDOW_TOKENS
+        if business_tokens is None
+        else _bounded_int(
+            business_tokens,
+            default=BUSINESS_CONTEXT_WINDOW_TOKENS,
+            low=BUSINESS_CONTEXT_TOKENS_MIN,
+            high=BUSINESS_CONTEXT_TOKENS_MAX,
+        )
+    )
     model = _positive_int(model_total_window)
     if model is None:
-        return BUSINESS_CONTEXT_WINDOW_TOKENS
-    return max(CONTEXT_WINDOW_MIN, min(int(model), BUSINESS_CONTEXT_WINDOW_TOKENS))
+        return ceiling
+    return max(CONTEXT_WINDOW_MIN, min(int(model), ceiling))
 
 
 def effective_context_window(settings: Any) -> int:
@@ -934,13 +1043,14 @@ def effective_context_window(settings: Any) -> int:
     * ``fixed`` → 配置值（再叠同一个 272Ki 业务上限，只允许比 272Ki 更小）。
     """
 
+    business = configured_business_tokens(settings)
     legacy = legacy_context_tokens(settings)
     if context_window_mode(settings) == CONTEXT_MODE_FIXED:
-        return business_total_window(legacy)
+        return business_total_window(legacy, business_tokens=business)
     resolved = resolved_main_window(settings)
     if not resolved:
-        return business_total_window(legacy)
-    return business_total_window(resolved)
+        return business_total_window(legacy, business_tokens=business)
+    return business_total_window(resolved, business_tokens=business)
 
 
 def auto_mode_enabled(settings: Any) -> bool:

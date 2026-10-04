@@ -505,6 +505,8 @@ class LLMService:
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
         context_window_mode: str | None = None,
+        business_context_tokens: int | None = None,
+        context_reserve_tokens: int | None = None,
     ) -> None:
         self.main = main
         self.vision_config = vision or main
@@ -515,8 +517,21 @@ class LLMService:
         self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
+        # 业务预算（运行时可配置；默认 272Ki 总窗口 / 32Ki 预留）。
+        self.business_context_tokens = model_limits_module.configured_business_tokens(
+            SimpleNamespace(
+                context_budget_tokens=business_context_tokens,
+                max_context_tokens=self.max_context_tokens,
+            )
+        )
+        self.context_reserve_tokens = model_limits_module.configured_reserve_tokens(
+            SimpleNamespace(
+                context_reserve_tokens=context_reserve_tokens,
+                context_budget_tokens=self.business_context_tokens,
+            )
+        )
         # ``auto``（默认）自动发现模型真实窗口；``fixed`` 不查元数据。两者都受
-        # 272Ki 业务预算约束（见 ``input_token_budget``）。
+        # 业务预算约束（见 ``input_token_budget``）。
         self.context_window_mode = (
             CONTEXT_MODE_FIXED
             if str(context_window_mode or "").strip().lower() == CONTEXT_MODE_FIXED
@@ -545,6 +560,8 @@ class LLMService:
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
         context_window_mode: str | None = None,
+        business_context_tokens: int | None = None,
+        context_reserve_tokens: int | None = None,
     ) -> None:
         """Replace model endpoints for requests started after this call."""
         self.main = main
@@ -555,6 +572,18 @@ class LLMService:
         self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
+        self.business_context_tokens = model_limits_module.configured_business_tokens(
+            SimpleNamespace(
+                context_budget_tokens=business_context_tokens,
+                max_context_tokens=self.max_context_tokens,
+            )
+        )
+        self.context_reserve_tokens = model_limits_module.configured_reserve_tokens(
+            SimpleNamespace(
+                context_reserve_tokens=context_reserve_tokens,
+                context_budget_tokens=self.business_context_tokens,
+            )
+        )
         if context_window_mode is not None:
             self.context_window_mode = (
                 CONTEXT_MODE_FIXED
@@ -1793,7 +1822,11 @@ class LLMService:
         )
         if limits is None:
             return 0
-        return limits.business_input_budget(output_reserve=reserve)
+        return limits.business_input_budget(
+            output_reserve=reserve,
+            business_tokens=self.business_context_tokens,
+            reserve_tokens=self.context_reserve_tokens,
+        )
 
     def _context_window_total(self, cfg: ChatEndpointConfig | None = None) -> int:
         return self.input_token_budget(cfg)

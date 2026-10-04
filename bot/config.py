@@ -7,8 +7,10 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from bot.utils.budget import validate_business_budget
 
 log = logging.getLogger(__name__)
 
@@ -152,8 +154,17 @@ class BotConfig(BaseModel):
     # 两种模式都还要再叠**业务预算 272Ki**（见下一项）。
     context_window_mode: Literal["auto", "fixed"] = "auto"
     # 模型侧窗口的**兼容字段**：``auto`` 下作为"查不到任何元数据"时的保守降级值，
-    # ``fixed`` 下作为硬上限。它不等于每轮的业务预算（业务预算是固定的 272Ki）。
+    # ``fixed`` 下作为硬上限。它不等于每轮的业务预算（见下面两项）。
     max_context_tokens: int = 278528
+    # 每轮**业务总预算**（运行时可读写，默认 272Ki = 278528）：覆盖 system/人设 +
+    # 工具定义 + 记忆/召回 + 历史 + 本轮 + 工具结果 + 输出预留。显式配置不被隐藏常量
+    # 截断（文档建议不超过 272Ki）；与模型真实窗口取小。
+    context_budget_tokens: int = Field(default=278528, ge=1024, le=16_000_000)
+    # 业务预算里留给**输出/工具余量**的部分（默认 32Ki = 32768），必须小于业务总预算；
+    # 实际输出需求更大时按 ``max_tokens`` 进一步增加预留（不重复扣）。
+    context_reserve_tokens: int = Field(default=32768, ge=1024, le=8_000_000)
+    # 群聊单次装配/读取的**条数安全上限**（默认最近 1000 条）。
+    group_history_max_messages: int = Field(default=1000, ge=1, le=20_000)
     max_output_tokens: int = 2048
     # Two-tier group memory: a bounded hot window plus a lossless, per-group
     # archive used by relevance-based recall.  The archive is the source of
@@ -212,6 +223,18 @@ class BotConfig(BaseModel):
     memory_recall_limit: int = 8
     memory_event_ttl_days: int = 30
     memory_deleted_retention_days: int = 30
+
+    @model_validator(mode="after")
+    def _validate_business_budget(self) -> "BotConfig":
+        """业务预算的显式校验：预留必须小于总预算，0 不能关闭门禁。"""
+
+        error = validate_business_budget(
+            self.context_budget_tokens,
+            self.context_reserve_tokens,
+        )
+        if error:
+            raise ValueError(error)
+        return self
 
 
 class ModerationConfig(BaseModel):
@@ -321,6 +344,12 @@ class Settings(BaseSettings):
     max_context_tokens: int = 278528
     # Kept in sync with ``bot.context_window_mode``; ``auto`` = match the model.
     context_window_mode: Literal["auto", "fixed"] = "auto"
+    # Business budget knobs (kept in sync with ``bot.*``): total window / output
+    # reserve / group-history row cap.  Defaults are the recommended values; the
+    # runtime config is authoritative and explicit values are never truncated.
+    context_budget_tokens: int = 278528
+    context_reserve_tokens: int = 32768
+    group_history_max_messages: int = 1000
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
     bot_reply_batch_timeout_seconds: float = 45.0
@@ -1294,6 +1323,23 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     # 的选择，否则 ``[bot] context_window_mode = "fixed"`` 会被默认值无声改回 auto。
     if "context_window_mode" in getattr(settings, "model_fields_set", set()):
         settings.bot.context_window_mode = settings.context_window_mode
+    # 业务预算三项同理：顶层显式设置才覆盖 ``[bot]`` 的值。
+    for top_level, bot_field in (
+        ("context_budget_tokens", "context_budget_tokens"),
+        ("context_reserve_tokens", "context_reserve_tokens"),
+        ("group_history_max_messages", "group_history_max_messages"),
+    ):
+        if top_level in getattr(settings, "model_fields_set", set()):
+            setattr(settings.bot, bot_field, getattr(settings, top_level))
+    budget_error = validate_business_budget(
+        settings.bot.context_budget_tokens,
+        settings.bot.context_reserve_tokens,
+    )
+    if budget_error:
+        raise ValueError(
+            f"业务预算配置非法：{budget_error}"
+            "（请修正 bot.context_budget_tokens / bot.context_reserve_tokens）"
+        )
     settings.bot.max_output_tokens = settings.max_output_tokens
     settings.bot.main_model.max_tokens = max(1, settings.max_output_tokens)
 

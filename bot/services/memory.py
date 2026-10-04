@@ -43,6 +43,9 @@ from bot.services.llm import LLMService
 from bot.services.model_limits import (
     auto_window_for,
     business_total_window,
+    configured_business_tokens,
+    configured_group_history_max_messages,
+    configured_reserve_tokens,
     loose_budget_tokens,
 )
 from bot.services.resource_health import register_resource_health_provider
@@ -1064,7 +1067,10 @@ class MemoryService:
         measured_window = auto_window_for(config, llm=self.llm)
         base_context = configured_context
         if measured_window is not None:
-            base_context = business_total_window(measured_window)
+            base_context = business_total_window(
+                measured_window,
+                business_tokens=configured_business_tokens(config),
+            )
         if model_input_limit > 0:
             self.max_context = min(
                 base_context,
@@ -1108,9 +1114,8 @@ class MemoryService:
         # （``self.max_context``）。夹取与硬闸门都在 bot.services.group_context。
         # 自动匹配到真实窗口时，历史预算也按窗口给（``max_context`` 已经是窗口）；
         # 只有保守降级时才用兼容字段 ``group_history_token_budget``。
-        self.group_history_reserve_tokens = bounded_group_history_reserve_tokens(
-            getattr(config, "group_history_reserve_tokens", None)
-        )
+        self.group_history_reserve_tokens = configured_reserve_tokens(config)
+        self.group_history_max_messages = configured_group_history_max_messages(config)
         self.group_history_token_budget = effective_group_history_budget(
             configured_budget=(
                 self.max_context
@@ -1895,7 +1900,7 @@ class MemoryService:
             )
         )
         count_cap = (
-            GROUP_HISTORY_MAX_MESSAGES
+            self.group_history_max_messages
             if max_messages is None
             else max(1, int(max_messages))
         )

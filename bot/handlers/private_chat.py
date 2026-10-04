@@ -90,6 +90,8 @@ def _reply_llm(settings: Settings):
         skill=bot_cfg.skill_model,
         max_context_tokens=bot_cfg.max_context_tokens,
         context_window_mode=getattr(bot_cfg, "context_window_mode", None),
+        business_context_tokens=getattr(bot_cfg, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(bot_cfg, "context_reserve_tokens", None),
     )
 
 

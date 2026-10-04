@@ -1312,4 +1312,6 @@ def _build_llm(settings: Settings) -> LLMService:
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )

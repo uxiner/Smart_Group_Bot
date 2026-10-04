@@ -461,6 +461,8 @@ async def _initialize_runtime_services(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )
     await _prefetch_model_context_metadata(
         llm,
@@ -751,6 +753,8 @@ async def main() -> None:
                 embed=settings.bot.embed_model,
                 max_context_tokens=settings.bot.max_context_tokens,
                 context_window_mode=getattr(settings.bot, "context_window_mode", None),
+                business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+                context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
             )
             # 路由/模型/上限模式变了：异步重取一次窗口元数据（不阻塞配置应用，
             # 失败就继续用保守降级值），拿到新窗口后再套一次 memory 预算。

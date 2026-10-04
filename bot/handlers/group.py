@@ -4451,6 +4451,8 @@ async def _guard_nsfw_video_only_message(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )
     vision_text = await _nsfw_video_thumbnail_vision_text(message, llm)
     marker = _parse_nsfw_marker(vision_text)
@@ -6094,6 +6096,8 @@ async def _process_pending_reply_batch(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )
     decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
     reply_mode_svc = ReplyModeService(llm)
@@ -8510,6 +8514,8 @@ async def on_group_message(
             embed=settings.bot.embed_model,
             max_context_tokens=settings.bot.max_context_tokens,
             context_window_mode=getattr(settings.bot, "context_window_mode", None),
+            business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+            context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
         )
         input_text, bot_vision_text = await _append_image_context(
             message, llm, input_text, msg_type
@@ -8650,6 +8656,8 @@ async def on_group_message(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
         context_window_mode=getattr(settings.bot, "context_window_mode", None),
+        business_context_tokens=getattr(settings.bot, "context_budget_tokens", None),
+        context_reserve_tokens=getattr(settings.bot, "context_reserve_tokens", None),
     )
 
     # 群内色情媒体处置：图片复用下面这一次视觉调用（只在提示词里追加要求），

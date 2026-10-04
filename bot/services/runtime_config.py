@@ -33,6 +33,17 @@ from bot.config import (
     _resolve_provider_profile,
 )
 from bot.db.models import RuntimeConfigRecord, RuntimeConfigSecret
+from bot.utils.budget import (
+    BUSINESS_CONTEXT_TOKENS_MAX,
+    BUSINESS_CONTEXT_TOKENS_MIN,
+    CONTEXT_RESERVE_TOKENS_MAX,
+    CONTEXT_RESERVE_TOKENS_MIN,
+    DEFAULT_GROUP_HISTORY_MAX_MESSAGES,
+    GROUP_HISTORY_MAX_MESSAGES_MAX,
+    GROUP_HISTORY_MAX_MESSAGES_MIN,
+    validate_business_budget,
+    validate_group_history_max_messages,
+)
 from bot.utils.prompts import load_prompt_defaults, set_runtime_prompts
 
 log = logging.getLogger(__name__)
@@ -320,6 +331,24 @@ class BotBehaviorConfig(StrictModel):
     # 两种模式都再叠固定的 272Ki 业务预算（每轮总窗口）。老配置没有这个字段 → 迁移成 auto。
     context_window_mode: Literal["auto", "fixed"] = "auto"
     max_context_tokens: int = Field(default=278528, ge=1024, le=2_000_000)
+    # 每轮业务总预算 / 输出工具预留 / 群历史单次读取条数（运行时可读写）。
+    # 默认是推荐值（272Ki / 32Ki / 1000）；显式配置不被隐藏常量截断，文档建议
+    # 业务总预算不超过 272Ki。预留必须小于总预算，0 不能关掉门禁。
+    context_budget_tokens: int = Field(
+        default=278528,
+        ge=BUSINESS_CONTEXT_TOKENS_MIN,
+        le=BUSINESS_CONTEXT_TOKENS_MAX,
+    )
+    context_reserve_tokens: int = Field(
+        default=32768,
+        ge=CONTEXT_RESERVE_TOKENS_MIN,
+        le=CONTEXT_RESERVE_TOKENS_MAX,
+    )
+    group_history_max_messages: int = Field(
+        default=DEFAULT_GROUP_HISTORY_MAX_MESSAGES,
+        ge=GROUP_HISTORY_MAX_MESSAGES_MIN,
+        le=GROUP_HISTORY_MAX_MESSAGES_MAX,
+    )
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
     memory_recent_messages: int = Field(default=500, ge=50, le=2000)
     memory_retention_days: int = Field(default=7, ge=1, le=365)
@@ -331,6 +360,18 @@ class BotBehaviorConfig(StrictModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = Field(default=8, ge=1, le=20)
     memory_automatic_compaction: bool = False
+    @model_validator(mode="after")
+    def _validate_business_budget(self) -> "BotBehaviorConfig":
+        """显式校验：预留必须小于业务总预算、条数在合法区间，0 不能关闭门禁。"""
+
+        error = validate_business_budget(
+            self.context_budget_tokens,
+            self.context_reserve_tokens,
+        ) or validate_group_history_max_messages(self.group_history_max_messages)
+        if error:
+            raise ValueError(error)
+        return self
+
     # Private-chat history: 278528 = 272K legacy depth target and the per-turn
     # business ceiling.  A *smaller* discovered model window tightens it further;
     # a 1M/4M window never loosens it (the turn is not filled to the model window).
@@ -999,6 +1040,9 @@ class RuntimeConfig(StrictModel):
         settings.bot.decision_context_items = bot.decision_context_items
         settings.bot.context_window_mode = bot.context_window_mode
         settings.bot.max_context_tokens = bot.max_context_tokens
+        settings.bot.context_budget_tokens = bot.context_budget_tokens
+        settings.bot.context_reserve_tokens = bot.context_reserve_tokens
+        settings.bot.group_history_max_messages = bot.group_history_max_messages
         settings.bot.max_output_tokens = bot.max_output_tokens
         settings.bot.memory_recent_messages = bot.memory_recent_messages
         settings.bot.memory_retention_days = bot.memory_retention_days
@@ -1048,6 +1092,9 @@ class RuntimeConfig(StrictModel):
         settings.bot.proactive_retry_minutes = bot.proactive_retry_minutes
         settings.max_context_tokens = bot.max_context_tokens
         settings.context_window_mode = bot.context_window_mode
+        settings.context_budget_tokens = bot.context_budget_tokens
+        settings.context_reserve_tokens = bot.context_reserve_tokens
+        settings.group_history_max_messages = bot.group_history_max_messages
         settings.max_output_tokens = bot.max_output_tokens
 
         settings.moderation = ModerationConfig(**self.moderation.model_dump())
@@ -1289,6 +1336,17 @@ def _normalize_deprecated_runtime_payload(
             "the per-turn business budget stays 272Ki and max_context_tokens is only "
             "the conservative fallback for unknown models"
         )
+
+    # 旧库只配了 ``group_history_reserve_tokens``（迁移前唯一的余量字段）时，把它镜像到
+    # 新的 ``context_reserve_tokens``：**显式运维配置必须保留**。写回之后不再触发。
+    mirror_bot = dict(normalized.get("bot") or {})
+    if (
+        "context_reserve_tokens" not in mirror_bot
+        and str(mirror_bot.get("group_history_reserve_tokens") or "").strip()
+    ):
+        mirror_bot["context_reserve_tokens"] = mirror_bot["group_history_reserve_tokens"]
+        normalized["bot"] = mirror_bot
+        changed = True
 
     # The former Sub2API credential was global and therefore cannot be safely
     # migrated to any particular group. All groups intentionally start with
@@ -1874,6 +1932,13 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
         legacy_mode = str(bot_data.get("context_window_mode") or "").strip().lower()
         if legacy_mode in {"auto", "fixed"}:
             settings.bot.context_window_mode = legacy_mode
+        for key in (
+            "context_budget_tokens",
+            "context_reserve_tokens",
+            "group_history_max_messages",
+        ):
+            if key in bot_data:
+                setattr(settings.bot, key, int(bot_data[key]))
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
     if isinstance(moderation_data, dict):
         settings.moderation = ModerationConfig(**moderation_data)
@@ -2031,6 +2096,9 @@ def build_legacy_runtime_config(
             decision_context_items=settings.bot_decision_context_items,
             context_window_mode=settings.bot.context_window_mode,
             max_context_tokens=settings.max_context_tokens,
+            context_budget_tokens=settings.bot.context_budget_tokens,
+            context_reserve_tokens=settings.bot.context_reserve_tokens,
+            group_history_max_messages=settings.bot.group_history_max_messages,
             max_output_tokens=settings.max_output_tokens,
             memory_recent_messages=(
                 settings.bot_memory_recent_messages

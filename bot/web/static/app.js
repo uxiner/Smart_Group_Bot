@@ -937,6 +937,9 @@
           ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，不再依赖自动压缩替代原文。")}
           <div class="field-grid three">
             ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
+            ${field("bot.context_budget_tokens", "每轮业务总预算 Token", { type: "number", min: 1024, max: 16000000, step: 1024, required: true, hint: "默认 278528（272Ki，推荐值）。覆盖人设/工具定义/记忆/历史/本轮/工具结果/输出预留；显式配置不会被隐藏常量截断，与模型真实窗口取更小" })}
+            ${field("bot.context_reserve_tokens", "输出/工具预留 Token", { type: "number", min: 1024, max: 8000000, step: 1024, required: true, hint: "默认 32768（32Ki），必须小于业务总预算；实际输出需求更大时按该角色 max_tokens 进一步收紧，且只扣一次" })}
+            ${field("bot.group_history_max_messages", "群历史单次读取条数", { type: "number", min: 1, max: 20000, step: 1, required: true, hint: "默认 1000（最近 N 条安全上限）；归档按页从新到旧读取，条数或预算先到即停" })}
             ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动发现模型窗口（默认）" }, { value: "fixed", label: "固定模型侧上限（兼容旧配置）" }], hint: "每轮业务预算固定为 272Ki（输入上限 245760，含人设/工具定义/记忆/历史/本轮/工具结果/输出预留）。auto：再自动发现模型真实窗口，只在模型更小时进一步收紧；fixed：不查元数据，用右侧固定值当模型侧上限" })}
             ${field("bot.max_context_tokens", "固定上限 Token（仅 fixed 生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。auto 模式下它只作为“查不到任何模型元数据”时的保守降级值，不再压住已知模型" })}
             ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
