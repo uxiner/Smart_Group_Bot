@@ -712,8 +712,10 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.bot.context_window_mode, "auto")
         self.assertEqual(settings.bot.max_context_tokens, 278_528)
         self.assertEqual(context_gate.context_token_budget(settings), 278_528)
+        # auto 已解析到模型窗口：群历史输入需扣固定余量；
+        # 278528 是业务总窗口，不能把它误当成可用历史输入。
         self.assertEqual(
-            group_context.group_history_token_budget(settings), 278_528
+            group_context.group_history_token_budget(settings), 245_760
         )
 
         # 旧 TOML 一次性导入同样落在同一个业务预算
