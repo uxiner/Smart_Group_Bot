@@ -1950,6 +1950,16 @@ async def init_db(
                 await _sqlite_migrate_telegram_delete_jobs(conn)
         await conn.run_sync(Base.metadata.create_all)
         if is_sqlite:
+            # B-27：老库的 checkin_reminder_posts 补 delivered_at（可空）。
+            # NULL = "这条占位从没确认送达"，与「刚 claim 正在发」同义，靠
+            # created_at 宽限期区分（见 checkin_reminder.reap_stale_reminder_slots）。
+            await _sqlite_ensure_column(
+                conn,
+                "checkin_reminder_posts",
+                "delivered_at",
+                "delivered_at DATETIME",
+            )
+        if is_sqlite:
             # 老库（已建过 group_summaries 的部署）补保护字段：默认 -1 = "无保护数据"，
             # 前台据此把旧摘要判失效并重建，绝不沿用没有来源保护的摘要。
             await _sqlite_ensure_column(

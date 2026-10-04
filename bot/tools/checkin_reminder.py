@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import timedelta
 
 from aiogram import Bot
 
@@ -55,10 +56,12 @@ from bot.services.checkin import local_today
 from bot.services.checkin_reminder import (
     REMINDER_AUTO_DELETE_SECONDS,
     REMINDER_SLOTS,
+    backfill_durable_auto_delete,
     build_checkin_reminder_keyboard,
     claim_reminder_slot,
     mark_reminder_sent,
     normalize_slot,
+    reap_stale_reminder_slots,
     release_reminder_slot,
     render_checkin_reminder,
     shop_start_payload,
@@ -71,6 +74,7 @@ from bot.utils.telegram import (
     configure_telegram_cleanup_scheduler,
     schedule_message_auto_delete_durable,
 )
+from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +166,13 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                     cleanup_ready = True
                 except Exception:
                     log.exception("checkin reminder cleanup scheduler failed to start")
+                # B-27：上一轮进程若在 claim 与 send 之间被 SIGKILL / OOM / 容器驱逐，
+                # 库里会留下一行 message_id=0 的空占位，让该时段**永远**不再发、
+                # 且没有补发路径。先把超宽限期的空占位清掉，下面的 claim 就能正常
+                # 认领并补发。宽限期远大于一次「claim → 读名单 → 发消息」的耗时。
+                released = await reap_stale_reminder_slots(session)
+                if released:
+                    print(f"已清理 {len(released)} 个未送达的空占位，本轮将补发")
                 for group_id in group_ids:
                     claimed = False
                     delivered = False
@@ -206,7 +217,26 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                                 "checkin reminder auto delete not queued | group=%s",
                                 group_id,
                             )
-                            print(f"提醒已发出但自动删除未排队 | group={group_id}")
+                            # B-27：调度器不健康时那条「10 分钟后自动删除」会留在群里
+                            # 永远不掉。直接往同一张持久表补一行，由常驻进程的清理
+                            # worker 到点执行（绝不重发已经发出去的消息）。
+                            backfilled = await backfill_durable_auto_delete(
+                                session_factory,
+                                chat_id=int(group_id),
+                                message_id=int(
+                                    getattr(sent_message, "message_id", 0) or 0
+                                ),
+                                due_at=now_shanghai_naive()
+                                + timedelta(seconds=REMINDER_AUTO_DELETE_SECONDS),
+                            )
+                            if not backfilled:
+                                print(
+                                    f"提醒已发出但自动删除既没排队也没补写 | group={group_id}"
+                                )
+                            else:
+                                print(
+                                    f"提醒已发出，自动删除已直接补写持久表 | group={group_id}"
+                                )
                         sent += 1
                         print(
                             f"已发送提醒 | group={group_id} | {key}"

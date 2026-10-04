@@ -21,22 +21,31 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from html import escape
+from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import CheckinReminderPost, MemberCheckin
+from bot.db.models import (
+    CheckinReminderPost,
+    MemberCheckin,
+    TelegramDeleteJob,
+)
 from bot.services.checkin import (
     CHECKIN_BUTTON_TEXT,
     CHECKIN_CALLBACK_DATA,
     local_today,
 )
+from bot.utils.timezone import now_shanghai_naive
+
+log = logging.getLogger(__name__)
 
 #: 每天四段提醒，取值就是**本地**时段（Asia/Shanghai）。`--slot` 只允许这几个值。
 REMINDER_SLOTS: tuple[int, ...] = (9, 12, 15, 18)
@@ -323,7 +332,13 @@ async def mark_reminder_sent(
     key: str,
     message_id: int,
 ) -> None:
-    """发送成功后回填 message_id（按钮回调按它反查时段）。"""
+    """发送成功后回填 message_id（按钮回调按它反查时段）并标记 ``delivered_at``。
+
+    ``delivered_at``（B-27）是「占位真的变成了消息」的证据：进程在 claim 与 send
+    之间被 SIGKILL / OOM / 容器驱逐时，只会留下一行 ``message_id=0`` 的空占位，
+    而 ``(group_id, slot_key)`` 唯一索引会让该时段**永远不再发**、且无补发路径。
+    :func:`reap_stale_reminder_slots` 靠它把超宽限期的空占位清掉并补发。
+    """
 
     await session.execute(
         update(CheckinReminderPost)
@@ -331,8 +346,129 @@ async def mark_reminder_sent(
             CheckinReminderPost.group_id == int(group_id),
             CheckinReminderPost.slot_key == str(key),
         )
-        .values(message_id=int(message_id))
+        .values(message_id=int(message_id), delivered_at=now_shanghai_naive())
     )
+
+
+#: 空占位的宽限期（秒，B-27）。必须**远大于**一次「claim → 读名单 → 发消息」的正常
+#: 耗时（秒级），否则会把「刚 claim、正在发」的行误判成空占位。
+STALE_REMINDER_GRACE_SECONDS = 15 * 60
+
+
+async def reap_stale_reminder_slots(
+    session: AsyncSession,
+    *,
+    grace_seconds: int = STALE_REMINDER_GRACE_SECONDS,
+    now: Any | None = None,
+) -> list[tuple[int, str]]:
+    """清理「claim 了但从没送达」的空占位，返回被释放的 ``(group_id, slot_key)``。
+
+    判据是**三个都有**才删：``message_id = 0``（没回填过）、
+    ``delivered_at IS NULL``（从没确认送达），再加 ``created_at`` 早于宽限期——
+    这样「刚 claim 正在发」的行不会被误删。腾出来的时段会在同一轮里被
+    :func:`claim_reminder_slot` 正常认领并补发。
+    """
+
+    stamp = now or now_shanghai_naive()
+    cutoff = stamp - timedelta(seconds=max(0, int(grace_seconds)))
+    try:
+        rows = (
+            await session.execute(
+                select(
+                    CheckinReminderPost.group_id, CheckinReminderPost.slot_key
+                ).where(
+                    CheckinReminderPost.message_id == 0,
+                    CheckinReminderPost.delivered_at.is_(None),
+                    CheckinReminderPost.created_at <= cutoff,
+                )
+            )
+        ).all()
+        stale = [(int(row[0]), str(row[1])) for row in rows]
+        if not stale:
+            return []
+        await session.execute(
+            delete(CheckinReminderPost).where(
+                CheckinReminderPost.message_id == 0,
+                CheckinReminderPost.delivered_at.is_(None),
+                CheckinReminderPost.created_at <= cutoff,
+            )
+        )
+        await session.commit()
+    except Exception as exc:  # 清理失败只是「这一轮不补发」，绝不影响发提醒
+        await session.rollback()
+        log.warning("checkin reminder: stale slot reap failed | error=%s", exc)
+        return []
+    log.info(
+        "checkin reminder: released %d stale undelivered slot(s) | groups=%s",
+        len(stale),
+        sorted({group_id for group_id, _slot in stale}),
+    )
+    return stale
+
+
+async def backfill_durable_auto_delete(
+    session_factory: Any,
+    *,
+    chat_id: int,
+    message_id: int,
+    due_at: Any,
+) -> bool:
+    """自动删除排队失败时的**持久兜底**（B-27）。
+
+    ``schedule_message_auto_delete_durable`` 返回 ``False``（调度器未初始化 / 不健康）
+    时，那条写着「本条提醒 10 分钟后自动删除」的消息会**永久**留在群里。
+    这里直接往同一张持久表 ``telegram_delete_jobs`` 补一行，由常驻进程的清理
+    worker 到点执行——与调度器走的是同一条队列、同一套幂等键。
+    """
+
+    normalized_chat_id = int(chat_id)
+    normalized_message_id = int(message_id)
+    if normalized_chat_id == 0 or normalized_message_id <= 0:
+        return False
+    due = due_at if isinstance(due_at, datetime) else now_shanghai_naive()
+    due = due.replace(tzinfo=None)
+    try:
+        async with session_factory() as session:
+            statement = sqlite_insert(TelegramDeleteJob).values(
+                chat_id=normalized_chat_id,
+                message_id=normalized_message_id,
+                due_at=due,
+                attempts=0,
+                lease_until=None,
+                last_error="",
+                updated_at=now_shanghai_naive(),
+            )
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[
+                        TelegramDeleteJob.chat_id,
+                        TelegramDeleteJob.message_id,
+                    ],
+                    set_={
+                        "due_at": func.min(
+                            TelegramDeleteJob.due_at, statement.excluded.due_at
+                        ),
+                        "updated_at": now_shanghai_naive(),
+                    },
+                )
+            )
+            await session.commit()
+    except Exception as exc:
+        log.warning(
+            "checkin reminder: durable auto delete backfill failed | chat=%s | "
+            "message=%s | error=%s",
+            normalized_chat_id,
+            normalized_message_id,
+            exc,
+        )
+        return False
+    log.warning(
+        "checkin reminder: durable auto delete backfilled directly | chat=%s | "
+        "message=%s",
+        normalized_chat_id,
+        normalized_message_id,
+    )
+    return True
 
 
 async def release_reminder_slot(

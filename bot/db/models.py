@@ -1631,6 +1631,12 @@ class CheckinReminderPost(Base):
     ``bot.services.checkin_reminder.release_reminder_slot``），这样"没发出去"
     不会被记成"已发过"。``message_id`` 在发送成功后才回填，供审计与按钮回调
     反查"这条提醒是哪个时段发的"。
+
+    ``delivered_at``（B-27）是「占位真的变成了消息」的证据。进程在 claim 与 send
+    之间被 SIGKILL / OOM / 容器驱逐时只会留下 ``message_id=0`` 的空占位，而唯一
+    索引会让该时段永远不再发、且没有补发路径；``reap_stale_reminder_slots`` 靠
+    「``message_id=0`` 且 ``delivered_at IS NULL`` 且 ``created_at`` 早于宽限期」
+    把这类空占位清掉并补发。
     """
 
     __tablename__ = "checkin_reminder_posts"
@@ -1641,6 +1647,8 @@ class CheckinReminderPost(Base):
     slot_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # 发送成功前为 0；发送成功后回填 Telegram message_id
     message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    #: 发送成功并回填 message_id 的时刻；空占位为 NULL（B-27 的判定依据）
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=now_shanghai_naive,
