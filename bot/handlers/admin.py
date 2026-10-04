@@ -332,6 +332,7 @@ def _build_skill_service(settings: Settings) -> SkillService:
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
     sticker_pool = [
         x.strip()

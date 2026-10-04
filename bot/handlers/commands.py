@@ -358,6 +358,7 @@ def _moderation_llm(settings: Settings):
         embed=bot_cfg.embed_model,
         skill=bot_cfg.skill_model,
         max_context_tokens=bot_cfg.max_context_tokens,
+        context_window_mode=getattr(bot_cfg, "context_window_mode", None),
     )
 
 
@@ -370,6 +371,7 @@ def _build_skill_service(settings: Settings) -> SkillService:
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
     sticker_pool = [
         x.strip()
@@ -878,6 +880,7 @@ def _av_synopsis_llm(settings: Settings) -> LLMService:
         embed=bot_cfg.embed_model,
         skill=bot_cfg.skill_model,
         max_context_tokens=bot_cfg.max_context_tokens,
+        context_window_mode=getattr(bot_cfg, "context_window_mode", None),
     )
 
 

@@ -216,6 +216,12 @@ _SILENT_REPLY_MARKERS = {
 _SHORT_UNCERTAIN_REPLY_RE = re.compile(
     r"^(?:我)?(?:不知道|不确定|无法(?:确定|判断|回答)|信息不足|暂无可信来源|无可信来源|无法根据可信来源(?:回答|解释))(?:[，,。.!！?？].*)?$"
 )
+#: 真正无法回答时（模型链路失败、载荷连核心块都装不下、主备都被 skip）的**诚实**提示。
+#: 2026-10-04 生产事故：主模型与备用都没发出 HTTP，这里却硬编码回「我在，直接说就好~」，
+#: 让群友以为机器人听懂了。这条文案**什么都不声称**：不说已签到、不说已排程、不说已
+#: 完成任何副作用，只说明这次没生成出来、可以再试一次。它也必须**不**命中
+#: ``_SHORT_UNCERTAIN_REPLY_RE`` / ``_SILENT_REPLY_MARKERS``，否则会再次被静默掉。
+REPLY_UNAVAILABLE_NOTICE = "抱歉，这次没能生成回答，请稍后再试一次。"
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
 _ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
 _PENDING_REPLY_QUESTION_RE = re.compile(
@@ -4444,6 +4450,7 @@ async def _guard_nsfw_video_only_message(
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
     vision_text = await _nsfw_video_thumbnail_vision_text(message, llm)
     marker = _parse_nsfw_marker(vision_text)
@@ -6086,6 +6093,7 @@ async def _process_pending_reply_batch(
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
     decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
     reply_mode_svc = ReplyModeService(llm)
@@ -6493,15 +6501,35 @@ async def _process_pending_reply_batch(
                 elif reply_specs or not skill_handled:
                     silence_reply, silence_reason = _should_silence_generated_reply(reply)
                     if silence_reply and force_reply:
-                        log.warning(
-                            "[%s] pending batch forced casual produced no usable reply, using fallback | reason=%s",
-                            group_id,
-                            silence_reason,
-                        )
-                        reply = "我在，直接说就好~"
-                        reply_specs = [ReplyMessageSpec(text=reply)]
-                        reply_source = "fallback"
-                        silence_reply = False
+                        # 2026-10-04：主模型与备用都因为"超限"被 skip、HTTP 根本没发出去，
+                        # 这里却硬编码回「我在，直接说就好~」——听起来像听懂了，实际上一句
+                        # 都没生成。改成**诚实失败**：什么都不声称（绝不虚称已签到/已排程/
+                        # 已完成任何副作用），只说明这次没生成出来、可以再试。
+                        if silence_reason == "uncertain_short_reply" and reply.strip():
+                            # 模型自己给出的"我不知道/无法确定"已经是诚实回答，原样发出。
+                            log.warning(
+                                "[%s] pending batch forced casual kept the model's own uncertain reply | reason=%s",
+                                group_id,
+                                silence_reason,
+                            )
+                            silence_reply = False
+                        elif silence_reason == "silent_marker":
+                            # 模型显式选择"不回"（NO_TRUSTED_ANSWER 之类）：这是主动语义，
+                            # 不用失败提示覆盖它。
+                            log.info(
+                                "[%s] pending batch forced casual honored the model's silence marker",
+                                group_id,
+                            )
+                        else:
+                            log.warning(
+                                "[%s] pending batch forced casual produced no usable reply, using honest unavailable notice | reason=%s",
+                                group_id,
+                                silence_reason,
+                            )
+                            reply = REPLY_UNAVAILABLE_NOTICE
+                            reply_specs = [ReplyMessageSpec(text=reply)]
+                            reply_source = "unavailable"
+                            silence_reply = False
                     if silence_reply:
                         preview = _truncate_text(reply, 80) if reply else "-"
                         log.info(
@@ -8481,6 +8509,7 @@ async def on_group_message(
             vision=settings.bot.vision_model,
             embed=settings.bot.embed_model,
             max_context_tokens=settings.bot.max_context_tokens,
+            context_window_mode=getattr(settings.bot, "context_window_mode", None),
         )
         input_text, bot_vision_text = await _append_image_context(
             message, llm, input_text, msg_type
@@ -8620,6 +8649,7 @@ async def on_group_message(
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
 
     # 群内色情媒体处置：图片复用下面这一次视觉调用（只在提示词里追加要求），

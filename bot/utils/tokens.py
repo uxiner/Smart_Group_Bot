@@ -40,3 +40,26 @@ def estimate_text_tokens(text: str) -> int:
     cjk_chars = len(_CJK_CHAR_RE.findall(body))
     other_chars = len(body) - cjk_chars
     return cjk_chars + (other_chars + 2) // 3
+
+
+def cut_text_to_tokens(text: str, limit_tokens: int) -> str:
+    """把文本**从尾部**硬切到 token 上限内（保留开头）。
+
+    历史装配、统一闸门与最终载荷裁剪都要"截断一条超长消息"，三处必须同口径，否则
+    同一个 limit 切出来的长度不同。二分在 :func:`estimate_text_tokens` 上做，非 CJK
+    字符约 3 字符/token，所以先在 ``3 * limit`` 字符处开窗再收敛。
+    """
+
+    if limit_tokens <= 0 or not text:
+        return ""
+    if estimate_text_tokens(text) <= limit_tokens:
+        return text
+    candidate = text[: min(len(text), limit_tokens * 3 + 3)]
+    low, high = 0, len(candidate)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if estimate_text_tokens(candidate[:mid]) <= limit_tokens:
+            low = mid
+        else:
+            high = mid - 1
+    return candidate[:low]

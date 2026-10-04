@@ -26,6 +26,19 @@ import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
 from bot.services import llm_metrics
+from bot.services import model_limits as model_limits_module
+from bot.services.model_limits import (
+    CONTEXT_MODE_FIXED,
+    MIN_OUTPUT_RESERVE_TOKENS,
+    ModelLimits,
+    conservative_message_tokens,
+    estimate_tools_tokens,
+)
+from bot.services.payload_fit import (
+    FittedPayload,
+    fit_messages_to_input_budget,
+    strip_internal_message_keys,
+)
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -159,6 +172,9 @@ _CHAT_DEGRADED_COOLDOWN_SECONDS = 300.0
 _LLM_TOKENIZER_THREAD_CAPACITY = 2
 _LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS = 1.0
 _LLM_TOKENIZER_STALE_SECONDS = 30.0
+#: 载荷超过这么多**源字符**时不再尝试真实分词器：那一定跑不完单次超时，只会在共享
+#: 线程池里占着槽位（让后面的请求全都退化成保守估算）。此时直接用同一个保守上界。
+_LLM_TOKENIZER_MAX_SOURCE_CHARACTERS = 4_000_000
 _LLM_TOKENIZER_THREAD_SLOTS = threading.BoundedSemaphore(
     _LLM_TOKENIZER_THREAD_CAPACITY
 )
@@ -488,6 +504,7 @@ class LLMService:
         skill: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
+        context_window_mode: str | None = None,
     ) -> None:
         self.main = main
         self.vision_config = vision or main
@@ -498,6 +515,12 @@ class LLMService:
         self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
+        # ``auto``（默认）按实际模型上限自动匹配；``fixed`` 保留迁移前的固定硬上限。
+        self.context_window_mode = (
+            CONTEXT_MODE_FIXED
+            if str(context_window_mode or "").strip().lower() == CONTEXT_MODE_FIXED
+            else model_limits_module.CONTEXT_MODE_AUTO
+        )
         # Endpoint -> monotonic deadline until which it is known to answer the
         # tool stage with an apology string instead of a tool call.
         self._tool_incapable: dict[tuple[str, str, str], float] = {}
@@ -506,6 +529,8 @@ class LLMService:
         # bridge is skipped while the stamp lasts so it cannot add its full
         # latency to every single reply.
         self._chat_degraded_until: dict[tuple[str, str, str], float] = {}
+        # "这个 endpoint 的窗口未知、已按保守值降级"只提醒一次。
+        self._unknown_window_logged: set[tuple[str, str, str]] = set()
 
     def reconfigure(
         self,
@@ -518,6 +543,7 @@ class LLMService:
         skill: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
+        context_window_mode: str | None = None,
     ) -> None:
         """Replace model endpoints for requests started after this call."""
         self.main = main
@@ -528,6 +554,12 @@ class LLMService:
         self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
+        if context_window_mode is not None:
+            self.context_window_mode = (
+                CONTEXT_MODE_FIXED
+                if str(context_window_mode).strip().lower() == CONTEXT_MODE_FIXED
+                else model_limits_module.CONTEXT_MODE_AUTO
+            )
 
     @classmethod
     def _resolve_request_api_base(
@@ -1661,10 +1693,104 @@ class LLMService:
         except Exception:
             return 0
 
+    def configured_endpoints(self) -> list[ChatEndpointConfig]:
+        """本实例上**已配置**的对话 endpoint（含 fallback），供元数据预热用。"""
+
+        endpoints: list[ChatEndpointConfig] = []
+        seen: set[tuple[str, str, str]] = set()
+        for cfg in (
+            self.main,
+            self.skill_config,
+            self.decision_config,
+            self.moderation_config,
+            self.vision_config,
+            self.compress_config,
+        ):
+            if cfg is None or not getattr(cfg, "model", ""):
+                continue
+            for candidate in self._chat_candidates(cfg):
+                key = self._tool_endpoint_key(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                endpoints.append(candidate)
+        return endpoints
+
+    async def refresh_model_limits(self, *, force: bool = False) -> dict[str, Any]:
+        """预热/刷新窗口元数据（启动与路由变更时调用）。
+
+        **永远不阻塞主链路**：失败只记日志；拿不到就按保守降级走。
+        """
+
+        try:
+            return await model_limits_module.MODEL_LIMITS.refresh(
+                self.configured_endpoints(),
+                force=force,
+            )
+        except Exception:
+            log.exception("model metadata refresh failed (continuing conservatively)")
+            return {}
+
+    def endpoint_limits(self, cfg: ChatEndpointConfig | None = None) -> ModelLimits | None:
+        """当前生效的窗口结论；``None`` = 显式关闭上限（兼容旧 ``0`` 语义）。"""
+
+        target = cfg or self.main
+        if self.context_window_mode == CONTEXT_MODE_FIXED:
+            if self.max_context_tokens <= 0:
+                # 迁移前 ``max_context_tokens=0`` = 不做上限判断，保留这个逃生舱。
+                return None
+            return model_limits_module.MODEL_LIMITS.legacy_limits(
+                target,
+                total_window=self.max_context_tokens,
+            )
+        limits = model_limits_module.MODEL_LIMITS.resolve(
+            target,
+            legacy_total_window=self.max_context_tokens or None,
+        )
+        if not limits.known:
+            self._log_unknown_window_once(target, limits)
+        return limits
+
+    def _log_unknown_window_once(
+        self,
+        cfg: ChatEndpointConfig,
+        limits: ModelLimits,
+    ) -> None:
+        """未知模型的保守降级只提醒一次（每个 endpoint 一条），不刷日志。"""
+
+        key = self._tool_endpoint_key(cfg)
+        if key in self._unknown_window_logged:
+            return
+        self._unknown_window_logged.add(key)
+        log.warning(
+            "LLM context window unknown, using conservative fallback | model=%s | "
+            "provider=%s | host=%s | source=%s | total_window=%s | detail=%s",
+            cfg.model,
+            str(getattr(cfg, "provider", "") or "-"),
+            model_limits_module.redact_base(getattr(cfg, "api_base", "")),
+            limits.source,
+            limits.total_window or "-",
+            limits.detail or "-",
+        )
+
+    def input_token_budget(self, cfg: ChatEndpointConfig | None = None) -> int:
+        """这个 endpoint 允许的 prompt 上限（已扣掉**一次**输出预留）。
+
+        ``0`` = 不做上限判断（旧 ``max_context_tokens=0`` 的兼容语义）。
+        """
+
+        target = cfg or self.main
+        limits = self.endpoint_limits(target)
+        if limits is None:
+            return 0
+        reserve = max(
+            MIN_OUTPUT_RESERVE_TOKENS,
+            max(0, int(getattr(target, "max_tokens", 0) or 0)),
+        )
+        return limits.input_budget_tokens(output_reserve=reserve)
+
     def _context_window_total(self, cfg: ChatEndpointConfig | None = None) -> int:
-        if self.max_context_tokens > 0:
-            return self.max_context_tokens
-        return self.model_input_token_limit(cfg or self.main)
+        return self.input_token_budget(cfg)
 
     @staticmethod
     def _format_prompt_usage(used_tokens: int, total_tokens: int) -> str:
@@ -1677,20 +1803,22 @@ class LLMService:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[int, int]:
-        """Return ``(estimate, source_characters)`` without model tokenization.
+        """Return ``(conservative_upper_bound, source_characters)``.
 
-        One token per source character plus a small per-message allowance is a
-        deliberately high estimate for the bot's usual Chinese/English text
-        and structured tool payloads. Inexact estimates are used for telemetry
-        and fallback only; ordinary requests are not rejected as if the value
-        were model-exact.
+        The estimate is the **same** CJK-aware口径 the context assemblers use
+        (``bot.utils.tokens.estimate_text_tokens``: 1 token/CJK char, ~3 chars per
+        token otherwise) plus a per-message allowance.  It is an upper bound, not
+        a model-exact count — callers must not label it ``exact``.
         """
 
         raw_characters = sum(len(str(msg.get("content", ""))) for msg in messages)
         if tools:
             raw_characters += len(str(tools))
-        estimate = max(1, raw_characters + (len(messages) * 16))
-        return estimate, raw_characters
+        estimate = 0
+        for message in messages:
+            estimate += conservative_message_tokens(message)
+        estimate += estimate_tools_tokens(tools)
+        return max(1, estimate), raw_characters
 
     def _count_prompt_tokens(
         self,
@@ -1707,16 +1835,7 @@ class LLMService:
         """
 
         del cfg
-        estimate, raw_characters = self._conservative_prompt_token_estimate(
-            messages,
-            tools,
-        )
-        if raw_characters >= 100_000:
-            # Treat the estimate as a conservative hard-budget upper bound.
-            # This avoids synchronous tokenizer CPU on pathological prompts
-            # while still preventing multi-megabyte requests from bypassing
-            # context checks merely because the estimate is not model-exact.
-            return estimate, True
+        estimate, _raw = self._conservative_prompt_token_estimate(messages, tools)
         return estimate, False
 
     async def _count_prompt_tokens_async(
@@ -1726,12 +1845,21 @@ class LLMService:
         tools: list[dict[str, Any]] | None = None,
         cfg: ChatEndpointConfig | None = None,
     ) -> tuple[int, bool]:
+        """``(tokens, exact)``：先试真实分词器（离线程 + 有界超时），失败/超时回退
+        到与装配链路**同一个**保守上界，并且**如实标记** ``exact=False``。
+
+        2026-10-04 的事故就是这里：载荷 ≥100K 字符时直接返回"一字符一 token"的估算
+        并标成 ``exact=True``，于是最终闸门拿一个比装配口径大 3 倍的数去比 272K，把
+        **主模型和备用都 skip 掉**。保守上界不是 exact——这一点必须是硬规矩。
+        """
+
         fallback, raw_characters = self._conservative_prompt_token_estimate(
             messages,
             tools,
         )
-        if raw_characters >= 100_000:
-            return fallback, True
+        if raw_characters > _LLM_TOKENIZER_MAX_SOURCE_CHARACTERS:
+            # 载荷已经大到分词器一定跑不完（而且它只会在共享线程里占着槽位）。
+            return fallback, False
 
         kwargs: dict[str, Any] = {
             "model": (cfg.model if cfg is not None else self.main.model),
@@ -1742,6 +1870,22 @@ class LLMService:
         return await _run_bounded_tokenizer_call(
             lambda: int(litellm.token_counter(**kwargs)),
             fallback=fallback,
+        )
+
+    def fit_messages_to_budget(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        budget_tokens: int,
+    ) -> FittedPayload:
+        """按统一优先级把载荷裁进 ``budget_tokens``（保守口径，可加）。"""
+
+        return fit_messages_to_input_budget(
+            messages,
+            message_tokens=conservative_message_tokens,
+            tools_tokens=estimate_tools_tokens(tools),
+            budget_tokens=budget_tokens,
         )
 
     def count_prompt_tokens(
@@ -2183,36 +2327,62 @@ class LLMService:
     ) -> Any | None:
         label_cn = self._label_cn(label)
         total_attempts = self._retry_attempts(cfg)
+        limits = self.endpoint_limits(cfg)
+        input_budget = self.input_token_budget(cfg)
         prompt_tokens, token_count_exact = await self._count_prompt_tokens_async(
             messages,
             tools=tools,
             cfg=cfg,
         )
-        configured_context = self.max_context_tokens
-        required_tokens = prompt_tokens + max(0, int(cfg.max_tokens or 0))
-        if token_count_exact and configured_context > 0 and required_tokens > configured_context:
-            log.error(
-                "LLM request exceeds configured context budget | stage=%s | model=%s | "
-                "prompt_tokens=%d output_tokens=%d total=%d/%d | skipping_model",
+        # 裁剪用**可加的保守上界**（与装配链路同口径），门禁看两者中更大的那个：
+        # 真实分词器说超了就必须裁，而且还要把"真实比保守多出来的那部分"也算进预算，
+        # 否则保守口径会先把载荷判成"装得下"而把真实超限放过去。
+        conservative_tokens, _raw_characters = self._conservative_prompt_token_estimate(
+            messages,
+            tools,
+        )
+        effective_tokens = max(prompt_tokens, conservative_tokens)
+        if input_budget > 0 and effective_tokens > input_budget:
+            overshoot_gap = max(0, prompt_tokens - conservative_tokens)
+            fitted = self.fit_messages_to_budget(
+                messages,
+                tools=tools,
+                budget_tokens=max(1, input_budget - overshoot_gap),
+            )
+            log.warning(
+                "LLM prompt exceeds endpoint budget, fitting before send | stage=%s | model=%s | "
+                "source=%s | prompt_tokens=%d (conservative=%d) /%d | exact=%s | dropped=%d | "
+                "truncated=%d | layers=%s",
                 label_cn,
                 cfg.model,
+                getattr(limits, "source", "-"),
                 prompt_tokens,
-                cfg.max_tokens,
-                required_tokens,
-                configured_context,
+                conservative_tokens,
+                input_budget,
+                token_count_exact,
+                fitted.dropped_messages,
+                fitted.truncated_messages,
+                ",".join(fitted.layers_dropped) or "-",
             )
-            return None
-        model_input_limit = self.model_input_token_limit(cfg)
-        if token_count_exact and model_input_limit > 0 and prompt_tokens > model_input_limit:
-            log.error(
-                "LLM prompt exceeds model input limit | stage=%s | model=%s | "
-                "prompt_tokens=%d/%d | skipping_model",
-                label_cn,
-                cfg.model,
-                prompt_tokens,
-                model_input_limit,
+            if fitted.over_budget:
+                log.error(
+                    "LLM request cannot fit the model window even after trimming | stage=%s | "
+                    "model=%s | source=%s | prompt_tokens=%d/%d | exact=%s | skipping_model",
+                    label_cn,
+                    cfg.model,
+                    getattr(limits, "source", "-"),
+                    fitted.prompt_tokens,
+                    input_budget,
+                    token_count_exact,
+                )
+                return None
+            messages = fitted.messages
+            prompt_tokens = max(
+                fitted.prompt_tokens,
+                prompt_tokens - (conservative_tokens - fitted.prompt_tokens),
             )
-            return None
+        # 清洁：层标记（``_ctx_layer`` 之类）只用于进程内决定裁剪顺序，绝不进请求体。
+        messages = strip_internal_message_keys(messages)
         configuration_issue = self.chat_configuration_issue(cfg)
         if configuration_issue:
             log.error(

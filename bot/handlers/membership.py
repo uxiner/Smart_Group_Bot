@@ -356,6 +356,7 @@ def _build_llm(settings: Settings) -> LLMService:
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
 
 

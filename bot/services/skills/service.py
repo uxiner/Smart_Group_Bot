@@ -16,6 +16,7 @@ from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_preference_context
 from bot.services.llm import LLMService
 from bot.services.message_templates import render_data_brief
+from bot.services.payload_fit import tag_rendered_history
 from bot.services.reply_progress import ProgressCallback, ProgressReference, ProgressUpdate
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
@@ -437,7 +438,12 @@ class SkillService:
             },
         ]
         if history:
-            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+            rendered_history = sanitize_history_for_llm(
+                history, max_items=len(history)
+            )
+            messages.extend(
+                tag_rendered_history(history, rendered_history)
+            )
         recent_context = format_recent_group_context(history, max_items=8)
         if recent_context:
             messages.append({"role": "system", "content": recent_context})

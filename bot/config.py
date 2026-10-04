@@ -144,9 +144,14 @@ class BotConfig(BaseModel):
     # Tool-calling (skills) stage route; ``None`` = reuse ``main_model``.
     skill_model: ModelConfig | None = None
     embed_model: EmbedConfig = EmbedConfig()
-    # 模型窗口上限：278528 = 272K（全项目统一的深度目标，与主模型实测窗口
-    # 1,000,000 相比仍留了大量余量）。群聊历史按下面的 group_history_* 装配，
-    # 装配结果 + 固定余量必须 ≤ 这个值。
+    # 上下文模式（2026-10-04 生产事故修复）：
+    #   * ``auto``（默认）：上限按**实际模型**自动匹配——优先网关 ``/models`` 自报的
+    #     窗口，其次直连厂商的模型注册表，都没有才退回 ``max_context_tokens`` 当保守
+    #     降级值。已知主模型（实测窗口 1,000,000）不再被固定值压住。
+    #   * ``fixed``：保留迁移前的语义，``max_context_tokens`` 是硬上限（逃生舱）。
+    context_window_mode: Literal["auto", "fixed"] = "auto"
+    # 模型窗口上限的**兼容字段**。``auto`` 模式下它不再压住已知模型，只作为"查不到
+    # 任何元数据"时的保守降级值（也是每个 endpoint 各自的兜底，不是全局硬上限）。
     max_context_tokens: int = 278528
     max_output_tokens: int = 2048
     # Two-tier group memory: a bounded hot window plus a lossless, per-group
@@ -159,16 +164,17 @@ class BotConfig(BaseModel):
     memory_recall_max_results: int = 8
     memory_automatic_compaction: bool = False
     # One-to-one private chat history: rows persist in ``private_chat_messages``
-    # and every turn is assembled by token budget.  278528 = 272K is the agreed
-    # depth target for the main model (measured gateway window 1,000,000); it is
-    # deliberately NOT tied to ``max_context_tokens`` (raising that is a later
-    # release).  Retention mirrors ``memory_retention_days`` (1..365).
+    # and every turn is assembled by token budget.  278528 = 272K is the legacy
+    # depth target; in ``auto`` mode the real gateway window (measured
+    # 1,000,000) is used instead.  Retention mirrors ``memory_retention_days``.
     private_chat_history_token_budget: int = 278528
     private_chat_history_retention_days: int = 30
     # 群聊回复的历史：不再按条数（``memory_recent_messages``）取，而是按 token 预算
     # 从 ``group_message_archive`` 里装配（数据来源与删除/保留策略都没变）。
     # ``group_history_reserve_tokens`` 是留给「系统提示词/人设 + 本轮消息 + 记忆召回
-    # + 回复预留」的余量：装配历史 + 余量 ≤ max_context_tokens，这是硬闸门。
+    # + 回复预留」的余量：装配历史 + 余量 ≤ 生效窗口，这是硬闸门。
+    # 生效窗口在 ``auto`` 模式下来自实际模型（网关元数据优先）；下面的 278528 只是
+    # 查不到任何元数据时的保守降级值。
     group_history_token_budget: int = 278528
     group_history_reserve_tokens: int = 32768
     # 第 3 期：检索结果留档（``search_result_records``）。
@@ -311,6 +317,8 @@ class Settings(BaseSettings):
     llm_retry_timeout_multiplier: float = 1.35
 
     max_context_tokens: int = 278528
+    # Kept in sync with ``bot.context_window_mode``; ``auto`` = match the model.
+    context_window_mode: Literal["auto", "fixed"] = "auto"
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
     bot_reply_batch_timeout_seconds: float = 45.0
@@ -951,6 +959,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
+        # 上下文模式：``auto``（按实际模型上限自动匹配，默认）/ ``fixed``（兼容旧硬上限）
+        mode = str(bot_data.get("context_window_mode") or "").strip().lower()
+        if mode in {"auto", "fixed"}:
+            settings.bot.context_window_mode = mode
 
     if "moderation" in toml_data:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
@@ -1276,6 +1288,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
 
     settings.bot.max_context_tokens = settings.max_context_tokens
+    # ``context_window_mode`` 只在顶层（env / 顶层 TOML 键）显式设置时才覆盖 ``[bot]``
+    # 的选择，否则 ``[bot] context_window_mode = "fixed"`` 会被默认值无声改回 auto。
+    if "context_window_mode" in getattr(settings, "model_fields_set", set()):
+        settings.bot.context_window_mode = settings.context_window_mode
     settings.bot.max_output_tokens = settings.max_output_tokens
     settings.bot.main_model.max_tokens = max(1, settings.max_output_tokens)
 

@@ -423,7 +423,11 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         mock_completion.assert_awaited_once()
 
     async def test_prompt_over_context_limit_is_not_sent(self) -> None:
+        # 2026-10-04 之后：``max_context_tokens`` 只在 ``fixed`` 兼容模式下才是硬上限，
+        # ``auto``（默认）按实际模型上限自动匹配。这个用例锁的是**逃生舱**本身：
+        # 显式声明的固定上限仍然会挡住请求（而且连保守估算都装不下就诚实失败）。
         llm = self._make_llm()
+        llm.context_window_mode = "fixed"
         llm.max_context_tokens = 100
         mock_completion = AsyncMock(return_value=_chat_resp(content="should-not-run"))
 
@@ -574,6 +578,13 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         token_counter.assert_not_called()
 
     async def test_inexact_token_fallback_is_not_used_for_hard_rejection(self) -> None:
+        """保守估算（``exact=False``）不许当"超限"把请求整条拒掉。
+
+        2026-10-04 事故的计量口径：分词器拿不到时用的是可加保守上界，它**不是**真实
+        计数。这里的形状是"分词器直接抛异常"——请求必须照发（需要裁剪时先裁），
+        而不是 ``skipping_model``。
+        """
+
         llm = self._make_llm()
         llm.max_context_tokens = 100
         mock_completion = AsyncMock(return_value=_chat_resp(content="ok"))
@@ -586,6 +597,59 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "ok")
         mock_completion.assert_awaited_once()
+
+    async def test_conservative_estimate_is_never_reported_as_exact(self) -> None:
+        """保守估算永远不许被标成 ``exact``。
+
+        旧捷径（``>=100K 字符`` 直接返回一字符一 token 的估算并标 ``exact=True``）正是
+        事故根因。现在超过分词器硬阈值（4M 源字符）时直接用同一个保守上界，并且
+        ``exact=False``——绝不假装是真实计数。
+        """
+
+        messages = [{"role": "user", "content": "a" * 4_100_000}]
+
+        llm = self._make_llm()
+        with patch("bot.services.llm.litellm.token_counter") as counter:
+            _tokens, exact = await llm._count_prompt_tokens_async(messages)
+
+        self.assertFalse(exact)
+        counter.assert_not_called()
+
+    async def test_timed_out_tokenizer_still_reports_inexact(self) -> None:
+        """分词器超时 → 用保守上界，并且如实标 ``exact=False``（不是"超限"）。"""
+
+        llm = self._make_llm()
+        messages = [{"role": "user", "content": "中文历史" * 30_000}]
+        release = threading.Event()
+
+        def slow_token_counter(**_kwargs: Any) -> int:
+            release.wait(timeout=0.5)
+            return 123
+
+        failsafe = threading.Timer(0.5, release.set)
+        failsafe.daemon = True
+        failsafe.start()
+        try:
+            with (
+                patch(
+                    "bot.services.llm.litellm.token_counter",
+                    side_effect=slow_token_counter,
+                ),
+                patch("bot.services.llm._LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS", 0.02),
+            ):
+                tokens, exact = await llm._count_prompt_tokens_async(messages)
+        finally:
+            release.set()
+            failsafe.cancel()
+            deadline = time.monotonic() + 1.0
+            while (
+                llm_module._tokenizer_stats_snapshot()["active"]
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+        self.assertFalse(exact)
+        self.assertGreater(tokens, 100_000)
 
     async def test_complete_with_tools_accepts_empty_content_when_tool_calls_exist(self) -> None:
         llm = self._make_llm()

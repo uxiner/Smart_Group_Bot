@@ -937,16 +937,17 @@
           ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，不再依赖自动压缩替代原文。")}
           <div class="field-grid three">
             ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
-            ${field("bot.max_context_tokens", "最大上下文 Token", { type: "number", min: 1024, max: 2000000, step: 1, required: true })}
+            ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动匹配模型上限（默认）" }, { value: "fixed", label: "固定上限（兼容旧配置）" }], hint: "auto：按实际模型上限自动匹配（优先读网关 /models 自报窗口，查不到才保守降级）；fixed：用右侧固定值当硬上限" })}
+            ${field("bot.max_context_tokens", "固定上限 Token（仅 fixed 生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。auto 模式下它只作为“查不到任何模型元数据”时的保守降级值，不再压住已知模型" })}
             ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
             ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
             ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
-            ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；按预算从新到旧装配私聊历史" })}
+            ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；仅在没有模型元数据时作为保守降级值（auto 模式优先用实际模型窗口）" })}
             ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期行由后台巡检清理" })}
-            ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；群聊回复按预算从群归档装配历史" })}
-            ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768；留给系统提示词/人设/本轮消息/召回/回复预留。历史 + 余量必须 ≤ 最大上下文 Token" })}
+            ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；仅在没有模型元数据时作为保守降级值（auto 模式优先用实际模型窗口）" })}
+            ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768；留给系统提示词/人设/本轮消息/召回/回复预留。装配历史 + 余量必须 ≤ 生效窗口" })}
             ${field("bot.search_record_retention_days", "检索留档保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；检索结果留档由后台巡检按此清理" })}
             ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}

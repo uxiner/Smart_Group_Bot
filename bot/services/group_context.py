@@ -1,4 +1,4 @@
-"""群聊历史按 token 预算装配（第 2 期：深度对齐 272K）。
+"""群聊历史按 token 预算装配（第 2 期；第 5 期起按实际模型上限自动匹配）。
 
 为什么要单独一个模块（而不是塞进 ``bot/services/memory.py``）：
 
@@ -20,10 +20,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from bot.services.model_limits import auto_window_for
 from bot.utils.tokens import estimate_text_tokens
 
 #: 群聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
-#: 主模型实测窗口 1,000,000；272K 是本期约定的深度目标。
+#: **2026-10-04 之后**：这只是``auto`` 模式查不到任何模型元数据时的保守降级值。
+#: 拿到了真实窗口（网关自报 1,000,000）时，预算按 ``窗口 − 固定余量`` 给。
 GROUP_HISTORY_TOKEN_BUDGET = 278_528
 #: token 预算的夹取范围（与 ``runtime_config.BotBehaviorConfig`` 的 ge/le 一致）
 GROUP_HISTORY_TOKEN_BUDGET_MIN = 1024
@@ -109,8 +111,21 @@ def _bot_setting(settings: Any, name: str, default: Any) -> Any:
 
 
 def group_history_token_budget(settings: Any) -> int:
-    """当前生效的群聊历史 token 预算（默认 278528）。"""
+    """当前生效的群聊历史 token 预算。
 
+    ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 固定余量`` 装配，
+    **不再**被兼容字段 ``group_history_token_budget``（默认 272K）压住；只有拿不到
+    任何可信窗口时才退回那个保守值（保持迁移前的深度口径）。``fixed`` 仍读配置值。
+    """
+
+    reserve = group_history_reserve_tokens(settings)
+    window = auto_window_for(settings)
+    if window is not None:
+        return effective_group_history_budget(
+            configured_budget=window,
+            reserve_tokens=reserve,
+            model_window_tokens=window,
+        )
     return bounded_group_history_token_budget(
         _bot_setting(
             settings,

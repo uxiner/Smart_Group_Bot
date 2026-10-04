@@ -295,6 +295,42 @@ def run_bot() -> None:
     run_async_entrypoint(main(), force_exit_watchdog=True)
 
 
+async def _prefetch_model_context_metadata(llm: LLMService) -> None:
+    """启动时预热模型窗口元数据（2026-10-04 事故修复）。
+
+    只查**已配置且带认证**的 endpoint（``api_base`` + key），单次查询 4 秒超时、
+    最多 3 个并发。启动最多只等 6 秒：等不到就让它继续在后台跑（``shield``），
+    期间主链路按保守降级值工作，拿到后自动生效。日志只打印来源与数值，绝不打印 key。
+    """
+
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(llm.refresh_model_limits())
+    try:
+        report = await asyncio.wait_for(asyncio.shield(task), timeout=6.0)
+    except Exception as exc:  # noqa: BLE001 - 启动不能因为元数据查询失败而失败
+        log.info(
+            "model context metadata prefetch still running in the background | note=%s",
+            type(exc).__name__,
+        )
+    else:
+        if report:
+            log.info("model context metadata prefetch | sources=%s", report)
+    if not task.done():
+        task.add_done_callback(_observe_model_metadata_refresh)
+    limits = llm.endpoint_limits(llm.main)
+    if limits is not None:
+        log.info("main chat context window resolved | %s", limits.describe())
+
+
+def _observe_model_metadata_refresh(task: asyncio.Task[Any]) -> None:
+    try:
+        report = task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    if report:
+        log.info("model context metadata refreshed after config change | sources=%s", report)
+
+
 async def _initialize_runtime_services(
     *,
     settings: Any,
@@ -319,7 +355,9 @@ async def _initialize_runtime_services(
         vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
+        context_window_mode=getattr(settings.bot, "context_window_mode", None),
     )
+    await _prefetch_model_context_metadata(llm)
     main_candidates = llm._chat_candidates(settings.bot.main_model)
     if main_candidates and all(
         llm.chat_configuration_issue(item) for item in main_candidates
@@ -328,10 +366,14 @@ async def _initialize_runtime_services(
             "AI 模型尚不可用：主模型及其回退均缺少所需凭据；"
             "请由最高管理员私聊 bot 发送 /settings 完成模型配置。"
         )
-    if settings.bot.max_context_tokens <= 4096:
+    if (
+        getattr(settings.bot, "context_window_mode", "auto") == "fixed"
+        and settings.bot.max_context_tokens <= 4096
+    ):
         log.warning(
-            "当前最大上下文仅 %d Token，可能小于内置提示词；"
-            "请在 /settings 的 Bot 行为中调高上下文预算。",
+            "上下文上限模式为 fixed 且仅 %d Token，可能小于内置提示词；"
+            "请在 /settings 的 Bot 行为中把「上下文上限模式」改为 auto"
+            "（按实际模型上限自动匹配）或调高固定值。",
             settings.bot.max_context_tokens,
         )
     # Semantic archive recall is only useful when an embedding provider is
@@ -594,7 +636,17 @@ async def main() -> None:
                 vision=settings.bot.vision_model,
                 embed=settings.bot.embed_model,
                 max_context_tokens=settings.bot.max_context_tokens,
+                context_window_mode=getattr(settings.bot, "context_window_mode", None),
             )
+            # 路由/模型/上限模式变了：异步重取一次窗口元数据（不阻塞配置应用，
+            # 失败就继续用保守降级值）。
+            try:
+                refresh_task = asyncio.get_running_loop().create_task(
+                    llm.refresh_model_limits(force=True)
+                )
+                refresh_task.add_done_callback(_observe_model_metadata_refresh)
+            except RuntimeError:
+                pass
             archive_policy_before = (
                 getattr(memory, "memory_retention_days", None),
                 getattr(memory, "memory_archive_max_messages_per_group", None),

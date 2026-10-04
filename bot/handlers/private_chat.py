@@ -89,6 +89,7 @@ def _reply_llm(settings: Settings):
         embed=bot_cfg.embed_model,
         skill=bot_cfg.skill_model,
         max_context_tokens=bot_cfg.max_context_tokens,
+        context_window_mode=getattr(bot_cfg, "context_window_mode", None),
     )
 
 

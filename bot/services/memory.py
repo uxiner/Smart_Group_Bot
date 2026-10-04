@@ -40,6 +40,11 @@ from bot.services.group_context import (
     effective_group_history_budget,
 )
 from bot.services.llm import LLMService
+from bot.services.model_limits import (
+    CONTEXT_WINDOW_MAX as _CONTEXT_WINDOW_MAX,
+    CONTEXT_WINDOW_MIN as _CONTEXT_WINDOW_MIN,
+    auto_window_for,
+)
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
@@ -1053,13 +1058,22 @@ class MemoryService:
         model_input_limit = 0
         if callable(model_limit_fn):
             model_input_limit = max(0, int(model_limit_fn(self.llm.main) or 0))
+        # 自动匹配模型上限（2026-10-04 事故修复）：拿到可信窗口（网关 /models 元数据
+        # 或直连厂商注册表）就用它，``max_context_tokens`` 只作为保守降级值。
+        measured_window = auto_window_for(config, llm=self.llm)
+        base_context = configured_context
+        if measured_window is not None:
+            base_context = min(
+                _CONTEXT_WINDOW_MAX,
+                max(_CONTEXT_WINDOW_MIN, int(measured_window)),
+            )
         if model_input_limit > 0:
             self.max_context = min(
-                configured_context,
+                base_context,
                 model_input_limit + self.max_output,
             )
         else:
-            self.max_context = configured_context
+            self.max_context = base_context
         self._llm_reserve_tokens = max(1024, self.max_output // 2)
         self.memory_recent_messages = min(
             2000,
@@ -1094,11 +1108,17 @@ class MemoryService:
         )
         # 群聊历史装配（第 2 期）：token 预算 + 固定余量必须一起 ≤ 模型窗口
         # （``self.max_context``）。夹取与硬闸门都在 bot.services.group_context。
+        # 自动匹配到真实窗口时，历史预算也按窗口给（``max_context`` 已经是窗口）；
+        # 只有保守降级时才用兼容字段 ``group_history_token_budget``。
         self.group_history_reserve_tokens = bounded_group_history_reserve_tokens(
             getattr(config, "group_history_reserve_tokens", None)
         )
         self.group_history_token_budget = effective_group_history_budget(
-            configured_budget=getattr(config, "group_history_token_budget", None),
+            configured_budget=(
+                self.max_context
+                if measured_window is not None
+                else getattr(config, "group_history_token_budget", None)
+            ),
             reserve_tokens=self.group_history_reserve_tokens,
             model_window_tokens=self.max_context,
         )

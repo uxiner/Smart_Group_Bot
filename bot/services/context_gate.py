@@ -29,9 +29,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from bot.services.model_limits import effective_context_window
 from bot.utils.tokens import estimate_text_tokens
 
 #: 统一闸门的默认预算：272K = 278528（全项目统一用这个精确数字）。
+#: **2026-10-04 之后**：``auto`` 模式下这是"查不到模型元数据"时的保守降级值；
+#: 拿到真实窗口时闸门按真实窗口给（见 :func:`context_token_budget`）。
 CONTEXT_TOKEN_BUDGET = 278_528
 #: 夹取范围（与 ``runtime_config`` 里 max_context_tokens 的 ge/le 一致）
 CONTEXT_TOKEN_BUDGET_MIN = 1024
@@ -69,22 +72,19 @@ def bounded_context_token_budget(value: Any) -> int:
     )
 
 
-def _bot_setting(settings: Any, name: str, default: Any) -> Any:
-    bot = getattr(settings, "bot", None)
-    value = getattr(bot, name, None) if bot is not None else None
-    return default if value is None else value
-
-
 def context_token_budget(settings: Any) -> int:
-    """当前生效的统一闸门预算（默认 278528，读 ``bot.max_context_tokens``）。
+    """当前生效的统一闸门预算。
+
+    * ``auto``（默认）：主链路实际模型的**总窗口**——优先网关 ``/models`` 元数据，
+      其次直连厂商的模型注册表，都没有才退回兼容字段（保守降级值）。已知主模型
+      （实测 1,000,000）不再被旧的 ``278528`` 固定值压住。
+    * ``fixed``：兼容模式，仍用 ``bot.max_context_tokens``。
 
     三条链路必须用同一个数字：群聊 / 私聊 / 搜索的资料块都往同一个模型窗口里塞，
     各读各的默认值正是这一期要消掉的分叉。
     """
 
-    return bounded_context_token_budget(
-        _bot_setting(settings, "max_context_tokens", CONTEXT_TOKEN_BUDGET)
-    )
+    return bounded_context_token_budget(effective_context_window(settings))
 
 
 def _message_tokens(message: Any) -> int:

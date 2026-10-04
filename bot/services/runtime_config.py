@@ -314,6 +314,10 @@ class BotBehaviorConfig(StrictModel):
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
     decision_context_items: int = Field(default=5, ge=0, le=20)
+    # 上下文模式：``auto``（默认）= 上限按实际模型自动匹配（网关 /models 元数据优先，
+    # 其次直连厂商注册表，都没有才退回 ``max_context_tokens`` 保守降级）；``fixed`` =
+    # 兼容迁移前的固定硬上限语义。老配置里没有这个字段 → 迁移成 ``auto``。
+    context_window_mode: Literal["auto", "fixed"] = "auto"
     max_context_tokens: int = Field(default=278528, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
     memory_recent_messages: int = Field(default=500, ge=50, le=2000)
@@ -326,8 +330,9 @@ class BotBehaviorConfig(StrictModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = Field(default=8, ge=1, le=20)
     memory_automatic_compaction: bool = False
-    # Private-chat history: 278528 = 272K, the agreed depth target for the main
-    # model.  Independent of max_context_tokens on purpose.
+    # Private-chat history: 278528 = 272K legacy depth target.  In ``auto`` mode the
+    # measured model window (gateway /models, announced 1,000,000) is used instead;
+    # this value is only the conservative fallback when nothing is known.
     private_chat_history_token_budget: int = Field(
         default=278528,
         ge=1024,
@@ -336,8 +341,9 @@ class BotBehaviorConfig(StrictModel):
     private_chat_history_retention_days: int = Field(default=30, ge=1, le=365)
     # Group-chat history: assembled from the group archive by token budget instead
     # of "most recent N messages".  ``reserve_tokens`` is the headroom kept for the
-    # fixed prompt parts; assembled history + reserve must stay within
-    # ``max_context_tokens`` (the hard gate lives in bot.services.group_context).
+    # fixed prompt parts; assembled history + reserve must stay within the
+    # effective window (``auto`` = the real model window; the hard gate lives in
+    # bot.services.group_context).
     group_history_token_budget: int = Field(default=278528, ge=1024, le=2_000_000)
     group_history_reserve_tokens: int = Field(default=32768, ge=1024, le=1_000_000)
     # 第 3 期：检索结果留档（search_result_records）。
@@ -989,6 +995,7 @@ class RuntimeConfig(StrictModel):
             bot.auto_delete_category_mode
         )
         settings.bot.decision_context_items = bot.decision_context_items
+        settings.bot.context_window_mode = bot.context_window_mode
         settings.bot.max_context_tokens = bot.max_context_tokens
         settings.bot.max_output_tokens = bot.max_output_tokens
         settings.bot.memory_recent_messages = bot.memory_recent_messages
@@ -1038,6 +1045,7 @@ class RuntimeConfig(StrictModel):
         settings.bot.proactive_quiet_hours_end = bot.proactive_quiet_hours_end
         settings.bot.proactive_retry_minutes = bot.proactive_retry_minutes
         settings.max_context_tokens = bot.max_context_tokens
+        settings.context_window_mode = bot.context_window_mode
         settings.max_output_tokens = bot.max_output_tokens
 
         settings.moderation = ModerationConfig(**self.moderation.model_dump())
@@ -1261,6 +1269,23 @@ def _normalize_deprecated_runtime_payload(
         normalized_bot["drop_pending_updates"] = False
         normalized["bot"] = normalized_bot
         changed = True
+
+    # 2026-10-04 事故修复：上下文上限从"固定 272K"改成"按实际模型上限自动匹配"。
+    # 老库里没有 ``context_window_mode``，这里**一次性**补成 ``auto``（真正迁移既有
+    # 部署的语义），并且只在缺字段时写：管理员之后显式改成 ``fixed`` 绝不会被覆盖。
+    migration_bot = dict(normalized.get("bot") or {})
+    if str(migration_bot.get("context_window_mode") or "").strip().lower() not in {
+        "auto",
+        "fixed",
+    }:
+        migration_bot["context_window_mode"] = "auto"
+        normalized["bot"] = migration_bot
+        changed = True
+        log.warning(
+            "Context window mode migrated to 'auto' (match the real model limit); "
+            "the configured max_context_tokens is now only the conservative "
+            "fallback for unknown models"
+        )
 
     # The former Sub2API credential was global and therefore cannot be safely
     # migrated to any particular group. All groups intentionally start with
@@ -1843,6 +1868,9 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
         ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
+        legacy_mode = str(bot_data.get("context_window_mode") or "").strip().lower()
+        if legacy_mode in {"auto", "fixed"}:
+            settings.bot.context_window_mode = legacy_mode
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
     if isinstance(moderation_data, dict):
         settings.moderation = ModerationConfig(**moderation_data)
@@ -1998,6 +2026,7 @@ def build_legacy_runtime_config(
             ),
             auto_delete_category_mode=dict(settings.bot.auto_delete_category_mode),
             decision_context_items=settings.bot_decision_context_items,
+            context_window_mode=settings.bot.context_window_mode,
             max_context_tokens=settings.max_context_tokens,
             max_output_tokens=settings.max_output_tokens,
             memory_recent_messages=(

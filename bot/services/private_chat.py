@@ -51,6 +51,13 @@ from bot.services.long_term_memory import (
     LONG_TERM_MEMORY_HEADER_BLOCK,
     render_facts_block,
 )
+from bot.services.model_limits import auto_window_for
+from bot.services.payload_fit import (
+    LAYER_HISTORY,
+    LAYER_MEMORY_RECALL,
+    LAYER_SEARCH_RECORDS,
+    tag_context_layers,
+)
 from bot.services.reply_output import (
     REPLY_OUTPUT_AWARENESS,
     REPLY_OUTPUT_PROTOCOL,
@@ -106,12 +113,14 @@ HISTORY_MAX_TURNS = 12
 PRIVATE_INPUT_LIMIT = 1000
 
 #: 私聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
-#: 主模型实测窗口 1,000,000，本次深度目标 272K，留出系统提示词、本轮消息与
-#: 联网检索结果块的空间。**这不是** ``max_context_tokens``（那是另一期的事）。
+#: **2026-10-04 之后**：``auto`` 模式下这只是查不到模型元数据时的保守降级值；
+#: 拿到真实窗口（实测 1,000,000）时按 ``窗口 − PRIVATE_HISTORY_RESERVE_TOKENS`` 给。
 PRIVATE_HISTORY_TOKEN_BUDGET = 278_528
 #: token 预算的夹取范围（与 runtime_config 里该字段的 ge/le 保持一致）
 PRIVATE_HISTORY_TOKEN_BUDGET_MIN = 1024
 PRIVATE_HISTORY_TOKEN_BUDGET_MAX = 2_000_000
+#: 自动匹配模型窗口时留给「系统提示词 + 本轮消息 + 检索块 + 回复预留」的余量。
+PRIVATE_HISTORY_RESERVE_TOKENS = 32_768
 
 #: 私聊历史的轮数安全上限。**上限的理由**：token 预算才是真正的闸门，但预算只在
 #: 「内容本身够长」时才会先咬住——对方连发几万条一个字的消息时，272K 预算能装下
@@ -733,8 +742,20 @@ def _bot_setting(settings: Any, name: str, default: Any) -> Any:
 
 
 def private_history_token_budget(settings: Any) -> int:
-    """当前生效的私聊历史 token 预算（默认 278528）。"""
+    """当前生效的私聊历史 token 预算。
 
+    ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 本地余量`` 装配，已知主模型
+    不再被旧的 272K 固定值压住；只有拿不到可信窗口时才退回兼容字段（迁移前口径）。
+    """
+
+    window = auto_window_for(settings)
+    if window is not None:
+        return bounded_history_token_budget(
+            max(
+                PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
+                window - PRIVATE_HISTORY_RESERVE_TOKENS,
+            )
+        )
     return bounded_history_token_budget(
         _bot_setting(
             settings,
@@ -1330,6 +1351,11 @@ def build_private_chat_messages(
     kept = assembly.layers
     head_system = kept["system"][:1]  # 人设/围栏那一段
     tail_system = kept["system"][1:]  # 时间/输出协议/身份/模式块/焦点/项目事实 + 三个头部
+    # 打层标记：最终请求闸门里如果还要再裁一次（载荷比声明的窗口还长），必须按
+    # 「历史 → 检索留档 → 召回」的顺序裁，而人设/本轮消息永不裁。
+    tag_context_layers(kept["history"], LAYER_HISTORY)
+    tag_context_layers(kept["search_records"], LAYER_SEARCH_RECORDS)
+    tag_context_layers(kept["memory_recall"], LAYER_MEMORY_RECALL)
     return [
         *head_system,
         *kept["history"],
