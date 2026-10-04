@@ -21,7 +21,8 @@ class DeploymentConfigTests(unittest.TestCase):
             "${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}",
             compose,
         )
-        self.assertIn("os.environ.get('MINIAPP_LISTEN_PORT', '8480')", compose)
+        self.assertIn("load_bootstrap_settings as s", compose)
+        self.assertNotIn("os.environ.get('MINIAPP_LISTEN_PORT', '8480')", compose)
         self.assertRegex(compose, r"(?m)^\s*stop_grace_period:\s*125s\s*$")
 
     def test_compose_bounds_swap_fds_pids_and_logs(self) -> None:

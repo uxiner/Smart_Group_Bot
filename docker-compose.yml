@@ -24,6 +24,10 @@ services:
       # Safe default for a reverse proxy on this host. Set
       # MINIAPP_BIND_ADDRESS=0.0.0.0 only when another container/host must reach
       # the backend directly and a firewall protects the port.
+      # 注意：compose 插值**只能**读变量、不能跑代码，所以这里的映射仍以
+      # MINIAPP_LISTEN_PORT 为准。只在 .env 里设了遗留别名
+      # JOIN_VERIFICATION_LISTEN_PORT 的部署，必须同时导出 MINIAPP_LISTEN_PORT
+      # 才能对上端口（healthcheck 不受此限：它问的是应用本人）。
       - "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}"
     environment:
       # The application now defaults to binding loopback (safe for bare-metal
@@ -38,13 +42,22 @@ services:
       # 8 小时：半夜活跃、白天装死）。镜像已装 tzdata，这里给死默认值。
       TZ: "${TZ:-Asia/Shanghai}"
     healthcheck:
+      # C3-03：端口探测必须走**应用自己的**解析链。应用的链路是
+      #   MINIAPP_LISTEN_PORT → JOIN_VERIFICATION_LISTEN_PORT（遗留别名，README
+      #   明确说继续接受以免改反代）→ 8480
+      # 过去这里只读 MINIAPP_LISTEN_PORT 这一个环境变量、读不到就当 8480，于是 .env
+      # 用遗留变量名时：应用监听 A 端口、healthcheck 探 8480、端口映射也固定 8480 →
+      # **容器永远 unhealthy 而进程健康**，编排会错误摘流量。
+      # 现在直接问应用本人：load_bootstrap_settings() 会跑完同一套回落并把
+      # miniapp_listen_port 写成解析后的值。
       test:
         - CMD
         - python
         - -c
         - >-
-          import os, urllib.request;
-          port = os.environ.get('MINIAPP_LISTEN_PORT', '8480');
+          import urllib.request;
+          from bot.config import load_bootstrap_settings as s;
+          port = s().miniapp_listen_port;
           urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).read()
       interval: 30s
       timeout: 5s
