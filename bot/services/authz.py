@@ -175,6 +175,13 @@ async def authorize_group_admin(
         return False
 
     session.add(Admin(group_id=group_id, user_id=user_id, role=role))
+    # Same reason as ``authorize_group`` above: the session factory sets
+    # ``autoflush=False``, so a pending Admin row stays invisible to the SELECT
+    # above.  Without this flush, a caller that composes two grants in one
+    # transaction gets ``True`` twice and the commit dies on
+    # ``UNIQUE(admins.group_id, admins.user_id)``, taking the whole transaction
+    # (group settings, roster, ...) down with it.
+    await session.flush()
     return True
 
 

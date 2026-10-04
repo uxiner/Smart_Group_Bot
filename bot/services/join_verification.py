@@ -2154,7 +2154,16 @@ async def lease_join_verification_for_unban(
                     session.add(JoinVerification(**values))
                     await session.flush()
             except IntegrityError:
-                pass
+                # 并发下另一条请求先插进去了：控制流不变（下面统一走 upsert），
+                # 但"唯一索引冲突确实发生过"必须留痕，否则验证记录缺失无从排查。
+                log.warning(
+                    "join verification row lost a unique-index race; falling back to upsert"
+                    " | group=%s user=%s kind=%s",
+                    int(group_id),
+                    int(user_id),
+                    values.get("kind"),
+                    exc_info=True,
+                )
     result = await session.execute(
         update(JoinVerification)
         .where(

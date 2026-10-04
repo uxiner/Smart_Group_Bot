@@ -35,6 +35,7 @@ from bot.db.models import (
     Violation,
 )
 from bot.services.checkin import local_today
+from bot.utils.security import escape_html
 from bot.utils.timezone import now_shanghai_naive
 
 # 置信度低于这个值 = "边缘判定"：模型说违规但自己也不确定，最可能误伤
@@ -471,10 +472,15 @@ def render_quality_report(
         )
         if quality.by_rule:
             lines.append("命中最多的规则：")
-            lines.extend(f"· {label} — {count} 条" for label, count in quality.by_rule)
+            lines.extend(
+                f"· {escape_html(label)} — {count} 条" for label, count in quality.by_rule
+            )
         if quality.top_reasons:
             lines.append("模型给的理由（Top3）：")
-            lines.extend(f"· {reason} — {count} 条" for reason, count in quality.top_reasons)
+            lines.extend(
+                f"· {escape_html(reason)} — {count} 条"
+                for reason, count in quality.top_reasons
+            )
         ban_text = f"入群资料拦截 {quality.join_bans} 人"
         others = {
             source: count
@@ -499,7 +505,7 @@ def render_quality_report(
         if activity.top_members:
             medals = ["🥇", "🥈", "🥉"]
             board = "｜".join(
-                f"{medals[index] if index < 3 else ''}{name} {points} 分"
+                f"{medals[index] if index < 3 else ''}{escape_html(name)} {points} 分"
                 for index, (name, points) in enumerate(activity.top_members)
             )
             lines.append(f"本周积分榜：{board}")

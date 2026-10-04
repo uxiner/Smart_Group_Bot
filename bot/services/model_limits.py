@@ -119,7 +119,8 @@ _OUTPUT_LIMIT_KEYS = (
 def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: json.loads 默认接受 Infinity/NaN，int(float("inf")) 抛的是它。
         number = int(default)
     return min(int(high), max(int(low), number))
 
@@ -127,7 +128,7 @@ def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
 def _positive_int(value: Any) -> int | None:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number > 0 else None
 
@@ -152,12 +153,14 @@ def redact_base(api_base: str | None) -> str:
         return ""
     try:
         parts = urlsplit(raw if "//" in raw else f"//{raw}")
+        # parts.port / parts.hostname 是**属性访问**：端口越界或非数字时在读取时才抛
+        # ValueError，必须留在 try 里，否则一个写错的 api_base 会让整轮 refresh 抛出。
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
     except ValueError:
         return ""
-    host = parts.hostname or ""
     if not host:
         return ""
-    port = f":{parts.port}" if parts.port else ""
     return f"{parts.scheme or 'http'}://{host}{port}"
 
 

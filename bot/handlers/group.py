@@ -1838,6 +1838,12 @@ async def _moderation_direct_ban(
                 is_banned=True,
             )
             session.add(warning)
+            # A-02：这张表有 UNIQUE(group_id, user_id)，而这里是"先 SELECT、
+            # 查不到就 INSERT"。管理员手动直接封禁与自动计数封禁
+            # （_apply_counted_moderation_ban）并发命中同一个人时，落败方会在
+            # 下面的 commit 撞唯一索引，把**整笔**审核事务（刚写的 direct 标记
+            # + 封禁恢复工单）一起打掉。按兄弟函数
+            # _moderation_add_permanent_exemption 的写法在 commit 处兜住。
         else:
             warning_lock = await session.execute(
                 update(UserWarning)
@@ -1865,6 +1871,20 @@ async def _moderation_direct_ban(
             return "retry"
         try:
             await session.commit()
+        except IntegrityError:
+            # A-02：见上面 INSERT 分支的注释。撞车说明并发的另一条路径已经写过
+            # (group_id, user_id) 这一行；这一笔整笔回滚，交给既有重试机制，
+            # 不要让管理员收到「审核操作失败」这种无法定位的报错。
+            await session.rollback()
+            log.warning(
+                "moderation direct ban lost user_warning race | group=%s user=%s "
+                "violation=%s",
+                group_id,
+                target_id,
+                violation_id,
+            )
+            await callback.answer("该用户的封禁状态已变化，请重新点击", show_alert=True)
+            return "retry"
         except Exception:
             await session.rollback()
             raise
@@ -2461,7 +2481,15 @@ async def _reapply_restriction_for_review(
         if is_super_admin_user_id(user_id, settings):
             return "该用户是最高管理员，完全豁免，不施加限制"
     except Exception:
-        pass
+        # 判不出来就按"不是超管"继续（控制流不变），但必须留证据：否则一次配置读取
+        # 失败会让最高管理员被静默处罚，事后连日志都没有。
+        log.exception(
+            "review restriction: super admin check failed, continuing without exemption"
+            " | violation=%s group=%s user=%s",
+            violation_id,
+            group_id,
+            user_id,
+        )
 
     # 手动豁免名单（/aiexempt）里的人不动。
     try:
@@ -3057,7 +3085,13 @@ async def on_review_action(
             try:
                 await session.rollback()
             except Exception:
-                pass
+                # 外层已经记过失败原因；这里只补"回滚也没成"——会话状态已不可知，
+                # 后续同一个 session 的读写都可能带脏数据（控制流不变）。
+                log.exception(
+                    "review pending persist: rollback failed | violation=%s action=%s",
+                    violation_id,
+                    action,
+                )
             await callback.answer("确认状态保存失败，请稍后重试", show_alert=True)
             return
         await _edit_review_channel_status(
@@ -3079,7 +3113,14 @@ async def on_review_action(
         try:
             await session.rollback()
         except Exception:
-            pass
+            # 注意：这里失败后**仍会继续执行放行/封禁**（B-19 只补日志，不改控制流）。
+            # 但 pending 未清空这一点必须有据可查，否则下一次点击会被误判成"已 arm"。
+            log.exception(
+                "review pending clear: rollback failed, the action below still runs"
+                " | violation=%s action=%s",
+                violation_id,
+                action,
+            )
     if action == "rel":
         await _review_do_release(callback, settings, session, violation, operator_id)
     else:

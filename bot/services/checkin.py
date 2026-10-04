@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy import DateTime, func, insert, literal, select
+from sqlalchemy import ColumnElement, DateTime, func, insert, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -345,6 +345,7 @@ async def spend_points(
     points: int,
     reason: str = "",
     ref: str,
+    extra_guard: ColumnElement[bool] | None = None,
 ) -> bool:
     """扣积分；余额不足或同一 ref 已扣过都返回 False（业务失败不抛异常）。
 
@@ -361,6 +362,14 @@ async def spend_points(
     旧余额、双双通过检查，把余额扣成负数。这里把条件直接写进
     ``INSERT ... SELECT ... WHERE 余额 >= cost``，整条语句在 SQLite 的写锁之下执行，
     ``rowcount`` 为 0 就代表余额不足（或并发下已被别人扣掉）。
+
+    ``extra_guard``（可选）把"每日次数上限"这类**计数型**闸门也变成同一条语句的
+    ``WHERE`` 条件，而不是先 ``SELECT COUNT`` 再判：``/draw`` 的每日 10 次上限
+    之前是 check-then-act，25 个并发请求会各自读到同一份计数、双双通过，把
+    上限变成 25 次（抽奖的期望值是净赚，所以这是直接的积分泄漏）。守卫表达式
+    必须只依赖当前行可见的数据（典型写法是「当日某个 ref 前缀的行数 < 上限」的
+    ``scalar_subquery``），这样它和余额条件一样在写锁下判完。``None`` = 不加
+    额外条件，行为与以前完全一致。
     """
 
     idempotency_key = str(ref or "").strip()
@@ -389,6 +398,11 @@ async def spend_points(
         .where(MemberPointSpend.group_id == gid, MemberPointSpend.user_id == uid)
         .scalar_subquery()
     )
+    # 余额守卫和 extra_guard 在**同一条**语句里判完：并发下后到的那些请求看到的
+    # 是前一笔已经提交的行数，不会拿着同一份旧计数一起通过。
+    condition = earned + awarded - spent >= cost
+    if extra_guard is not None:
+        condition = condition & extra_guard
     statement = (
         sqlite_insert(MemberPointSpend)
         .from_select(
@@ -403,7 +417,7 @@ async def spend_points(
                 literal(str(reason or "")[:64]),
                 literal(idempotency_key[:64]),
                 literal(now_shanghai_naive(), type_=DateTime),
-            ).where(earned + awarded - spent >= cost),
+            ).where(condition),
         )
         # F-053 验收修补（SQLite 原子性）：这里原来包在 ``session.begin_nested()``
         # 里捕获 IntegrityError，但 pysqlite/aiosqlite 驱动对 SAVEPOINT 支持不完整，

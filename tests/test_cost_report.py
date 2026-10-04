@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -27,6 +29,7 @@ from bot.services.llm import LLMService
 from bot.utils.timezone import now_shanghai_naive
 
 GROUP_ID = -100
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class UsageAccumulatorTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +119,43 @@ class UsageAccumulatorTests(unittest.IsolatedAsyncioTestCase):
         rows = await self._rows()
         self.assertEqual({r.stage for r in rows}, {"decision", "moderation"})
         self.assertEqual({r.usage_date for r in rows}, {now_shanghai_naive().date().isoformat()})
+
+    async def test_scheduled_flush_task_is_strongly_referenced(self) -> None:
+        """事件循环只持弱引用：没有模块级强引用，落盘任务可能被 GC 掉。"""
+
+        self.assertIsNone(llm_metrics._flush_task)
+        llm_metrics.record("decision", calls=1, prompt_tokens=42)
+
+        task = llm_metrics._flush_task
+        self.assertIsNotNone(task, "record 排出的落盘任务没有被任何地方引用")
+        self.assertFalse(task.done())
+        await task
+        await asyncio.sleep(0)  # 让 done_callback 跑完
+
+        self.assertIsNone(llm_metrics._flush_task, "完成后必须放掉引用，否则再也排不出下一轮")
+        rows = await self._rows()
+        self.assertEqual([(r.stage, r.calls, r.prompt_tokens) for r in rows], [("decision", 1, 42)])
+
+    async def test_shutdown_flushes_the_tail_batch(self) -> None:
+        """关停链必须 flush(force=True)，否则重启丢掉最后不足 60 秒的计数。"""
+
+        llm_metrics.record("decision", calls=2, prompt_tokens=7)
+        self.assertEqual(await llm_metrics.flush(force=True), 1)
+        self.assertEqual(await llm_metrics.flush(force=True), 0)
+        self.assertEqual([(r.calls, r.prompt_tokens) for r in await self._rows()], [(2, 7)])
+
+    def test_ordered_shutdown_flushes_before_disposing_the_engine(self) -> None:
+        source = (_REPO_ROOT / "bot" / "__main__.py").read_text(encoding="utf-8")
+
+        self.assertTrue(
+            "llm_metrics.flush(force=True)" in source,
+            "关停链里没有 llm_metrics.flush(force=True)：重启会丢掉最后不足 60 秒的用量",
+        )
+        self.assertLess(
+            source.index("llm_metrics.flush(force=True)"),
+            source.rindex("engine.dispose()"),
+            "用量 flush 必须排在关停链末尾的 engine.dispose() 之前",
+        )
 
     def test_window_start_includes_today(self) -> None:
         today = now_shanghai_naive().date()

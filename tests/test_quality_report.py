@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import unittest
 from datetime import timedelta
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -34,6 +36,23 @@ from bot.services.quality_report import (
 from bot.utils.timezone import now_shanghai_naive
 
 GROUP_ID = -100
+
+#: 报表正文只允许这两种标签；多出来的就是不受信任文本被拼了进来。
+_ALLOWED_TAGS = {"b", "blockquote"}
+_BARE_AMPERSAND_RE = re.compile(r"&(?![a-zA-Z#][a-zA-Z0-9]*;)")
+
+
+def _html_tags(text: str) -> set[str]:
+    """渲染结果里出现的标签名集合（Telegram 只认自己那几种）。"""
+
+    found: set[str] = set()
+
+    class _Collector(HTMLParser):
+        def handle_starttag(self, tag, attrs):  # noqa: ANN001 - 覆写标准签名
+            found.add(tag)
+
+    _Collector().feed(text)
+    return found
 
 
 def _violation(
@@ -276,6 +295,52 @@ class QualityReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("审核质量 · 近 7 天", text)
         self.assertIn("<blockquote expandable>", text, "管理命令靠 blockquote 保持排版")
         self.assertIn("群活跃", text)
+
+    async def test_untrusted_text_is_html_escaped_before_rendering(self) -> None:
+        """D3-14：管理员自由输入 / LLM 生成 / 成员自填含裸 ``<``、``&`` 时整条报表发不出去。
+
+        Telegram ``parse_mode=HTML`` 遇到裸标签/裸 ``&`` 直接 400，而
+        ``admin.py`` 的 ``try`` 只包渲染不包发送，所以整条 ``/modstats`` 会静默消失。
+        """
+
+        await self._seed(
+            # 管理员自由输入的匹配模式
+            ModerationRule(
+                id=2,
+                group_id=GROUP_ID,
+                rule_type="regex",
+                pattern="<script>广告</script>&",
+                action="ban",
+                enabled=True,
+            ),
+            # LLM 生成的判定理由（照抄 cost_report._esc docstring 里那个坑）
+            _violation(user_id=1, confidence=0.7, reason="置信<0.9 & 判定", rule_id=2),
+            # 成员自填的签到昵称
+            MemberCheckin(
+                group_id=GROUP_ID,
+                user_id=11,
+                checkin_date=now_shanghai_naive().date().isoformat(),
+                points=3,
+                display_name="<b>evil</b>&co",
+            ),
+        )
+
+        async with self.session_factory() as session:
+            text = await render_group_quality(session, group_id=GROUP_ID, days=7)
+
+        # 三类文本都还在（转义只改显示，不改统计口径与内容）
+        self.assertIn("[regex]", text)
+        self.assertIn("置信", text)
+        self.assertIn("evil", text)
+        # 但必须已经转义成实体，而不是把裸标签交给 Telegram 解析
+        self.assertNotIn("<script>", text, "ModerationRule.pattern 没转义")
+        self.assertNotIn("<b>evil", text, "MemberCheckin.display_name 没转义")
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("置信&lt;0.9 &amp; 判定", text)
+        self.assertIn("&lt;b&gt;evil&lt;/b&gt;&amp;co", text)
+        # 整条正文必须是 Telegram 能解析的 HTML
+        self.assertEqual(_html_tags(text), _ALLOWED_TAGS, f"正文里混进了外来标签：{text}")
+        self.assertEqual(_BARE_AMPERSAND_RE.findall(text), [], f"正文里有裸 & ：{text}")
 
     async def test_record_violation_persists_confidence_and_reason(self) -> None:
         """新列要真的被写进去，否则报表永远只有 NULL。"""

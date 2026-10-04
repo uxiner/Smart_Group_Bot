@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import html
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -30,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import LlmUsageDaily
 from bot.services.llm_metrics import COUNTER_FIELDS, window_start
+from bot.utils.security import escape_html
 from bot.utils.timezone import now_shanghai_naive
 
 #: 缓存命中率低于这个值就在报表里点一句（目前是 0，即完全没复用前缀）
@@ -37,13 +37,9 @@ CACHE_TARGET_RATE = 0.30
 
 
 def _esc(text: object) -> str:
-    """报表正文是 Telegram HTML：任何透传字段都要转义。
+    """报表正文是 Telegram HTML：任何透传字段都要转义（收口见 ``bot.utils.security``）。"""
 
-    上次就是漏了这一步——「置信<0.9」里的裸尖括号让整条消息解析失败，
-    报表于是"发不出去"。凡是插进 HTML 的字符串都过这个函数。
-    """
-
-    return html.escape(str(text), quote=False)
+    return escape_html(text)
 
 
 def _fmt_tokens(value: int) -> str:

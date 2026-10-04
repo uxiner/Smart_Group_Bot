@@ -33,7 +33,7 @@ from datetime import timedelta
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from bot.db.models import PrivateChatMessage, PrivateChatUsage
@@ -512,6 +512,29 @@ async def _bump(session: Any, *, user_id: int, day: str, stamp: Any) -> int:
     return int(result.scalar_one())
 
 
+async def _unbump(session: Any, *, user_id: int, day: str, stamp: Any) -> int:
+    """把某个计数行 -1 并返回新值（原子 UPSERT，不会两行）。
+
+    下界用 ``max(0, ...)`` 兜住：并发下另一条请求可能刚好把同一行加回去，
+    两次退款不能把计数压成负数——负的 ``messages`` 会让每日上限凭空多出额度。
+    """
+
+    stmt = (
+        sqlite_insert(PrivateChatUsage)
+        .values(user_id=int(user_id), usage_date=str(day), messages=0, updated_at=stamp)
+        .on_conflict_do_update(
+            index_elements=["user_id", "usage_date"],
+            set_={
+                "messages": func.max(PrivateChatUsage.messages - 1, 0),
+                "updated_at": stamp,
+            },
+        )
+        .returning(PrivateChatUsage.messages)
+    )
+    result = await session.execute(stmt)
+    return int(result.scalar_one())
+
+
 async def record_contact(
     session: Any, *, user_id: int, day: str | None = None, stamp: Any | None = None
 ) -> None:
@@ -599,6 +622,42 @@ async def consume_daily_quota(
         global_limit=int(global_limit),
         tier=tier,
     )
+
+
+async def refund_daily_quota(
+    session: Any,
+    *,
+    user_id: int,
+    is_admin: bool = False,
+    day: str | None = None,
+    stamp: Any | None = None,
+) -> int:
+    """把 :func:`consume_daily_quota` 扣掉的那一笔还回去。
+
+    B-04：``consume_daily_quota`` 在函数内部就 ``commit()``，所以调用方后面
+    ``rollback()`` 撤不回这次扣减——模型调用失败、回复发不出去、认图拿不到描述
+    时，用户白白耗掉当日私聊配额，界面上只看到「稍后再试」。配额是「先扣再用」，
+    所以退款要显式做：这一轮没真的回上话，就不计入当日用量。
+
+    同样退回本人行 + 本档全局行两道计数，调用方需要时按返回值判断是否成功；
+    写失败只记日志并吞掉异常（绝不能让"退配额"本身把这次 update 带崩）。
+    """
+
+    stamp = stamp or now_shanghai_naive()
+    key = str(day or local_day_key(stamp))
+    global_row = ADMIN_GLOBAL_COUNTER_USER_ID if is_admin else GLOBAL_COUNTER_USER_ID
+    try:
+        user_left = await _unbump(session, user_id=int(user_id), day=key, stamp=stamp)
+        await _unbump(session, user_id=global_row, day=key, stamp=stamp)
+        await session.commit()
+    except Exception as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            log.exception("private chat: 配额退款回滚失败 | user=%s", user_id)
+        log.warning("private chat: 配额退款失败 | user=%s | error=%s", user_id, exc)
+        return 0
+    return user_left
 
 
 def quota_notice(outcome: QuotaOutcome) -> str:
