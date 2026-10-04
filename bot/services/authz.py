@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aiogram.types import Message
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
@@ -131,13 +131,38 @@ async def list_authorized_groups(
     session: AsyncSession,
     *,
     include_inactive: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[AuthorizedGroup]:
+    """List authorized groups, optionally paged in the database.
+
+    ``limit``/``offset`` keep a paged caller (the ``/authlist`` Telegram list)
+    from instantiating the whole table on every page click.  Use
+    :func:`count_authorized_groups` for the unpaged total shown in the header.
+    """
+
     stmt = select(AuthorizedGroup)
     if not include_inactive:
         stmt = stmt.where(AuthorizedGroup.bot_present.is_(True))
     stmt = stmt.order_by(AuthorizedGroup.created_at.desc())
+    if limit is not None:
+        stmt = stmt.offset(max(0, int(offset))).limit(max(1, int(limit)))
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def count_authorized_groups(
+    session: AsyncSession,
+    *,
+    include_inactive: bool = False,
+) -> int:
+    """Unpaged row count for the paged authorized-group list."""
+
+    stmt = select(func.count()).select_from(AuthorizedGroup)
+    if not include_inactive:
+        stmt = stmt.where(AuthorizedGroup.bot_present.is_(True))
+    result = await session.execute(stmt)
+    return int(result.scalar() or 0)
 
 
 async def is_group_admin_authorized(session: AsyncSession, group_id: int, user_id: int) -> bool:

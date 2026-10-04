@@ -19,7 +19,7 @@ from aiogram.exceptions import (
 )
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,6 +41,7 @@ from bot.services.ban_audit import record_ban_event
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
+    count_authorized_groups,
     deauthorize_group,
     deauthorize_group_admin,
     ensure_group_admin_permission,
@@ -453,19 +454,89 @@ def _parse_int(value: str, *, default: int = 0) -> int:
         return default
 
 
+def _clamp_list_page(page: int, total: int) -> int:
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    return min(max(int(page), 0), total_pages - 1)
+
+
+async def _load_warning_list_page(
+    session: AsyncSession,
+    group_id: int,
+    page: int,
+) -> tuple[list[UserWarning], int, int, int]:
+    """One warning page straight from SQL, plus the two header counts.
+
+    原来这里整群 ``UserWarning`` 全量实例化，翻页只是对已加载列表切片，
+    ``banned_count`` 还在 Python 层再遍历一次全表（A-05）。
+    """
+
+    predicate = (
+        UserWarning.group_id == group_id,
+        or_(UserWarning.count > 0, UserWarning.is_banned.is_(True)),
+    )
+    ordering = (
+        UserWarning.is_banned.desc(),
+        UserWarning.count.desc(),
+        UserWarning.user_id.asc(),
+    )
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(UserWarning).where(*predicate)
+            )
+        ).scalar()
+        or 0
+    )
+    if total <= 0:
+        return [], 0, 0, 0
+    banned = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(UserWarning)
+                .where(
+                    *predicate,
+                    UserWarning.is_banned.is_(True),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    page = _clamp_list_page(page, total)
+    rows = list(
+        (
+            await session.execute(
+                select(UserWarning)
+                .where(*predicate)
+                .order_by(*ordering)
+                .offset(page * _LIST_PAGE_SIZE)
+                .limit(_LIST_PAGE_SIZE)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows, page, total, banned
+
+
 def _build_auth_group_list_page(
     rows: list,
     *,
     page: int,
+    total: int,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    total = len(rows)
+    """Render one already-paged slice of authorized groups.
+
+    ``rows`` holds at most ``_LIST_PAGE_SIZE`` rows and ``total`` is the
+    unpaged row count; the table is never fully loaded for one page (A-05).
+    """
+
     total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
-    end = min(start + _LIST_PAGE_SIZE, total)
 
     lines: list[str] = []
-    for idx, row in enumerate(rows[start:end], start=start + 1):
+    for idx, row in enumerate(rows, start=start + 1):
         reachability = "可用" if bool(getattr(row, "bot_present", True)) else "Bot 不可达/暂停"
         lines.extend(
             [
@@ -567,16 +638,22 @@ def _build_warning_list_page(
     *,
     threshold: int,
     page: int,
+    total: int,
+    banned_count: int,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    total = len(rows)
+    """Render one already-paged slice of the group warning list.
+
+    ``rows`` holds at most ``_LIST_PAGE_SIZE`` rows; ``total`` and
+    ``banned_count`` come from two ``select(count(...))`` queries so the
+    command stops instantiating the whole table per page (A-05).
+    """
+
     total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
-    end = min(start + _LIST_PAGE_SIZE, total)
-    banned_count = sum(1 for row in rows if row.is_banned)
 
     lines: list[str] = []
-    for idx, row in enumerate(rows[start:end], start=start + 1):
+    for idx, row in enumerate(rows, start=start + 1):
         status = "已封禁" if row.is_banned else "警告中"
         lines.extend(
             [
@@ -879,7 +956,13 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
     if not await ensure_super_admin(message, settings):
         return
 
-    rows = await list_authorized_groups(session, include_inactive=True)
+    rows = await list_authorized_groups(
+        session,
+        include_inactive=True,
+        limit=_LIST_PAGE_SIZE,
+        offset=0,
+    )
+    total = await count_authorized_groups(session, include_inactive=True)
     await session.commit()
     if not rows:
         await _answer(
@@ -889,7 +972,7 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
         )
         return
 
-    text, keyboard = _build_auth_group_list_page(rows, page=0)
+    text, keyboard = _build_auth_group_list_page(rows, page=0, total=total)
     await _answer(
         message,
         settings,
@@ -3774,7 +3857,14 @@ async def on_authlist_paging(
         return
     page = _parse_int(parts[1], default=0)
 
-    rows = await list_authorized_groups(session, include_inactive=True)
+    total = await count_authorized_groups(session, include_inactive=True)
+    page = _clamp_list_page(page, total)
+    rows = await list_authorized_groups(
+        session,
+        include_inactive=True,
+        limit=_LIST_PAGE_SIZE,
+        offset=page * _LIST_PAGE_SIZE,
+    )
     await session.commit()
     if not rows:
         await msg.edit_text(
@@ -3784,7 +3874,7 @@ async def on_authlist_paging(
         await callback.answer("列表已空")
         return
 
-    text, keyboard = _build_auth_group_list_page(rows, page=page)
+    text, keyboard = _build_auth_group_list_page(rows, page=page, total=total)
     try:
         await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
@@ -3884,16 +3974,9 @@ async def on_warnings_paging(
         return
     page = _parse_int(parts[1], default=0)
 
-    stmt = (
-        select(UserWarning)
-        .where(
-            UserWarning.group_id == msg.chat.id,
-            or_(UserWarning.count > 0, UserWarning.is_banned.is_(True)),
-        )
-        .order_by(UserWarning.is_banned.desc(), UserWarning.count.desc(), UserWarning.user_id.asc())
+    rows, page, total, banned_count = await _load_warning_list_page(
+        session, msg.chat.id, page
     )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
     await session.commit()
     if not rows:
         await msg.edit_text(
@@ -3907,7 +3990,13 @@ async def on_warnings_paging(
         return
 
     threshold = max(1, settings.moderation.warn_threshold)
-    text, keyboard = _build_warning_list_page(rows, threshold=threshold, page=page)
+    text, keyboard = _build_warning_list_page(
+        rows,
+        threshold=threshold,
+        page=page,
+        total=total,
+        banned_count=banned_count,
+    )
     try:
         await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
@@ -4392,16 +4481,9 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
     if not await ensure_group_admin_permission(message, session, settings):
         return
 
-    stmt = (
-        select(UserWarning)
-        .where(
-            UserWarning.group_id == message.chat.id,
-            or_(UserWarning.count > 0, UserWarning.is_banned.is_(True)),
-        )
-        .order_by(UserWarning.is_banned.desc(), UserWarning.count.desc(), UserWarning.user_id.asc())
+    rows, page, total, banned_count = await _load_warning_list_page(
+        session, message.chat.id, 0
     )
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
     await session.commit()
 
     if not rows:
@@ -4416,7 +4498,13 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
         return
 
     threshold = max(1, settings.moderation.warn_threshold)
-    text, keyboard = _build_warning_list_page(rows, threshold=threshold, page=0)
+    text, keyboard = _build_warning_list_page(
+        rows,
+        threshold=threshold,
+        page=page,
+        total=total,
+        banned_count=banned_count,
+    )
     await _answer(
         message,
         settings,

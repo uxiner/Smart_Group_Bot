@@ -567,10 +567,12 @@ class AdminTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_warnings_command_commits_before_answer(self) -> None:
         events: list[str] = []
+        # A-05：/warnings 现在只取一页 + 两条 count(...)，不再是全表实例化。
         session = SimpleNamespace(
             execute=AsyncMock(
                 return_value=SimpleNamespace(
-                    scalars=lambda: SimpleNamespace(all=lambda: [])
+                    scalar=lambda: 0,
+                    scalars=lambda: SimpleNamespace(all=lambda: []),
                 )
             ),
             commit=AsyncMock(side_effect=lambda: events.append("commit")),
