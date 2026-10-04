@@ -960,6 +960,7 @@
             ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "全局控制 AI 自动回复等 Bot 生成内容的网页预览")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
+            ${toggle("bot.enable_rich_messages", "启用富文本排版", "D3-40：控制粗体/斜体/代码块等富文本渲染。此前的开关既无 UI、又无 env、又无 DB 路径（load_settings() 从不被调用），读取侧 getattr(..., False) 恒真，等于没有关")}
             ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}
             ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true })}
           </div>
@@ -993,7 +994,6 @@
             ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动发现模型窗口（默认）" }, { value: "fixed", label: "固定模型侧上限（兼容旧配置）" }], hint: "每轮业务预算固定为 272Ki（输入上限 245760，含人设/工具定义/记忆/历史/本轮/工具结果/输出预留）。auto：再自动发现模型真实窗口，只在模型更小时进一步收紧；fixed：不查元数据，用右侧固定值当模型侧上限" })}
             ${field("bot.max_context_tokens", "固定上限 Token（仅 fixed 生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。auto 模式下它只作为“查不到任何模型元数据”时的保守降级值，不再压住已知模型" })}
             ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
-            ${toggle("bot.enable_rich_messages", "启用富文本排版", "D3-40：此前该开关既无 UI、又无 env、又无 DB 路径（load_settings() 从不被调用），getattr(..., False) 恒真，等于没有关")}
             ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
