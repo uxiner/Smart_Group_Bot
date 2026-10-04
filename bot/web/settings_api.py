@@ -6,7 +6,8 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import wraps
 from typing import Annotated, Any, Literal
@@ -203,6 +204,9 @@ _VOTE_BAN_GROUP_INT_FIELDS = {
 _SCHEDULED_TASKS_KEY = "scheduled_tasks"
 _COOLDOWN_TASK_KEY = "cooldown_topic"
 _GROUP_UPDATE_LOCKS: dict[int, asyncio.Lock] = {}
+#: 每个群更新锁的当前持有/等待者计数。引用归零后立刻把锁从字典里摘掉，
+#: 免得这个模块级字典随授权群数单调增长（A-10）。
+_GROUP_UPDATE_LOCK_WAITERS: dict[int, int] = {}
 _JSON_BODY_TIMEOUT_SECONDS = 5.0
 _JSON_BODY_CANCEL_GRACE_SECONDS = 0.1
 _JSON_BODY_ORPHAN_LIMIT = 32
@@ -481,6 +485,39 @@ def _consume_background_task(task: asyncio.Task[Any]) -> None:
         task.exception()
     except (asyncio.CancelledError, Exception):
         pass
+
+
+@asynccontextmanager
+async def _group_update_guard(group_id: int) -> AsyncIterator[asyncio.Lock]:
+    """Serialize group-settings writes per group without leaking lock objects.
+
+    The lock table is module level, so a plain ``setdefault`` grows it forever
+    (one entry per group ever touched, never released on authorization
+    removal).  Entries are dropped as soon as the last holder/waiter leaves.
+
+    Deliberately **not** an LRU: evicting a lock that is still held would let
+    two concurrent writers take two different locks and defeat the protection.
+    """
+
+    key = int(group_id)
+    lock = _GROUP_UPDATE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _GROUP_UPDATE_LOCKS[key] = lock
+    _GROUP_UPDATE_LOCK_WAITERS[key] = _GROUP_UPDATE_LOCK_WAITERS.get(key, 0) + 1
+    try:
+        async with lock:
+            yield lock
+    finally:
+        remaining = _GROUP_UPDATE_LOCK_WAITERS.get(key, 0) - 1
+        if remaining > 0:
+            _GROUP_UPDATE_LOCK_WAITERS[key] = remaining
+            return
+        _GROUP_UPDATE_LOCK_WAITERS.pop(key, None)
+        # Only drop the object this holder actually used; a newer entry may
+        # already have replaced it.
+        if _GROUP_UPDATE_LOCKS.get(key) is lock:
+            _GROUP_UPDATE_LOCKS.pop(key, None)
 
 
 def _track_json_body_orphan(task: asyncio.Task[Any]) -> None:
@@ -2500,8 +2537,7 @@ def register_settings_routes(
         permissions_changed = (
             GROUP_PERMISSIONS_SETTINGS_KEY in settings_update.model_fields_set
         )
-        lock = _GROUP_UPDATE_LOCKS.setdefault(group_id, asyncio.Lock())
-        async with lock:
+        async with _group_update_guard(group_id):
             async with session_factory() as session:
                 authorized = await session.get(AuthorizedGroup, group_id)
                 if authorized is None or not bool(authorized.bot_present):
