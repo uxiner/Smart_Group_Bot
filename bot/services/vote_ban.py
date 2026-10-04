@@ -17,7 +17,8 @@ from typing import Any
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, insert, literal, or_, select, update
+from sqlalchemy import func, literal, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -876,34 +877,64 @@ async def open_vote_session(
     """Create a poll and the starter's first vote without poisoning the outer transaction."""
     if await get_active_session(session, group_id, target_user_id) is not None:
         return None
-    record = VoteBanSession(
-        group_id=int(group_id),
-        target_user_id=int(target_user_id),
-        target_display=str(target_display or "")[:255],
-        target_username=str(target_username or "")[:255],
-        starter_user_id=int(starter_user_id),
-        starter_display=str(starter_display or "")[:255],
-        reason=str(reason or "")[:1000],
-        evidence=str(evidence or "")[:1000],
-        source=str(source or "command")[:32],
-        target_message_id=int(target_message_id or 0),
-        threshold=int(config.threshold),
-        pin_message=bool(config.pin_message),
-        status="active",
-        deadline_at=now_shanghai_naive() + timedelta(seconds=config.duration_seconds),
+    # A-07：原来这两行包在 ``session.begin_nested()`` 里捕获 IntegrityError，
+    # 但 pysqlite / aiosqlite 只在第一条 DML 之前才发出 BEGIN，``SAVEPOINT``
+    # 不是 DML，所以最外层的 ``RELEASE SAVEPOINT`` 按 SQLite 语义就是 COMMIT ——
+    # 调用方的 ``rollback()`` 撤不回这两行，投票一开出来就撤不掉
+    # （GAP-D1 §3.1 实测 B5：rollback 后 sessions 仍残留 1 行）。
+    # 改用原生 ``ON CONFLICT DO NOTHING`` + ``rowcount`` 判定：并发开同一个
+    # 目标的投票由部分唯一索引
+    # (group_id, target_user_id) WHERE status IN ('active','enforcing') 挡住，
+    # 不抛异常、不改变事务边界。
+    inserted = await session.execute(
+        sqlite_insert(VoteBanSession)
+        .values(
+            group_id=int(group_id),
+            target_user_id=int(target_user_id),
+            target_display=str(target_display or "")[:255],
+            target_username=str(target_username or "")[:255],
+            starter_user_id=int(starter_user_id),
+            starter_display=str(starter_display or "")[:255],
+            reason=str(reason or "")[:1000],
+            evidence=str(evidence or "")[:1000],
+            source=str(source or "command")[:32],
+            target_message_id=int(target_message_id or 0),
+            threshold=int(config.threshold),
+            pin_message=bool(config.pin_message),
+            status="active",
+            resolution="",
+            resolver_user_id=0,
+            resolver_display="",
+            message_id=0,
+            # Core 的 INSERT 不会套用 Python 侧列 default，created_at 必须显式
+            # 带上本地（Asia/Shanghai）朴素时间（与 F-050 同一口径）。
+            created_at=now_shanghai_naive(),
+            deadline_at=now_shanghai_naive()
+            + timedelta(seconds=config.duration_seconds),
+        )
+        .on_conflict_do_nothing()
     )
-    try:
-        async with session.begin_nested():
-            session.add(record)
-            await session.flush()
-            session.add(
-                VoteBanVote(
-                    session_id=int(record.id),
-                    user_id=int(starter_user_id),
-                )
-            )
-            await session.flush()
-    except IntegrityError:
+    if int(getattr(inserted, "rowcount", 0) or 0) != 1:
+        return None
+    primary_key = inserted.inserted_primary_key
+    if not primary_key:
+        return None
+    record_id = int(primary_key[0])
+    # 发起人的首票。新建的 session_id 上不可能已有票，所以这里的 DO NOTHING
+    # 只是"不改变事务边界"的保证；真的没记上时如实记日志，不伪造成"已有投票"。
+    starter_vote = await session.execute(
+        sqlite_insert(VoteBanVote)
+        .values(session_id=record_id, user_id=int(starter_user_id))
+        .on_conflict_do_nothing(index_elements=["session_id", "user_id"])
+    )
+    if int(getattr(starter_vote, "rowcount", 0) or 0) != 1:
+        log.error(
+            "vote-ban starter ballot missing right after session insert | session=%s starter=%s",
+            record_id,
+            starter_user_id,
+        )
+    record = await session.get(VoteBanSession, record_id)
+    if record is None:
         return None
     return record
 
@@ -938,16 +969,19 @@ async def record_vote(
         )
         .with_for_update()
     )
-    try:
-        async with session.begin_nested():
-            result = await session.execute(
-                insert(VoteBanVote).from_select(
-                    ("session_id", "user_id"),
-                    source,
-                )
-            )
-    except IntegrityError:
-        return False
+    # A-07：原来这里包在 ``session.begin_nested()`` 里捕获 IntegrityError，
+    # SAVEPOINT 的 ``RELEASE`` 会提前提交外层事务，投票一旦计入就撤不回来
+    # （GAP-D1 §3.1 实测 B6：rollback 后 votes 仍残留 2 行，取消/撤销投票在
+    # 事务层没有退路）。与 spend_points / award_points 同款：原生
+    # ``ON CONFLICT DO NOTHING``，``rowcount == 1`` 依旧是"这一票真记上了"。
+    result = await session.execute(
+        sqlite_insert(VoteBanVote)
+        .from_select(
+            ("session_id", "user_id"),
+            source,
+        )
+        .on_conflict_do_nothing(index_elements=["session_id", "user_id"])
+    )
     return int(result.rowcount or 0) == 1
 
 

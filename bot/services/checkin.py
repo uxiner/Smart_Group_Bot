@@ -16,7 +16,6 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import ColumnElement, DateTime, func, insert, literal, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import (
@@ -211,20 +210,31 @@ async def record_checkin(
         # 先算出"含今天"的连续天数，再决定这次加几分
         streak_with_today = _streak(existing | {today.isoformat()}, today)
         award = award_for_streak(streak_with_today)
-        try:
-            # SAVEPOINT：只回滚这一条插入，不牵连调用方在这个 session 里
-            # 还没提交的其它改动
-            async with session.begin_nested():
-                session.add(
-                    MemberCheckin(
-                        group_id=int(group_id),
-                        user_id=int(user_id),
-                        checkin_date=today.isoformat(),
-                        points=award,
-                        display_name=str(display_name or "")[:255],
-                    )
-                )
-        except IntegrityError:
+        # F-053 同口径（A-07）：这里原来包在 ``session.begin_nested()`` 里捕获
+        # IntegrityError，但 pysqlite / aiosqlite 只在第一条 DML 之前才发出
+        # BEGIN，``SAVEPOINT`` 不是 DML，所以最外层的 ``RELEASE SAVEPOINT`` 按
+        # SQLite 语义就是 COMMIT —— 调用方的 ``rollback()`` 撤不回这一行，
+        # 签到一旦写入就抹不掉了（GAP-D1 §3.1 实测 B1）。
+        # 改成原生 ``ON CONFLICT DO NOTHING``：不抛异常、不改变事务边界，幂等
+        # 仍由唯一索引 (group_id, user_id, checkin_date) 保证，
+        # ``rowcount == 1`` 依旧是"这次真签上了"的判据。
+        inserted = await session.execute(
+            sqlite_insert(MemberCheckin)
+            .values(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                checkin_date=today.isoformat(),
+                points=award,
+                display_name=str(display_name or "")[:255],
+                # F-050：Core 的 INSERT 不会套用 Python 侧列 default，
+                # created_at 必须显式带上本地（Asia/Shanghai）朴素时间。
+                created_at=now_shanghai_naive(),
+            )
+            .on_conflict_do_nothing(
+                index_elements=["group_id", "user_id", "checkin_date"]
+            )
+        )
+        if int(getattr(inserted, "rowcount", 0) or 0) != 1:
             # 唯一索引挡住重复签到：按"今天已签"处理
             already = True
             award = 0
