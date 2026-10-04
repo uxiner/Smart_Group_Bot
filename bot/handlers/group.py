@@ -2461,7 +2461,15 @@ async def _reapply_restriction_for_review(
         if is_super_admin_user_id(user_id, settings):
             return "该用户是最高管理员，完全豁免，不施加限制"
     except Exception:
-        pass
+        # 判不出来就按"不是超管"继续（控制流不变），但必须留证据：否则一次配置读取
+        # 失败会让最高管理员被静默处罚，事后连日志都没有。
+        log.exception(
+            "review restriction: super admin check failed, continuing without exemption"
+            " | violation=%s group=%s user=%s",
+            violation_id,
+            group_id,
+            user_id,
+        )
 
     # 手动豁免名单（/aiexempt）里的人不动。
     try:
@@ -3035,7 +3043,13 @@ async def on_review_action(
             try:
                 await session.rollback()
             except Exception:
-                pass
+                # 外层已经记过失败原因；这里只补"回滚也没成"——会话状态已不可知，
+                # 后续同一个 session 的读写都可能带脏数据（控制流不变）。
+                log.exception(
+                    "review pending persist: rollback failed | violation=%s action=%s",
+                    violation_id,
+                    action,
+                )
             await callback.answer("确认状态保存失败，请稍后重试", show_alert=True)
             return
         await _edit_review_channel_status(
@@ -3057,7 +3071,14 @@ async def on_review_action(
         try:
             await session.rollback()
         except Exception:
-            pass
+            # 注意：这里失败后**仍会继续执行放行/封禁**（B-19 只补日志，不改控制流）。
+            # 但 pending 未清空这一点必须有据可查，否则下一次点击会被误判成"已 arm"。
+            log.exception(
+                "review pending clear: rollback failed, the action below still runs"
+                " | violation=%s action=%s",
+                violation_id,
+                action,
+            )
     if action == "rel":
         await _review_do_release(callback, settings, session, violation, operator_id)
     else:
