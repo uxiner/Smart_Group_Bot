@@ -573,14 +573,15 @@ class OptOutTests(_DbTestCase):
 
 class GuardrailTests(_DbTestCase):
     async def test_should_extract_needs_enough_new_messages(self) -> None:
-        settings = _settings(memory_extract_min_messages=3)
-        await self._archive("第一条")
+        # 下限是 5（见 test_config_getters_default_and_clamp），所以边界用 5 来测
+        settings = _settings(memory_extract_min_messages=5)
+        for index in range(1, 5):
+            await self._archive(f"第{index}条", message_id=index)
         async with self.session_factory() as session:
             self.assertFalse(
                 await ltm.should_extract(ltm.SCOPE_GROUP, GROUP_ID, settings, session)
             )
-        await self._archive("第二条", message_id=2)
-        await self._archive("第三条", message_id=3)
+        await self._archive("第五条", message_id=5)
         async with self.session_factory() as session:
             self.assertTrue(
                 await ltm.should_extract(ltm.SCOPE_GROUP, GROUP_ID, settings, session)
@@ -602,9 +603,11 @@ class GuardrailTests(_DbTestCase):
                     )
 
     async def test_extract_daily_cap_skips_and_only_logs(self) -> None:
-        await self._archive("第一条")
+        # 先满足 min_messages 下限（5），才走得到「今日上限」这一层
+        for index in range(1, 6):
+            await self._archive(f"第{index}条", message_id=index)
         settings = _settings(
-            memory_extract_min_messages=1, memory_extract_daily_cap=1
+            memory_extract_min_messages=5, memory_extract_daily_cap=1
         )
         ltm.note_extraction_run(ltm.SCOPE_GROUP, OTHER_GROUP_ID, now=NOW)
         with self.assertLogs("bot.services.long_term_memory", level="INFO") as captured:
@@ -865,8 +868,10 @@ class ExtractionRoundTests(_DbTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=GROUP_ID, authorized_by=1))
             await session.commit()
-        await self._archive("我很喜欢喝咖啡", message_id=1)
-        await self._private_turn("我喜欢喝咖啡", key="u:1")
+        for index in range(1, 6):
+            await self._archive(f"我很喜欢喝咖啡 {index}", message_id=index)
+        for index in range(1, 6):
+            await self._private_turn(f"我喜欢喝咖啡 {index}", key=f"u:{index}")
         llm = _StubLLM(
             lambda user_text: json.dumps(
                 [
@@ -881,7 +886,7 @@ class ExtractionRoundTests(_DbTestCase):
                 ensure_ascii=False,
             )
         )
-        settings = _settings(memory_extract_min_messages=1)
+        settings = _settings(memory_extract_min_messages=5)
         touched = await ltm.run_extraction_round(
             self.session_factory, llm=llm, settings=settings, now=NOW
         )
@@ -1033,8 +1038,9 @@ class LoadRelevantFactsTests(_DbTestCase):
         self.assertEqual([record["id"] for record in records], [new, old])
 
     async def test_limit_and_size_stay_bounded(self) -> None:
+        # 用非冲突类别：preference 属「冲突替代」类，20 条近似文本会互相替代只剩 1 条
         for index in range(20):
-            await self._record(f"他喜欢咖啡 {index}")
+            await self._record(f"他喜欢咖啡 {index}", category="other")
         async with self.session_factory() as session:
             records = await ltm.load_relevant_facts(
                 session,
@@ -1159,8 +1165,9 @@ class GroupInjectionTests(_DbTestCase):
         self.assertNotIn(ltm.LONG_TERM_MEMORY_HEADER_BLOCK, joined)
 
     async def test_injection_respects_the_recall_limit(self) -> None:
+        # 同上：用非冲突类别，20 条才能并存，才测得出注入条数上限
         for index in range(20):
-            await self._record(f"他喜欢咖啡 {index}")
+            await self._record(f"他喜欢咖啡 {index}", category="other")
         history = await self._inject("喜欢咖啡", settings=_settings(memory_recall_limit=3))
         joined = "\n".join(str(item.get("content") or "") for item in history)
         self.assertEqual(joined.count("- [长期记忆 · 群内"), 3)
