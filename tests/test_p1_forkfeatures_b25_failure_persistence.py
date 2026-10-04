@@ -70,6 +70,24 @@ class FailureBackoffPersistenceTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 pass
 
+    async def _wait_for(self, predicate, *, attempts: int = 200) -> list[tuple[int, int]]:
+        """轮询直到 ``predicate(rows)`` 成立。
+
+        落库是 fire-and-forget（``_spawn``），调用后事件循环还没跑完时表里可能是
+        1 条、2 条…… 只等「表非空」会随机地读到中间态——本文件之前就栽在这上面
+        （全量跑时 ``[(1, 2)] != [(1, 4)]``）。
+        """
+
+        import asyncio
+
+        rows: list[tuple[int, int]] = []
+        for _ in range(attempts):
+            rows = await self._rows_in_db()
+            if predicate(rows):
+                return rows
+            await asyncio.sleep(0.01)
+        return rows
+
     async def _rows_in_db(self) -> list[tuple[int, int]]:
         async with self.session_factory() as session:
             rows = (
@@ -101,12 +119,12 @@ class FailureBackoffPersistenceTests(unittest.IsolatedAsyncioTestCase):
         for expected_attempts in (1, 2, 3, 4):
             first._register_failure(GROUP_ID, cfg)
             self.assertEqual(first._failures[GROUP_ID], expected_attempts)
-        # 落库任务是 fire-and-forget：让出控制权让它跑完
-        for _ in range(50):
-            if await self._rows_in_db():
-                break
-            await __import__("asyncio").sleep(0.01)
-        self.assertEqual(await self._rows_in_db(), [(GROUP_ID, 4)])
+        # 落库任务是 fire-and-forget：等到 4 次写**全部**落库（而不是「表非空」）
+        self.assertEqual(
+            await self._wait_for(lambda rows: rows == [(GROUP_ID, 4)]),
+            [(GROUP_ID, 4)],
+            "四次失败都应落库（阶梯爬到第 4 级）",
+        )
 
         # 「重启」：全新调度器 + 全新内存，必须把台账读回来
         second = GroupSummaryScheduler(
@@ -133,10 +151,7 @@ class FailureBackoffPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         for _ in range(3):
             first._register_failure(GROUP_ID, cfg)
-        for _ in range(50):
-            if await self._rows_in_db():
-                break
-            await __import__("asyncio").sleep(0.01)
+        await self._wait_for(lambda rows: rows == [(GROUP_ID, 3)])
 
         second = GroupSummaryScheduler(
             llm=FakeLLM(), store=store, config_provider=lambda: cfg, slot_waiter=None
@@ -178,12 +193,10 @@ class FailureBackoffPersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         scheduler.notify(GROUP_ID)
         self.assertEqual(await scheduler.run_group(GROUP_ID, cfg), "published")
-        for _ in range(50):
-            if not await self._rows_in_db():
-                break
-            await __import__("asyncio").sleep(0.01)
         self.assertEqual(
-            await self._rows_in_db(), [], "发布成功必须删掉台账，否则重启又恢复旧阶梯"
+            await self._wait_for(lambda rows: not rows),
+            [],
+            "发布成功必须删掉台账，否则重启又恢复旧阶梯",
         )
 
     async def test_aux_tasks_do_not_consume_the_pump_execution_slots(self) -> None:
