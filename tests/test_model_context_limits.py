@@ -108,6 +108,38 @@ class ParseModelsPayloadTests(unittest.TestCase):
         )
         self.assertEqual(ml.redact_base(""), "")
 
+    def test_one_dirty_infinity_entry_does_not_void_the_whole_catalog(self) -> None:
+        """``json.loads`` 默认接受 ``Infinity`` 字面量，旧代码只 catch ValueError。"""
+
+        payload = (
+            '{"data": [{"id": "dirty", "context_length": Infinity},'
+            ' {"id": "cn:deepseek-v4.1-flash", "context_length": 1000000}]}'
+        )
+        self.assertEqual(
+            ml.parse_models_payload(payload),
+            {
+                "cn:deepseek-v4.1-flash": {
+                    "total_window": 1_000_000,
+                    "max_input_tokens": None,
+                    "max_output_tokens": None,
+                }
+            },
+            "单条脏 entry 应当被跳过，其余条目照常解析",
+        )
+
+    def test_non_finite_windows_never_reach_the_budget(self) -> None:
+        """``int(float('inf'))`` 是 OverflowError，不是 ValueError。"""
+
+        for value in (float("inf"), float("-inf"), float("nan")):
+            self.assertIsNone(ml._positive_int(value))
+            self.assertLessEqual(ml._bounded_int(value, default=7, low=1, high=9), 9)
+
+    def test_unparsable_port_is_dropped_instead_of_raising(self) -> None:
+        """``parts.port`` 的属性访问会抛 ValueError，且过去在 ``try`` 之外。"""
+
+        self.assertEqual(ml.redact_base("http://gw.internal:70000/v1"), "")
+        self.assertEqual(ml.redact_base("gw.internal:not-a-port/v1"), "")
+
 
 class AuthHeaderTests(unittest.TestCase):
     def test_gemini_native_host_uses_the_native_header_only(self) -> None:
@@ -520,6 +552,25 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sk-super-secret", joined)
         self.assertNotIn("sk-super-secret", json.dumps(snapshot))
         self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
+
+    async def test_a_bad_port_does_not_stop_the_other_endpoints(self) -> None:
+        """一个 ``api_base`` 端口写错，不该让**所有** endpoint 的 TTL 永不续期。"""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return _catalog_response(
+                [{"id": "cn:deepseek-v4.1-flash", "context_length": 1_000_000}]
+            )
+
+        registry = self._registry(handler)
+        broken = _endpoint(model="broken/model", api_base="http://gw.internal:70000/v1")
+        healthy = _endpoint()
+
+        report = await registry.refresh([broken, healthy])
+
+        self.assertEqual(registry.resolve(healthy).total_window, 1_000_000, "好端点必须照常刷新")
+        self.assertEqual(
+            sorted(report), ["broken||broken/model", "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"]
+        )
 
 
 class PeriodicRefreshTests(unittest.IsolatedAsyncioTestCase):

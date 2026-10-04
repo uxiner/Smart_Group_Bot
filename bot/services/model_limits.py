@@ -119,7 +119,8 @@ _OUTPUT_LIMIT_KEYS = (
 def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: json.loads 默认接受 Infinity/NaN，int(float("inf")) 抛的是它。
         number = int(default)
     return min(int(high), max(int(low), number))
 
@@ -127,7 +128,7 @@ def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
 def _positive_int(value: Any) -> int | None:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number > 0 else None
 
