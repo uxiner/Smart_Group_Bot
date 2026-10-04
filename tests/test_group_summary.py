@@ -50,6 +50,14 @@ class FakeStore:
         self.messages = messages or {}
         self.published: dict[int, dict] = {}
         self.publish_calls = 0
+        #: 与 GroupArchiveState 同语义：只在内容被改/删时 +1（新消息插入不动）。
+        self.revisions: dict[int, int] = {}
+
+    def bump_revision(self, group_id: int) -> None:
+        self.revisions[int(group_id)] = self.revisions.get(int(group_id), 0) + 1
+
+    async def content_revision(self, group_id: int) -> int:
+        return int(self.revisions.get(int(group_id), 0))
 
     async def load(self, group_id: int):
         record = self.published.get(int(group_id))
@@ -83,6 +91,9 @@ class FakeStore:
             older = [row for row in older if row.message_id > int(after_id)]
         return older[: max(1, int(max_messages))]
 
+    def bump_revision(self, group_id: int) -> None:
+        self.revisions[int(group_id)] = self.revisions.get(int(group_id), 0) + 1
+
     async def coverage_intact(
         self,
         group_id: int,
@@ -90,14 +101,23 @@ class FakeStore:
         covered_from_id: int,
         covered_through_id: int,
         covered_count: int,
+        source_revision: int | None = None,
     ) -> bool:
+        current_revision = int(self.revisions.get(int(group_id), 0))
+        if source_revision is not None:
+            return current_revision == int(source_revision)
         rows = self.messages.get(int(group_id), [])
         present = [
             row
             for row in rows
             if int(covered_from_id) <= int(row.message_id) <= int(covered_through_id)
         ]
-        return len(present) >= int(covered_count)
+        if len(present) < int(covered_count):
+            return False
+        record = self.published.get(int(group_id))
+        if record is None:
+            return True
+        return int(record.get("source_revision", -1)) == current_revision
 
     async def publish(
         self,
@@ -113,6 +133,7 @@ class FakeStore:
         covered_through_id: int = 0,
         allow_watermark_rewind: bool = False,
         reset_coverage: bool = False,
+        expected_source_revision: int | None = None,
     ):
         from bot.services.group_summary import PublishedSummary
 
@@ -120,6 +141,13 @@ class FakeStore:
         current = self.published.get(int(group_id))
         current_version = int(current["version"]) if current else 0
         current_through_id = int(current["covered_through_id"]) if current else 0
+        guard_revision = (
+            int(self.revisions.get(int(group_id), 0))
+            if expected_source_revision is None
+            else int(expected_source_revision)
+        )
+        if int(self.revisions.get(int(group_id), 0)) != guard_revision:
+            return None
         if current_version != int(expected_version):
             return None
         if (
@@ -150,6 +178,7 @@ class FakeStore:
             "covered_from_id": merged_from_id,
             "covered_through_id": int(covered_through_id or 0) or current_through_id,
             "source_truncated": merged_truncated,
+            "source_revision": guard_revision,
             "generated_at": now_shanghai_naive(),
         }
         self.published[int(group_id)] = record

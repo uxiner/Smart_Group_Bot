@@ -105,6 +105,51 @@ class _PriorityCapacitySemaphore:
         self._value = min(self.capacity, self._value + 1)
 
 
+class _GatePermit:
+    """一张已取得的入场许可；``consume()`` 把所有权交给真正执行请求的任务。
+
+    为什么需要显式所有权：调用方（后台调度）先做**有界入场等待**，再把许可交给下游
+    的请求任务，由它 ``release()``——不合作的取消不会提前释放额度（与 llm.py 里
+    "permit 归实际请求任务所有"的既有约定一致）。
+    """
+
+    __slots__ = ("_gate", "_priority", "_semaphores", "_owner", "_released")
+
+    def __init__(self, gate: "ReservedCapacityGate", priority: ExecutionPriority, semaphores: list[Any]) -> None:
+        self._gate = gate
+        self._priority = priority
+        self._semaphores = semaphores
+        self._owner = "caller"
+        self._released = False
+
+    def consume(self) -> "_GatePermit | None":
+        """把所有权交给当前请求任务；已经被接手/已释放时返回 ``None``。"""
+
+        if self._released or self._owner != "caller":
+            return None
+        self._owner = "request"
+        return self
+
+    @property
+    def consumed(self) -> bool:
+        return self._owner == "request"
+
+    def release(self) -> None:
+        """释放（请求任务/持有者调用）；幂等。"""
+
+        if self._released:
+            return
+        self._released = True
+        self._gate._release_permit(self._priority, self._semaphores)
+
+    def release_unconsumed(self) -> None:
+        """调用方专用：只有**没人接手**时才释放，避免把请求任务还在用的额度提前还回去。"""
+
+        if self._released or self._owner == "request":
+            return
+        self.release()
+
+
 class ReservedCapacityGate:
     """Three-tier admission gate with capacity reserved for urgent work.
 
@@ -159,6 +204,61 @@ class ReservedCapacityGate:
     ) -> None:
         async with asyncio.timeout(max(0.01, float(timeout))):
             await semaphore.acquire(priority)
+
+    async def acquire_permit(
+        self,
+        *,
+        priority: ExecutionPriority,
+        timeout: float,
+    ) -> "_GatePermit":
+        """显式取一张许可（供"入场等待与执行期限分离"的调用方使用）。
+
+        调用方拿到许可后把它交给下游（``_GatePermit.consume()``），由**真正执行请求的
+        任务**在结束时释放；没人接手时调用方必须 ``release()``。释放幂等，绝不提前
+        释放别人的额度。
+        """
+
+        selected = ExecutionPriority(priority)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.01, float(timeout))
+
+        def remaining() -> float:
+            value = deadline - loop.time()
+            if value <= 0:
+                raise TimeoutError("resource admission deadline exceeded")
+            return value
+
+        acquired: list[Any] = []
+        self._waiting[selected] += 1
+        try:
+            if selected >= ExecutionPriority.BACKGROUND and self._background is not None:
+                await self._acquire(self._background, remaining())
+                acquired.append(self._background)
+            if selected >= ExecutionPriority.NORMAL:
+                await self._acquire(self._normal, remaining())
+                acquired.append(self._normal)
+            if selected >= ExecutionPriority.HIGH:
+                await self._acquire(self._noncritical, remaining())
+                acquired.append(self._noncritical)
+            await self._acquire_total(self._total, selected, remaining())
+            acquired.append(self._total)
+        except BaseException:
+            for semaphore in reversed(acquired):
+                semaphore.release()
+            raise
+        finally:
+            self._waiting[selected] -= 1
+        self._active[selected] += 1
+        return _GatePermit(self, selected, acquired)
+
+    def _release_permit(
+        self,
+        selected: ExecutionPriority,
+        acquired: list[Any],
+    ) -> None:
+        self._active[selected] -= 1
+        for semaphore in reversed(acquired):
+            semaphore.release()
 
     @asynccontextmanager
     async def slot(

@@ -2369,6 +2369,7 @@ class LLMService:
         preview_limit: int,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
+        permit: Any | None = None,
     ) -> Any | None:
         label_cn = self._label_cn(label)
         total_attempts = self._retry_attempts(cfg)
@@ -2488,49 +2489,63 @@ class LLMService:
                     # released only when that orphan really exits; nominal
                     # timeouts therefore cannot create unbounded real network
                     # concurrency behind a semaphore that was released early.
-                    async with _LLM_PRIORITY_GATE.slot(timeout=timeout_sec):
-                        async with _LLM_REQUEST_SEMAPHORE:
-                            raw_resp: Any
-                            request: Any
-                            if self._uses_responses_api(cfg):
-                                request = self._responses_async_request(
-                                    messages=messages,
-                                    cfg=cfg,
-                                    stream=stream,
-                                    tools=tools,
-                                    tool_choice=tool_choice,
-                                    exclude_params=set(excluded_params),
-                                    timeout_sec=timeout_sec,
-                                )
-                            else:
-                                if tools:
-                                    tool_kwargs: dict[str, Any] = {
-                                        "tools": tools,
-                                        "tool_choice": tool_choice,
-                                    }
-                                    if not any(
-                                        isinstance(tool, dict)
-                                        and str(tool.get("type", "")).strip().lower() == "mcp"
-                                        for tool in tools
-                                    ):
-                                        # LiteLLM 1.92 imports its optional Proxy/MCP stack
-                                        # before it checks that these are ordinary function tools.
-                                        tool_kwargs["_skip_mcp_handler"] = True
-                                    request = litellm.acompletion(
+                    # A caller that already waited for admission (background
+                    # summary) hands its permit over here instead of acquiring
+                    # again -- never a second acquire, never a bypass.
+                    owned_permit = permit.consume() if permit is not None else None
+                    gate_scope = (
+                        nullcontext()
+                        if owned_permit is not None
+                        else _LLM_PRIORITY_GATE.slot(timeout=timeout_sec)
+                    )
+                    try:
+                        async with gate_scope:
+                            async with _LLM_REQUEST_SEMAPHORE:
+                                raw_resp: Any
+                                request: Any
+                                if self._uses_responses_api(cfg):
+                                    request = self._responses_async_request(
                                         messages=messages,
-                                        **tool_kwargs,
-                                        **kwargs,
+                                        cfg=cfg,
+                                        stream=stream,
+                                        tools=tools,
+                                        tool_choice=tool_choice,
+                                        exclude_params=set(excluded_params),
+                                        timeout_sec=timeout_sec,
                                     )
                                 else:
-                                    request = litellm.acompletion(messages=messages, **kwargs)
+                                    if tools:
+                                        tool_kwargs: dict[str, Any] = {
+                                            "tools": tools,
+                                            "tool_choice": tool_choice,
+                                        }
+                                        if not any(
+                                            isinstance(tool, dict)
+                                            and str(tool.get("type", "")).strip().lower() == "mcp"
+                                            for tool in tools
+                                        ):
+                                            # LiteLLM 1.92 imports its optional Proxy/MCP stack
+                                            # before it checks that these are ordinary function tools.
+                                            tool_kwargs["_skip_mcp_handler"] = True
+                                        request = litellm.acompletion(
+                                            messages=messages,
+                                            **tool_kwargs,
+                                            **kwargs,
+                                        )
+                                    else:
+                                        request = litellm.acompletion(messages=messages, **kwargs)
 
-                            raw_resp = await request
-                            if stream:
-                                try:
-                                    return await self._consume_chat_stream(raw_resp)
-                                finally:
-                                    self._close_stream_best_effort(raw_resp)
-                            return self._normalize_response_object(raw_resp)
+                                raw_resp = await request
+                                if stream:
+                                    try:
+                                        return await self._consume_chat_stream(raw_resp)
+                                    finally:
+                                        self._close_stream_best_effort(raw_resp)
+                                return self._normalize_response_object(raw_resp)
+                    finally:
+                        if owned_permit is not None:
+                            # 许可归**实际请求任务**所有；不合作的取消也不会提前释放。
+                            owned_permit.release()
 
                 resp = await self._await_with_timeout(
                     _perform_attempt(),
@@ -2653,6 +2668,7 @@ class LLMService:
         candidates: list[ChatEndpointConfig],
         label: str,
         preview_limit: int,
+        permit: Any | None = None,
     ) -> str:
         total = len(candidates)
         loop = asyncio.get_running_loop()
@@ -2686,6 +2702,7 @@ class LLMService:
                         cfg=cfg,
                         label=label,
                         preview_limit=preview_limit,
+                        permit=permit,
                     )
             except TimeoutError:
                 log.error(
@@ -2982,6 +2999,7 @@ class LLMService:
         label: str = "group_summary",
         preview_limit: int = 80,
         max_tokens: int | None = None,
+        permit: Any | None = None,
     ) -> str:
         """后台摘要 / 维护专用的一次性对话调用。
 
@@ -3010,6 +3028,7 @@ class LLMService:
                 candidates=self._chat_candidates(target),
                 label=label,
                 preview_limit=preview_limit,
+                permit=permit,
             )
 
     async def decision(self, system: str, user_text: str) -> str:

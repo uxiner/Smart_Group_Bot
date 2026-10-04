@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import BotConfig
 from bot.db.sqlite_session import is_database_locked_error
 from bot.db.models import (
+    GroupArchiveState,
     AuthorizedGroup,
     Group,
     GroupContextSummary,
@@ -673,6 +674,96 @@ class MemoryService:
             ),
         )
 
+    @staticmethod
+    async def _bump_archive_revision(session: AsyncSession, group_id: int) -> None:
+        """归档内容被**修改或删除**时 +1；新消息插入绝不调用。
+
+        * SQLite：由 ``init_db`` 安装的 ``trg_archive_revision_on_update`` /
+          ``trg_archive_revision_on_delete`` 触发器维护——**任何连接**（批量 upsert、
+          ORM fallback、维护脚本、人工 SQL）改正文或删行都会 +1，这里无需重复写。
+        * 其它方言：没有触发器可用，由写入路径显式 +1（同一事务提交，不遍历归档）。
+        """
+
+        gid = int(group_id)
+        dialect = getattr(getattr(session, "bind", None), "dialect", None)
+        if getattr(dialect, "name", "") == "sqlite":
+            return
+        row = await session.get(GroupArchiveState, gid)
+        if row is None:
+            session.add(GroupArchiveState(group_id=gid, content_revision=1))
+        else:
+            row.content_revision = int(row.content_revision or 0) + 1
+
+    @classmethod
+    async def _bump_archive_revisions(
+        cls,
+        session: AsyncSession,
+        group_ids: Iterable[int],
+    ) -> None:
+        for group_id in sorted({int(value) for value in group_ids}):
+            await cls._bump_archive_revision(session, group_id)
+
+    @staticmethod
+    def _archive_revision_is_native(session: AsyncSession) -> bool:
+        """SQLite 用触发器维护内容版本 → 写入路径不必再查一次旧值。"""
+
+        dialect = getattr(getattr(session, "bind", None), "dialect", None)
+        return getattr(dialect, "name", "") == "sqlite"
+
+    @staticmethod
+    async def _detect_archive_edits(
+        session: AsyncSession,
+        archive_rows: list[dict[str, Any]],
+    ) -> set[int]:
+        """找出本批里**已存在且正文发生变化**的行（= 原地编辑）的 group_id。
+
+        只查本批的 key（≤ 批大小，走 (group_id, message_key) 索引），不扫归档；
+        新插入（key 不存在）与同内容重放都不算编辑 → 不会让已覆盖的摘要失效。
+        """
+
+        edited: set[int] = set()
+        by_group: dict[int, list[dict[str, Any]]] = {}
+        for row in archive_rows:
+            by_group.setdefault(int(row["group_id"]), []).append(row)
+        for group_id, rows in by_group.items():
+            keys = [str(row.get("message_key") or "") for row in rows]
+            existing = {
+                str(message_key): (str(content or ""), str(raw_text or ""), edited_at)
+                for message_key, content, raw_text, edited_at in (
+                    await session.execute(
+                        select(
+                            GroupMessageArchive.message_key,
+                            GroupMessageArchive.content,
+                            GroupMessageArchive.raw_text,
+                            GroupMessageArchive.edited_at,
+                        ).where(
+                            GroupMessageArchive.group_id == group_id,
+                            GroupMessageArchive.message_key.in_(keys),
+                        )
+                    )
+                ).all()
+            }
+            for row in rows:
+                current = existing.get(str(row.get("message_key") or ""))
+                if current is None:
+                    continue
+                existing_content, existing_raw, existing_edited_at = current
+                incoming = (
+                    str(row.get("content") or ""),
+                    str(row.get("raw_text") or ""),
+                )
+                if (existing_content, existing_raw) == incoming:
+                    continue
+                incoming_edited_at = row.get("edited_at")
+                if existing_edited_at is not None and (
+                    incoming_edited_at is None
+                    or incoming_edited_at < existing_edited_at
+                ):
+                    # 与 upsert 的 where 一致：陈旧重放不会真正改到内容 → 不算编辑、不动计数。
+                    continue
+                edited.add(group_id)
+        return edited
+
     async def _persist_message_batch(
         self,
         batch: list[_PendingMemoryWrite],
@@ -693,6 +784,15 @@ class MemoryService:
                     dialect = getattr(getattr(session, "bind", None), "dialect", None)
                     if getattr(dialect, "name", "") == "sqlite":
                         if archive_rows:
+                            # **先**检测原地编辑（upsert 之后再查就只看到新值了），
+                            # 再执行 upsert，最后在同事务里 +1。SQLite 由触发器负责。
+                            edited_groups = (
+                                set()
+                                if self._archive_revision_is_native(session)
+                                else await self._detect_archive_edits(
+                                    session, archive_rows
+                                )
+                            )
                             archive_insert = sqlite_insert(GroupMessageArchive).values(
                                 archive_rows
                             )
@@ -746,6 +846,8 @@ class MemoryService:
                                     ),
                                 )
                             )
+                            # 原地编辑（正文变了）→ 同事务 +1：已覆盖的旧摘要因此失效。
+                            await self._bump_archive_revisions(session, edited_groups)
                         if active_items:
                             await session.execute(
                                 sqlite_insert(MessageVector)
@@ -753,8 +855,11 @@ class MemoryService:
                                 .on_conflict_do_nothing()
                             )
                     else:
+                        edited_groups: set[int] = set()
                         for values in archive_rows:
-                            await self._upsert_archive_in_session(session, values)
+                            if await self._upsert_archive_in_session(session, values):
+                                edited_groups.add(int(values["group_id"]))
+                        await self._bump_archive_revisions(session, edited_groups)
                         for item in active_items:
                             session.add(MessageVector(**item.values()))
                     await session.commit()
@@ -818,7 +923,8 @@ class MemoryService:
         if existing_edited_at is not None and (
             incoming_edited_at is None or incoming_edited_at < existing_edited_at
         ):
-            return
+            return False
+        changed = False
         for key, value in values.items():
             if key not in {
                 "id",
@@ -828,7 +934,10 @@ class MemoryService:
                 "access_count",
                 "last_accessed",
             }:
+                if getattr(row, key, None) != value:
+                    changed = True
                 setattr(row, key, value)
+        return changed
 
     async def _pending_write_worker(self) -> None:
         try:
@@ -1453,6 +1562,7 @@ class MemoryService:
                             GroupMessageArchive.id.in_(expired_ids)
                         )
                     )
+                    await self._bump_archive_revision(session, normalized_group_id)
                     await session.commit()
                     removed_archive += len(expired_ids)
                 await asyncio.sleep(0)
@@ -1514,6 +1624,9 @@ class MemoryService:
                             delete(GroupMessageArchive).where(
                                 GroupMessageArchive.id.in_(overflow_ids)
                             )
+                        )
+                        await self._bump_archive_revision(
+                            session, normalized_group_id
                         )
                         await session.commit()
                         removed_archive += len(overflow_ids)
@@ -1593,16 +1706,19 @@ class MemoryService:
         removed_for_limit = 0
         while True:
             async with self._session_factory() as session:
-                expired_ids = list(
-                    (
-                        await session.execute(
-                            select(GroupMessageArchive.id)
-                            .where(GroupMessageArchive.sent_at < cutoff)
-                            .order_by(GroupMessageArchive.id.asc())
-                            .limit(_ARCHIVE_PRUNE_BATCH_SIZE)
+                expired_rows = (
+                    await session.execute(
+                        select(
+                            GroupMessageArchive.id,
+                            GroupMessageArchive.group_id,
                         )
-                    ).scalars()
-                )
+                        .where(GroupMessageArchive.sent_at < cutoff)
+                        .order_by(GroupMessageArchive.id.asc())
+                        .limit(_ARCHIVE_PRUNE_BATCH_SIZE)
+                    )
+                ).all()
+                expired_ids = [int(row_id) for row_id, _gid in expired_rows]
+                expired_groups = {int(gid) for _row_id, gid in expired_rows}
                 if not expired_ids:
                     break
                 await session.execute(
@@ -1610,6 +1726,7 @@ class MemoryService:
                         GroupMessageArchive.id.in_(expired_ids)
                     )
                 )
+                await self._bump_archive_revisions(session, expired_groups)
                 await session.commit()
                 removed_archive += len(expired_ids)
             await asyncio.sleep(0)
@@ -1674,6 +1791,9 @@ class MemoryService:
                         delete(GroupMessageArchive).where(
                             GroupMessageArchive.id.in_(overflow_ids)
                         )
+                    )
+                    await self._bump_archive_revision(
+                        session, normalized_group_id
                     )
                     await session.commit()
                     removed_for_limit += len(overflow_ids)
@@ -3488,6 +3608,13 @@ class MemoryService:
                     dialect = getattr(getattr(session, "bind", None), "dialect", None)
                     if getattr(dialect, "name", "") == "sqlite":
                         values = dict(archive_record)
+                        is_edit = (
+                            False
+                            if self._archive_revision_is_native(session)
+                            else bool(
+                                await self._detect_archive_edits(session, [values])
+                            )
+                        )
                         archive_insert = sqlite_insert(GroupMessageArchive).values(values)
                         mutable = {
                             key: getattr(archive_insert.excluded, key)
@@ -3514,11 +3641,15 @@ class MemoryService:
                                 ),
                             )
                         )
+                        # 原地编辑（同 key、正文变了）→ 同事务 +1：旧摘要因此失效。
+                        if is_edit:
+                            await self._bump_archive_revision(session, group_id)
                     else:
-                        await self._upsert_archive_in_session(
+                        if await self._upsert_archive_in_session(
                             session,
                             dict(archive_record),
-                        )
+                        ):
+                            await self._bump_archive_revision(session, group_id)
                     await session.commit()
                 self._notify_vector_archive_changed()
                 return True
@@ -3893,8 +4024,33 @@ class MemoryService:
             store = self.group_summary_store()
             record = await store.load(int(group_id))
             if record is not None and record.usable:
-                # 覆盖范围内的原文被删/被编辑（审核删除、过期清理、隐私删除同一语义）
-                # → 摘要失效、不注入旧内容（重建由 worker 负责，前台只管不注入）。
+                # 主守卫：归档**内容版本**。原地编辑（id/行数不变）与删除、以及被快照
+                # 跳过/截断的行，都会让计数变化 → 摘要立刻失效、不注入。
+                # 旧摘要（本特性之前发布，source_revision=-1）一律按失效处理。
+                if int(record.source_revision) < 0:
+                    log.info(
+                        "group summary has no source protection, treating as stale | "
+                        "group=%s | version=%s",
+                        group_id,
+                        record.version,
+                    )
+                    record = None
+                else:
+                    revision_fn = getattr(store, "content_revision", None)
+                    if callable(revision_fn):
+                        current_revision = int(await revision_fn(int(group_id)))
+                        if current_revision != int(record.source_revision):
+                            log.warning(
+                                "group summary invalidated (archive content changed) | "
+                                "group=%s | version=%s | revision=%s->%s",
+                                group_id,
+                                record.version,
+                                record.source_revision,
+                                current_revision,
+                            )
+                            record = None
+            if record is not None and record.usable:
+                # 次守卫（便宜、只会更保守）：覆盖区间行数变少也不注入。
                 intact_fn = getattr(store, "coverage_intact", None)
                 if callable(intact_fn):
                     intact = await intact_fn(

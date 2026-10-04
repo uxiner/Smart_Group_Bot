@@ -45,11 +45,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Sequence
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from bot.db.models import GroupMessageArchive, GroupSummary
+from bot.db.models import GroupArchiveState, GroupMessageArchive, GroupSummary
+from bot.services.request_priority import ExecutionPriority
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.model_limits import (
     MESSAGE_TOKEN_OVERHEAD,
@@ -100,6 +101,10 @@ _FORBIDDEN_OUTPUT_RE = re.compile(
 
 #: 单条快照消息在提示词里的渲染上限（防止一条超长消息吃掉整批预算）。
 _SNAPSHOT_MESSAGE_MAX_CHARS = 600
+#: 回复压力期间的有界再检查间隔（秒）：既不忙循环，也能在压力解除后自动继续。
+_REPLY_PRESSURE_RECHECK_SECONDS = 1.0
+#: 还有 pending 但暂时没有定时事件时的最小再检查间隔（秒）。
+_MIN_PENDING_RECHECK_SECONDS = 0.25
 #: 辅助 map 的容量兜底：观测用的"最近成功"只保留这么多群（其余是历史噪声）。
 _METRICS_LAST_SUCCESS_LIMIT = 200
 #: 旧摘要失效（覆盖范围内原文被删）时的重建标记：水位可以回退，但版本 CAS 仍然生效。
@@ -276,6 +281,8 @@ class PublishedSummary:
     covered_through_id: int = 0
     covered_count: int = 0
     source_truncated: bool = False
+    #: 生成时的归档内容版本；``-1`` = 本特性之前的旧摘要（无保护数据）→ 视为失效。
+    source_revision: int = -1
     generated_at: datetime | None = None
 
     @property
@@ -392,8 +399,22 @@ class SqlGroupSummaryStore:
             covered_through_id=int(row.covered_through_id or 0),
             covered_count=int(row.covered_count or 0),
             source_truncated=bool(row.source_truncated),
+            source_revision=int(row.source_revision if row.source_revision is not None else -1),
             generated_at=row.generated_at,
         )
+
+    async def content_revision(self, group_id: int) -> int:
+        """这个群的归档**内容变更**计数（没有变更过/没有行 → 0）。一次主键读。"""
+
+        async with self._session_factory() as session:
+            value = (
+                await session.execute(
+                    select(GroupArchiveState.content_revision).where(
+                        GroupArchiveState.group_id == int(group_id)
+                    )
+                )
+            ).scalar_one_or_none()
+        return int(value or 0)
 
     async def pending_count(
         self,
@@ -429,24 +450,60 @@ class SqlGroupSummaryStore:
         covered_from_id: int,
         covered_through_id: int,
         covered_count: int,
+        source_revision: int | None = None,
     ) -> bool:
-        """覆盖范围内的归档行是否还在（防"用旧摘要复活已删除内容"）。
+        """覆盖范围是否还是原样。
 
-        被审核删除 / 过期清理 / 隐私删除都会让覆盖范围内的行数变少；一旦变少，摘要就
-        视为**失效**（前台不注入、等下次重新生成），而不是拿旧摘要把删掉的内容重新说出来。
-        一次带索引的 COUNT，在有界范围内。
+        两道判据：
+
+        * 行数：区间内现存行数不得少于 ``covered_count``（能挡住普通删除）；
+        * **内容版本**：``source_revision`` 给了就要求当前版本等于它（worker 用它做
+          "生成期间源没变"的发布前确认）；没给、且调用描述的正是已发布摘要自己的范围时
+          （探测/前台都这么用），要求记录的版本等于当前版本——原地编辑（行数不变）与
+          任何删除都会被数据库触发器计进版本，这一条能把"COUNT 看不见"的情况挡住。
+          描述别的范围又没给期望版本时只做行数判据（避免误判）。
         """
 
-        if covered_through_id <= 0 or covered_count <= 0:
-            return True
         async with self._session_factory() as session:
-            statement = select(func.count(GroupMessageArchive.id)).where(
-                GroupMessageArchive.group_id == int(group_id),
-                GroupMessageArchive.id >= int(covered_from_id),
-                GroupMessageArchive.id <= int(covered_through_id),
+            present = int(
+                (
+                    await session.execute(
+                        select(func.count(GroupMessageArchive.id)).where(
+                            GroupMessageArchive.group_id == int(group_id),
+                            GroupMessageArchive.id >= int(covered_from_id),
+                            GroupMessageArchive.id <= int(covered_through_id),
+                        )
+                    )
+                ).scalar_one()
+                or 0
             )
-            remaining = int((await session.execute(statement)).scalar_one() or 0)
-        return remaining >= int(covered_count)
+            if present < int(covered_count):
+                return False
+            current_revision = int(
+                (
+                    await session.execute(
+                        select(GroupArchiveState.content_revision).where(
+                            GroupArchiveState.group_id == int(group_id)
+                        )
+                    )
+                ).scalar_one_or_none()
+                or 0
+            )
+            if source_revision is not None:
+                return current_revision == int(source_revision)
+            record_revision = (
+                await session.execute(
+                    select(GroupSummary.source_revision).where(
+                        GroupSummary.group_id == int(group_id)
+                    )
+                )
+            ).scalar_one_or_none()
+            if record_revision is None:
+                return True
+        # 归档内容版本是**每群**的：只要有一份已发布摘要，任何内容改动/删除都会让它的
+        # 来源承诺不再成立（宁可保守判失效）。调用方想核对"生成时刻版本"时用
+        # ``source_revision=`` 显式给出（worker 走这条路）。
+        return int(record_revision) == current_revision
 
     async def read_snapshot(
         self,
@@ -520,6 +577,7 @@ class SqlGroupSummaryStore:
         covered_through_id: int = 0,
         allow_watermark_rewind: bool = False,
         reset_coverage: bool = False,
+        expected_source_revision: int | None = None,
     ) -> PublishedSummary | None:
         """原子发布（条件 UPDATE / INSERT，**真正的 CAS**）。
 
@@ -530,6 +588,9 @@ class SqlGroupSummaryStore:
         * 行不存在时走 INSERT（主键唯一冲突 = 别人先发布 → 返回 ``None``）；
         * ``allow_watermark_rewind=True`` 只用于"旧摘要已被删除而失效、需要重建"：
           水位可以回退，但**版本条件仍然生效**（迟到任务不能覆盖重建结果）。
+        * ``expected_source_revision``（归档**内容变更**计数）作为**同一句 SQL 里的条件**
+          （标量子查询）：生成期间原文被改/被删 → 条件不成立 → rowcount=0 → 不发布。
+          这是"守卫与发布之间没有 TOCTOU"的保证，不是"生成前后各查一次"。
         """
 
         normalized = (summary or "").strip()
@@ -539,7 +600,36 @@ class SqlGroupSummaryStore:
         new_through = int(covered_through_id or 0)
         new_count = max(0, int(covered_count or 0))
         now = now_shanghai_naive()
+        revision_subquery = (
+            select(GroupArchiveState.content_revision)
+            .where(GroupArchiveState.group_id == gid)
+            .scalar_subquery()
+        )
         async with self._session_factory() as session:
+            guard_revision = expected_source_revision
+            if guard_revision is None:
+                # 调用方没有给"生成时刻"的版本。默认用**已发布记录自己的**版本当条件：
+                # 只要已经有一份受保护的摘要，任何源改/删之后都不能再"直接发布"覆盖它
+                # （无保护数据的旧摘要 -1 例外：那是重建场景，用当前版本）。
+                # 条件仍在同一条 SQL 里（标量子查询），不存在 TOCTOU。
+                existing_row = await session.get(GroupSummary, gid)
+                existing_revision = (
+                    int(existing_row.source_revision)
+                    if existing_row is not None
+                    and existing_row.source_revision is not None
+                    else -1
+                )
+                if existing_revision >= 0:
+                    guard_revision = existing_revision
+                else:
+                    guard_revision = int(
+                        (
+                            await session.execute(
+                                select(func.coalesce(revision_subquery, 0))
+                            )
+                        ).scalar_one()
+                        or 0
+                    )
             statement = (
                 update(GroupSummary)
                 .where(
@@ -601,56 +691,128 @@ class SqlGroupSummaryStore:
                         )
                     ),
                     prompt_version=GROUP_SUMMARY_PROMPT_VERSION,
+                    source_revision=func.coalesce(revision_subquery, 0),
                     generated_at=now,
                 )
+            )
+            statement = statement.where(
+                func.coalesce(revision_subquery, 0) == int(guard_revision)
             )
             if not allow_watermark_rewind and new_through > 0:
                 # 水位必须前进（首次发布时现有水位为 0，条件天然成立）。
                 statement = statement.where(GroupSummary.covered_through_id < new_through)
             result = await session.execute(statement)
             if int(getattr(result, "rowcount", 0) or 0) != 1:
-                # 行还不存在 → 首次发布走 INSERT；主键冲突说明并发者已插入。
+                existing = await session.get(GroupSummary, gid)
+                if existing is not None:
+                    # 行存在但条件不成立：版本/水位/来源版本已变 → 迟到或不安全，丢弃。
+                    await session.rollback()
+                    return None
                 if int(expected_version) != 0:
                     await session.rollback()
                     return None
+                # 行不存在 → 首次发布；用**条件 INSERT ... SELECT** 把来源版本守卫
+                # 放进同一句 SQL（并发修改在语句原子性下定胜负，不存在 check→insert 竞态）。
+                insert_source = select(
+                    literal(gid),
+                    literal(normalized),
+                    literal(1),
+                    literal(int(covered_from_id or 0)),
+                    literal(new_through),
+                    literal(str(covered_from_key or "")),
+                    literal(str(covered_through_key or "")),
+                    literal(new_count),
+                    literal(bool(source_truncated)),
+                    literal(GROUP_SUMMARY_PROMPT_VERSION),
+                    literal(int(guard_revision)),
+                    literal(now),
+                )
+                insert_source = insert_source.where(
+                    func.coalesce(revision_subquery, 0) == int(guard_revision)
+                )
                 try:
-                    session.add(
-                        GroupSummary(
-                            group_id=gid,
-                            summary=normalized,
-                            version=1,
-                            covered_from_id=int(covered_from_id or 0),
-                            covered_through_id=new_through,
-                            covered_from_key=str(covered_from_key or ""),
-                            covered_through_key=str(covered_through_key or ""),
-                            covered_count=new_count,
-                            source_truncated=bool(source_truncated),
-                            prompt_version=GROUP_SUMMARY_PROMPT_VERSION,
-                            generated_at=now,
+                    inserted = await session.execute(
+                        insert(GroupSummary).from_select(
+                            [
+                                "group_id",
+                                "summary",
+                                "version",
+                                "covered_from_id",
+                                "covered_through_id",
+                                "covered_from_key",
+                                "covered_through_key",
+                                "covered_count",
+                                "source_truncated",
+                                "prompt_version",
+                                "source_revision",
+                                "generated_at",
+                            ],
+                            insert_source,
                         )
                     )
+                    if int(getattr(inserted, "rowcount", 0) or 0) != 1:
+                        await session.rollback()
+                        return None
                     await session.commit()
-                except IntegrityError:
+                except IntegrityError as exc:
                     await session.rollback()
-                    return None
-                row = await session.get(GroupSummary, gid)
+                    if _is_unique_violation(exc):
+                        # 并发者已经插入 → 记 stale，不静默其它数据库错误。
+                        return None
+                    raise
             else:
                 await session.commit()
-                row = await session.get(GroupSummary, gid)
-        if row is None:
-            return None
-        return PublishedSummary(
-            group_id=gid,
-            summary=str(row.summary or ""),
-            version=int(row.version or 0),
-            covered_from_key=str(row.covered_from_key or ""),
-            covered_through_key=str(row.covered_through_key or ""),
-            covered_from_id=int(row.covered_from_id or 0),
-            covered_through_id=int(row.covered_through_id or 0),
-            covered_count=int(row.covered_count or 0),
-            source_truncated=bool(row.source_truncated),
-            generated_at=row.generated_at,
+            # 显式按列回读（不要用可能已过期的 ORM 实例：commit 之后属性访问会触发
+            # 惰性 IO，在异步会话里会抛 MissingGreenlet）。
+            snapshot = (
+                await session.execute(
+                    select(
+                        GroupSummary.summary,
+                        GroupSummary.version,
+                        GroupSummary.covered_from_key,
+                        GroupSummary.covered_through_key,
+                        GroupSummary.covered_from_id,
+                        GroupSummary.covered_through_id,
+                        GroupSummary.covered_count,
+                        GroupSummary.source_truncated,
+                        GroupSummary.source_revision,
+                        GroupSummary.generated_at,
+                    ).where(GroupSummary.group_id == gid)
+                )
+            ).first()
+            if snapshot is None:
+                return None
+            return PublishedSummary(
+                group_id=gid,
+                summary=str(snapshot[0] or ""),
+                version=int(snapshot[1] or 0),
+                covered_from_key=str(snapshot[2] or ""),
+                covered_through_key=str(snapshot[3] or ""),
+                covered_from_id=int(snapshot[4] or 0),
+                covered_through_id=int(snapshot[5] or 0),
+                covered_count=int(snapshot[6] or 0),
+                source_truncated=bool(snapshot[7]),
+                source_revision=int(snapshot[8] if snapshot[8] is not None else -1),
+                generated_at=snapshot[9],
+            )
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """区分"唯一键/主键竞争"与其它 IntegrityError（外键等必须上抛，不静默）。"""
+
+    text_value = " ".join(
+        str(part or "").lower()
+        for part in (
+            getattr(exc, "orig", None),
+            exc,
         )
+    )
+    return (
+        "unique constraint" in text_value
+        or "unique index" in text_value
+        or "primary key" in text_value
+        or "duplicate" in text_value
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +973,8 @@ class GroupSummaryMetrics:
     queue_full_total: int = 0
     queue_expired_total: int = 0
     deadline_exceeded_total: int = 0
+    source_changed_total: int = 0
+    admission_timeout_total: int = 0
     success_total: int = 0
     failure_total: int = 0
     skipped_not_ready_total: int = 0
@@ -828,6 +992,8 @@ class GroupSummaryMetrics:
             "queue_full_total": self.queue_full_total,
             "queue_expired_total": self.queue_expired_total,
             "deadline_exceeded_total": self.deadline_exceeded_total,
+            "source_changed_total": self.source_changed_total,
+            "admission_timeout_total": self.admission_timeout_total,
             "success_total": self.success_total,
             "failure_total": self.failure_total,
             "skipped_not_ready_total": self.skipped_not_ready_total,
@@ -875,10 +1041,17 @@ class GroupSummaryScheduler:
         self._clock = clock
         self._sleep = sleep
         self._concurrency_clamp_logged = 0
+        #: 回复压力（普通回复在等入场）期间的有界再检查时刻：压力期间不把时间算成
+        #: "摘要的入场等待"，压力解除后自动继续。
+        self._reply_pressure_until = 0.0
         # 只在模型入口真的接受 ``max_tokens`` 时才传（测试替身/旧实现保持兼容）。
         self._summary_accepts_max_tokens = _accepts_keyword(
             getattr(llm, "background_summary_completion", None),
             "max_tokens",
+        )
+        self._summary_accepts_permit = _accepts_keyword(
+            getattr(llm, "background_summary_completion", None),
+            "permit",
         )
 
         self._pending: dict[int, _PendingGroup] = {}
@@ -980,6 +1153,8 @@ class GroupSummaryScheduler:
 
         now = self._clock()
         waits: list[float] = []
+        if self._reply_pressure_until > now:
+            waits.append(self._reply_pressure_until - now)
         for pending in self._pending.values():
             if pending.claimed:
                 continue
@@ -989,8 +1164,12 @@ class GroupSummaryScheduler:
                 )
             if pending.ready_at > now:
                 waits.append(pending.ready_at - now)
+        has_pending = any(not pending.claimed for pending in self._pending.values())
         waits = [value for value in waits if value > 0.0]
         if not waits:
+            if has_pending:
+                # 还有等待中的群（例如回复压力刚结束）→ 给一个有界再检查，绝不让它睡死。
+                return _MIN_PENDING_RECHECK_SECONDS
             return None
         return min(min(waits), max(1.0, cfg.retry_poll_seconds))
 
@@ -1103,10 +1282,24 @@ class GroupSummaryScheduler:
 
         now = self._clock()
         if self._slot_waiter is not None and self._slot_waiter():
-            # 普通回复正在排队等入场：这一次不claim新摘要（回复优先）。
+            # 普通回复正在排队等入场：这一次不 claim 新摘要（回复优先）。
+            # 关键：这段等待**不是摘要的入场等待**——把所有 pending 的入场计时重置到
+            # "现在"（否则回复压力一旦超过 queue_wait，摘要会被误判 queue_expired 并退避），
+            # 同时安排一个有界的再检查时刻，压力解除后自动继续（不忙循环、不靠新通知）。
             if self._order:
                 self.metrics.skipped_reply_waiting_total += 1
+            for pending in self._pending.values():
+                if pending.dirty_since is not None:
+                    pending.dirty_since = now
+            self._reply_pressure_until = now + _REPLY_PRESSURE_RECHECK_SECONDS
             return None
+        if self._reply_pressure_until:
+            # 压力刚解除：入场计时从"现在"重新开始 —— 压力期间的时间不算入场等待，
+            # 所以"压力 > queue_wait 之后恢复"也不会被判 queue_expired / 无端退避。
+            for pending in self._pending.values():
+                if pending.dirty_since is not None:
+                    pending.dirty_since = now
+            self._reply_pressure_until = 0.0
         attempts = len(self._order)
         for _ in range(attempts):
             if not self._order:
@@ -1208,14 +1401,39 @@ class GroupSummaryScheduler:
     async def _run_group_inner(self, group_id: int, cfg: GroupSummaryConfig) -> str:
         gid = int(group_id)
         intact_fn = getattr(self._store, "coverage_intact", None)
+        revision_fn = getattr(self._store, "content_revision", None)
+        # "生成时刻"的归档内容版本：既用来判断旧摘要是否还可用，也会被带进**发布语句的
+        # 条件**里，所以生成期间任何编辑/删除（更早批次、被快照跳过的行都算）都会让发布失败。
+        source_revision = int(await revision_fn(gid)) if callable(revision_fn) else None
         previous = await self._store.load(gid)
 
-        # 旧摘要的覆盖必须**现在**仍然完整；失效（原文被删/编辑）时绝不把它的正文
-        # 带进提示词——否则会把已删除内容重新合并回摘要里。失效即从零重建。
+        # 旧摘要的覆盖必须**现在**仍然可用；失效（原文被删/被编辑/无保护数据）时绝不把它
+        # 的正文带进提示词——否则会把已删除或已改掉的内容重新合并回摘要里。失效即从零重建。
         previous_valid = False
         if previous is not None and previous.usable:
             previous_valid = True
-            if callable(intact_fn):
+            if int(previous.source_revision) < 0:
+                previous_valid = False
+                log.warning(
+                    "group summary rebuild: previous summary has no source protection | "
+                    "group=%s | version=%s",
+                    gid,
+                    previous.version,
+                )
+            elif (
+                source_revision is not None
+                and int(previous.source_revision) != int(source_revision)
+            ):
+                previous_valid = False
+                log.warning(
+                    "group summary rebuild: archive content changed | group=%s | "
+                    "version=%s | revision=%s->%s",
+                    gid,
+                    previous.version,
+                    previous.source_revision,
+                    source_revision,
+                )
+            elif callable(intact_fn):
                 previous_valid = bool(
                     await intact_fn(
                         gid,
@@ -1270,19 +1488,43 @@ class GroupSummaryScheduler:
             self.metrics.skipped_not_ready_total += 1
             return "no_messages"
 
+        # 有界入场：只在**拿到许可前**等待，且等待时间归 queue_wait，不占执行期限。
+        permit = None
+        gate = self._gate
+        if gate is not None:
+            admission_budget = max(0.05, float(cfg.queue_wait_seconds))
+            try:
+                permit = await gate.acquire_permit(
+                    priority=ExecutionPriority.BACKGROUND,
+                    timeout=admission_budget,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                self.metrics.admission_timeout_total += 1
+                pending_state = self._pending.get(gid)
+                if pending_state is not None:
+                    pending_state.requeue = True
+                log.info(
+                    "group summary admission timed out | group=%s | waited=%.2fs",
+                    gid,
+                    admission_budget,
+                )
+                return "admission_timeout"
+
         self.metrics.claimed_total += 1
         self._note_model_concurrency(+1, cfg)
         try:
             # 整体硬超时：入场后模型调用 + fallback + 重试合计不超过 deadline。
             # 输出上限走 **API max_tokens**（不是只靠事后截断）。
             async with asyncio.timeout(cfg.deadline_seconds) as deadline:
+                call_kwargs: dict[str, Any] = {}
                 if self._summary_accepts_max_tokens:
-                    raw = await self._llm.background_summary_completion(
-                        messages,
-                        max_tokens=cfg.max_summary_tokens,
-                    )
-                else:
-                    raw = await self._llm.background_summary_completion(messages)
+                    call_kwargs["max_tokens"] = cfg.max_summary_tokens
+                if self._summary_accepts_permit and permit is not None:
+                    call_kwargs["permit"] = permit
+                raw = await self._llm.background_summary_completion(
+                    messages,
+                    **call_kwargs,
+                )
             # A client may swallow cancellation and return a late value.
             if deadline.expired():
                 raise TimeoutError
@@ -1304,6 +1546,10 @@ class GroupSummaryScheduler:
             return "failure"
         finally:
             self._note_model_concurrency(-1, cfg)
+            if permit is not None:
+                # 许可若已被下游请求任务接手，由它释放（取消不合作也不提前归还）；
+                # 没人接手（早退/异常）才由这里归还。
+                permit.release_unconsumed()
 
         body = str(raw or "")
         valid, reason = is_valid_summary_output(body, group_id=gid)
@@ -1331,6 +1577,7 @@ class GroupSummaryScheduler:
                     covered_from_id=covered_from,
                     covered_through_id=covered_through,
                     covered_count=len(covered_ids),
+                    source_revision=source_revision,
                 )
             )
             if not still_intact:
@@ -1354,9 +1601,19 @@ class GroupSummaryScheduler:
             covered_through_id=covered_through,
             allow_watermark_rewind=rebuilding,
             reset_coverage=rebuilding,
+            expected_source_revision=source_revision,
         )
         if published is None:
-            # 迟到任务：期间已经有更新的摘要发布，直接丢弃（不覆盖）。
+            # 发布被拒：区分"来源在生成期间变了"（需要重建）与"只是迟到"（有更新的版本）。
+            if callable(revision_fn) and source_revision is not None:
+                if int(await revision_fn(gid)) != int(source_revision):
+                    self.metrics.failure_total += 1
+                    self.metrics.source_changed_total += 1
+                    log.warning(
+                        "group summary source changed during generation | group=%s",
+                        gid,
+                    )
+                    return "source_changed"
             log.info("group summary publish skipped (stale) | group=%s", gid)
             return "stale"
 
@@ -1475,6 +1732,7 @@ class GroupSummaryScheduler:
             "gate_background_capacity": self._gate_background_capacity(),
             "per_group_concurrency": cfg.per_group_concurrency,
             "backoff_groups": len(self._backoff_until),
+            "reply_pressure_pending": self._reply_pressure_until > self._clock(),
             "next_retry_in_seconds": (
                 round(max(0.0, (self.next_retry_at() or now) - now), 3)
                 if self._backoff_until

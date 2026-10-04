@@ -635,6 +635,9 @@ async def main() -> None:
                 ExecutionPriority.NORMAL
             ),
             background_capacity=lambda: _LLM_PRIORITY_GATE.background_capacity,
+            # 有界入场等待由调度器做（归 queue_wait），拿到许可后交给请求任务；
+            # 模型/重试/fallback 才算执行期限。用的就是同一个门禁对象。
+            gate=_LLM_PRIORITY_GATE,
         )
         if callable(summary_store_factory)
         else None

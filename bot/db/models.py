@@ -73,6 +73,30 @@ class GroupContextSummary(Base):
     group: Mapped[Group] = relationship(back_populates="context_summary")
 
 
+class GroupArchiveState(Base):
+    """归档**内容变更**的单调计数器（摘要来源完整性保护的唯一依据）。
+
+    只在"已归档内容被**修改或删除**"时 +1；**新消息插入不动它**（否则每条新消息都会让
+    已覆盖的摘要失效）。一次主键读写即可判定"摘要覆盖的来源是否还是原样"，不需要在
+    回复/审核热路径里遍历或哈希整个归档。
+
+    与发布同事务：摘要发布用这个计数器做 SQL 条件（标量子查询），所以"生成期间删改"
+    不可能被带进新摘要，也不存在 check→publish 的 TOCTOU。
+    """
+
+    __tablename__ = "group_archive_state"
+
+    # 刻意**不设**外键：归档行可以存在于没有 ``groups`` 行的群（维护/导入场景），
+    # 计数器必须对这些群同样可写，否则删除/编辑会因为 FK 失败而绕过保护。
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    content_revision: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GroupSummary(Base):
     """后台群摘要（2026-10-04 第②项）：只加不改，与旧的热历史压缩完全独立。
 
@@ -100,6 +124,9 @@ class GroupSummary(Base):
     #: 源在被截断时不许声称"完整原文"（前台据此加免责声明）。
     source_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
     prompt_version: Mapped[str] = mapped_column(String(32), default="")
+    #: 生成这份摘要时的 :class:`GroupArchiveState` 计数；``-1`` = 没有保护数据
+    #: （本特性之前发布的旧摘要）→ 前台按"失效"处理，由 worker 重建。
+    source_revision: Mapped[int] = mapped_column(Integer, default=-1)
     generated_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,

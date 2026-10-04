@@ -143,7 +143,35 @@ system/人设 + 工具定义 + 记忆召回 + 检索留档 + 群/私聊历史 + 
 * 发布是**原子 CAS**（`version` + 覆盖水位 `covered_through_id`）：迟到任务不得覆盖更新的
   摘要；源被截断时标注 `source_truncated`，前台渲染明确"**不是**完整原文"。
 
-## 机制保证（2026-10-04 收口）
+## 机制保证（2026-10-04 第二轮收口）
+
+* **来源内容版本（真实失效保护）**：新增 `group_archive_state.content_revision`，只在归档内容
+  **被修改或删除**时 +1（新消息插入不动）。SQLite 用**数据库触发器**维护
+  （`init_db` 幂等安装，冷启动老库同样生效）：
+  * `trg_archive_revision_on_update`：`WHEN OLD.content IS NOT NEW.content OR
+    OLD.raw_text IS NOT NEW.raw_text` → 原地编辑 +1（只改 `access_count`/`last_accessed`
+    的召回访问计数不算内容变更）；
+  * `trg_archive_revision_on_delete`：任何删除 +1。
+  触发器覆盖**任何写入方**：批量 upsert、ORM fallback、`archive_message`、全部
+  prune/retention/删除入口、维护脚本乃至人工 SQL——不依赖应用层记得调用。其它方言没有
+  触发器，由写入路径显式 +1（批量 upsert 先按本批 key 查旧正文，正文真的变了才 +1；
+  ORM fallback 用"是否真的改了"判断；删除入口按受影响群 +1）。
+  前台注入前比一次"摘要记录里的 `source_revision` == 当前计数"（一次主键读）；**旧摘要**
+  （本特性之前发布、没有保护数据，`source_revision = -1`）一律按失效处理 → worker 重建。
+  原地编辑（id 与行数都不变）、被快照跳过的空行、被预算截断的行，删改都会失效——不再依赖
+  区间 COUNT。
+* **守卫与发布同一句 SQL**：`publish` 的 `UPDATE`/条件 `INSERT ... SELECT` 里带
+  `coalesce((SELECT content_revision ...), 0) = :生成时刻版本`。生成期间任何改/删 → rowcount=0
+  → 不发布（`source_changed`），没有 check→publish 的 TOCTOU；唯一键竞争记 stale，
+  **外键等其它 IntegrityError 照常上抛**。
+* **入场与执行期限分离**：调度器先用 `gate.acquire_permit(BACKGROUND, timeout=queue_wait)`
+  做**有界入场**（超时 → `admission_timeout`，不算执行超时、不占失败退避），拿到许可后交给
+  LLM 的**实际请求任务**（`permit.consume()`/`release()`，取消不合作也不提前归还），
+  模型/重试/fallback 才计入 `deadline_seconds`；同一路径不会二次 acquire（背景 2/2 全占时
+  仍能完成）。边界不变：总 8 / normal 4 / background 2 / HIGH-CRITICAL 保留。
+* **回复压力不算入场等待**：`slot_waiter` 为真时重置所有 pending 的入场计时并安排有界唤醒
+  （≤1s），压力解除后计时从"现在"重新开始 → 压力超过 `queue_wait` 也不会被判 `queue_expired`
+  或无端退避，且**不需要新通知**就能自动继续；`_next_wake_in` 不再把 0 过滤成 None。
 
 * **真正的原子发布**：`UPDATE ... WHERE group_id=? AND version=? AND covered_through_id<?`
   （版本与水位条件都在 SQL 里）+ 行不存在时 `INSERT`（主键唯一冲突即失败）；`session.get`

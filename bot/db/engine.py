@@ -273,6 +273,47 @@ async def _sqlite_ensure_column(conn, table: str, column: str, column_def_sql: s
     return True
 
 
+#: 归档内容版本触发器：任何**修改正文或删除**都必须让计数 +1，插入不动。
+#:
+#: 放在数据库层（而不是只在 Python 写入路径里 +1）是因为"原地编辑"可能来自任何
+#: 连接：批量 upsert、ORM fallback、维护脚本、甚至人工 SQL。COUNT 口径看不见原地编辑，
+#: 只有写路径全覆盖的计数器才能低成本、无遗漏地回答"摘要覆盖的原文还是原样吗"。
+_SQLITE_ARCHIVE_REVISION_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_archive_revision_on_update
+    AFTER UPDATE ON group_message_archive
+    FOR EACH ROW
+    WHEN OLD.content IS NOT NEW.content OR OLD.raw_text IS NOT NEW.raw_text
+    BEGIN
+        INSERT INTO group_archive_state (group_id, content_revision, updated_at)
+        VALUES (OLD.group_id, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(group_id) DO UPDATE SET
+            content_revision = content_revision + 1,
+            updated_at = CURRENT_TIMESTAMP;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_archive_revision_on_delete
+    AFTER DELETE ON group_message_archive
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO group_archive_state (group_id, content_revision, updated_at)
+        VALUES (OLD.group_id, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT(group_id) DO UPDATE SET
+            content_revision = content_revision + 1,
+            updated_at = CURRENT_TIMESTAMP;
+    END
+    """,
+)
+
+
+async def _sqlite_install_archive_revision_triggers(conn) -> None:
+    """安装/刷新归档内容版本触发器（幂等；老库冷启动也会执行）。"""
+
+    for statement in _SQLITE_ARCHIVE_REVISION_TRIGGERS:
+        await conn.execute(text(statement))
+
+
 async def _sqlite_get_user_version(conn) -> int:
     result = await conn.execute(text("PRAGMA user_version"))
     row = result.first()
@@ -1893,6 +1934,16 @@ async def init_db(
             if await _sqlite_table_exists(conn, "telegram_delete_jobs"):
                 await _sqlite_migrate_telegram_delete_jobs(conn)
         await conn.run_sync(Base.metadata.create_all)
+        if is_sqlite:
+            # 老库（已建过 group_summaries 的部署）补保护字段：默认 -1 = "无保护数据"，
+            # 前台据此把旧摘要判失效并重建，绝不沿用没有来源保护的摘要。
+            await _sqlite_ensure_column(
+                conn,
+                "group_summaries",
+                "source_revision",
+                "source_revision INTEGER NOT NULL DEFAULT -1",
+            )
+            await _sqlite_install_archive_revision_triggers(conn)
         if is_sqlite:
             await _sqlite_ensure_column(
                 conn,
