@@ -1030,7 +1030,8 @@ class GroupSummaryScheduler:
     * **每群合并**：同一个群多次 ``notify`` 只保留一份 pending 状态（``merged`` 计数）；
     * **有界队列**：超过 ``pending_capacity`` 时本次跳过并计数，绝不留下无界 dict/task；
     * **排队过期**：等待超过 ``queue_wait_seconds`` 的任务直接丢弃并计数（不调用模型）；
-    * **执行硬超时**：入场后（含 fallback 与重试）整体 ``deadline_seconds``；
+    * **执行硬超时**：``run_group`` 入口起、入场准备 + 模型调用（含 fallback 与重试）
+      + 发布在内，整体不超过 ``deadline_seconds``（B-24：原先它只包住模型调用）；
     * **回复优先**：主门禁有 NORMAL 在排队时不再claim新摘要；
     * **迟到不发布**：发布走版本 CAS；取消/超时后不再触碰 DB。
     """
@@ -1398,9 +1399,31 @@ class GroupSummaryScheduler:
         outcome = "skipped"
         try:
             try:
-                outcome = await self._run_group_inner(gid, cfg)
+                # B-24：硬超时上移到**任务入口**，覆盖整条链路——原先它只包住
+                # ``background_summary_completion`` 一个调用，前置的
+                # content_revision / load / coverage_intact / pending_count /
+                # read_snapshot 与后置的 publish 全部在 timeout 之外。DB 一卡，
+                # 任务可以远超 deadline_seconds 仍占着执行槽（``_pump`` 的并发判定
+                # 看的就是 ``_running``），整条摘要流水线随之停摆。
+                #
+                # 口径不变：``deadline_seconds`` 仍是「入场准备 + 模型调用 + 发布」
+                # 的**总**预算（docstring 早就这么写的），只是现在名副其实了。
+                # 模型调用内部仍保留它自己的 ``asyncio.timeout``（那一次会先命中，
+                # 走既有的 ``deadline_exceeded`` 分支）。
+                async with asyncio.timeout(cfg.deadline_seconds):
+                    outcome = await self._run_group_inner(gid, cfg)
             except asyncio.CancelledError:
                 raise
+            except (TimeoutError, asyncio.TimeoutError):
+                self.metrics.deadline_exceeded_total += 1
+                self.metrics.failure_total += 1
+                self._register_failure(gid, cfg)
+                log.warning(
+                    "group summary deadline exceeded | group=%s | deadline=%.2fs",
+                    gid,
+                    float(cfg.deadline_seconds),
+                )
+                outcome = "deadline_exceeded"
             except Exception:
                 self.metrics.failure_total += 1
                 self._register_failure(gid, cfg)
@@ -1542,7 +1565,15 @@ class GroupSummaryScheduler:
         permit = None
         gate = self._gate
         if gate is not None:
-            admission_budget = max(0.05, float(cfg.queue_wait_seconds))
+            # B-23：``queue_wait_seconds`` 是**整个入场等待**的预算，而 ``dirty_since``
+            # 在 ``_claim_next`` 里已经计过一次入场时间（并做过一次过期判定）。这里
+            # 再给满额就等于把同一份预算花两遍：中间还夹着 read_snapshot /
+            # fit_summary_prompt。方向是「剩余预算」，且不短于 50ms。
+            waited = 0.0
+            pending_now = self._pending.get(gid)
+            if pending_now is not None and pending_now.dirty_since is not None:
+                waited = max(0.0, self._clock() - pending_now.dirty_since)
+            admission_budget = max(0.05, float(cfg.queue_wait_seconds) - waited)
             try:
                 permit = await gate.acquire_permit(
                     priority=ExecutionPriority.BACKGROUND,
