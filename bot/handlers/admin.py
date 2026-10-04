@@ -4074,7 +4074,30 @@ async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) 
             created_by=(message.from_user.id if message.from_user else 0),
         )
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # D3-45：``reply_mutes`` 上有 ix_reply_mute_group_user 唯一索引，而上面
+        # 的 SELECT 不进 SQLiteSafeAsyncSession 的写锁（锁在 flush/commit 才拿）。
+        # 两个管理员（或同一管理员双击）同时对同一用户 /mute 时，两条协程的 SELECT
+        # 都会在对方 INSERT 之前完成，后提交者在这里抛 IntegrityError——异常直接
+        # 逃出 handler，:4078 的 _answer 永不执行，管理员**完全无反馈**，只剩一条
+        # 未处理异常栈；用户其实已被先提交者静默。
+        # 语义与 :4059 的「已在静默名单」分支一致：回滚后按已存在处理。
+        await session.rollback()
+        log.info(
+            "reply mute already recorded by a concurrent /mute | group=%s user=%s",
+            group_id,
+            target.id,
+        )
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 已在静默名单",
+        )
+        return
     await _answer(
         message,
         settings,
