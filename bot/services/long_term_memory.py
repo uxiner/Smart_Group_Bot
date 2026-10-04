@@ -1206,7 +1206,14 @@ def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
             parsed = None
         if isinstance(parsed, list):
             return [item for item in parsed if isinstance(item, dict)]
-    salvaged = _salvage_fact_objects(body)
+    # 抢救出来的对象必须**真的像一条事实**（带非空 fact 字符串）：否则「模型回了一段
+    # 带花括号的解释文本」（例如 `抱歉，我无法输出 JSON。{}`）会被当成解析成功，
+    # 于是游标前移、整批静默跳过——那正是最该避免的方向。
+    salvaged = [
+        item
+        for item in _salvage_fact_objects(body)
+        if isinstance(item.get("fact"), str) and item["fact"].strip()
+    ]
     return salvaged or None
 
 
