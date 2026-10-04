@@ -716,9 +716,17 @@ async def record_fact(
       「再次确认」的 ``confidence`` 也改成 SQL 原子表达式，避免并发丢掉一次 bump。
     """
 
-    # D3-06(b)：入口先判断「这笔事务是不是我们自己的」。
+    # D3-06(b)：先判断「这笔事务是不是我们自己的」。SAVEPOINT **懒开**——只在真正
+    # 动笔之前开：入口处的若干条早退（参数非法 / 空事实 / 敏感 / 已 opt-out）全是纯校验，
+    # 不该在调用方的事务里留下一个空嵌套层。
     owns_transaction = not _in_transaction(session)
-    savepoint = None if owns_transaction else await _begin_savepoint(session)
+    savepoint: Any | None = None
+
+    async def _ensure_savepoint() -> None:
+        nonlocal savepoint
+        if not owns_transaction and savepoint is None:
+            savepoint = await _begin_savepoint(session)
+
     normalized_scope = normalize_scope(scope)
     try:
         sid = int(scope_id)
@@ -813,6 +821,7 @@ async def record_fact(
                 )
                 await session.commit()
                 return 0
+            await _ensure_savepoint()
             await session.execute(
                 update(UserFact)
                 .where(UserFact.id == row_id)
@@ -883,6 +892,7 @@ async def record_fact(
             status=STATUS_ACTIVE,
             created_at=stamp,
         )
+        await _ensure_savepoint()
         session.add(row)
         await session.flush()
         row_id = int(row.id)
