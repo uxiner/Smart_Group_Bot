@@ -970,7 +970,6 @@
             ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
             ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
-            ${toggle("bot.group_can_read_private_history", "允许群聊读取私聊历史", "默认关闭（隐私红线：群→私聊允许，私聊→群默认禁止）。本期只保证关闭时绝不读取，打开后的读取逻辑尚未实现")}
             ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>

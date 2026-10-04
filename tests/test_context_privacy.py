@@ -275,10 +275,18 @@ class PrivateToGroupPrivacyTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_turning_the_switch_on_still_reads_nothing(self) -> None:
-        """本期不实现打开后的读取：开关为 True 也不会有任何私聊正文进群聊。"""
+        """D3-35：那条「开关」已退役——即使 settings 上残留该属性也**恒为 False**。
+
+        以前这是个「可配置、无消费者」的假旋钮：UI 上可点、DB 里可 PUT，但 ``bot/``
+        里零调用方，拨 true 不改变任何行为。现在配置项已从 RuntimeConfig 移除，
+        getter 恒返回 False，方向规则是单向红线。
+        """
 
         settings = _group_settings(group_can_read_private_history=True)
-        self.assertTrue(sm.group_can_read_private_history(settings))
+        self.assertFalse(
+            sm.group_can_read_private_history(settings),
+            "不存在任何能打开群→私聊方向的配置",
+        )
         history = await self._group_history(settings)
         for messages in (history, self._skill_prompt(history), self._casual_prompt(history)):
             gpc.assert_no_private_content(
