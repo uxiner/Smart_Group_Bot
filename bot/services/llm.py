@@ -3022,10 +3022,29 @@ class LLMService:
                 except Exception:
                     pass
                 target = copy
+        candidates = self._chat_candidates(target)
+        if label == "group_summary":
+            # Do not mutate the shared compress/reply/audit route. This request-only
+            # override also follows retries/fallbacks within the summary deadline.
+            candidates = [
+                candidate.model_copy(
+                    update={
+                        "request_params": {
+                            **{
+                                key: value
+                                for key, value in (candidate.request_params or {}).items()
+                                if key != "reasoning_effort"
+                            },
+                            "thinking": {"type": "disabled"},
+                        }
+                    }
+                )
+                for candidate in candidates
+            ]
         with execution_priority_scope(ExecutionPriority.BACKGROUND):
             return await self._chat_with_fallbacks(
                 messages=messages,
-                candidates=self._chat_candidates(target),
+                candidates=candidates,
                 label=label,
                 preview_limit=preview_limit,
                 permit=permit,
