@@ -348,6 +348,70 @@ class PurchaseRefTests(unittest.TestCase):
     def test_same_moment_gives_the_same_stamp(self) -> None:
         self.assertEqual(purchase_stamp(_day()), purchase_stamp(_day()))
 
+    def test_the_production_clock_is_not_the_second_truncated_one(self) -> None:
+        """D2-03：``purchase_stamp`` 的默认时钟必须是不截断微秒的那个。
+
+        旧实现走 :func:`now_shanghai_naive`，它带着 ``.replace(microsecond=0)``，
+        于是毫秒位恒为 ``00``（那一段是死代码），同一秒内的第二笔同款购买会落到
+        同一个 ref，被判成「这笔购买已经处理过了」。
+        """
+
+        precise = _day() + timedelta(milliseconds=250)
+        with patch.object(point_shop, "now_shanghai_naive", return_value=_day()):
+            with patch.object(
+                point_shop, "now_shanghai_naive_precise", return_value=precise
+            ):
+                self.assertEqual(
+                    purchase_stamp(None),
+                    purchase_stamp(precise),
+                    "purchase_stamp(None) 仍在用被抹掉微秒的时钟",
+                )
+
+    def test_the_stamp_keeps_sub_second_resolution(self) -> None:
+        """同一秒内、相差 1 毫秒的两次购买必须拿到不同的 ref。"""
+
+        first = purchase_stamp(_day())
+        second = purchase_stamp(_day() + timedelta(milliseconds=1))
+
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(
+            point_shop.tag_spend_ref(
+                group_id=GROUP_ID, user_id=7, days=7, stamp=first
+            ),
+            point_shop.tag_spend_ref(
+                group_id=GROUP_ID, user_id=7, days=7, stamp=second
+            ),
+        )
+
+    def test_the_stamp_stays_a_pure_function_of_the_moment(self) -> None:
+        """重试同一笔交易必须拿到同一个 ref，否则唯一索引挡不住重复扣分。
+
+        所以 stamp 只能是 ``now`` 的纯函数——不能掺任何进程内计数器。
+        """
+
+        self.assertEqual(purchase_stamp(_day()), purchase_stamp(_day()))
+        self.assertEqual(
+            purchase_stamp(_day() + timedelta(microseconds=7)),
+            purchase_stamp(_day() + timedelta(microseconds=7)),
+        )
+
+    def test_the_stamp_still_fits_the_ref_column(self) -> None:
+        """改成微秒之后，ref 仍然要放得进 String(64)。"""
+
+        stamp = purchase_stamp(_day() + timedelta(microseconds=999999))
+        self.assertLessEqual(
+            len(point_shop.tag_spend_ref(group_id=GROUP_ID, user_id=7, days=7, stamp=stamp)),
+            64,
+        )
+        self.assertLessEqual(
+            len(
+                point_shop.lottery_spend_ref(
+                    group_id=GROUP_ID, user_id=7, day="20261001", stamp=stamp
+                )
+            ),
+            64,
+        )
+
     def test_the_short_and_long_tag_skus_are_different(self) -> None:
         stamp = purchase_stamp(_day())
 
@@ -651,6 +715,45 @@ class TagPurchaseTests(_DbTestCase):
 
         self.assertEqual(reply.status, "ok")
         self.assertEqual(len(bot.tag_calls), 2)
+
+    async def test_two_renewals_in_the_same_second_both_charge(self) -> None:
+        """D2-03 端到端：生产时钟下同一秒内的第二笔 ``/tag`` 不该被当成重投。
+
+        ``_buy_tag`` 传 ``now=`` 时用的是显式时刻，绕开了生产时钟；这里刻意用
+        ``now=None`` 走真实路径。旧实现的毫秒位恒为 ``00``，两笔会落到同一个
+        ref，第二笔得到「这笔购买已经处理过了」——用户没被多扣钱，但续期被静默
+        拒绝，文案还完全误导。
+        """
+
+        await self._grant_points(7, 200)
+        bot = FakeBot()
+
+        async with self.session_factory() as session:
+            first = await buy_member_tag(
+                session,
+                bot=bot,
+                group_id=GROUP_ID,
+                user_id=7,
+                raw_text="Tester",
+                now=None,
+            )
+            second = await buy_member_tag(
+                session,
+                bot=bot,
+                group_id=GROUP_ID,
+                user_id=7,
+                raw_text="Tester",
+                now=None,
+            )
+
+        self.assertEqual(first.status, "ok")
+        self.assertEqual(
+            second.status,
+            "ok",
+            f"同一秒内的第二笔续期被误判成重投：{second.text}",
+        )
+        self.assertEqual(len(await self._spends(7)), 2)
+        self.assertEqual(await self._balance(7), 200 - 2 * TAG_PRICE_7D)
 
     async def test_telegram_failure_refunds_the_points(self) -> None:
         await self._grant_points(7, 100)
@@ -1167,6 +1270,158 @@ class LotteryPurchaseTests(_DbTestCase):
         self.assertFalse(second)
         self.assertEqual(len(await self._spends(7)), 1)
         self.assertEqual(await self._balance(7), 95)
+
+
+# ---------------------------------------------------------------------------
+# D2-04：/draw 每日次数上限必须与扣分在同一条语句里判完
+# ---------------------------------------------------------------------------
+
+
+class LotteryDailyLimitRaceTests(_DbTestCase):
+    """并发 ``/draw`` 不能把 10 次/天的上限撑破。
+
+    旧实现是 check-then-act：``lottery_draws_today()`` 数一次、判 ``< LIMIT``、
+    再 ``spend_points()``，两步之间既没有锁也没有条件写。之前它没被利用只是
+    因为 D2-03——同一秒的请求全塌缩到同一个 ref，只有一笔能扣成功。ref 粒度
+    修好之后，那些请求就全是白送的分（抽奖期望值是净赚 +1.00 分/次）。
+
+    用例把当日次数先推到 ``上限 - 1``，再让若干个请求**同时**发起：它们全都
+    能通过旧的 ``used < LIMIT`` 快速路径，于是竞态窗口是敞开的。
+    """
+
+    async def _draws_just_below_the_limit(self, *, user_id: int = 7) -> None:
+        for index in range(LOTTERY_DAILY_LIMIT - 1):
+            reply = await self._draw(user_id=user_id, now=_ms(index))
+            self.assertEqual(reply.status, "ok", f"预热第 {index + 1} 次应该能抽")
+
+    async def _concurrent_draws(self, count: int) -> list:
+        """count 个已经预热好连接的 session 同时发 /draw。"""
+
+        async with AsyncExitStack() as stack:
+            sessions = []
+            for _ in range(count):
+                session = await stack.enter_async_context(self.session_factory())
+                await available_points(
+                    session, group_id=GROUP_ID, user_id=7
+                )  # 预热连接，避免建连耗时把请求错开
+                sessions.append(session)
+            return await asyncio.gather(
+                *[
+                    play_lottery(
+                        session,
+                        group_id=GROUP_ID,
+                        user_id=7,
+                        # 每次一个不同的毫秒 → ref 不同，唯一索引挡不住重复扣分，
+                        # 能过闸的请求会真的各扣 5 分。
+                        now=_ms(1000 + index),
+                        randbelow=lambda _total, r=0: r,
+                    )
+                    for index, session in enumerate(sessions)
+                ]
+            )
+
+    async def test_concurrent_draws_cannot_exceed_the_daily_limit(self) -> None:
+        await self._grant_points(7, 500)
+        await self._draws_just_below_the_limit()
+
+        replies = await self._concurrent_draws(25)
+
+        charged = [
+            row for row in await self._spends(7) if row.reason == "shop_lottery"
+        ]
+        self.assertEqual(
+            len(charged),
+            LOTTERY_DAILY_LIMIT,
+            f"上限被并发绕过了：{[r.status for r in replies]}",
+        )
+        self.assertEqual([reply.status for reply in replies].count("ok"), 1)
+        self.assertEqual(
+            await self._balance(7), 500 - LOTTERY_DAILY_LIMIT * LOTTERY_PRICE
+        )
+
+    async def test_a_rejected_draw_leaves_no_write_transaction_behind(self) -> None:
+        """被闸门挡下的那次必须把事务收掉，而且不能顺手改余额。
+
+        ``rowcount == 0`` 只说明这一行没插进去，驱动已经为那条 INSERT 发过
+        BEGIN。不显式 rollback 的话，写事务会一直挂在连接上直到调用方关闭
+        session，把并发的其它 /draw 全堵在 SQLite 的 busy_timeout 上——实测
+        25 并发要干等 5s，然后 23 个 ``sqlite write lock timeout after 5.0s``。
+        上面的 :meth:`test_concurrent_draws_cannot_exceed_the_daily_limit` 就是
+        这条的直接回归（``asyncio.gather`` 不吞异常，OperationalError 会让用例红）。
+        """
+
+        await self._grant_points(7, 500)
+        for index in range(LOTTERY_DAILY_LIMIT):
+            await self._draw(now=_ms(index))
+
+        async with self.session_factory() as session:
+            reply = await play_lottery(
+                session,
+                group_id=GROUP_ID,
+                user_id=7,
+                now=_ms(500),
+                randbelow=lambda _total, r=0: r,
+            )
+            self.assertEqual(reply.status, "daily_limit")
+            self.assertEqual(
+                await available_points(session, group_id=GROUP_ID, user_id=7),
+                500 - LOTTERY_DAILY_LIMIT * LOTTERY_PRICE,
+                "被挡下的这次不能顺手改余额",
+            )
+            self.assertEqual(len(await self._spends(7)), LOTTERY_DAILY_LIMIT)
+
+    async def test_concurrent_draws_report_the_right_reason(self) -> None:
+        """被挡下来的那些必须说清是「今日次数已满」，不是「已经处理过了」。
+
+        后者会让人以为自己被重复扣过款，是完全误导的文案。
+        """
+
+        await self._grant_points(7, 500)
+        await self._draws_just_below_the_limit()
+
+        replies = await self._concurrent_draws(25)
+
+        blocked = [reply for reply in replies if reply.status != "ok"]
+        self.assertEqual(len(blocked), 24)
+        for reply in blocked:
+            self.assertEqual(reply.status, "daily_limit", reply.text)
+            self.assertIn("每天最多", reply.text)
+            self.assertNotIn("已经处理过", reply.text)
+
+    async def test_a_refund_does_not_give_the_day_back(self) -> None:
+        """``lottery_draws_today`` 数的是**消费**流水，退款行不匹配前缀。
+
+        D2-04 把上限写进了扣分语句，这里守住"退款不放行当日次数"这条旧语义。
+        """
+
+        await self._grant_points(7, 500)
+        for index in range(LOTTERY_DAILY_LIMIT):
+            await self._draw(now=_ms(index))
+        spent = await self._spends(7)
+        self.assertEqual(len(spent), LOTTERY_DAILY_LIMIT)
+
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await refund_points(
+                    session,
+                    group_id=GROUP_ID,
+                    user_id=7,
+                    points=LOTTERY_PRICE,
+                    original_ref=spent[0].ref,
+                )
+            )
+            await session.commit()
+
+        async with self.session_factory() as session:
+            self.assertEqual(
+                await lottery_draws_today(
+                    session, group_id=GROUP_ID, user_id=7, day="20261001"
+                ),
+                LOTTERY_DAILY_LIMIT,
+                "退款把当日次数放回去了 = 抽奖次数上限可以被刷",
+            )
+
+        self.assertEqual((await self._draw(now=_ms(99))).status, "daily_limit")
 
 
 # ---------------------------------------------------------------------------

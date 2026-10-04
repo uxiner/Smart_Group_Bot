@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.db.models import MemberEntitlement, MemberPointAward, MemberPointSpend
 from bot.services.background_health import record_background_failure
 from bot.services.checkin import available_points, local_today, spend_points
-from bot.utils.timezone import now_shanghai_naive
+from bot.utils.timezone import now_shanghai_naive, now_shanghai_naive_precise
 
 log = logging.getLogger(__name__)
 
@@ -288,18 +288,36 @@ def _base36(value: int) -> str:
     return "".join(reversed(digits))
 
 
-def purchase_stamp(now: datetime) -> str:
-    """本次购买的时间戳：base36 秒（6 位）+ 毫秒（2 位）。
+def _purchase_now() -> datetime:
+    """购买幂等键用的时钟：**不截断微秒**。
 
-    一起购买的时间戳必须**稳定**（同一笔交易重试时用同一个 ref，唯一索引才能挡住
-    重复扣分）且**唯一**（同一个人前后两次购买不能撞 key）。毫秒精度足够：
-    同一个人在同一毫秒里下两单是不可能的。
+    :func:`now_shanghai_naive` 带着 ``.replace(microsecond=0)``，用它生成的
+    stamp 毫秒位恒为 ``00``（毫秒那一段是死代码），同一秒内的第二笔同款购买会
+    落到同一个 ref，被 :func:`spend_points` 的 ``ON CONFLICT DO NOTHING`` 挡成
+    「这笔购买已经处理过了」。全局 ``now_shanghai`` 承担"自然日 / 整分"语义，
+    不能动，所以只在这里换成不截断的时钟。
     """
 
-    moment = now if isinstance(now, datetime) else now_shanghai_naive()
+    return now_shanghai_naive_precise()
+
+
+def purchase_stamp(now: datetime | None = None) -> str:
+    """本次购买的时间戳：base36 秒（6 位）+ 微秒（4 位）。
+
+    一起购买的时间戳必须**稳定**（同一笔交易重试时用同一个 ref，唯一索引才能挡住
+    重复扣分）且**唯一**（同一个人前后两次购买不能撞 key）。所以它是 ``now`` 的
+    **纯函数**——不要在这里掺任何进程内计数器，那会把"同一笔交易重试"也变成新 ref。
+
+    旧实现是「秒 + 毫秒」，但生产路径的时钟 :func:`now_shanghai_naive` 抹掉了
+    微秒，毫秒位因此恒为 ``00``，实际只有 1 秒精度——它 docstring 里"同一个人
+    在同一毫秒里下两单是不可能的"这个前提从未成立，同一秒内的第二笔 ``/tag``
+    会被误判成重投。现在改用不截断的时钟并直接编码微秒。
+    """
+
+    moment = now if isinstance(now, datetime) else _purchase_now()
     seconds = _base36(int(moment.timestamp()))
-    millis = _base36(int(moment.microsecond // 1000)).rjust(2, "0")
-    return f"{seconds}{millis}"
+    micros = _base36(int(moment.microsecond)).rjust(4, "0")
+    return f"{seconds}{micros}"
 
 
 def tag_spend_ref(
@@ -841,7 +859,10 @@ async def _buy_member_tag_locked(
             available=available,
         )
 
-    stamp = purchase_stamp(moment)
+    # 幂等键的时钟不能是 ``moment``：它按"整秒"口径取（now_shanghai_naive
+    # 抹掉微秒），同一秒内的第二笔会落进同一个 ref。``now=None`` 时让
+    # purchase_stamp 自己去拿不截断的时钟。
+    stamp = purchase_stamp(now)
     ref = tag_spend_ref(group_id=gid, user_id=uid, days=request.days, stamp=stamp)
     try:
         expires_at = await next_expiry(
@@ -1142,7 +1163,10 @@ async def _buy_pin_locked(
             available=available,
         )
 
-    stamp = purchase_stamp(moment)
+    # 幂等键的时钟不能是 ``moment``：它按"整秒"口径取（now_shanghai_naive
+    # 抹掉微秒），同一秒内的第二笔会落进同一个 ref。``now=None`` 时让
+    # purchase_stamp 自己去拿不截断的时钟。
+    stamp = purchase_stamp(now)
     ref = pin_spend_ref(group_id=gid, user_id=uid, stamp=stamp)
     expires_at = moment + timedelta(hours=PIN_HOURS)
     # F-053：购买前先留一份权益快照（这里正常情况下为空，但置顶行可能刚好被
@@ -1282,6 +1306,28 @@ async def lottery_draws_today(
     return int(total or 0)
 
 
+def lottery_daily_guard(*, group_id: int, user_id: int, day: str):
+    """D2-04：把「当日抽奖次数 < 上限」写成扣分语句的 WHERE 条件。
+
+    与 :func:`lottery_draws_today` 同一口径（数消费流水里当天前缀的行），所以
+    **退款行不计入次数**（退款 ref 是 ``shop-refund:lottery:...``，不匹配前缀），
+    「当日次数用掉了就是用掉了」这条语义不变。
+    """
+
+    prefix = f"lottery:{int(group_id)}:{int(user_id)}:{day}:"
+    today_rows = (
+        select(func.count())
+        .select_from(MemberPointSpend)
+        .where(
+            MemberPointSpend.group_id == int(group_id),
+            MemberPointSpend.user_id == int(user_id),
+            MemberPointSpend.ref.like(prefix + "%"),
+        )
+        .scalar_subquery()
+    )
+    return today_rows < int(LOTTERY_DAILY_LIMIT)
+
+
 async def play_lottery(
     session: AsyncSession,
     *,
@@ -1290,13 +1336,22 @@ async def play_lottery(
     now: datetime | None = None,
     randbelow=None,
 ) -> ShopReply:
-    """``/draw``：5 分一次，每天最多 10 次；中奖的分写奖励流水（不伪造签到）。"""
+    """``/draw``：5 分一次，每天最多 10 次；中奖的分写奖励流水（不伪造签到）。
+
+    D2-04：每日次数上限**不再**是"先数一次、再判一次"。两次 ``/draw`` 之间没有锁
+    也没有条件写，25 个并发请求会各自读到同一份 ``used`` 计数并全部通过检查，把
+    10 次/天的上限变成 25 次（抽奖期望值是净赚 +1.00 分/次，见 :data:`LOTTERY_TABLE`
+    的注释，所以这是能直接兑换成头衔的积分泄漏）。现在把"当日行数 < 上限"写成
+    :func:`spend_points` 的 ``extra_guard``，与余额守卫在**同一条** ``INSERT ...
+    SELECT`` 里判完，整条语句跑在 SQLite 的写锁之下。
+    """
 
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
     gid, uid = int(group_id), int(user_id)
     available = await available_points(session, group_id=gid, user_id=uid)
     day = lottery_day(moment)
 
+    # 快速路径：已经用满就直接回话，不必再走写语句。真正的闸门在下面的扣分里。
     used = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
     if used >= LOTTERY_DAILY_LIMIT:
         return ShopReply(
@@ -1312,7 +1367,10 @@ async def play_lottery(
             available=available,
         )
 
-    stamp = purchase_stamp(moment)
+    # 幂等键的时钟不能是 ``moment``：它按"整秒"口径取（now_shanghai_naive
+    # 抹掉微秒），同一秒内的第二笔会落进同一个 ref。``now=None`` 时让
+    # purchase_stamp 自己去拿不截断的时钟。
+    stamp = purchase_stamp(now)
     ref = lottery_spend_ref(group_id=gid, user_id=uid, day=day, stamp=stamp)
     charged = await spend_points(
         session,
@@ -1321,12 +1379,35 @@ async def play_lottery(
         points=LOTTERY_PRICE,
         reason=SPEND_REASON_LOTTERY,
         ref=ref,
+        extra_guard=lottery_daily_guard(group_id=gid, user_id=uid, day=day),
     )
     if not charged:
+        # rowcount==0：这一行没插进去，但驱动已经为这条 INSERT 发过 BEGIN，
+        # 连接上留着一个握着 RESERVED 锁的写事务。不显式收掉的话，它会一直
+        # 占到调用方关闭 session 为止，把并发的其它 /draw 全堵在 busy_timeout 上。
+        await session.rollback()
+        # 余额守卫和次数守卫都在同一条语句里判完了，rowcount==0 有三种可能：
+        # 今日次数已满（并发下别人抢先）、余额被别处扣光、同一 ref 已经扣过。
+        # 逐个说清楚，别一律报「已经处理过了」——那句话会让人以为被重复扣过款。
+        after = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
+        if after >= LOTTERY_DAILY_LIMIT:
+            return ShopReply(
+                "daily_limit",
+                f"今天已经抽了 {after} 次，每天最多 {LOTTERY_DAILY_LIMIT} 次，明天再来吧。"
+                f"当前可用 {available} 分，这次没有扣分。",
+                available=available,
+            )
+        remaining_now = await available_points(session, group_id=gid, user_id=uid)
+        if remaining_now < LOTTERY_PRICE:
+            return ShopReply(
+                "insufficient",
+                _insufficient_text(price=LOTTERY_PRICE, available=remaining_now),
+                available=remaining_now,
+            )
         return ShopReply(
             "replay",
             "这次抽奖已经处理过了，请重新发一次 /draw。",
-            available=await available_points(session, group_id=gid, user_id=uid),
+            available=remaining_now,
         )
     await session.commit()
 
@@ -1367,7 +1448,10 @@ async def play_lottery(
     remaining = await available_points(session, group_id=gid, user_id=uid)
     net = int(prize.points) - LOTTERY_PRICE
     net_text = f"+{net}" if net >= 0 else str(net)
-    left = max(0, LOTTERY_DAILY_LIMIT - (used + 1))
+    # 重新数一次而不是用 `used + 1`：并发下 `used` 是这一笔之前的旧读数，
+    # 报出去的「今天还能抽 N 次」会偏大。
+    used_now = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
+    left = max(0, LOTTERY_DAILY_LIMIT - used_now)
     return ShopReply(
         "ok",
         f"🎲 抽奖结果：{prize.label}（本次净 {net_text} 分，当前可用 {remaining} 分）\n"

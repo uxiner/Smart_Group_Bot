@@ -36,6 +36,18 @@ def now_shanghai_naive() -> datetime:
     return now_shanghai().replace(tzinfo=None)
 
 
+def now_shanghai_naive_precise() -> datetime:
+    """本地（Asia/Shanghai）朴素时间，**保留微秒**。
+
+    :func:`now_shanghai_naive` 抹掉微秒是为了让"自然日 / 整分"这类语义稳定，
+    拿它当幂等键的时钟会让同一秒内的两次操作撞 key（见
+    :func:`bot.services.point_shop.purchase_stamp`）。只给"要区分同一秒内的
+    先后"的地方用，不要改 :func:`now_shanghai` 的全局语义。
+    """
+
+    return datetime.now(SHANGHAI_TZ).replace(tzinfo=None)
+
+
 def format_shanghai_timestamp(
     value: Any,
     *,
