@@ -7049,6 +7049,14 @@ async def _process_pending_reply_batch(
                         # so it cannot text-match the original full plan.
                         matched_evidence = unmatched_delivery_evidence.pop(0)
                         matched_plan = matched_evidence.plan
+                        # D3-51：这里借走了一条 evidence，就必须把它对应的 plan 也从
+                        # ``unmatched_plans`` 里一并移除，让两边同进同出。否则该 plan
+                        # 仍留在列表里，下一轮 stored_reply 可能再文本命中它一次，
+                        # 同一个 plan 被匹配两遍。
+                        for borrowed_index, borrowed in enumerate(unmatched_plans):
+                            if borrowed is matched_plan:
+                                unmatched_plans.pop(borrowed_index)
+                                break
                     resolved_delivery_mode = (
                         matched_plan.delivery_mode if matched_plan is not None else "reply"
                     )
