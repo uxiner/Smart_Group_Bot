@@ -256,21 +256,18 @@ class ModelLimits:
             ),
             max(0, int(output_reserve or 0)),
         )
-        if reserve >= business:
-            # 配置非法：收紧而不是关掉门禁。
-            reserve = max(1, business - MIN_INPUT_ALLOWANCE_TOKENS)
-        ceiling = max(1, business - reserve)
-        if self.max_input_tokens:
-            # 显式输入上限本身已排除输出：与业务输入上限取小，不再重复减。
-            return max(1, min(int(self.max_input_tokens), ceiling))
         total = int(self.total_window or 0)
-        if total <= 0:
-            total = business
-        total = min(total, business)
-        if reserve >= total:
-            # 模型总窗口比预留还小（小模型）：给它留最小的输入空间，而不是压成 0/1。
-            reserve = max(1, total - MIN_INPUT_ALLOWANCE_TOKENS)
-        return max(1, total - reserve)
+        effective_total = min(total, business) if total > 0 else business
+        # No usable input is an honest failure, not permission to shrink the
+        # declared output reservation or disable final request protection.
+        if reserve >= effective_total:
+            return 0
+        ceiling = effective_total - reserve
+        if self.max_input_tokens:
+            # An explicit input cap is an additional constraint. If a total
+            # window is also advertised, input + reserved output must fit it.
+            return max(0, min(int(self.max_input_tokens), ceiling))
+        return ceiling
 
     def describe(self) -> str:
         return (

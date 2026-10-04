@@ -1815,8 +1815,8 @@ class LLMService:
 
         取 ``min(模型可用输入, 272Ki − 预留)``：正常情况恒为 ``245760``；模型更小就跟着
         更小；本次输出需求更大（``max_tokens > 32Ki``）就更紧。模型真实窗口 1M/4M 不会
-        让这一轮填满百万窗口。``0`` 只可能出现在"窗口信息完全拿不到"的退化情况，
-        调用方按不裁剪处理（业务预算仍由装配链路兜住）。
+        让这一轮填满百万窗口。``0`` 表示没有可用输入空间，调用方必须拒绝
+        该候选，绝不能把它解释成关闭预算保护。
         """
 
         target = cfg or self.main
@@ -2373,6 +2373,13 @@ class LLMService:
         total_attempts = self._retry_attempts(cfg)
         limits = self.endpoint_limits(cfg)
         input_budget = self.input_token_budget(cfg)
+        if input_budget <= 0:
+            log.error(
+                "LLM output reservation leaves no input capacity | stage=%s | model=%s | skipping_model",
+                label_cn,
+                cfg.model,
+            )
+            return None
         prompt_tokens, token_count_exact = await self._count_prompt_tokens_async(
             messages,
             tools=tools,

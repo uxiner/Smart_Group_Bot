@@ -786,6 +786,9 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_tool_result_is_truncated_and_the_pair_is_kept(self) -> None:
         llm = self._llm()
+        # Exercise tool trimming with a reservation that really fits the
+        # deliberately small model; impossible reservations must fail closed.
+        llm.context_reserve_tokens = 4096
         ml.MODEL_LIMITS.record(_gateway_model(), total_window=30_000)
         messages = [
             {"role": "system", "content": "核心人设"},
@@ -866,6 +869,9 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
         """即使工具协议消息被误标成 history，也不能在最终载荷里被拆散。"""
 
         llm = self._llm()
+        # Exercise tool trimming with a reservation that really fits the
+        # deliberately small model; impossible reservations must fail closed.
+        llm.context_reserve_tokens = 4096
         ml.MODEL_LIMITS.record(_gateway_model(), total_window=30_000)
         messages = [
             {"role": "system", "content": "核心人设"},
