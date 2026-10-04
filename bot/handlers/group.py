@@ -3197,13 +3197,24 @@ async def on_moderation_action(
         in_transaction = getattr(session, "in_transaction", None)
         if callable(in_transaction) and in_transaction():
             await session.commit()
-        target_hint = violation_id
+        # 去重键必须是"这个用户"，不能退化成"这条违规事件"：否则同一群的多个
+        # 违规事件（或伪造的 callback_data）各自拿到互不相同的键，绕过 per-user
+        # 单飞去重，在授权校验之后、锁之前就占住 CRITICAL lane 任务。解析不出
+        # 目标用户就直接拒掉——真正执行时 :3288 同样会以"审核事件不存在或不属于
+        # 当前群"拒绝，这里只是把那次拒绝提前，不再分配特权任务（A-14）。
         try:
             violation_hint = await session.get(Violation, violation_id)
-            if violation_hint is not None and int(violation_hint.group_id) == group_id:
-                target_hint = int(violation_hint.user_id)
+            target_hint = (
+                int(violation_hint.user_id)
+                if violation_hint is not None
+                and int(violation_hint.group_id) == group_id
+                else 0
+            )
         finally:
             await session.commit()
+        if target_hint <= 0:
+            await callback.answer("审核事件不存在或不属于当前群", show_alert=True)
+            return
 
         deferred_callback = _DetachedCallbackProxy(callback)
         callback_acknowledged = asyncio.Event()
