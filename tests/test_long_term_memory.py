@@ -321,12 +321,20 @@ class PureFunctionTests(unittest.TestCase):
         ]
         messages = ltm.render_facts_block(records)
         self.assertEqual(len(messages), ltm.MEMORY_RECALL_LIMIT)
-        self.assertTrue(all(item["role"] == "system" for item in messages))
+        # B-31：事实正文是成员可控原话，只能走 user 角色 + 不可信围栏。
+        self.assertTrue(all(item["role"] == "user" for item in messages))
+        self.assertTrue(
+            all(
+                item["content"].startswith("<untrusted:long_term_memory>")
+                for item in messages
+            )
+        )
         self.assertEqual(ltm.render_facts_block([]), [])
         self.assertEqual(ltm.render_facts_block(None), [])
-        # 头部说明不含任何强制措辞（第 4 期硬边界）
+        # 头部说明不含祈使式强制措辞（第 4 期硬边界），但必须声明「不可信数据」。
         for forbidden in ("必须", "务必", "MUST", "must"):
             self.assertNotIn(forbidden, ltm.LONG_TERM_MEMORY_HEADER_BLOCK)
+        self.assertIn("不可信数据", ltm.LONG_TERM_MEMORY_HEADER_BLOCK)
 
     def test_parse_fact_items(self) -> None:
         self.assertIsNone(ltm.parse_fact_items("这不是 JSON"))
@@ -1109,7 +1117,9 @@ class LoadRelevantFactsTests(_DbTestCase):
         messages = ltm.render_facts_block(records, max_records=8)
         self.assertLessEqual(len(messages), 8)
         for message in messages:
-            self.assertLessEqual(len(message["content"]), 200 + 80)
+            # 围栏外壳（`<untrusted:long_term_memory>` + 换行 + 闭合标签）本身有固定
+            # 开销，正文上限是 `FACT_TEXT_MAX_CHARS + 128`（B-31）。
+            self.assertLessEqual(len(message["content"]), 200 + 128 + 64)
 
     async def test_private_chat_reader_merges_own_and_group_facts(self) -> None:
         await self._record(

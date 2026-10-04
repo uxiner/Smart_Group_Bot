@@ -354,10 +354,19 @@ def sanitize_history_for_llm(
         formatted = format_history_message_block(msg, max_body_chars=max_item_chars)
         wrapper_limit = max_item_chars + 512
         if role == "system":
+            # system 身份不等于「这条正文的每个字符都可信」：链路上仍有把成员可控
+            # 文本以 system 身份流动的调用点（B-31 的 `long_term_memory` 事实块就是
+            # 曾经的一个）。裸标签在这里同样要中和，否则正文可以闭合 `casual.py`
+            # 真实发出的 `<untrusted:user_message>`，让整条序列的围栏配对失衡。
+            # 仓库里没有任何 `wrap_untrusted*` 的产物走 system 角色
+            # （`grep -rn 'wrap_untrusted' bot/` 全部落在 user 消息上），所以这步
+            # 不会误伤自家围栏。
             out.append(
                 {
                     "role": role,
-                    "content": clean_multiline_text(raw_content, max_len=wrapper_limit),
+                    "content": _neutralize_untrusted_tags(
+                        clean_multiline_text(raw_content, max_len=wrapper_limit)
+                    ),
                 }
             )
             continue
