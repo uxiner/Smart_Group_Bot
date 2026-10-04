@@ -314,9 +314,10 @@ class BotBehaviorConfig(StrictModel):
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
     decision_context_items: int = Field(default=5, ge=0, le=20)
-    # 上下文模式：``auto``（默认）= 上限按实际模型自动匹配（网关 /models 元数据优先，
-    # 其次直连厂商注册表，都没有才退回 ``max_context_tokens`` 保守降级）；``fixed`` =
-    # 兼容迁移前的固定硬上限语义。老配置里没有这个字段 → 迁移成 ``auto``。
+    # 上下文模式：``auto``（默认）= 自动发现模型真实窗口（网关 /models 优先，其次直连
+    # 厂商注册表，都没有才退回 ``max_context_tokens`` 保守降级），发现值只用于"模型比
+    # 业务预算小就跟着小"；``fixed`` = 不查元数据，``max_context_tokens`` 即模型侧上限。
+    # 两种模式都再叠固定的 272Ki 业务预算（每轮总窗口）。老配置没有这个字段 → 迁移成 auto。
     context_window_mode: Literal["auto", "fixed"] = "auto"
     max_context_tokens: int = Field(default=278528, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
@@ -330,20 +331,21 @@ class BotBehaviorConfig(StrictModel):
     memory_recall_enabled: bool = True
     memory_recall_max_results: int = Field(default=8, ge=1, le=20)
     memory_automatic_compaction: bool = False
-    # Private-chat history: 278528 = 272K legacy depth target.  In ``auto`` mode the
-    # measured model window (gateway /models, announced 1,000,000) is used instead;
-    # this value is only the conservative fallback when nothing is known.
+    # Private-chat history: 278528 = 272K legacy depth target and the per-turn
+    # business ceiling.  A *smaller* discovered model window tightens it further;
+    # a 1M/4M window never loosens it (the turn is not filled to the model window).
     private_chat_history_token_budget: int = Field(
         default=278528,
         ge=1024,
         le=2_000_000,
     )
     private_chat_history_retention_days: int = Field(default=30, ge=1, le=365)
-    # Group-chat history: assembled from the group archive by token budget instead
-    # of "most recent N messages".  ``reserve_tokens`` is the headroom kept for the
-    # fixed prompt parts; assembled history + reserve must stay within the
-    # effective window (``auto`` = the real model window; the hard gate lives in
-    # bot.services.group_context).
+    # Group-chat history: assembled from the group archive by token budget (at most
+    # the most recent ``GROUP_HISTORY_MAX_MESSAGES`` = 1000 rows) instead of "most
+    # recent N messages".  ``reserve_tokens`` is the headroom kept for the fixed
+    # prompt parts; assembled history + reserve must stay within the effective
+    # window = min(discovered model window, 272Ki business budget).  The hard gate
+    # lives in bot.services.group_context.
     group_history_token_budget: int = Field(default=278528, ge=1024, le=2_000_000)
     group_history_reserve_tokens: int = Field(default=32768, ge=1024, le=1_000_000)
     # 第 3 期：检索结果留档（search_result_records）。
@@ -1270,7 +1272,8 @@ def _normalize_deprecated_runtime_payload(
         normalized["bot"] = normalized_bot
         changed = True
 
-    # 2026-10-04 事故修复：上下文上限从"固定 272K"改成"按实际模型上限自动匹配"。
+    # 2026-10-04 事故修复：上下文上限从"固定 272K 硬上限"改成"自动发现模型窗口 +
+    # 每轮 272Ki 业务预算"（发现值只用于比业务预算更紧，不放松 272Ki）。
     # 老库里没有 ``context_window_mode``，这里**一次性**补成 ``auto``（真正迁移既有
     # 部署的语义），并且只在缺字段时写：管理员之后显式改成 ``fixed`` 绝不会被覆盖。
     migration_bot = dict(normalized.get("bot") or {})
@@ -1282,9 +1285,9 @@ def _normalize_deprecated_runtime_payload(
         normalized["bot"] = migration_bot
         changed = True
         log.warning(
-            "Context window mode migrated to 'auto' (match the real model limit); "
-            "the configured max_context_tokens is now only the conservative "
-            "fallback for unknown models"
+            "Context window mode migrated to 'auto' (discover the real model window); "
+            "the per-turn business budget stays 272Ki and max_context_tokens is only "
+            "the conservative fallback for unknown models"
         )
 
     # The former Sub2API credential was global and therefore cannot be safely

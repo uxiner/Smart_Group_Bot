@@ -145,13 +145,14 @@ class BotConfig(BaseModel):
     skill_model: ModelConfig | None = None
     embed_model: EmbedConfig = EmbedConfig()
     # 上下文模式（2026-10-04 生产事故修复）：
-    #   * ``auto``（默认）：上限按**实际模型**自动匹配——优先网关 ``/models`` 自报的
-    #     窗口，其次直连厂商的模型注册表，都没有才退回 ``max_context_tokens`` 当保守
-    #     降级值。已知主模型（实测窗口 1,000,000）不再被固定值压住。
-    #   * ``fixed``：保留迁移前的语义，``max_context_tokens`` 是硬上限（逃生舱）。
+    #   * ``auto``（默认）：自动**发现**模型真实窗口（网关 ``/models`` 优先，其次直连
+    #     厂商注册表，都没有才用 ``max_context_tokens`` 保守降级）。发现值只用于
+    #     "模型比业务预算更小就跟着更小"——它**不会**让每轮去填满百万窗口。
+    #   * ``fixed``：不查元数据，``max_context_tokens`` 就是模型侧的硬上限。
+    # 两种模式都还要再叠**业务预算 272Ki**（见下一项）。
     context_window_mode: Literal["auto", "fixed"] = "auto"
-    # 模型窗口上限的**兼容字段**。``auto`` 模式下它不再压住已知模型，只作为"查不到
-    # 任何元数据"时的保守降级值（也是每个 endpoint 各自的兜底，不是全局硬上限）。
+    # 模型侧窗口的**兼容字段**：``auto`` 下作为"查不到任何元数据"时的保守降级值，
+    # ``fixed`` 下作为硬上限。它不等于每轮的业务预算（业务预算是固定的 272Ki）。
     max_context_tokens: int = 278528
     max_output_tokens: int = 2048
     # Two-tier group memory: a bounded hot window plus a lossless, per-group
@@ -165,16 +166,17 @@ class BotConfig(BaseModel):
     memory_automatic_compaction: bool = False
     # One-to-one private chat history: rows persist in ``private_chat_messages``
     # and every turn is assembled by token budget.  278528 = 272K is the legacy
-    # depth target; in ``auto`` mode the real gateway window (measured
-    # 1,000,000) is used instead.  Retention mirrors ``memory_retention_days``.
+    # depth target and the upper bound of the per-turn business budget; in ``auto``
+    # mode a *smaller* discovered model window tightens it further (a 1M/4M window
+    # never loosens it).  Retention mirrors ``memory_retention_days``.
     private_chat_history_token_budget: int = 278528
     private_chat_history_retention_days: int = 30
     # 群聊回复的历史：不再按条数（``memory_recent_messages``）取，而是按 token 预算
     # 从 ``group_message_archive`` 里装配（数据来源与删除/保留策略都没变）。
     # ``group_history_reserve_tokens`` 是留给「系统提示词/人设 + 本轮消息 + 记忆召回
     # + 回复预留」的余量：装配历史 + 余量 ≤ 生效窗口，这是硬闸门。
-    # 生效窗口在 ``auto`` 模式下来自实际模型（网关元数据优先）；下面的 278528 只是
-    # 查不到任何元数据时的保守降级值。
+    # 生效窗口 = min(模型真实窗口, 这里的 272Ki 业务预算)；模型更小就跟着更小。
+    # 条数安全上限另见 ``GROUP_HISTORY_MAX_MESSAGES``（最近 1000 条）。
     group_history_token_budget: int = 278528
     group_history_reserve_tokens: int = 32768
     # 第 3 期：检索结果留档（``search_result_records``）。
@@ -959,7 +961,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         ):
             if key in bot_data:
                 setattr(settings.bot, key, bool(bot_data[key]))
-        # 上下文模式：``auto``（按实际模型上限自动匹配，默认）/ ``fixed``（兼容旧硬上限）
+        # 上下文模式：``auto``（自动发现模型窗口，默认）/ ``fixed``（不查元数据，兼容旧配置）
         mode = str(bot_data.get("context_window_mode") or "").strip().lower()
         if mode in {"auto", "fixed"}:
             settings.bot.context_window_mode = mode

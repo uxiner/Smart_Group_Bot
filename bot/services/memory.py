@@ -41,8 +41,8 @@ from bot.services.group_context import (
 )
 from bot.services.llm import LLMService
 from bot.services.model_limits import (
-    CONTEXT_WINDOW_MIN as _CONTEXT_WINDOW_MIN,
     auto_window_for,
+    business_total_window,
     loose_budget_tokens,
 )
 from bot.services.resource_health import register_resource_health_provider
@@ -1058,14 +1058,13 @@ class MemoryService:
         model_input_limit = 0
         if callable(model_limit_fn):
             model_input_limit = max(0, int(model_limit_fn(self.llm.main) or 0))
-        # 自动匹配模型上限（2026-10-04 事故修复）：拿到可信窗口（网关 /models 元数据
-        # 或直连厂商注册表）就**原样**使用——用户口径是"上限不要设置了，根据模型的上限
-        # 自动匹配"，所以真实宣告 3M/4M 时这里不再夹 2M。``max_context_tokens`` 只作为
-        # 查不到任何元数据时的保守降级值。
+        # 业务预算与模型窗口分离（2026-10-04 最终口径）：每一轮的业务总窗口是
+        # min(模型真实窗口, 272Ki)。模型宣告 1M/4M 也不会每轮填满；模型比 272Ki 小
+        # 就跟着更小；拿不到元数据时用 ``max_context_tokens`` 保守降级（未知 ≠ 无限）。
         measured_window = auto_window_for(config, llm=self.llm)
         base_context = configured_context
         if measured_window is not None:
-            base_context = max(_CONTEXT_WINDOW_MIN, int(measured_window))
+            base_context = business_total_window(measured_window)
         if model_input_limit > 0:
             self.max_context = min(
                 base_context,

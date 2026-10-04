@@ -423,9 +423,10 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         mock_completion.assert_awaited_once()
 
     async def test_prompt_over_context_limit_is_not_sent(self) -> None:
-        # 2026-10-04 之后：``max_context_tokens`` 只在 ``fixed`` 兼容模式下才是硬上限，
-        # ``auto``（默认）按实际模型上限自动匹配。这个用例锁的是**逃生舱**本身：
-        # 显式声明的固定上限仍然会挡住请求（而且连保守估算都装不下就诚实失败）。
+        # 2026-10-04 之后：每轮业务预算是固定的 272Ki（输入 ≤ 245760），
+        # ``max_context_tokens`` 在 ``fixed`` 兼容模式下作为**模型侧**上限。
+        # 这个用例锁的是**逃生舱**本身：显式声明的小上限仍然会挡住请求
+        # （而且连保守估算都装不下就诚实失败）。
         llm = self._make_llm()
         llm.context_window_mode = "fixed"
         llm.max_context_tokens = 100

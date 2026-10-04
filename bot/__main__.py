@@ -354,13 +354,15 @@ class _MemoryContextWindowSync:
         if memory is None:
             # 还在启动过程中（memory 尚未构造）：bind() 会补一次。
             return
-        resolved = model_limits.auto_window_for(
+        discovered = model_limits.auto_window_for(
             getattr(self._settings, "bot", None),
             llm=self._llm,
         )
-        if resolved is None:
+        if discovered is None:
             return
-        resolved = int(resolved)
+        # 以**业务有效窗口**（min(模型窗口, 272Ki)）为基准：只有它真的变了才 reconfigure
+        # ——模型从 1M 变成 4M 不会改变每轮预算，也就没必要动一次历史投影。
+        resolved = int(model_limits.business_total_window(discovered))
         if not force and resolved == self._applied:
             return
         previous = self._applied
@@ -423,7 +425,13 @@ async def _prefetch_model_context_metadata(
     limits_fn = getattr(llm, "endpoint_limits", None)
     limits = limits_fn(getattr(llm, "main", None)) if callable(limits_fn) else None
     if limits is not None:
-        log.info("main chat context window resolved | %s", limits.describe())
+        budget_fn = getattr(llm, "input_token_budget", None)
+        budget = budget_fn(getattr(llm, "main", None)) if callable(budget_fn) else None
+        log.info(
+            "main chat context window resolved | %s | business_input_budget=%s",
+            limits.describe(),
+            budget if budget is not None else "-",
+        )
     return None if task.done() else task
 
 
@@ -473,7 +481,7 @@ async def _initialize_runtime_services(
         log.warning(
             "上下文上限模式为 fixed 且仅 %d Token，可能小于内置提示词；"
             "请在 /settings 的 Bot 行为中把「上下文上限模式」改为 auto"
-            "（按实际模型上限自动匹配）或调高固定值。",
+            "（auto：自动发现模型窗口，每轮业务预算仍为 272Ki）或调高固定值。",
             settings.bot.max_context_tokens,
         )
     # Semantic archive recall is only useful when an embedding provider is

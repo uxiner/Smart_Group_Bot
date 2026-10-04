@@ -699,6 +699,8 @@ class ConfigReaderTests(unittest.TestCase):
         self.assertFalse(ml.auto_mode_enabled(settings))
 
     def test_auto_mode_uses_the_measured_window_and_falls_back_to_the_legacy_value(self) -> None:
+        """发现到的模型窗口只用于"更紧"；1M/4M 不会放松 272Ki 业务预算。"""
+
         ml.reset_model_limits_for_tests()
         try:
             model = ModelConfig(
@@ -717,9 +719,16 @@ class ConfigReaderTests(unittest.TestCase):
             self.assertEqual(ml.effective_context_window(settings), 278_528)
             self.assertIsNone(ml.auto_window_for(settings))
 
+            # 1M：自动发现（auto_window_for）拿到真实值，业务有效窗口仍是 272Ki。
             ml.MODEL_LIMITS.record(model, total_window=1_000_000)
-            self.assertEqual(ml.effective_context_window(settings), 1_000_000)
             self.assertEqual(ml.auto_window_for(settings), 1_000_000)
+            self.assertEqual(ml.effective_context_window(settings), 278_528)
+
+            # 100K：比业务预算更小 → 生效窗口跟着变小。
+            ml.reset_model_limits_for_tests()
+            ml.MODEL_LIMITS.record(model, total_window=100_000)
+            self.assertEqual(ml.auto_window_for(settings), 100_000)
+            self.assertEqual(ml.effective_context_window(settings), 100_000)
         finally:
             ml.reset_model_limits_for_tests()
 

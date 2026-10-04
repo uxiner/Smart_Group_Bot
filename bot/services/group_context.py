@@ -1,4 +1,4 @@
-"""群聊历史按 token 预算装配（第 2 期；第 5 期起按实际模型上限自动匹配）。
+"""群聊历史按 token 预算装配（第 2 期；每轮业务预算 272Ki，最近 1000 条）。
 
 为什么要单独一个模块（而不是塞进 ``bot/services/memory.py``）：
 
@@ -20,7 +20,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot.services.model_limits import auto_window_for, loose_budget_tokens
+from bot.services.model_limits import (
+    auto_window_for,
+    business_total_window,
+    loose_budget_tokens,
+)
 from bot.utils.tokens import estimate_text_tokens
 
 #: 群聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
@@ -51,8 +55,9 @@ GROUP_HISTORY_RESERVE_TOKENS_MAX = 1_000_000
 
 #: 单次装配的**条数安全上限**。token 预算才是真正的闸门，但预算只在「内容本身够长」
 #: 时才会先咬住——一个刷「+1」的群，272K 预算能装下两万多行，读库/组装/估算就成了
-#: 每条回复的固定开销。单次最多装配 2000 行；正常群聊在保留期内远达不到这个数。
-GROUP_HISTORY_MAX_MESSAGES = 2000
+#: 每条回复的固定开销。单次最多装配最近 **1000** 行（用户 2026-10-04 最终口径）：
+#: 归档读取按页从新到旧进行，累计到"条数或预算"先到即停，**不会**读出几万条再切片。
+GROUP_HISTORY_MAX_MESSAGES = 1000
 #: 每条历史消息在预算里额外占的固定开销（角色、时间、发送者、分隔等），与第 1 期
 #: 私聊同口径（``private_chat._HISTORY_MESSAGE_TOKEN_OVERHEAD`` 也是 +12）。
 GROUP_HISTORY_MESSAGE_TOKEN_OVERHEAD = 12
@@ -113,19 +118,20 @@ def _bot_setting(settings: Any, name: str, default: Any) -> Any:
 def group_history_token_budget(settings: Any) -> int:
     """当前生效的群聊历史 token 预算。
 
-    ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 固定余量`` 装配，
-    **不再**被兼容字段 ``group_history_token_budget``（默认 272K）或 2M 的兼容上限压住
-    （真实宣告 3M/4M 就装配到 3M/4M）；只有拿不到任何可信窗口时才退回那个保守值
-    （保持迁移前的深度口径）。``fixed`` 仍读配置值。
+    ``auto``（默认）且拿到了真实模型窗口时：按 ``min(模型真实窗口, 272Ki) − 固定余量``
+    装配——模型是 1M/4M 也不会填满（业务预算 272Ki），模型比 272Ki 小就跟着更小。
+    只有拿不到任何可信窗口时才退回兼容字段的保守值（保持迁移前的深度口径）。
+    ``fixed`` 仍读配置值。
     """
 
     reserve = group_history_reserve_tokens(settings)
     window = auto_window_for(settings)
     if window is not None:
+        business = business_total_window(window)
         return effective_group_history_budget(
-            configured_budget=window,
+            configured_budget=business,
             reserve_tokens=reserve,
-            model_window_tokens=window,
+            model_window_tokens=business,
             clamp_budget=False,
         )
     return bounded_group_history_token_budget(
@@ -175,9 +181,9 @@ def effective_group_history_budget(
     传入 ``model_window_tokens`` 的是**模型输入窗口**（``MemoryService.max_context``：
     配置的 ``max_context_tokens`` 与网关自报窗口的较小值）。
 
-    ``clamp_budget=False``（``auto`` + 真实元数据时）：``configured_budget`` 就是
-    **实测窗口**，不再套 2M 的兼容上限——用户口径是"按模型的上限自动匹配"，真实宣告
-    3M/4M 就该装配到 3M/4M。硬闸门本身（历史 + 余量 ≤ 窗口）一点不放松。
+    ``clamp_budget=False``（``auto`` + 真实元数据时）：``configured_budget`` 是
+    ``min(模型真实窗口, 272Ki 业务预算)``，不再套 ``CONTEXT_WINDOW_MAX`` 那道只约束
+    兼容配置字段的夹取。硬闸门本身（历史 + 余量 ≤ 窗口）一点不放松。
     """
 
     if clamp_budget:

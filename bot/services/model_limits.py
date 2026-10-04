@@ -55,20 +55,34 @@ LIMIT_SOURCE_LEGACY = "legacy_configured"
 LIMIT_SOURCE_FIXED = "fixed_configured"
 LIMIT_SOURCE_UNKNOWN = "conservative_default"
 
-#: 未知模型（网关没元数据、litellm 也不认识这个 id）时的保守降级：**不是无限**，
-#: 也不再是"已知模型也被它压住"的全局硬上限——每个 endpoint 各用各的 limit。
+#: 未知模型（网关没元数据、litellm 也不认识这个 id）时的保守降级：**不是无限**。
+#: 它恰好等于业务预算 272Ki，所以未知模型走的就是"业务预算本身"（不会更宽松）。
 DEFAULT_UNKNOWN_TOTAL_WINDOW = 278_528
 #: **兼容字段/保守降级**的夹取范围（与 runtime_config 的字段约束一致）。
-#: 注意：``auto`` 模式从网关元数据/注册表拿到的真实窗口**不套这个上限**——用户口径是
-#: "上限不要设置了，根据模型的上限自动匹配"，真实宣告 3M/4M 就按 3M/4M 装配与放行。
-#: 位置：见 :func:`effective_context_window` / :func:`auto_window_for`。
+#: 注意：网关元数据里解析出来的模型真实窗口**不做任何截断**（1M/4M 都原样记录、原样
+#: 出现在日志与快照里）；真正限制"每一轮能塞多少"的是下面的**业务预算**。
 CONTEXT_WINDOW_MIN = 1024
 CONTEXT_WINDOW_MAX = 2_000_000
 #: 保守降级最少保留的输出余量（token）。
 MIN_OUTPUT_RESERVE_TOKENS = 1024
 
-#: 上下文模式：``auto`` = 按实际模型上限自动匹配（默认）；``fixed`` = 兼容旧配置，
-#: 用 ``max_context_tokens`` 当硬上限（迁移前的语义，保留为逃生舱）。
+# ---------------------------------------------------------------------------
+# 业务预算（用户口径，2026-10-04 最终确认）
+# ---------------------------------------------------------------------------
+#: 每一轮的**业务总窗口**：272Ki = 278528。它覆盖 system/人设 + 工具定义 + 记忆召回
+#: + 检索留档 + 群/私聊历史 + 本轮消息 + 工具结果 + 输出预留——**不是**只限制历史。
+#: 模型真实窗口比它大也不会填满（不做"每轮灌满百万窗口"）；比它小就按模型更小的窗口。
+BUSINESS_CONTEXT_WINDOW_TOKENS = 272 * 1024
+#: 业务预算里留给输出的部分：32Ki = 32768（输入上限因此不超过 245760）。
+BUSINESS_OUTPUT_RESERVE_TOKENS = 32 * 1024
+#: 业务输入硬上限 = 272Ki − 32Ki = 245760。
+BUSINESS_INPUT_BUDGET_TOKENS = (
+    BUSINESS_CONTEXT_WINDOW_TOKENS - BUSINESS_OUTPUT_RESERVE_TOKENS
+)
+
+#: 上下文模式：``auto`` = 自动**发现**模型真实窗口（默认；发现值只用于比业务预算更紧，
+#: 不会放松 272Ki）；``fixed`` = 不查元数据，``max_context_tokens`` 即模型侧上限
+#: （仍受 272Ki 业务预算约束）。
 CONTEXT_MODE_AUTO = "auto"
 CONTEXT_MODE_FIXED = "fixed"
 
@@ -176,7 +190,7 @@ class ModelLimits:
         return None
 
     def input_budget_tokens(self, *, output_reserve: int) -> int:
-        """本次请求允许的 prompt 上限。
+        """**模型侧**允许的 prompt 上限（不含业务预算）。
 
         口径（"输出预留不可重复减"）：
 
@@ -187,6 +201,8 @@ class ModelLimits:
 
         ``fixed`` 模式下配置值就是硬上限，**不再**被 1024 的下限抬高（旧的
         ``max_context_tokens=100`` 语义必须原样保留，否则逃生舱就失效了）。
+
+        实际发请求用的是 :meth:`business_input_budget`（再叠 272Ki 业务预算）。
         """
 
         if self.max_input_tokens:
@@ -198,6 +214,32 @@ class ModelLimits:
         if reserve >= total:
             # 输出预留比窗口还大只能是配置错了：至少给输入留 1 token 的余地，
             # 让"装不下"由最终裁剪如实报出来，而不是悄悄把门禁关掉。
+            reserve = max(1, total // 8)
+        return max(1, total - reserve)
+
+    def business_input_budget(self, *, output_reserve: int) -> int:
+        """**业务**输入上限（最终闸门真正用的那个数）。
+
+        取 ``min(模型可用输入, 272Ki − 预留)``，预留不小于 32Ki：
+
+        * 正常情况：``278528 − 32768 = 245760``（输入上限恒不超过 245760）；
+        * 模型更小（例如 128K 窗口）→ 跟着更小；
+        * 本次实际输出需求更大（``max_tokens > 32Ki``）→ 预留取它，进一步收紧；
+        * 元数据给了显式输入上限 → 那条上限本身已经排除了输出，与 245760 取小即可。
+        """
+
+        reserve = max(
+            BUSINESS_OUTPUT_RESERVE_TOKENS,
+            max(0, int(output_reserve or 0)),
+        )
+        ceiling = max(1, BUSINESS_CONTEXT_WINDOW_TOKENS - reserve)
+        if self.max_input_tokens:
+            return max(1, min(int(self.max_input_tokens), ceiling))
+        total = int(self.total_window or 0)
+        if total <= 0:
+            total = BUSINESS_CONTEXT_WINDOW_TOKENS
+        total = min(total, BUSINESS_CONTEXT_WINDOW_TOKENS)
+        if reserve >= total:
             reserve = max(1, total // 8)
         return max(1, total - reserve)
 
@@ -855,9 +897,10 @@ def resolved_main_window(settings: Any) -> int | None:
 def loose_budget_tokens(value: Any, *, default: int, low: int) -> int:
     """宽容预算：拿不到数字就用默认值、只做**下限**保护。
 
-    用于"调用方已经算好的装配预算"——``auto`` 模式下真实模型窗口可能是 3M/4M，
-    这些入口绝不能再套 :data:`CONTEXT_WINDOW_MAX`（2M）这个人为主导上限。
-    2M 只约束**兼容配置字段与保守降级值**本身（``bounded_*`` 系列 + ``fixed`` 模式）。
+    用于"调用方已经算好的装配预算"：**业务上限由
+    :func:`business_total_window` / :data:`BUSINESS_CONTEXT_WINDOW_TOKENS` 决定**，
+    这里只是不给装配入口再藏一道 2M 截断（:data:`CONTEXT_WINDOW_MAX` 只约束兼容配置
+    字段的取值范围）。
     """
 
     try:
@@ -867,22 +910,37 @@ def loose_budget_tokens(value: Any, *, default: int, low: int) -> int:
     return max(int(low), number)
 
 
-def effective_context_window(settings: Any) -> int:
-    """装配链路统一使用的总窗口。
+def business_total_window(model_total_window: Any) -> int:
+    """每轮**业务总窗口** = min(模型有效窗口, 272Ki)。
 
-    * ``fixed`` → 配置值（迁移前语义，逃生舱，按兼容区间夹取）；
-    * ``auto`` + 可信元数据 → **真实窗口原样返回，不套 2M 兼容上限**；
-    * ``auto`` + 查不到 → 配置的保守降级值（同样只作为未知时的兜底）。
+    用户最终口径（2026-10-04 确认，覆盖之前"不设上限"的说法）：
+
+    * 模型真实窗口 1M/4M → 业务窗口仍是 272Ki（**不把百万窗口每轮填满**）；
+    * 模型真实窗口比 272Ki 小 → 保持模型那个更小的值；
+    * 模型未知 → 保守降级值参与同一个 min（未知 ≠ 无限）。
+    """
+
+    model = _positive_int(model_total_window)
+    if model is None:
+        return BUSINESS_CONTEXT_WINDOW_TOKENS
+    return max(CONTEXT_WINDOW_MIN, min(int(model), BUSINESS_CONTEXT_WINDOW_TOKENS))
+
+
+def effective_context_window(settings: Any) -> int:
+    """装配链路统一使用的**业务总窗口**（含 272Ki 上限）。
+
+    * ``auto`` + 可信元数据 → ``min(模型真实窗口, 272Ki)``；
+    * ``auto`` + 查不到 → 兼容字段的保守降级值（同一个 min）；
+    * ``fixed`` → 配置值（再叠同一个 272Ki 业务上限，只允许比 272Ki 更小）。
     """
 
     legacy = legacy_context_tokens(settings)
     if context_window_mode(settings) == CONTEXT_MODE_FIXED:
-        return legacy
+        return business_total_window(legacy)
     resolved = resolved_main_window(settings)
     if not resolved:
-        return legacy
-    # 真实宣告多少就是多少：这里只有一个下界保护，没有人为上界。
-    return max(CONTEXT_WINDOW_MIN, int(resolved))
+        return business_total_window(legacy)
+    return business_total_window(resolved)
 
 
 def auto_mode_enabled(settings: Any) -> bool:

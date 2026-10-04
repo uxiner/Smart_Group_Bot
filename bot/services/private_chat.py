@@ -51,7 +51,11 @@ from bot.services.long_term_memory import (
     LONG_TERM_MEMORY_HEADER_BLOCK,
     render_facts_block,
 )
-from bot.services.model_limits import auto_window_for, loose_budget_tokens
+from bot.services.model_limits import (
+    auto_window_for,
+    business_total_window,
+    loose_budget_tokens,
+)
 from bot.services.payload_fit import (
     LAYER_HISTORY,
     LAYER_MEMORY_RECALL,
@@ -744,8 +748,8 @@ def _bot_setting(settings: Any, name: str, default: Any) -> Any:
 def private_history_token_budget(settings: Any) -> int:
     """当前生效的私聊历史 token 预算。
 
-    ``auto``（默认）且拿到了真实模型窗口时：按 ``窗口 − 本地余量`` 装配，已知主模型
-    不再被旧的 272K 固定值或 2M 兼容上限压住（真实宣告 3M/4M 就装配到 3M/4M）；
+    ``auto``（默认）且拿到了真实模型窗口时：按 ``min(模型真实窗口, 272Ki) − 32Ki`` 装配
+    ——模型是 1M/4M 也仍然是 272Ki 的业务预算（不填满百万窗口），模型更小就跟着更小。
     只有拿不到可信窗口时才退回兼容字段（迁移前口径）。
     """
 
@@ -753,7 +757,7 @@ def private_history_token_budget(settings: Any) -> int:
     if window is not None:
         return max(
             PRIVATE_HISTORY_TOKEN_BUDGET_MIN,
-            int(window) - PRIVATE_HISTORY_RESERVE_TOKENS,
+            business_total_window(window) - PRIVATE_HISTORY_RESERVE_TOKENS,
         )
     return bounded_history_token_budget(
         _bot_setting(

@@ -29,11 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from bot.services.model_limits import (
-    auto_window_for,
-    effective_context_window,
-    loose_budget_tokens,
-)
+from bot.services.model_limits import effective_context_window, loose_budget_tokens
 from bot.utils.tokens import estimate_text_tokens
 
 #: 统一闸门的默认预算：272K = 278528（全项目统一用这个精确数字）。
@@ -77,21 +73,21 @@ def bounded_context_token_budget(value: Any) -> int:
 
 
 def context_token_budget(settings: Any) -> int:
-    """当前生效的统一闸门预算。
+    """当前生效的统一闸门**业务总窗口**（含 272Ki 上限）。
 
-    * ``auto``（默认）+ 可信元数据：主链路实际模型的**总窗口原样**——用户口径是
-      "上限不要设置了，根据模型的上限自动匹配"，所以真实宣告 3M/4M 就按 3M/4M 装配，
-      **不再套 2M 的兼容上限**（那个上限只约束兼容字段/保守降级值）。
-    * ``auto`` + 查不到：临时兼容字段（保守降级值，按兼容区间夹取）。
-    * ``fixed``：兼容模式，仍用 ``bot.max_context_tokens``。
+    用户最终口径：每一轮的业务预算是 **272Ki = 278528**，它覆盖 system/人设 + 工具定义
+    + 记忆召回 + 检索留档 + 历史 + 本轮消息 + 工具结果 + 输出预留——**不是只限制历史**。
+    模型侧解析出来的真实窗口（1M/4M 都原样记录、原样出现在日志里）只用于"模型更小就
+    跟着更小"：
 
-    三条链路必须用同一个数字：群聊 / 私聊 / 搜索的资料块都往同一个模型窗口里塞，
-    各读各的默认值正是这一期要消掉的分叉。
+    * ``auto`` + 可信元数据 → ``min(模型真实窗口, 272Ki)``；
+    * ``auto`` + 查不到 → 兼容字段的保守降级值（同一个 min，未知 ≠ 无限）；
+    * ``fixed`` → 配置值（同样叠 272Ki，只允许更小）。
+
+    三条链路必须用同一个数字：群聊 / 私聊 / 搜索的资料块都往同一个业务窗口里塞，
+    各读各的默认值正是要消掉的分叉。
     """
 
-    measured = auto_window_for(settings)
-    if measured is not None:
-        return max(CONTEXT_TOKEN_BUDGET_MIN, int(measured))
     return bounded_context_token_budget(effective_context_window(settings))
 
 
@@ -194,8 +190,8 @@ def assemble_context_within_budget(
       默认顺序（system → memory_recall → search_records → history → current_turn）。
     """
 
-    # 调用方算好的预算直接采信（真实模型窗口可能是 3M/4M）：这里只保下限，
-    # 不再套 2M 的兼容上限。
+    # 调用方算好的预算直接采信（业务上限由 context_token_budget 决定，≤272Ki）：
+    # 这里只保下限，不给装配入口再藏一道 2M 截断。
     budget = loose_budget_tokens(
         budget_tokens,
         default=CONTEXT_TOKEN_BUDGET,

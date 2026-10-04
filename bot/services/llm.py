@@ -515,7 +515,8 @@ class LLMService:
         self.skill_config = skill or main
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
-        # ``auto``（默认）按实际模型上限自动匹配；``fixed`` 保留迁移前的固定硬上限。
+        # ``auto``（默认）自动发现模型真实窗口；``fixed`` 不查元数据。两者都受
+        # 272Ki 业务预算约束（见 ``input_token_budget``）。
         self.context_window_mode = (
             CONTEXT_MODE_FIXED
             if str(context_window_mode or "").strip().lower() == CONTEXT_MODE_FIXED
@@ -1732,16 +1733,18 @@ class LLMService:
             return {}
 
     def endpoint_limits(self, cfg: ChatEndpointConfig | None = None) -> ModelLimits | None:
-        """当前生效的窗口结论；``None`` = 显式关闭上限（兼容旧 ``0`` 语义）。"""
+        """当前生效的**模型侧**窗口结论（业务 272Ki 上限在 :meth:`input_token_budget`）。
+
+        ``None`` = 没有可用结论（调用方按业务预算兜底）。
+        """
 
         target = cfg or self.main
         if self.context_window_mode == CONTEXT_MODE_FIXED:
-            if self.max_context_tokens <= 0:
-                # 迁移前 ``max_context_tokens=0`` = 不做上限判断，保留这个逃生舱。
-                return None
+            # 兼容字段：0/缺项一律按业务预算兜底——绝不"关闭上限"（那就是无限预算版）。
             return model_limits_module.MODEL_LIMITS.legacy_limits(
                 target,
-                total_window=self.max_context_tokens,
+                total_window=self.max_context_tokens
+                or model_limits_module.BUSINESS_CONTEXT_WINDOW_TOKENS,
             )
         limits = model_limits_module.MODEL_LIMITS.resolve(
             target,
@@ -1774,20 +1777,23 @@ class LLMService:
         )
 
     def input_token_budget(self, cfg: ChatEndpointConfig | None = None) -> int:
-        """这个 endpoint 允许的 prompt 上限（已扣掉**一次**输出预留）。
+        """这个 endpoint 本次请求允许的 prompt 上限（**业务口径**）。
 
-        ``0`` = 不做上限判断（旧 ``max_context_tokens=0`` 的兼容语义）。
+        取 ``min(模型可用输入, 272Ki − 预留)``：正常情况恒为 ``245760``；模型更小就跟着
+        更小；本次输出需求更大（``max_tokens > 32Ki``）就更紧。模型真实窗口 1M/4M 不会
+        让这一轮填满百万窗口。``0`` 只可能出现在"窗口信息完全拿不到"的退化情况，
+        调用方按不裁剪处理（业务预算仍由装配链路兜住）。
         """
 
         target = cfg or self.main
         limits = self.endpoint_limits(target)
-        if limits is None:
-            return 0
         reserve = max(
             MIN_OUTPUT_RESERVE_TOKENS,
             max(0, int(getattr(target, "max_tokens", 0) or 0)),
         )
-        return limits.input_budget_tokens(output_reserve=reserve)
+        if limits is None:
+            return 0
+        return limits.business_input_budget(output_reserve=reserve)
 
     def _context_window_total(self, cfg: ChatEndpointConfig | None = None) -> int:
         return self.input_token_budget(cfg)

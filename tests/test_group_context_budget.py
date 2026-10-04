@@ -172,8 +172,8 @@ class GroupHistoryBudgetGateTests(unittest.TestCase):
     def test_default_target_and_clamping_ranges(self) -> None:
         self.assertEqual(GROUP_HISTORY_TOKEN_BUDGET, 278_528)
         self.assertEqual(GROUP_HISTORY_RESERVE_TOKENS, 32_768)
-        # 条数只是安全上限（token 预算才是主驱动）：默认 2000 条 = 旧窗口 50 条的 40 倍。
-        self.assertEqual(GROUP_HISTORY_MAX_MESSAGES, 2000)
+        # 条数只是安全上限（token 预算才是主驱动）：用户 2026-10-04 最终口径为最近 1000 条。
+        self.assertEqual(GROUP_HISTORY_MAX_MESSAGES, 1000)
 
         self.assertEqual(bounded_group_history_token_budget(0), 1024)
         self.assertEqual(bounded_group_history_token_budget(9_000_000), 2_000_000)
@@ -317,6 +317,68 @@ class GroupArchiveHistoryTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ).scalar_one()
             )
+
+    async def test_tens_of_thousands_of_short_messages_stop_at_the_1000_cap(self) -> None:
+        """几万条短消息：单轮最多装配最近 1000 条，而且读库是**按页有界**的。
+
+        用户 2026-10-04 最终口径：群加载最近 1000 条安全上限，budget 与条数先到即停，
+        绝不"读出几万条再切片"。这里用真实的 sqlite 归档 + SQLAlchemy 语句钩子验证：
+        返回条数被 1000 卡住、保留的是最新那批、每一条归档查询都带 LIMIT 且页数有限。
+        """
+
+        from sqlalchemy import event, insert
+
+        memory = await self._memory(memory_retention_days=365)
+        total = 30_000
+        # 用 executemany 批量写入（ORM 逐对象 add_all 在这个量级上要几十秒）。
+        base = now_shanghai_naive() - timedelta(seconds=total + 1)
+        async with memory.session_factory() as session:
+            await MemoryService._ensure_group_row(session, self.GROUP_ID)
+            await session.execute(
+                insert(GroupMessageArchive),
+                [
+                    {
+                        "group_id": self.GROUP_ID,
+                        "message_key": f"{self.GROUP_ID}:{1000 + index}",
+                        "telegram_message_id": 1000 + index,
+                        "role": "user",
+                        "direction": "inbound",
+                        "sender_display_name": "Alice",
+                        "sender_id": 7,
+                        "message_type": "text",
+                        "content": f"m{index}",
+                        "raw_text": f"m{index}",
+                        "sent_at": base + timedelta(seconds=index),
+                    }
+                    for index in range(total)
+                ],
+            )
+            await session.commit()
+
+        statements: list[str] = []
+        engine = self._engines[-1]
+
+        def _record(_conn, _cursor, statement, _params, _ctx, _many) -> None:
+            lowered = statement.lower()
+            if "group_message_archive" in lowered and "select" in lowered:
+                statements.append(statement)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", _record)
+        try:
+            history = await memory.load_group_history_by_budget(self.GROUP_ID)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+        self.assertEqual(GROUP_HISTORY_MAX_MESSAGES, 1000)
+        self.assertEqual(len(history), GROUP_HISTORY_MAX_MESSAGES)
+        # 最新消息优先（保留的是尾部那批）
+        self.assertIn(f"m{total - 1}", history[-1]["content"])
+        self.assertNotIn("m0]", history[0]["content"])
+        # 读库有界：每条归档查询都带 LIMIT，页数远小于"一页一条地扫几万条"。
+        self.assertTrue(statements)
+        for statement in statements:
+            self.assertIn("LIMIT", statement.upper())
+        self.assertLessEqual(len(statements), 6)
 
     async def test_reads_by_budget_not_by_a_fixed_message_count(self) -> None:
         """条数远多于 50、总 token 仍在预算内 → 早期历史一条都不许丢。"""
