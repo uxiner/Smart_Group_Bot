@@ -4125,48 +4125,6 @@ async def _reconcile_moderation_challenge_restriction(
     return True
 
 
-async def _shield_reconcile_moderation_challenge_restriction(
-    *,
-    bot: Bot,
-    session: AsyncSession,
-    session_factory: async_sessionmaker[AsyncSession] | None,
-    group_id: int,
-    user_id: int,
-) -> bool:
-    """Do not detach latest-intent reconciliation during update cancellation."""
-
-    task = asyncio.create_task(
-        _reconcile_moderation_challenge_restriction(
-            bot=bot,
-            session=session,
-            session_factory=session_factory,
-            group_id=group_id,
-            user_id=user_id,
-        ),
-        name=f"moderation-challenge-reconcile:{group_id}:{user_id}",
-    )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception(
-                "moderation restriction reconciliation failed while cancellation was pending | "
-                "group=%s user=%s",
-                group_id,
-                user_id,
-            )
-        raise
-
-
 async def _compensate_moderation_challenge(
     *,
     bot: Bot,
@@ -4352,10 +4310,21 @@ async def _begin_moderation_challenge_locked(
             and current_status
             in {VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_ENFORCING}
         ):
-            # Another concurrent message already issued the challenge. Keep
-            # the original deadline and prompt instead of extending it. Check
-            # the exact generation both before and after Telegram: /unban can
-            # replace/delete the row in either side of that network await.
+            # Another message already issued this challenge. Keep the original
+            # deadline and prompt instead of extending it, and keep the original
+            # mute: the row only reaches pending/enforcing *after* the issuer's
+            # `restrict_new_member` succeeded and `commit_prepared_join_verification`
+            # ran (a failed mute is compensated away and never gets that far), so
+            # this row's existence already proves the member is muted.
+            #
+            # The generation check is therefore the only one needed. The former
+            # "check again after Telegram" pair existed solely to cover the race
+            # that *this function's own* `restrict_new_member` network await opened
+            # up (/unban landing on either side of it). With no await between the
+            # check and the return, that window is gone, so re-muting on every
+            # Telegram redelivery only burned quota and API budget (B-11 residual,
+            # measured by GAP-D1 §3.3 B11-3/B11-7: restrict_chat_member was called
+            # once per redelivery while the DB layer stayed idempotent).
             generation_current = await _join_verification_generation_is_current(
                 session,
                 **current_generation,
@@ -4363,35 +4332,10 @@ async def _begin_moderation_challenge_locked(
             await session.commit()
             if not generation_current:
                 log.info(
-                    "duplicate moderation challenge superseded before mute | "
-                    "group=%s user=%s",
+                    "duplicate moderation challenge superseded | group=%s user=%s",
                     group_id,
                     user_id,
                 )
-                return True
-            restricted = await restrict_new_member(bot, group_id, user_id)
-            if not restricted:
-                return False
-            generation_current = await _join_verification_generation_is_current(
-                session,
-                **current_generation,
-            )
-            await session.commit()
-            if not generation_current:
-                reconciled = await _shield_reconcile_moderation_challenge_restriction(
-                    bot=bot,
-                    session=session,
-                    session_factory=session_factory,
-                    group_id=group_id,
-                    user_id=user_id,
-                )
-                if not reconciled:
-                    log.critical(
-                        "duplicate moderation mute lost generation and could not reconcile | "
-                        "group=%s user=%s",
-                        group_id,
-                        user_id,
-                    )
             return True
         return False
 

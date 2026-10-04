@@ -124,7 +124,17 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
         self.assertTrue(handled)
         session.execute.assert_not_awaited()
 
-    async def test_duplicate_moderation_challenge_releases_read_before_restrict(self) -> None:
+    async def test_duplicate_moderation_challenge_releases_read_before_returning(
+        self,
+    ) -> None:
+        """重复分支的读事务仍在返回前释放，且全程不碰 Telegram（B-11 残留）。
+
+        原来这里叫 ``..._releases_read_before_restrict``：它断言 SELECT 事务在
+        ``restrict_new_member`` 这个网络 await 之前就 commit 掉了。重复分支不再重复
+        静音之后就没有这个 await 了，但**「读事务不跨出调用」这条纪律不变**，所以这里
+        继续钉住提交序列，并额外断言静音一次都没被调。
+        """
+
         events: list[str] = []
         session = SimpleNamespace(
             commit=AsyncMock(side_effect=lambda: events.append("commit")),
@@ -141,10 +151,6 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
 
         async def restrict_after_release(*_args, **_kwargs) -> bool:
             events.append("restrict")
-            self.assertEqual(
-                events,
-                ["commit", "commit", "check", "commit", "restrict"],
-            )
             return True
 
         async def generation_check(*_args, **_kwargs) -> bool:
@@ -166,7 +172,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 join_verification,
                 "restrict_new_member",
                 new=AsyncMock(side_effect=restrict_after_release),
-            ),
+            ) as restrict,
             patch.object(
                 join_verification,
                 "_join_verification_generation_is_current",
@@ -186,20 +192,18 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
             )
 
         self.assertTrue(started)
-        self.assertEqual(
-            events,
-            [
-                "commit",
-                "commit",
-                "check",
-                "commit",
-                "restrict",
-                "check",
-                "commit",
-            ],
-        )
+        self.assertEqual(events, ["commit", "commit", "check", "commit"])
+        restrict.assert_not_awaited()
 
-    async def test_duplicate_moderation_mute_losing_generation_reconciles(self) -> None:
+    async def test_duplicate_moderation_does_not_mute_again(self) -> None:
+        """重复分支不再重复静音（B-11 残留）。
+
+        原来这里断言「静音 → 丢 generation → reconcile」。那个 reconcile 存在的唯一
+        目的就是覆盖**本次静音自己的网络 await** 让 ``/unban`` 插进来的窗口；不再静音
+        之后，校验与返回之间没有任何 await，窗口消失，后置校验与 reconcile 一并失去
+        可达性。
+        """
+
         current = SimpleNamespace(
             id=8,
             group_id=-100,
@@ -222,7 +226,7 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
             patch.object(
                 join_verification,
                 "_join_verification_generation_is_current",
-                new=AsyncMock(side_effect=[True, False]),
+                new=AsyncMock(return_value=True),
             ) as generation_check,
             patch.object(
                 join_verification,
@@ -248,9 +252,65 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
             )
 
         self.assertTrue(handled)
-        self.assertEqual(generation_check.await_count, 2)
-        restrict.assert_awaited_once()
-        reconcile.assert_awaited_once()
+        # 只校验一次 generation，且不再调静音。
+        self.assertEqual(generation_check.await_count, 1)
+        restrict.assert_not_awaited()
+        reconcile.assert_not_awaited()
+
+    async def test_duplicate_moderation_losing_generation_short_circuits(self) -> None:
+        """generation 已失效时，重复分支仍然早退、不去动 Telegram。"""
+
+        current = SimpleNamespace(
+            id=8,
+            group_id=-100,
+            user_id=88,
+            kind=join_verification.VERIFICATION_KIND_MODERATION,
+            status=join_verification.VERIFICATION_STATUS_PENDING,
+            deadline_at=now_shanghai_naive() + timedelta(minutes=2),
+            lease_until=None,
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        reconcile = AsyncMock(return_value=True)
+
+        with (
+            patch.object(join_verification, "moderation_challenge_ready", return_value=True),
+            patch.object(
+                join_verification,
+                "get_join_verification",
+                new=AsyncMock(return_value=current),
+            ),
+            patch.object(
+                join_verification,
+                "_join_verification_generation_is_current",
+                new=AsyncMock(return_value=False),
+            ) as generation_check,
+            patch.object(
+                join_verification,
+                "restrict_new_member",
+                new=AsyncMock(return_value=True),
+            ) as restrict,
+            patch.object(
+                join_verification,
+                "_reconcile_moderation_challenge_restriction",
+                new=reconcile,
+            ),
+        ):
+            handled = await join_verification._begin_moderation_challenge_locked(
+                bot=SimpleNamespace(),
+                session=session,
+                settings=SimpleNamespace(),
+                group_id=-100,
+                user_id=88,
+                display_name="member",
+                bot_username="bot",
+                reason="test",
+                rule_action="ban",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(generation_check.await_count, 1)
+        restrict.assert_not_awaited()
+        reconcile.assert_not_awaited()
 
     async def test_moderation_mute_losing_generation_reconciles_before_prompt(self) -> None:
         now = now_shanghai_naive()
