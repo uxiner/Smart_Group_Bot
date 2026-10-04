@@ -437,6 +437,111 @@ class AdvancementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(scheduler._next_wake_in(cfg))
 
 
+class ReplyPressureTests(unittest.IsolatedAsyncioTestCase):
+    """B-22：回复压力必须仍然是"回复优先"，但不能把摘要饿死到永远排不上。
+
+    ``_LONG_PRESSURE_SECONDS`` 远大于实现里的总预算（300s），这里只断言"不会无限期
+    停摆"，不把具体秒数锁死进用例。
+    """
+
+    _LONG_PRESSURE_SECONDS = 3600.0
+
+    def _scheduler(self, cfg, *, clock, pressured=True, alerts=None):
+        scheduler = GroupSummaryScheduler(
+            llm=FakeLLM(),
+            store=FakeStore({}),
+            config_provider=lambda: cfg,
+            slot_waiter=lambda: pressured,
+            clock=clock,
+        )
+        if alerts is not None:
+            scheduler.set_alert(alerts)
+        for group_id in (1, 2):
+            scheduler.notify(group_id)
+        return scheduler
+
+    async def test_reply_priority_holds_within_the_starvation_budget(self) -> None:
+        now = [1000.0]
+        cfg = GroupSummaryConfig(enabled=True, min_refresh_seconds=0.0, queue_wait_seconds=5.0)
+        scheduler = self._scheduler(cfg, clock=lambda: now[0])
+
+        # 压力持续，但还没到总预算：回复优先，一个都不放行
+        for _ in range(10):
+            now[0] += 1.0
+            self.assertIsNone(scheduler._claim_next(cfg))
+
+        snapshot = scheduler.snapshot()
+        self.assertEqual(snapshot["skipped_reply_waiting_total"], 10)
+        self.assertEqual(snapshot["starvation_released_total"], 0)
+        self.assertEqual(snapshot["queue_expired_total"], 0, "压力期不算排队超期")
+        self.assertEqual(len(scheduler._pending), 2, "pending 不该被丢")
+
+    async def test_sustained_pressure_releases_one_summary_and_alerts(self) -> None:
+        now = [1000.0]
+        alerts: list[dict] = []
+
+        async def fake_alert(**payload) -> bool:
+            alerts.append(payload)
+            return True
+
+        cfg = GroupSummaryConfig(enabled=True, min_refresh_seconds=0.0, queue_wait_seconds=5.0)
+        scheduler = self._scheduler(cfg, clock=lambda: now[0], alerts=fake_alert)
+        scheduler.notify(3)
+
+        # 第一轮只起算连续压力，回复优先照旧
+        now[0] += 1.0
+        self.assertIsNone(scheduler._claim_next(cfg))
+        # 连续压力超过总预算：强制放行一个，并且必须留下计数与告警
+        now[0] += self._LONG_PRESSURE_SECONDS
+        claimed = scheduler._claim_next(cfg)
+
+        self.assertIn(claimed, (1, 2, 3))
+        snapshot = scheduler.snapshot()
+        self.assertEqual(snapshot["starvation_released_total"], 1)
+        self.assertGreaterEqual(snapshot["reply_pressure_seconds"], 0.0)
+        await asyncio.gather(*list(scheduler._alert_tasks))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["kind"], "group_summary_starvation")
+        self.assertGreaterEqual(alerts[0]["fields"]["pending"], 1)
+        self.assertEqual(alerts[0]["fields"]["starvation_released_total"], 1)
+
+        # 放行后重新计时：预算又用满了才会再放一个
+        now[0] += 1.0
+        self.assertIsNone(scheduler._claim_next(cfg))
+        now[0] += self._LONG_PRESSURE_SECONDS
+        self.assertIsNotNone(scheduler._claim_next(cfg))
+        self.assertEqual(scheduler.snapshot()["starvation_released_total"], 2)
+
+    async def test_pressure_release_stops_when_replies_clear(self) -> None:
+        now = [1000.0]
+        pressured = [True]
+        cfg = GroupSummaryConfig(enabled=True, min_refresh_seconds=0.0, queue_wait_seconds=5.0)
+        scheduler = GroupSummaryScheduler(
+            llm=FakeLLM(),
+            store=FakeStore({}),
+            config_provider=lambda: cfg,
+            slot_waiter=lambda: pressured[0],
+            clock=lambda: now[0],
+        )
+        scheduler.notify(1)
+
+        pressured[0] = False
+        self.assertEqual(scheduler._claim_next(cfg), 1, "压力解除后立即恢复")
+
+        # 重新压上：计时从零开始，之前那段压力不累计进新预算
+        scheduler._pending[1].claimed = False
+        scheduler._order.append(1)
+        pressured[0] = True
+        now[0] += 1.0
+        self.assertIsNone(scheduler._claim_next(cfg), "新一段压力的第 1 轮：只起算预算")
+        now[0] += 5.0
+        self.assertIsNone(scheduler._claim_next(cfg), "预算还没用满，仍然回复优先")
+        self.assertEqual(scheduler.snapshot()["starvation_released_total"], 0)
+        now[0] += self._LONG_PRESSURE_SECONDS
+        self.assertIsNotNone(scheduler._claim_next(cfg), "预算用满后放行一个")
+        self.assertEqual(scheduler.snapshot()["starvation_released_total"], 1)
+
+
 class BoundedStateTests(unittest.IsolatedAsyncioTestCase):
     async def test_aux_maps_are_pruned_and_capped(self) -> None:
         store = FakeStore({})

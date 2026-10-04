@@ -103,6 +103,13 @@ _FORBIDDEN_OUTPUT_RE = re.compile(
 _SNAPSHOT_MESSAGE_MAX_CHARS = 600
 #: 回复压力期间的有界再检查间隔（秒）：既不忙循环，也能在压力解除后自动继续。
 _REPLY_PRESSURE_RECHECK_SECONDS = 1.0
+#: **连续**回复压力的总预算（秒）：超过它就强制放行一个摘要。否则 busy 群里摘要会
+#: 无限期停摆——每轮都把 dirty_since 推回"现在"，queue_wait 的过期判定永远不成立，
+#: 于是既没有 queue_expired、没有退避，也没有任何告警（只有 pending 悄悄涨到队满）。
+#: 取值要宽松：回复优先仍然是常态，这只是防"永远排不上"的兜底。
+_REPLY_PRESSURE_STARVATION_SECONDS = 300.0
+#: 饿死兜底告警的 kind（超管私聊的标识，便于按类检索历史）。
+_STARVATION_ALERT_KIND = "group_summary_starvation"
 #: 还有 pending 但暂时没有定时事件时的最小再检查间隔（秒）。
 _MIN_PENDING_RECHECK_SECONDS = 0.25
 #: 辅助 map 的容量兜底：观测用的"最近成功"只保留这么多群（其余是历史噪声）。
@@ -979,6 +986,8 @@ class GroupSummaryMetrics:
     failure_total: int = 0
     skipped_not_ready_total: int = 0
     skipped_reply_waiting_total: int = 0
+    #: 连续回复压力超过总预算后被强制放行的摘要数（>0 就说明"回复优先"曾把摘要饿死过）。
+    starvation_released_total: int = 0
     requeued_backlog_total: int = 0
     requeued_redirty_total: int = 0
     aux_pruned_total: int = 0
@@ -998,6 +1007,7 @@ class GroupSummaryMetrics:
             "failure_total": self.failure_total,
             "skipped_not_ready_total": self.skipped_not_ready_total,
             "skipped_reply_waiting_total": self.skipped_reply_waiting_total,
+            "starvation_released_total": self.starvation_released_total,
             "requeued_backlog_total": self.requeued_backlog_total,
             "requeued_redirty_total": self.requeued_redirty_total,
             "aux_pruned_total": self.aux_pruned_total,
@@ -1044,6 +1054,12 @@ class GroupSummaryScheduler:
         #: 回复压力（普通回复在等入场）期间的有界再检查时刻：压力期间不把时间算成
         #: "摘要的入场等待"，压力解除后自动继续。
         self._reply_pressure_until = 0.0
+        #: 连续回复压力的起点（clock 口径）。超过 _REPLY_PRESSURE_STARVATION_SECONDS
+        #: 就放行一个摘要并重新计时；压力解除即清零。
+        self._reply_pressure_since = 0.0
+        #: 超管告警通道（``ops_alert.alert_super_admin`` 的薄封装），由启动流程注入。
+        self._alert: Callable[..., Awaitable[Any]] | None = None
+        self._alert_tasks: set[asyncio.Task[Any]] = set()
         # 只在模型入口真的接受 ``max_tokens`` 时才传（测试替身/旧实现保持兼容）。
         self._summary_accepts_max_tokens = _accepts_keyword(
             getattr(llm, "background_summary_completion", None),
@@ -1281,7 +1297,14 @@ class GroupSummaryScheduler:
         """
 
         now = self._clock()
-        if self._slot_waiter is not None and self._slot_waiter():
+        under_pressure = self._slot_waiter is not None and self._slot_waiter()
+        if under_pressure and not self._reply_pressure_since:
+            self._reply_pressure_since = now
+        starving = (
+            under_pressure
+            and 0.0 < now - self._reply_pressure_since >= _REPLY_PRESSURE_STARVATION_SECONDS
+        )
+        if under_pressure and not starving:
             # 普通回复正在排队等入场：这一次不 claim 新摘要（回复优先）。
             # 关键：这段等待**不是摘要的入场等待**——把所有 pending 的入场计时重置到
             # "现在"（否则回复压力一旦超过 queue_wait，摘要会被误判 queue_expired 并退避），
@@ -1293,6 +1316,26 @@ class GroupSummaryScheduler:
                     pending.dirty_since = now
             self._reply_pressure_until = now + _REPLY_PRESSURE_RECHECK_SECONDS
             return None
+        if not under_pressure:
+            self._reply_pressure_since = 0.0
+        if starving:
+            # 饥饿兜底：连续压力超过总预算就放行一个（回复优先仍是常态），
+            # 否则 pending 会一直涨到队满，而 queue_expired / 退避 / 告警一个都不涨。
+            pressure_seconds = now - self._reply_pressure_since
+            self._reply_pressure_since = now
+            self.metrics.starvation_released_total += 1
+            log.warning(
+                "group summary starvation escape | pending=%d | running=%d | "
+                "reply_pressure_seconds=%.1f | queue_wait_seconds=%s",
+                len(self._pending),
+                len(self._running),
+                pressure_seconds,
+                cfg.queue_wait_seconds,
+            )
+            self._notify_starvation(
+                pending=len(self._pending),
+                pressure_seconds=pressure_seconds,
+            )
         if self._reply_pressure_until:
             # 压力刚解除：入场计时从"现在"重新开始 —— 压力期间的时间不算入场等待，
             # 所以"压力 > queue_wait 之后恢复"也不会被判 queue_expired / 无端退避。
@@ -1693,6 +1736,49 @@ class GroupSummaryScheduler:
 
         self._wake_event.set()
 
+    def set_alert(self, alert: Callable[..., Awaitable[Any]] | None) -> None:
+        """注入超管告警通道（``ops_alert.alert_super_admin`` 的薄封装）。
+
+        没注入就只记 WARNING 日志——告警是可选增强，绝不能让摘要流水线依赖它。
+        """
+
+        self._alert = alert
+
+    def _notify_starvation(self, *, pending: int, pressure_seconds: float) -> None:
+        """把"摘要被回复压力饿死"这件事报给超管（无运行循环/未注入时只留日志）。"""
+
+        alert = self._alert
+        if alert is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            coro = alert(
+                kind=_STARVATION_ALERT_KIND,
+                summary=(
+                    "后台群摘要被持续的回复压力饿死：已超过总预算，强制放行了一个摘要。"
+                    "若频繁出现，说明摘要并发（门禁背景容量 2）相对回复量偏小。"
+                ),
+                fields={
+                    "pending": pending,
+                    "reply_pressure_seconds": round(float(pressure_seconds), 1),
+                    "starvation_released_total": self.metrics.starvation_released_total,
+                },
+            )
+        except Exception:  # pragma: no cover - 告警绝不影响调度
+            log.warning("group summary starvation alert could not be built", exc_info=True)
+            return
+        try:
+            # 留住强引用：只靠事件循环的弱引用，告警任务可能在发出去之前就被回收。
+            task = loop.create_task(coro, name="group-summary-starvation-alert")
+        except Exception:  # pragma: no cover - 同上
+            coro.close()
+            return
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
+
     def next_retry_at(self) -> float | None:
         """下一个退避到点的时刻（``clock`` 口径），没有则 ``None``（观测用）。"""
 
@@ -1733,6 +1819,11 @@ class GroupSummaryScheduler:
             "per_group_concurrency": cfg.per_group_concurrency,
             "backoff_groups": len(self._backoff_until),
             "reply_pressure_pending": self._reply_pressure_until > self._clock(),
+            "reply_pressure_seconds": (
+                round(max(0.0, self._clock() - self._reply_pressure_since), 3)
+                if self._reply_pressure_since
+                else 0.0
+            ),
             "next_retry_in_seconds": (
                 round(max(0.0, (self.next_retry_at() or now) - now), 3)
                 if self._backoff_until

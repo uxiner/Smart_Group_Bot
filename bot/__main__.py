@@ -46,6 +46,7 @@ from bot.services.group_permissions import (
 )
 from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_tasks
 from bot.services.memory import MemoryService
+from bot.services.ops_alert import alert_super_admin
 from bot.services.patrol import PatrolService, init_patrol_service
 from bot.services.point_shop import ShopExpiryService
 from bot.services.private_chat import (
@@ -681,6 +682,11 @@ async def main() -> None:
         )
         log.info("Bot identity resolved: @%s (%s)", me.username, me.full_name)
         await _publish_bot_command_menu(bot)
+        # 摘要饿死兜底的超管告警通道（bot 要等构造出来之后才拿得到）
+        if summary_scheduler is not None:
+            summary_scheduler.set_alert(
+                lambda **alert: alert_super_admin(bot, settings, **alert)
+            )
         telegram_cleanup = TelegramCleanupScheduler(
             bot=bot,
             session_factory=session_factory,
