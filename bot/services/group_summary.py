@@ -1172,6 +1172,10 @@ class GroupSummaryScheduler:
         self._active_models = 0
         self.metrics = GroupSummaryMetrics()
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: fire-and-forget 的辅助任务（退避台账落库/清理）。**刻意与 ``_tasks``
+        #: 分开**：``_pump`` 的并发判定是 ``len(self._tasks) < limit``，把辅助
+        #: 任务混进去会凭空吃掉摘要的执行槽（limit 默认 2）。
+        self._aux_tasks: set[asyncio.Task[Any]] = set()
 
     # -- 前台唯一入口（绝不阻塞、绝不 await 生成） -------------------------
     def notify(
@@ -1890,15 +1894,20 @@ class GroupSummaryScheduler:
             )
 
     def _spawn(self, coro: Awaitable[Any], *, label: str) -> None:
-        """跑一个**不阻塞调度**的后台协程（失败只记日志，绝不影响主流程）。"""
+        """跑一个**不阻塞调度**的后台协程（失败只记日志，绝不影响主流程）。
+
+        放在 ``_aux_tasks`` 而不是 ``_tasks``：后者是 ``_pump`` 的执行槽预算
+        （``len(self._tasks) < limit``），辅助任务混进去会挤掉真正的摘要。
+        """
 
         try:
             task = asyncio.ensure_future(coro)
         except RuntimeError:  # pragma: no cover - 没有运行中的事件循环
             log.debug("group summary: no loop; dropped %s", label)
+            coro.close()
             return
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._aux_tasks.add(task)
+        task.add_done_callback(self._aux_tasks.discard)
 
         def _done(finished: asyncio.Future[Any]) -> None:
             if finished.cancelled():
@@ -1922,6 +1931,12 @@ class GroupSummaryScheduler:
         await self._cancel_tasks(timeout_seconds=timeout_seconds)
 
     async def _cancel_tasks(self, *, timeout_seconds: float = 5.0) -> None:
+        aux = [task for task in self._aux_tasks if not task.done()]
+        self._aux_tasks = {task for task in self._aux_tasks if not task.done()}
+        for task in aux:
+            task.cancel()
+        if aux:
+            await asyncio.wait(aux, timeout=max(0.1, float(timeout_seconds)))
         tasks = [task for task in self._tasks if not task.done()]
         self._tasks = {task for task in self._tasks if not task.done()}
         for task in tasks:
@@ -2014,6 +2029,7 @@ class GroupSummaryScheduler:
             "pending_capacity": cfg.pending_capacity,
             "running": len(self._running),
             "tasks": len([task for task in self._tasks if not task.done()]),
+            "aux_tasks": len([task for task in self._aux_tasks if not task.done()]),
             "global_concurrency": cfg.global_concurrency,
             "effective_concurrency": self._effective_concurrency(cfg),
             "gate_background_capacity": self._gate_background_capacity(),

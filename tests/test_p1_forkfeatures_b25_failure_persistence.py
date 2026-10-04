@@ -186,6 +186,46 @@ class FailureBackoffPersistenceTests(unittest.IsolatedAsyncioTestCase):
             await self._rows_in_db(), [], "发布成功必须删掉台账，否则重启又恢复旧阶梯"
         )
 
+    async def test_aux_tasks_do_not_consume_the_pump_execution_slots(self) -> None:
+        """回归：fire-and-forget 的台账任务不能挤掉摘要的执行槽。
+
+        ``_pump`` 的并发判定是 ``while len(self._tasks) < limit``（limit 默认 2）。
+        辅助任务若混进 ``_tasks``，两次落库就能让 ``_pump`` 以为已满、整条摘要
+        流水线停摆。
+        """
+
+        cfg = self._cfg()
+        store = _PersistentStore(_rows(GROUP_ID, 600), self.session_factory)
+        scheduler = GroupSummaryScheduler(
+            llm=FakeLLM(), store=store, config_provider=lambda: cfg, slot_waiter=None
+        )
+        for _ in range(4):
+            scheduler._register_failure(GROUP_ID, cfg)
+        # 落库任务确实挂起了（还没给事件循环机会跑完）
+        self.assertGreaterEqual(len(scheduler._aux_tasks), 1)
+        self.assertEqual(
+            len(scheduler._tasks),
+            0,
+            "辅助任务必须在 _aux_tasks 里，不得进入 _tasks 的执行槽预算",
+        )
+        self.assertLess(
+            len(scheduler._aux_tasks),
+            scheduler._effective_concurrency(cfg) + 4,
+            "辅助任务数量不应影响并发判定",
+        )
+
+    async def test_shutdown_cancels_the_aux_tasks(self) -> None:
+        cfg = self._cfg()
+        store = _PersistentStore(_rows(GROUP_ID, 600), self.session_factory)
+        scheduler = GroupSummaryScheduler(
+            llm=FakeLLM(), store=store, config_provider=lambda: cfg, slot_waiter=None
+        )
+        scheduler._register_failure(GROUP_ID, cfg)
+        await scheduler.shutdown(timeout_seconds=1.0)
+        self.assertEqual(
+            len([t for t in scheduler._aux_tasks if not t.done()]), 0
+        )
+
     async def test_store_without_the_table_is_survivable(self) -> None:
         """读不到台账（老库/替身）时按「无退避」处理，绝不抛。"""
 
