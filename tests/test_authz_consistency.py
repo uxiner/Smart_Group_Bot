@@ -6,11 +6,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from bot.config import Settings
 from bot.db.engine import init_db
-from bot.db.models import AuthorizedGroup
+from bot.db.models import Admin, AuthorizedGroup, MemberCheckin
 from bot.handlers import admin, membership
 from bot.services.authz import (
     authorize_group,
@@ -61,6 +62,72 @@ class AuthorizationConsistencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await deauthorize_group(session, -999))
             await session.commit()
             self.assertFalse(await is_group_admin_authorized(session, -999, 42))
+
+    async def test_granting_the_same_admin_twice_in_one_transaction_commits(self) -> None:
+        """``authorize_group_admin`` 必须在 add 之后 flush。
+
+        sessionmaker 明确 ``autoflush=False``（``bot/db/engine.py``），所以待写的
+        ``Admin`` 行对同一事务里后面的 SELECT 不可见：不给它 flush 的话，
+        连续授权两次会拿到两个 ``True``，commit 时
+        ``UNIQUE(admins.group_id, admins.user_id)`` 把**整笔**事务打掉。
+        """
+
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await session.commit()
+
+            self.assertTrue(await authorize_group_admin(session, -100, 42, "admin"))
+            # 第二次同一个人：按实现语义应当返回 False（"没有新增授权"），
+            # 并且不能把上一行从待写队列里挤成两条 INSERT。
+            self.assertFalse(await authorize_group_admin(session, -100, 42, "superadmin"))
+            await session.commit()
+
+            self.assertTrue(await is_group_admin_authorized(session, -100, 42))
+            admins = list(
+                (
+                    await session.execute(
+                        select(Admin).where(
+                            Admin.group_id == -100, Admin.user_id == 42
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            self.assertEqual([row.role for row in admins], ["superadmin"])
+
+    async def test_repeat_grant_keeps_the_rest_of_the_transaction(self) -> None:
+        """回归的另一半：冲突不能把同事务里别的写入一起带走。"""
+
+        from bot.db.models import MemberCheckin
+
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await session.commit()
+
+            self.assertTrue(await authorize_group_admin(session, -100, 42))
+            session.add(
+                MemberCheckin(group_id=-100, user_id=99, checkin_date="2026-10-05")
+            )
+            await authorize_group_admin(session, -100, 42, "superadmin")
+            # 修前这里会排第二条 INSERT，commit 抛
+            # IntegrityError(UNIQUE admins.group_id, admins.user_id)，
+            # 整笔事务（包括上面这条签到）一起被打掉。
+            await session.commit()
+
+            stored = list(
+                (
+                    await session.execute(
+                        select(MemberCheckin).where(
+                            MemberCheckin.group_id == -100,
+                            MemberCheckin.user_id == 99,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            self.assertEqual(len(stored), 1, "同事务的其它写入被 UNIQUE 冲突打掉了")
 
     async def test_authadmin_rejects_an_unauthorized_target_group(self) -> None:
         settings = Settings(_env_file=None)
