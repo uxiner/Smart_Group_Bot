@@ -201,9 +201,10 @@ class AutoWindowBudgetTests(unittest.TestCase):
         """模型宣告 1M 会被**原样解析**，但每轮业务窗口仍是 272Ki（不填满百万）。"""
 
         settings = _settings()
-        # 未知时的口径：兼容字段的保守降级值，装配函数读配置值、MemoryService 再夹余量。
+        # 未拿到元数据时：闸门是业务总窗口 272Ki；**可用历史输入要扣固定余量**
+        # （245760 = 278528 − 32768），不能把总窗口当成可用输入。
         self.assertEqual(context_gate.context_token_budget(settings), 278_528)
-        self.assertEqual(group_context.group_history_token_budget(settings), 278_528)
+        self.assertEqual(group_context.group_history_token_budget(settings), 245_760)
         self.assertEqual(private_chat.private_history_token_budget(settings), 278_528)
 
         ml.MODEL_LIMITS.record(

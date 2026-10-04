@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from bot.services.model_limits import (
+    auto_mode_enabled,
     auto_window_for,
     business_total_window,
     configured_business_tokens,
@@ -128,18 +129,26 @@ def group_history_token_budget(settings: Any) -> int:
     """
 
     reserve = group_history_reserve_tokens(settings)
-    window = auto_window_for(settings)
-    if window is not None:
-        business = business_total_window(
-            window,
+    if auto_mode_enabled(settings):
+        # auto：可用历史输入 = min(显式配置, 业务总窗口 − 固定余量)。
+        # 与"元数据到没到"无关——278528 是**总**窗口，不能当成可用输入
+        # （默认配置因此是 245760，这条口径由专项用例锁定）；显式配更小仍然生效，
+        # 模型窗口更小就跟着更小。
+        window = business_total_window(
+            auto_window_for(settings),
             business_tokens=configured_business_tokens(settings),
         )
         return effective_group_history_budget(
-            configured_budget=business,
+            configured_budget=_bot_setting(
+                settings,
+                "group_history_token_budget",
+                GROUP_HISTORY_TOKEN_BUDGET,
+            ),
             reserve_tokens=reserve,
-            model_window_tokens=business,
+            model_window_tokens=window,
             clamp_budget=False,
         )
+    # fixed（兼容逃生舱）：保持迁移前的配置口径。
     return bounded_group_history_token_budget(
         _bot_setting(
             settings,

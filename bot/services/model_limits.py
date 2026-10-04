@@ -971,11 +971,17 @@ def configured_reserve_tokens(settings: Any) -> int:
     view = _config_view(settings)
     value = getattr(view, "context_reserve_tokens", None)
     legacy = getattr(view, "group_history_reserve_tokens", None)
-    if value is None or (
-        # 新字段还是默认值、而旧字段被显式配过 → 以旧字段为准（显式配置必须保留）。
-        _positive_int(value) == BUSINESS_OUTPUT_RESERVE_TOKENS
-        and _positive_int(legacy) not in (None, BUSINESS_OUTPUT_RESERVE_TOKENS)
-    ):
+    fields_set = getattr(view, "model_fields_set", None)
+    if isinstance(fields_set, (set, frozenset)):
+        # pydantic：按**显式设置过哪个字段**决定，绝不按"值看起来等于默认"猜。
+        # 新字段被显式设置（哪怕正好等于默认 32768）→ 以新字段为准；
+        # 只有"旧字段被显式设置、新字段没设"时才用旧字段（旧库/旧代码兼容）。
+        if "context_reserve_tokens" in fields_set:
+            value = value
+        elif "group_history_reserve_tokens" in fields_set:
+            value = legacy
+    elif value is None:
+        # 非 pydantic 替身：新字段缺项才回退旧字段。
         value = legacy
     reserve = _bounded_int(
         value,
@@ -985,7 +991,9 @@ def configured_reserve_tokens(settings: Any) -> int:
     )
     budget = configured_business_tokens(settings)
     if reserve >= budget:
-        # 配置非法：不能"0 关闭门禁"，收紧到留 1024 输入。
+        # 配置非法（正常会被 pydantic 拒绝）：只收紧**配置值**本身，绝不缩小
+        # "本次实际输出需求"——`business_input_budget` 始终取
+        # ``max(配置预留, 实际 max_tokens)``，所以不会制造虚假的正数输入空间。
         reserve = max(1, budget - MIN_INPUT_ALLOWANCE_TOKENS)
     return reserve
 

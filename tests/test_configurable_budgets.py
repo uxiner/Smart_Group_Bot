@@ -245,6 +245,51 @@ class EffectiveBudgetTests(unittest.TestCase):
         )
 
 
+class ReservePrecedenceTests(unittest.TestCase):
+    """旧字段兼容按"显式设置过哪个字段"判定，绝不按"值看起来等于默认"猜。"""
+
+    def test_legacy_field_wins_only_when_explicitly_set(self) -> None:
+        # 只显式设了旧字段（旧库/旧代码）→ 用旧字段
+        legacy_only = BotConfig(group_history_reserve_tokens=8192)
+        self.assertEqual(ml.configured_reserve_tokens(legacy_only), 8192)
+
+        # 新字段被显式设回默认 32768 → 以新字段为准，不被旧字段静默覆盖
+        explicit_default = BotConfig(
+            context_reserve_tokens=32_768,
+            group_history_reserve_tokens=8192,
+        )
+        self.assertEqual(ml.configured_reserve_tokens(explicit_default), 32_768)
+
+        # 两个都显式设置 → 新字段为准（数据库是权威）
+        both = BotConfig(context_reserve_tokens=40_000, group_history_reserve_tokens=8192)
+        self.assertEqual(ml.configured_reserve_tokens(both), 40_000)
+
+    def test_non_pydantic_fakes_fall_back_to_the_legacy_field(self) -> None:
+        self.assertEqual(
+            ml.configured_reserve_tokens(
+                SimpleNamespace(group_history_reserve_tokens=4096)
+            ),
+            4096,
+        )
+        self.assertEqual(
+            ml.configured_reserve_tokens(SimpleNamespace(context_reserve_tokens=8192)),
+            8192,
+        )
+
+    def test_auto_group_history_respects_an_explicitly_smaller_budget(self) -> None:
+        """auto 默认是 245760（总窗口 − 余量），但运维显式配更小必须生效。"""
+
+        default = _settings()
+        self.assertEqual(group_context.group_history_token_budget(default), 245_760)
+
+        small = _settings(group_history_token_budget=100_000)
+        self.assertEqual(group_context.group_history_token_budget(small), 100_000)
+
+        # fixed 逃生舱保持迁移前口径（读配置值，不预扣余量）
+        fixed = _settings(context_window_mode="fixed")
+        self.assertEqual(group_context.group_history_token_budget(fixed), 278_528)
+
+
 class ReconfigureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         ml.reset_model_limits_for_tests()
