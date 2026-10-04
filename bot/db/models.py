@@ -135,6 +135,45 @@ class GroupSummary(Base):
     )
 
 
+class WeeklyReportPost(Base):
+    """周报的**发送台账**：一行 = 一个目标在某个 ISO 周收到过一次周报。
+
+    ``bot.tools.weekly_report`` 以前对群消息**完全没有幂等**：cron 与上一次运行重叠、
+    运维手工补跑、手动重跑，都会让**每个授权群收到重复周报**，而 exit code 仍是 0、
+    数据上无法察觉。积分结算那半边是幂等的（``(用户, ISO 周)`` 唯一键），只有发消息
+    这一半不是。
+
+    ``(target_id, week_key)`` 上的唯一索引就是幂等键，写入走
+    ``INSERT ... ON CONFLICT DO NOTHING + RETURNING``（与 ``checkin_reminder_posts``
+    同一套模式）。``target_id`` 为 0 表示"私发超管的成本摘要"——它同样需要幂等。
+    ``message_id`` 在发送成功后才回填。
+    """
+
+    __tablename__ = "weekly_report_posts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 群 id；``0`` = 私发超管的成本摘要（不是群，所以不与群 id 冲突）
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: ISO 周，形如 ``2026-W41``（发送时刻的 ISO 周，不依赖 ``days`` 参数）
+    week_key: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 发送成功前为 0；发送成功后回填 Telegram message_id
+    message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ux_weekly_report_posts_target_week",
+            "target_id",
+            "week_key",
+            unique=True,
+        ),
+    )
+
+
 class GroupSummaryFailureState(Base):
     """摘要调度器的**失败退避台账**（B-25）。
 
