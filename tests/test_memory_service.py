@@ -506,7 +506,7 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             db_path = tmpdir / "bot.db"
             engine, session_factory = await init_db(self._sqlite_url(db_path))
             memory = MemoryService(
-                BotConfig(max_context_tokens=5000, max_output_tokens=512),
+                BotConfig(context_window_mode="fixed", max_context_tokens=5000, max_output_tokens=512),
                 _SummaryStubLLM(),
                 session_factory=session_factory,
             )

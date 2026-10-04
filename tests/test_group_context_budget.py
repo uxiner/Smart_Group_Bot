@@ -321,7 +321,8 @@ class GroupArchiveHistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_reads_by_budget_not_by_a_fixed_message_count(self) -> None:
         """条数远多于 50、总 token 仍在预算内 → 早期历史一条都不许丢。"""
 
-        memory = await self._memory()
+        # 此用例验证旧固定预算；auto 的真实模型窗口由专项用例覆盖。
+        memory = await self._memory(context_window_mode="fixed")
         contents = [f"msg-{index:03d}" for index in range(300)]
         await self._seed_sequence(memory, contents)
 
@@ -605,6 +606,7 @@ class GroupHistoryConfigTests(unittest.TestCase):
     def test_memory_service_applies_effective_budget(self) -> None:
         memory = MemoryService(
             BotConfig(
+                context_window_mode="fixed",
                 max_context_tokens=278_528,
                 group_history_token_budget=278_528,
                 group_history_reserve_tokens=32_768,
@@ -622,13 +624,14 @@ class GroupHistoryConfigTests(unittest.TestCase):
 
     def test_reconfigure_applies_a_runtime_budget_change(self) -> None:
         memory = MemoryService(
-            BotConfig(max_context_tokens=278_528),
+            BotConfig(context_window_mode="fixed", max_context_tokens=278_528),
             _StubLLM(),  # type: ignore[arg-type]
             session_factory=object(),  # type: ignore[arg-type]
         )
 
         memory.reconfigure(
             BotConfig(
+                context_window_mode="fixed",
                 max_context_tokens=278_528,
                 group_history_token_budget=100_000,
                 group_history_reserve_tokens=8192,
