@@ -1161,7 +1161,15 @@ async def _group_member_map(
     user_ids: list[int],
     *,
     bot_obj: Any | None = None,
+    persist: bool = True,
 ) -> dict[int, GroupMember]:
+    """Resolve roster rows for ``user_ids``, enriching missing names from Telegram.
+
+    ``persist=False`` keeps a read-only caller (the policy list endpoints) from
+    opening a write transaction: the enrichment only labels that one response
+    and is thrown away afterwards.  A GET request must not create rows, and on
+    SQLite every write transaction competes with moderation writes for the lock.
+    """
     ids = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
     if not ids:
         return {}
@@ -1229,6 +1237,28 @@ async def _group_member_map(
         if profile_data is not None:
             profiles_by_id[user_id] = profile_data
     if not profiles_by_id:
+        return members
+
+    if not persist:
+        # Read-only caller: label this response without touching the database.
+        # The rows here are detached (their session already closed) and are
+        # never added to one, so the merge below cannot reach disk.
+        for user_id, (full_name, username, is_bot) in profiles_by_id.items():
+            row = members.get(user_id)
+            if row is None:
+                members[user_id] = GroupMember(
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    full_name=full_name,
+                    username=username,
+                    is_bot=is_bot,
+                    left=False,
+                )
+                continue
+            if full_name and not str(row.full_name or "").strip():
+                row.full_name = full_name
+            if username and not str(row.username or "").strip():
+                row.username = username
         return members
 
     # Open a fresh, short write transaction only after every network wait has
@@ -2090,12 +2120,18 @@ def register_settings_routes(
         _forget_admin_revalidation(group_id, user_id)
         return _success_response({"deleted": row is not None})
 
-    def _global_registry_query(request: web.Request) -> tuple[int, int, str]:
+    def _page_window(request: web.Request) -> tuple[int, int]:
+        """Clamped ``limit``/``offset`` shared by every paged list endpoint."""
+
         try:
             limit = min(500, max(1, int(request.query.get("limit", "100"))))
             offset = max(0, int(request.query.get("offset", "0")))
         except (TypeError, ValueError) as exc:
             raise _APIError(400, "invalid_pagination", "分页参数无效。") from exc
+        return limit, offset
+
+    def _global_registry_query(request: web.Request) -> tuple[int, int, str]:
+        limit, offset = _page_window(request)
         query = clean_text(str(request.query.get("query", "")), max_len=200)
         return limit, offset, query
 
@@ -3066,25 +3102,32 @@ def register_settings_routes(
     ) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
+        # A-04: 这些列表曾经完全没有 LIMIT，一次把整群记录拉进内存再序列化成
+        # 单个 JSON；与同文件全局端点的 limit<=500 对齐。响应多带一个
+        # next_offset，调用方按游标翻页即可拿全量。
+        limit, offset = _page_window(request)
         async with session_factory() as session:
             stmt = select(model).where(model.group_id == group_id).order_by(model.user_id)
             if model is UserWarning:
                 stmt = stmt.where(
                     or_(UserWarning.count > 0, UserWarning.is_banned.is_(True))
                 )
-            rows = (await session.scalars(stmt)).all()
+            rows = (await session.scalars(stmt.offset(offset).limit(limit))).all()
         members = await _group_member_map(
             session_factory,
             group_id,
             [int(row.user_id) for row in rows],
             bot_obj=bot,
+            # 只读端点不写库：只读语义的 GET 不该开写事务和锁。
+            persist=False,
         )
         return _success_response(
             {
                 key: [
                     _user_policy_document(row, members.get(int(row.user_id)))
                     for row in rows
-                ]
+                ],
+                "next_offset": offset + len(rows) if len(rows) == limit else None,
             }
         )
 
@@ -3117,6 +3160,8 @@ def register_settings_routes(
     async def list_group_bans(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
+        # A-04: 同 _list_user_rows —— 分页 + 只读，不再一次拉全群封禁历史。
+        limit, offset = _page_window(request)
         async with session_factory() as session:
             rows = (await session.scalars(
                 select(UserWarning)
@@ -3125,19 +3170,23 @@ def register_settings_routes(
                     UserWarning.is_banned == True,  # noqa: E712
                 )
                 .order_by(UserWarning.count.desc(), UserWarning.user_id.asc())
+                .offset(offset)
+                .limit(limit)
             )).all()
         members = await _group_member_map(
             session_factory,
             group_id,
             [int(row.user_id) for row in rows],
             bot_obj=bot,
+            persist=False,
         )
         return _success_response(
             {
                 "bans": [
                     _ban_document(row, members.get(int(row.user_id)))
                     for row in rows
-                ]
+                ],
+                "next_offset": offset + len(rows) if len(rows) == limit else None,
             }
         )
 

@@ -2937,6 +2937,21 @@
     }
   }
 
+  // Per-group user-policy lists are paged server-side (limit <= 500). Walk the
+  // cursor so the panel still shows the whole list without ever asking the
+  // worker to build one unbounded JSON document.
+  async function loadPagedGroupResource(url, responseKey) {
+    const all = [];
+    let offset = 0;
+    while (true) {
+      const result = await apiFetch(`${url}?limit=500&offset=${offset}`);
+      all.push(...(result?.[responseKey] || []));
+      const next = result?.next_offset;
+      if (next == null || Number(next) <= offset) return all;
+      offset = Number(next);
+    }
+  }
+
   async function loadGroupResources(groupId) {
     const key = String(groupId);
     const previous = state.groupResources.get(key);
@@ -2958,7 +2973,17 @@
       ["keyword_replies", "keyword_replies", `${base}/keyword-replies`],
       ["scheduled_messages", "scheduled_messages", `${base}/scheduled-messages`],
     ];
-    const results = await Promise.allSettled(definitions.map(([, , url]) => apiFetch(url)));
+    const PAGED_GROUP_RESOURCES = new Set([
+      "warnings",
+      "bans",
+      "exemptions",
+      "reply_mutes",
+    ]);
+    const results = await Promise.allSettled(definitions.map(async ([property, responseKey, url]) => {
+      if (!PAGED_GROUP_RESOURCES.has(property)) return await apiFetch(url);
+      const items = await loadPagedGroupResource(url, responseKey);
+      return { [responseKey]: items };
+    }));
     if (state.groupResourceLoads.get(key) !== requestToken) return;
     const current = state.groupResources.get(key) || {};
     const staleAfterMutation = (state.groupResourceMutationEpochs.get(key) || 0) !== mutationEpoch;
