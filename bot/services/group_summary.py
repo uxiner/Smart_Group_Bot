@@ -73,6 +73,10 @@ GROUP_SUMMARY_PROMPT_VERSION = "gs1"
 GROUP_SUMMARY_BLOCK_MARKER = "[GROUP_SUMMARY]"
 
 #: 摘要**绝不允许**出现在输出里的保留标记/口吻：命中即判无效，保留旧摘要。
+#: D3-01：这里**只收真正的块标记**。原来的裸子串 ``system:`` / ``System:`` /
+#: ``SYSTEM:`` 会命中完全正常、忠实、不含任何指令的群聊摘要
+#: （「配置文件里会带 ``system:`` 这一行」「迁移到 system: docker 部署」），
+#: 而真正的块标记伪造已经被 ``[SYSTEM]`` / ``[system]`` 覆盖。
 _FORBIDDEN_OUTPUT_MARKERS: tuple[str, ...] = (
     "[SAFETY_RULES]",
     "[CURRENT_TURN_FOCUS]",
@@ -84,17 +88,17 @@ _FORBIDDEN_OUTPUT_MARKERS: tuple[str, ...] = (
     "[permanent-memory]",
     "[SEARCH_RECORDS]",
     GROUP_SUMMARY_BLOCK_MARKER,
-    "system:",
-    "System:",
-    "SYSTEM:",
 )
 #: 明显的"以管理员/系统身份下令"的口吻（低信任资料不许冒充证据或指令）。
+#: D3-01：中文分支只拦**主语是模型自己**或**动作指向读者**的句子；「已封禁该用户」
+#: 这类第三人称转述是群聊摘要的正常内容（运维群天天在讨论封禁/解封），不能拦。
 _FORBIDDEN_OUTPUT_RE = re.compile(
     r"(?:"
     r"ignore (?:all |the )?(?:previous|above) instructions"
     r"|you are (?:now )?(?:an? )?(?:admin|administrator|system)"
     r"|(?:我是|作为)(?:管理员|系统|机器人管理员)"
-    r"|已(?:经)?(?:封禁|踢出|解封|警告)(?:了)?(?:该|此)?(?:用户|成员)"
+    r"|(?:我|本人)(?:已|已经)?(?:经)?(?:把)?你(?:给)?(?:封禁|踢出|禁言|移出|拉黑)"
+    r"|你(?:已|已经)?(?:经)?(?:被)?(?:封禁|踢出|禁言|移出|拉黑)"
     r")",
     re.IGNORECASE,
 )
@@ -982,6 +986,8 @@ class GroupSummaryMetrics:
     deadline_exceeded_total: int = 0
     source_changed_total: int = 0
     admission_timeout_total: int = 0
+    #: 输出被校验拒绝的次数（与「是不是真的伪造」无关，见 D3-01）。
+    output_rejected_total: int = 0
     success_total: int = 0
     failure_total: int = 0
     skipped_not_ready_total: int = 0
@@ -1003,6 +1009,7 @@ class GroupSummaryMetrics:
             "deadline_exceeded_total": self.deadline_exceeded_total,
             "source_changed_total": self.source_changed_total,
             "admission_timeout_total": self.admission_timeout_total,
+            "output_rejected_total": self.output_rejected_total,
             "success_total": self.success_total,
             "failure_total": self.failure_total,
             "skipped_not_ready_total": self.skipped_not_ready_total,
@@ -1598,9 +1605,18 @@ class GroupSummaryScheduler:
         valid, reason = is_valid_summary_output(body, group_id=gid)
         if not valid:
             self.metrics.failure_total += 1
-            self._register_failure(gid, cfg)
+            self.metrics.output_rejected_total += 1
+            # D3-01：只有「真的是伪造/注入」才配得上指数退避。``reserved_marker``
+            # 这类闭集拒绝会误伤忠实摘要（群聊里讨论 ``system:`` 配置、复述封禁
+            # 记录都很正常），拿它去把退避从 60s 翻到 3600s 等于让该群的后台摘要
+            # **永久**停摆，而且每来一条新消息就白烧一次模型调用。
+            if not reason.startswith("reserved_marker:"):
+                self._register_failure(gid, cfg)
             log.warning(
-                "group summary output rejected | group=%s | reason=%s", gid, reason
+                "group summary output rejected | group=%s | reason=%s | backoff=%s",
+                gid,
+                reason,
+                "no" if reason.startswith("reserved_marker:") else "yes",
             )
             return "invalid_output"
 
