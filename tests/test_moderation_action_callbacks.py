@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from bot.db.engine import init_db
 from bot.db.models import (
@@ -923,6 +924,112 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         inner.bot.edit_message_text.assert_awaited_once()
         inner.message.answer.assert_not_awaited()
 
+    async def test_direct_ban_survives_a_concurrent_user_warning_insert(self) -> None:
+        """A-02：直接封禁与自动计数封禁并发命中同一个人时不能整笔回滚。
+
+        ``UserWarning`` 有 ``UNIQUE(group_id, user_id)``，而这条路径是"先 SELECT、
+        查不到就 INSERT"。修前 INSERT 分支不捕 ``IntegrityError``，冲突直接冒泡
+        出 :func:`_moderation_direct_ban`，落败方被 ``on_moderation_action`` 的
+        兜底接住、回滚整笔审核事务（含刚写的 direct 标记与封禁恢复工单），管理员
+        只看到一句无法定位的「审核操作失败，请稍后重试」。
+
+        真并发在单进程里复现不了：``SQLiteSafeAsyncSession`` 的进程级写锁是
+        "整笔事务"粒度，本事务一 UPDATE 别人就写不进来（实测对方干等 5s 后报
+        ``sqlite write lock timeout after 5.0s``）。所以这里在 commit 处等价地
+        注入"另一条连接已经写好并提交了"，让本事务撞上唯一索引——缺陷与修法都
+        在这个异常处理上。
+        """
+
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id)
+        real_lease = group.lease_join_verification_for_unban
+        armed = False
+
+        async with self.session_factory() as session:
+            real_commit = session.commit
+
+            async def arm_the_race(_session, group_id, user_id, **kwargs):
+                # 竞态窗口就在这一步：INSERT 分支已经 session.add(UserWarning)、
+                # 还没 flush；另一条连接抢先写掉了 (group_id, user_id) 这一行。
+                nonlocal armed
+                armed = True
+                return await real_lease(_session, group_id, user_id, **kwargs)
+
+            async def commit_after_losing_the_race() -> None:
+                if not armed:
+                    await real_commit()
+                    return
+                await session.rollback()  # 放开进程写锁，让"另一条连接"写得进去
+                async with self.session_factory() as rival:
+                    rival.add(
+                        UserWarning(
+                            group_id=-100, user_id=42, count=0, is_banned=True
+                        )
+                    )
+                    await rival.commit()
+                raise IntegrityError(
+                    "INSERT INTO user_warnings (group_id, user_id, count, is_banned) "
+                    "VALUES (?, ?, ?, ?)",
+                    None,
+                    Exception(
+                        "UNIQUE constraint failed: "
+                        "user_warnings.group_id, user_warnings.user_id"
+                    ),
+                )
+
+            with (
+                patch(
+                    "bot.handlers.group.is_group_admin_or_higher",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch(
+                    "bot.handlers.group.restore_member_permissions",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch(
+                    "bot.handlers.group.lease_join_verification_for_unban",
+                    new=arm_the_race,
+                ),
+                patch.object(session, "commit", new=commit_after_losing_the_race),
+            ):
+                await group.on_moderation_action(
+                    callback,
+                    session=session,
+                    settings=self.settings,
+                )
+
+        answers = [args.args[0] for args in callback.answer.await_args_list if args.args]
+        self.assertFalse(
+            any("审核操作失败" in text for text in answers),
+            f"并发撞车被当成了通用失败：{answers}",
+        )
+        self.assertIn(
+            "该用户的封禁状态已变化，请重新点击",
+            answers,
+            f"没有给管理员可理解的提示：{answers}",
+        )
+        # 整笔事务回滚后状态自洽：direct 标记没留下，恢复工单也没留下，
+        # 而并发那一方写下的 UserWarning 行还在（不该被这次回滚带走）。
+        async with self.session_factory() as session:
+            violation = await session.get(Violation, violation_id)
+            self.assertEqual(
+                violation.action_taken, "warn", "回滚了却把 direct 标记留下了"
+            )
+            self.assertIsNone(
+                await session.scalar(
+                    select(JoinVerification).where(
+                        JoinVerification.group_id == -100,
+                        JoinVerification.user_id == 42,
+                    )
+                )
+            )
+            winner = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100, UserWarning.user_id == 42
+                )
+            )
+            self.assertIsNotNone(winner, "并发那一方写下的行不该被回滚掉")
+            self.assertTrue(winner.is_banned)
 
 if __name__ == "__main__":
     unittest.main()

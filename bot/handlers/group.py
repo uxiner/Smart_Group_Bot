@@ -1838,6 +1838,12 @@ async def _moderation_direct_ban(
                 is_banned=True,
             )
             session.add(warning)
+            # A-02：这张表有 UNIQUE(group_id, user_id)，而这里是"先 SELECT、
+            # 查不到就 INSERT"。管理员手动直接封禁与自动计数封禁
+            # （_apply_counted_moderation_ban）并发命中同一个人时，落败方会在
+            # 下面的 commit 撞唯一索引，把**整笔**审核事务（刚写的 direct 标记
+            # + 封禁恢复工单）一起打掉。按兄弟函数
+            # _moderation_add_permanent_exemption 的写法在 commit 处兜住。
         else:
             warning_lock = await session.execute(
                 update(UserWarning)
@@ -1865,6 +1871,20 @@ async def _moderation_direct_ban(
             return "retry"
         try:
             await session.commit()
+        except IntegrityError:
+            # A-02：见上面 INSERT 分支的注释。撞车说明并发的另一条路径已经写过
+            # (group_id, user_id) 这一行；这一笔整笔回滚，交给既有重试机制，
+            # 不要让管理员收到「审核操作失败」这种无法定位的报错。
+            await session.rollback()
+            log.warning(
+                "moderation direct ban lost user_warning race | group=%s user=%s "
+                "violation=%s",
+                group_id,
+                target_id,
+                violation_id,
+            )
+            await callback.answer("该用户的封禁状态已变化，请重新点击", show_alert=True)
+            return "retry"
         except Exception:
             await session.rollback()
             raise
