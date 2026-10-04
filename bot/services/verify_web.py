@@ -401,10 +401,26 @@ def _verification_config_tag(
     settings: Settings,
     provider: str,
 ) -> str:
-    """Opaque public tag that detects key rotation between GET and POST."""
+    """Opaque public tag that detects key rotation between GET and POST.
+
+    **只纳入 site key，绝不纳入 secret key（D3-16）。** 这个 tag 会经
+    ``handle_challenge_page`` 写进**任何人可 GET** 的 ``/verify`` HTML。site key 本来
+    就是公开且已知的（同一页面上就明文放着 ``data-sitekey``），所以一旦把 secret key
+    也混进摘要，这个摘要就成了一条**确定性的 secret 校验预言机**：从任何其它渠道拿到
+    候选 secret（配置备份、日志、离职人员的拷贝）的人，可以本地比对摘要确认它对不对，
+    同时把「secret 未轮换」这一状态对外变成可验证的。暴力破解不可行（secret 约 170 bit
+    熵），但这仍然是不该有的确定性校验通道。
+
+    轮换检测语义：Turnstile / hCaptcha 的 site key 与 secret key 是成对签发的，正常
+    轮换必然同时换 site key，所以去掉 secret 后仍然覆盖真实的轮换事件。唯一丢失的是
+    「只换 secret 不换 site key」这一种——要安全地表达它需要一个攻击者拿不到的盐，而
+    加进程内随机盐会让每次重启都作废所有在途验证页（``verification_id`` 存在库里、
+    能跨重启存活），代价大于收益。
+    """
     parts = [normalize_verification_provider(provider)]
     for subprovider in verification_subproviders(provider):
-        parts.extend(verification_keys_for_provider(settings, subprovider))
+        site_key, _secret_key = verification_keys_for_provider(settings, subprovider)
+        parts.append(site_key)
     parts.append(settings.join_verification_public_base_url.strip().rstrip("/"))
     payload = "\x00".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
