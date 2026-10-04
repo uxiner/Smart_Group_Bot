@@ -367,9 +367,21 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(salvaged[0]["fact"], "写代码时会用到 {config}")
 
     def test_parse_fact_items_returns_none_for_unusable_output(self) -> None:
-        """既没有完整数组、也抢不出对象 → None（游标不前移的信号）。"""
+        """既没有完整数组、也抢不出**像事实的对象** → None（游标不前移的信号）。
 
-        for bad in ("抱歉，我无法完成。", "", "```json\n[{半截", "[{半截", "没有数组也没有对象"):
+        ``抱歉…{}`` / ``{"facts": []}`` 这类「带花括号的解释文本或包了一层的外壳」绝不能
+        算解析成功——否则游标前移、这批消息被静默跳过（实测回归过）。
+        """
+
+        for bad in (
+            "抱歉，我无法完成。",
+            "抱歉，我无法输出 JSON。{}",
+            '{"note": "这批没有什么可记的"}',
+            "",
+            "```json\n[{半截",
+            "[{半截",
+            "没有数组也没有对象",
+        ):
             with self.subTest(raw=bad):
                 self.assertIsNone(ltm.parse_fact_items(bad))
 
@@ -379,6 +391,8 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(ltm.parse_fact_items("[]"), [])
         self.assertEqual(ltm.parse_fact_items("```json\n[]\n```"), [])
         self.assertEqual(ltm.parse_fact_items("[1, 2, 3]"), [])
+        # 包了一层外壳的「空批」（`{"facts": []}`）取到内层空数组 → 同样是「没有可记的」
+        self.assertEqual(ltm.parse_fact_items('{"facts": []}'), [])
 
     def test_config_getters_default_and_clamp(self) -> None:
         empty = _settings(
