@@ -2309,6 +2309,99 @@ async def _moderation_undo_false_positive(
     return "undo"
 
 
+@dataclass(frozen=True)
+class _UnbanRecoveryOutcome:
+    """``lease -> commit -> activate -> release`` 这条**共用**解禁序列的结果。"""
+
+    #: 是否真的拿到了恢复工单（False = 没有待处理的旧限制，无需解禁）
+    needs_work: bool
+    #: Telegram 侧的解禁调用是否成功
+    released: bool
+    #: 是否已经请求了持久化重投递（Telegram 没解干净时的补偿）
+    retry_requested: bool
+
+
+async def _lease_and_release_restriction(
+    *,
+    bot: Any,
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+    prefix: str,
+    raise_on_integrity: bool = False,
+) -> _UnbanRecoveryOutcome:
+    """「解禁」的**唯一实现**（B-06）。
+
+    永久豁免（:func:`_moderation_add_permanent_exemption`）与人工放行
+    （:func:`_release_member_restriction_for_review`）走的是同一条恢复流程。以前后者
+    是前者的「照抄」，两份实现已经开始漂移：人工放行在 Telegram 解禁调用失败时
+    **不**请求持久化重投递，两条路径的失败补偿行为不一致，以后再各自演进只会越差越大。
+
+    顺序固定（顺序本身就是恢复协议的一部分）：
+
+    1. ``lease`` —— 先把恢复工单拿到手（没有待处理限制时返回 ``None``，视为无需解禁）；
+    2. ``commit`` —— 工单**先落库**，之后进程崩了也不会丢；
+    3. ``activate`` —— 交给后台继续校准；
+    4. ``release`` —— 真正调 Telegram 解禁；没解干净时在这里**统一**请求重投递。
+
+    lease / commit / release 抛错统一往上抛，由各自的调用方按自己的口径处理；
+    ``raise_on_integrity`` 只给豁免路径用——它要把「已被并发插了
+    ``ModerationExemption``」这个 ``IntegrityError`` 翻译成一句用户提示。
+    """
+
+    try:
+        recovery = await lease_join_verification_for_unban(
+            session, int(group_id), int(user_id), manual_unban=False
+        )
+    except Exception as exc:
+        log.exception("%s: lease failed | group=%s user=%s", prefix, group_id, user_id)
+        raise RuntimeError(f"{prefix}: lease failed") from exc
+    if recovery is None:
+        return _UnbanRecoveryOutcome(
+            needs_work=False, released=True, retry_requested=False
+        )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        if raise_on_integrity:
+            raise
+        log.exception(
+            "%s: recovery commit conflicted | group=%s user=%s", prefix, group_id, user_id
+        )
+        raise RuntimeError(f"{prefix}: recovery commit conflicted")
+    except Exception as exc:
+        log.exception(
+            "%s: recovery commit failed | group=%s user=%s", prefix, group_id, user_id
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise RuntimeError(f"{prefix}: recovery commit failed") from exc
+    activate_manual_unban_recovery(recovery)
+    try:
+        released = bool(
+            await release_moderation_restriction_after_exemption(
+                bot, session, recovery
+            )
+        )
+    except Exception as exc:
+        log.exception("%s: unban failed | group=%s user=%s", prefix, group_id, user_id)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise RuntimeError(f"{prefix}: unban failed") from exc
+    if not released:
+        # 持久化重投递补偿提到**共用层**：Telegram 侧没解干净时让当前 update 再走一遍。
+        request_current_update_retry()
+        return _UnbanRecoveryOutcome(
+            needs_work=True, released=False, retry_requested=True
+        )
+    return _UnbanRecoveryOutcome(needs_work=True, released=True, retry_requested=False)
+
+
 async def _moderation_add_permanent_exemption(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -2330,35 +2423,29 @@ async def _moderation_add_permanent_exemption(
                 created_by=operator_id,
             )
         )
-    recovery = await lease_join_verification_for_unban(
-        session,
-        int(violation.group_id),
-        int(violation.user_id),
-        manual_unban=False,
-    )
-    if recovery is None:
-        await session.rollback()
-        await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
-        return "retry"
     try:
-        await session.commit()
+        outcome = await _lease_and_release_restriction(
+            bot=callback.bot,
+            session=session,
+            group_id=int(violation.group_id),
+            user_id=int(violation.user_id),
+            prefix="moderation exemption",
+            raise_on_integrity=True,
+        )
     except IntegrityError:
         await session.rollback()
         await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
         return None
-    activate_manual_unban_recovery(recovery)
-    released = await release_moderation_restriction_after_exemption(
-        callback.bot,
-        session,
-        recovery,
-    )
+    if not outcome.needs_work:
+        await session.rollback()
+        await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
+        return "retry"
     if existing is not None:
         text = "该用户已在当前群永久豁免 AI 审核"
     else:
         text = "已永久豁免该用户的当前群 AI 审核"
-    if not released:
+    if not outcome.released:
         text += "；旧限制正在由恢复任务继续校准"
-        request_current_update_retry()
     await callback.answer(text, show_alert=True)
     return "exempt" if existing is None else None
 
@@ -2393,10 +2480,11 @@ def _review_card_link(html_text: str) -> str:
 async def _release_member_restriction_for_review(*, bot, session, violation) -> bool:
     """人工放行时「只做解禁那一半」。
 
-    照抄 ``_moderation_add_permanent_exemption`` 的恢复流程，但**不**添加
-    ``ModerationExemption`` 行——人工放行不是永久豁免。这样质询超时封禁会被作废、
-    成员恢复发言权限。``recovery is None``（没有待处理质询/本来就没事）视为无需解禁，
-    不算错误。
+    解禁序列本身**不在这里**：B-06 之后它与永久豁免共用
+    :func:`_lease_and_release_restriction`（lease → commit → activate → release，
+    含统一的重投递补偿）。本函数只负责「不添加 ``ModerationExemption`` 行」这一条
+    差异——人工放行不是永久豁免。这样质询超时封禁会被作废、成员恢复发言权限。
+    没有待处理质询/本来就没事（``needs_work=False``）视为无需解禁，不算错误。
     """
 
     violation_id = int(getattr(violation, "id", 0) or 0)
@@ -2408,38 +2496,19 @@ async def _release_member_restriction_for_review(*, bot, session, violation) -> 
     if group_id == 0 or user_id == 0:
         return True
     try:
-        recovery = await lease_join_verification_for_unban(
-            session, group_id, user_id, manual_unban=False
+        outcome = await _lease_and_release_restriction(
+            bot=bot,
+            session=session,
+            group_id=group_id,
+            user_id=user_id,
+            prefix="review release",
         )
     except Exception:
-        log.exception("review release: lease failed | violation=%s", violation_id)
+        log.exception("review release failed | violation=%s", violation_id)
         return False
-    if recovery is None:
+    if not outcome.needs_work:
         return True
-    try:
-        await session.commit()
-    except Exception:
-        log.exception(
-            "review release: recovery commit failed | violation=%s", violation_id
-        )
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        return False
-    activate_manual_unban_recovery(recovery)
-    try:
-        released = await release_moderation_restriction_after_exemption(
-            bot, session, recovery
-        )
-    except Exception:
-        log.exception("review release: unban failed | violation=%s", violation_id)
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        return False
-    return bool(released)
+    return bool(outcome.released)
 
 
 async def _reapply_restriction_for_review(
