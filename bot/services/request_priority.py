@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from enum import IntEnum
-from typing import Final
+from typing import Any, Final
 
 
 class ExecutionPriority(IntEnum):
