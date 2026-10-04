@@ -1885,7 +1885,19 @@ def register_settings_routes(
                 session.add(Group(id=body.group_id, title=clean_text(body.title, max_len=255), settings={}))
             elif body.title:
                 group.title = clean_text(body.title, max_len=255)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                # 并发为同一个群建行时唯一索引（models.py 的 ix_*_unique）会撞。
+                # 兄弟接口 create_group_admin_api / put_group_settings 都显式回
+                # 409；这里原来让异常冒泡到装饰器的兜底 except Exception，管理员
+                # 看到的是 500 \"internal_error\"——看起来像授权失败，实际已经成功。
+                await session.rollback()
+                raise _APIError(
+                    409,
+                    "authorized_group_conflict",
+                    "该群刚刚被并发授权，请刷新后重试。",
+                ) from exc
         return _success_response({"created": True})
 
     @authenticated
@@ -3451,7 +3463,18 @@ def register_settings_routes(
                         "exemption_recovery_unavailable",
                         "无法建立豁免恢复工单，请立即重试。",
                     )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                # 同 _create_user_row 的其它兄弟接口：并发为同一个
+                # (group_id, user_id) 建行时唯一索引会撞，这里必须回 409 而不是
+                # 冒泡成 500（A-09）。
+                await session.rollback()
+                raise _APIError(
+                    409,
+                    "user_policy_conflict",
+                    "该用户刚刚被并发修改，请刷新后重试。",
+                ) from exc
             await session.refresh(row)
             if recovery is not None:
                 activate_manual_unban_recovery(recovery)
