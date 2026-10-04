@@ -5240,6 +5240,18 @@ _PENDING_REPLY_DEFAULT_TIMEOUT_SECONDS = 45.0
 _PENDING_REPLY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _PENDING_REPLY_MAX_SENDERS = 64
 _PENDING_REPLY_MAX_ITEMS_PER_SENDER = 20
+#: D3-50：单条回复的投递上限。``reply_specs`` 完全来自模型输出、代码里没有任何
+#: ``len(reply_specs)`` 截断，而两个投递循环（always-tts 与纯文本）都是串行、无
+#: sleep、无条数上限、无逐条超时。TTS 分支每条至少 2 次 Bot API 调用
+#: （合成 + 上传，``_TTS_MAX_HTTP_TIMEOUT_SECONDS = 60.0``）；plan 稍多或第一条遇
+#: flood-wait 后，后面的 plan 会在整段 45s 硬 deadline 到期时被取消 → **剩余 plan
+#: 静默丢失**，而进度 overlay 已在第一次 fallback 时被 ``_claim_progress_overlay``
+#: 消耗掉，群内不会有任何提示。截到 3 条覆盖了绝大多数正常多段回复，又让预算够用。
+_PENDING_REPLY_MAX_DELIVERY_PLANS = 3
+#: 两条投递之间插入的间隔：Telegram 的群级限速是 30 msg/s，串行连发会顶到它。
+_PENDING_REPLY_DELIVERY_GAP_SECONDS = 0.3
+#: 单条 plan 的逐条超时。取整段预算的一半，保证即使第一条超时，后面仍有机会发。
+_PENDING_REPLY_PLAN_TIMEOUT_SECONDS = _PENDING_REPLY_DEFAULT_TIMEOUT_SECONDS / 2
 _PENDING_REPLY_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
 _PENDING_REPLY_ORPHAN_STARTED: dict[asyncio.Future[Any], float] = {}
 _PENDING_REPLY_ORPHAN_MAX_AGE_SECONDS = 120.0
@@ -5820,6 +5832,31 @@ async def _deliver_reply_plans(
     sent_messages: list[str] = []
     overlay_claimed = False
 
+    async def _send_one(
+        awaitable: Any,
+        plan: _ReplyDeliveryPlan,
+        *,
+        default: Any,
+    ) -> Any:
+        """D3-50：给单条 plan 的投递一个本地上界，超时按"没发出去"处理。
+
+        没有它，一条 plan 撞上 flood-wait 就会占满整段 45s 硬 deadline，后面的
+        plan 被整段取消并**静默丢失**（overlay 早已在第一次 fallback 时被消费掉，
+        群里没有任何提示）。超时后返回 ``default``，让既有的文本兜底分支接手。
+        """
+
+        try:
+            async with asyncio.timeout(_PENDING_REPLY_PLAN_TIMEOUT_SECONDS):
+                return await awaitable
+        except TimeoutError:
+            log.warning(
+                "[%s] reply plan delivery timed out after %.1fs | text=%s",
+                group_id,
+                _PENDING_REPLY_PLAN_TIMEOUT_SECONDS,
+                _truncate_text(plan.text, 40),
+            )
+            return default
+
     def _record_plan_delivery(
         plan: _ReplyDeliveryPlan,
         delivery: Any,
@@ -5864,7 +5901,10 @@ async def _deliver_reply_plans(
         and bool(getattr(tts_service, "available", False))
     ):
         visible_delivery_seen = bool(tts_already_sent)
-        for plan in delivery_plans:
+        for plan_index, plan in enumerate(delivery_plans):
+            if plan_index:
+                # D3-50：串行连发会顶到 Telegram 的 30 msg/s 群级限速。
+                await asyncio.sleep(_PENDING_REPLY_DELIVERY_GAP_SECONDS)
             plan_receipt = [False]
 
             def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
@@ -5873,14 +5913,24 @@ async def _deliver_reply_plans(
 
             detailed_sender = getattr(tts_service, "send_message_tts_result", None)
             if callable(detailed_sender):
-                delivery = await detailed_sender(
-                    message,
-                    plan.text,
-                    delivery_mode=plan.delivery_mode,
-                    reply_to_message_id=plan.reply_to_message_id,
-                    auto_delete_seconds=configured_auto_delete_seconds(settings, "media"),
-                    uid=str(user_id or group_id),
-                    on_delivery=_confirm_plan_delivery,
+                delivery = await _send_one(
+                    detailed_sender(
+                        message,
+                        plan.text,
+                        delivery_mode=plan.delivery_mode,
+                        reply_to_message_id=plan.reply_to_message_id,
+                        auto_delete_seconds=configured_auto_delete_seconds(
+                            settings, "media"
+                        ),
+                        uid=str(user_id or group_id),
+                        on_delivery=_confirm_plan_delivery,
+                    ),
+                    plan,
+                    default=TTSDeliveryResult(
+                        requested_segments=(plan.text,),
+                        sent_segment_count=0,
+                        error="plan_delivery_timeout",
+                    ),
                 )
             else:
                 legacy_sender = tts_service.send_message_tts
@@ -5894,17 +5944,25 @@ async def _deliver_reply_plans(
                     "uid": str(user_id or group_id),
                 }
                 if tts_sender_accepts_delivery_callback(legacy_sender):
-                    complete = await legacy_sender(
-                        message,
-                        plan.text,
-                        **legacy_kwargs,
-                        on_delivery=_confirm_plan_delivery,
+                    complete = await _send_one(
+                        legacy_sender(
+                            message,
+                            plan.text,
+                            **legacy_kwargs,
+                            on_delivery=_confirm_plan_delivery,
+                        ),
+                        plan,
+                        default=False,
                     )
                 else:
-                    complete = await legacy_sender(
-                        message,
-                        plan.text,
-                        **legacy_kwargs,
+                    complete = await _send_one(
+                        legacy_sender(
+                            message,
+                            plan.text,
+                            **legacy_kwargs,
+                        ),
+                        plan,
+                        default=False,
                     )
                 delivery = TTSDeliveryResult(
                     requested_segments=(plan.text,),
@@ -5928,24 +5986,34 @@ async def _deliver_reply_plans(
                     fallback_overlay = await _claim_progress_overlay(
                         allowed=False,
                     )
-                    remaining_delivery = await send_reply(
-                        message,
-                        delivery.remaining_text,
-                        delivery_mode=plan.delivery_mode,
-                        reply_to_message_id=plan.reply_to_message_id,
-                        rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
-                        stream=False,
-                        auto_delete_seconds=configured_auto_delete_seconds(
-                            settings,
-                            "reply",
+                    remaining_delivery = await _send_one(
+                        send_reply(
+                            message,
+                            delivery.remaining_text,
+                            delivery_mode=plan.delivery_mode,
+                            reply_to_message_id=plan.reply_to_message_id,
+                            rich=bool(
+                                getattr(settings.bot, "enable_rich_messages", False)
+                            ),
+                            stream=False,
+                            auto_delete_seconds=configured_auto_delete_seconds(
+                                settings,
+                                "reply",
+                            ),
+                            disable_link_preview=bool(
+                                getattr(
+                                    settings.bot,
+                                    "disable_link_preview",
+                                    True,
+                                )
+                            ),
+                            on_delivery=_confirm_plan_delivery,
+                            on_ambiguous=on_ambiguous,
+                            overlay=fallback_overlay,
+                            return_result=delivery_evidence is not None,
                         ),
-                        disable_link_preview=bool(
-                            getattr(settings.bot, "disable_link_preview", True)
-                        ),
-                        on_delivery=_confirm_plan_delivery,
-                        on_ambiguous=on_ambiguous,
-                        overlay=fallback_overlay,
-                        return_result=delivery_evidence is not None,
+                        plan,
+                        default=False,
                     )
                 remaining_sent = bool(remaining_delivery)
                 sent_messages.append(
@@ -5981,21 +6049,27 @@ async def _deliver_reply_plans(
             fallback_overlay = await _claim_progress_overlay(
                 allowed=not visible_delivery_seen,
             )
-            text_delivery = await send_reply(
-                message,
-                plan.text,
-                delivery_mode=plan.delivery_mode,
-                reply_to_message_id=plan.reply_to_message_id,
-                rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
-                stream=False,
-                auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
-                disable_link_preview=bool(
-                    getattr(settings.bot, "disable_link_preview", True)
+            text_delivery = await _send_one(
+                send_reply(
+                    message,
+                    plan.text,
+                    delivery_mode=plan.delivery_mode,
+                    reply_to_message_id=plan.reply_to_message_id,
+                    rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
+                    stream=False,
+                    auto_delete_seconds=configured_auto_delete_seconds(
+                        settings, "reply"
+                    ),
+                    disable_link_preview=bool(
+                        getattr(settings.bot, "disable_link_preview", True)
+                    ),
+                    on_delivery=_confirm_plan_delivery,
+                    on_ambiguous=on_ambiguous,
+                    overlay=fallback_overlay,
+                    return_result=delivery_evidence is not None,
                 ),
-                on_delivery=_confirm_plan_delivery,
-                on_ambiguous=on_ambiguous,
-                overlay=fallback_overlay,
-                return_result=delivery_evidence is not None,
+                plan,
+                default=False,
             )
             text_ok = bool(text_delivery)
             if text_ok:
@@ -6013,7 +6087,10 @@ async def _deliver_reply_plans(
     if tts_already_sent and not force_text:
         return True, True, sent_messages
 
-    for plan in delivery_plans:
+    for plan_index, plan in enumerate(delivery_plans):
+        if plan_index:
+            # D3-50：串行连发会顶到 Telegram 的 30 msg/s 群级限速。
+            await asyncio.sleep(_PENDING_REPLY_DELIVERY_GAP_SECONDS)
         plan_receipt = [False]
 
         def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
@@ -6023,23 +6100,27 @@ async def _deliver_reply_plans(
         current_overlay = await _claim_progress_overlay(
             allowed=not tts_already_sent,
         )
-        text_delivery = await send_reply(
-            message,
-            plan.text,
-            delivery_mode=plan.delivery_mode,
-            reply_to_message_id=plan.reply_to_message_id,
-            rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
-            stream=bool(settings.bot.enable_streaming and len(delivery_plans) == 1),
-            stream_chunk_size=settings.bot.stream_chunk_size,
-            stream_interval=settings.bot.stream_edit_interval_sec,
-            auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
-            disable_link_preview=bool(
-                getattr(settings.bot, "disable_link_preview", True)
+        text_delivery = await _send_one(
+            send_reply(
+                message,
+                plan.text,
+                delivery_mode=plan.delivery_mode,
+                reply_to_message_id=plan.reply_to_message_id,
+                rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
+                stream=bool(settings.bot.enable_streaming and len(delivery_plans) == 1),
+                stream_chunk_size=settings.bot.stream_chunk_size,
+                stream_interval=settings.bot.stream_edit_interval_sec,
+                auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
+                disable_link_preview=bool(
+                    getattr(settings.bot, "disable_link_preview", True)
+                ),
+                on_delivery=_confirm_plan_delivery,
+                on_ambiguous=on_ambiguous,
+                overlay=current_overlay,
+                return_result=delivery_evidence is not None,
             ),
-            on_delivery=_confirm_plan_delivery,
-            on_ambiguous=on_ambiguous,
-            overlay=current_overlay,
-            return_result=delivery_evidence is not None,
+            plan,
+            default=False,
         )
         text_ok = bool(text_delivery)
         if text_ok:
@@ -6909,6 +6990,18 @@ async def _process_pending_reply_batch(
                     )
 
                 delivery_plans = _normalize_multi_message_delivery_plans(delivery_plans)
+                # D3-50：``reply_specs`` 完全来自模型输出，代码里没有任何条数上限。
+                # 两个投递循环串行、无逐条超时，plan 稍多就会在整段 45s 硬 deadline
+                # 到期时被整段取消，后面的 plan **静默丢失**（overlay 早已被消费掉，
+                # 群里没有任何提示）。这里按预算收口并留下可观测的日志。
+                if len(delivery_plans) > _PENDING_REPLY_MAX_DELIVERY_PLANS:
+                    log.warning(
+                        "[%s] pending batch delivery plan count truncated | plans=%d cap=%d",
+                        group_id,
+                        len(delivery_plans),
+                        _PENDING_REPLY_MAX_DELIVERY_PLANS,
+                    )
+                    delivery_plans = delivery_plans[:_PENDING_REPLY_MAX_DELIVERY_PLANS]
                 resolved_modes = [plan.delivery_mode for plan in delivery_plans]
 
                 unique_modes = sorted({mode for mode in resolved_modes if mode})
