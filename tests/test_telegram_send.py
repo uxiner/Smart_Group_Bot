@@ -1249,3 +1249,92 @@ class DeliveredCleanupIsAlwaysProtectedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, sent)
         message.reply_sticker.assert_awaited_once()
         cleanup.assert_awaited_once_with(sent, 60)
+
+
+class ContactContextIsRedactedTests(unittest.IsolatedAsyncioTestCase):
+    """A-12：联系人手机号 / vCard 不得明文进入 LLM 上下文。
+
+    ``extract_message_text`` 的返回值就是 prompt 的 ``text_for_ai``，而项目用的是
+    第三方 LLM：任何人私聊发一个联系人，就等于把对方的手机号和 vCard（内含
+    手机号 / 邮箱 / 地址）上传到外部服务。联系人姓名保留——模型判断"这是谁"需要
+    它；号码只留尾号，vCard 只留 FN/ORG。
+    """
+
+    @staticmethod
+    def _contact(**fields: object) -> SimpleNamespace:
+        base = {
+            "first_name": "张三",
+            "last_name": "",
+            "phone_number": "",
+            "vcard": "",
+            "user_id": None,
+        }
+        base.update(fields)
+        # extract_message_text 会依次探测其它内容类型，这里都给 None，
+        # 只留 contact，让它走到 _format_contact_text。
+        return SimpleNamespace(
+            text=None,
+            photo=None,
+            video=None,
+            animation=None,
+            document=None,
+            audio=None,
+            caption=None,
+            sticker=None,
+            voice=None,
+            video_note=None,
+            location=None,
+            contact=SimpleNamespace(**base),
+        )
+
+    def test_phone_number_is_masked(self) -> None:
+        message = self._contact(phone_number="+86 138-0013-8000")
+
+        text, kind = telegram.extract_message_text(message)
+
+        self.assertEqual(kind, "contact")
+        self.assertIn("name: 张三", text)
+        self.assertIn("…8000", text)
+        self.assertNotIn("138", text)
+        self.assertNotIn("0013", text)
+
+    def test_short_phone_number_is_fully_masked(self) -> None:
+        text, _kind = telegram.extract_message_text(self._contact(phone_number="1234"))
+
+        self.assertIn("phone: …", text)
+        self.assertNotIn("1234", text)
+
+    def test_vcard_keeps_only_whitelisted_fields(self) -> None:
+        vcard = (
+            "BEGIN:VCARD\r\n"
+            "VERSION:3.0\r\n"
+            "FN:李四\r\n"
+            "ORG:示例科技\r\n"
+            "TEL;TYPE=CELL:+86 139-0000-1111\r\n"
+            "EMAIL:rli@example.com\r\n"
+            "ADR;TYPE=WORK:;;某市某区某路1号;;100000\r\n"
+            "NOTE:私人备注\r\n"
+            "END:VCARD\r\n"
+        )
+
+        text, _kind = telegram.extract_message_text(self._contact(vcard=vcard))
+
+        self.assertIn("李四", text)
+        self.assertIn("示例科技", text)
+        self.assertNotIn("139-0000-1111", text)
+        self.assertNotIn("rli@example.com", text)
+        self.assertNotIn("某路1号", text)
+        self.assertNotIn("私人备注", text)
+
+    def test_vcard_parameterised_field_name_is_understood(self) -> None:
+        vcard = "BEGIN:VCARD\nFN;CHARSET=UTF-8:王五\nTEL:1234567890\nEND:VCARD"
+
+        text, _kind = telegram.extract_message_text(self._contact(vcard=vcard))
+
+        self.assertIn("王五", text)
+        self.assertNotIn("1234567890", text)
+
+    def test_contact_without_phone_and_vcard_keeps_name(self) -> None:
+        text, _kind = telegram.extract_message_text(self._contact(phone_number="", vcard=""))
+
+        self.assertEqual(text, "[contact]\nname: 张三")

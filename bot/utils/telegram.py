@@ -1625,6 +1625,40 @@ def _format_chat_identity(prefix: str, chat: object | None) -> str:
     return f"[{prefix}] {' '.join(parts)}"
 
 
+#: 允许进入 LLM 上下文的 vCard 字段。只有"这是谁 / 属于哪家"这类判断需要它们；
+#: TEL / EMAIL / ADR / NOTE 是纯个人数据，而上下文会被送进第三方 LLM。
+_VCARD_CONTEXT_FIELDS = ("FN", "ORG")
+
+
+def _mask_phone_for_context(phone: str) -> str:
+    """手机号只保留尾部几位；原值既不进上下文也不进日志（A-12）。"""
+
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    if len(digits) <= 4:
+        return "…"
+    return f"…{digits[-4:]}"
+
+
+def _vcard_context_summary(vcard: str) -> str:
+    """vCard 只取白名单字段，TEL/EMAIL/ADR 之类一律丢弃（A-12）。"""
+
+    summary: dict[str, str] = {name: "" for name in _VCARD_CONTEXT_FIELDS}
+    for raw_line in re.split(r"[\r\n]+", vcard or ""):
+        line = _compact_ws(raw_line)
+        if not line:
+            continue
+        head, separator, value = line.partition(":")
+        if not separator:
+            continue
+        # vCard 允许 "FN;CHARSET=UTF-8:value" 这种带参字段名。
+        key = head.split(";", 1)[0].strip().upper()
+        if key in summary and not summary[key]:
+            summary[key] = _truncate_for_context(value.strip(), 120)
+    return " / ".join(summary[name] for name in _VCARD_CONTEXT_FIELDS if summary[name])
+
+
 def _format_contact_text(message: Message) -> str:
     contact = getattr(message, "contact", None)
     if not contact:
@@ -1632,8 +1666,10 @@ def _format_contact_text(message: Message) -> str:
 
     first_name = _compact_ws(getattr(contact, "first_name", None) or "")
     last_name = _compact_ws(getattr(contact, "last_name", None) or "")
-    phone = _compact_ws(getattr(contact, "phone_number", None) or "")
-    vcard = _compact_ws(getattr(contact, "vcard", None) or "")
+    # 手机号与 vCard 属于个人数据：这里只让模型看到"有一个联系人"以及脱敏后的
+    # 尾号 / 单位名，明文原值不再无条件进入 LLM 上下文（A-12）。
+    phone = _mask_phone_for_context(_compact_ws(getattr(contact, "phone_number", None) or ""))
+    vcard = _vcard_context_summary(str(getattr(contact, "vcard", None) or ""))
     contact_uid = getattr(contact, "user_id", None)
 
     name = _compact_ws(" ".join(part for part in (first_name, last_name) if part))
@@ -1646,7 +1682,7 @@ def _format_contact_text(message: Message) -> str:
     if contact_uid is not None:
         lines.append(f"user_id: {contact_uid}")
     if vcard:
-        lines.append(f"vcard: {_truncate_for_context(vcard, 200)}")
+        lines.append(f"vcard: {vcard}")
 
     return "\n".join(lines)
 
