@@ -233,6 +233,19 @@ _MEMBER_IDENTITY_RPC_TASKS: set[asyncio.Task[Any]] = set()
 _MEMBER_IDENTITY_LOOKUP_LOOP: asyncio.AbstractEventLoop | None = None
 _MEMBER_IDENTITY_LOOKUP_SEMAPHORE: asyncio.Semaphore | None = None
 
+#: D3-18：群管理员授权的 Telegram 侧交叉校验缓存。
+#: ``(group_id, user_id) -> (过期时刻, 是否仍是管理员)``。只在「问到了 Telegram」
+#: 时才写入；问不到（超时/限流/异常）不写，下个请求重试。
+_ADMIN_REVALIDATION_TTL_SECONDS = 300.0
+_ADMIN_REVALIDATION_CACHE_MAX = 2048
+_ADMIN_REVALIDATION_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
+
+
+def _forget_admin_revalidation(group_id: int, user_id: int) -> None:
+    """授权记录变更时立刻作废该 (群, 人) 的交叉校验结论（D3-18）。"""
+
+    _ADMIN_REVALIDATION_CACHE.pop((int(group_id), int(user_id)), None)
+
 
 class _RuntimeSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1710,10 +1723,76 @@ def register_settings_routes(
         async with session_factory() as session:
             return {int(value) for value in (await session.scalars(stmt)).all()}
 
+    async def _telegram_admin_revalidated(
+        group_id: int, user_id: int
+    ) -> bool | None:
+        """向 Telegram 交叉校验「这个人现在还是不是该群的管理员」（D3-18）。
+
+        返回三态，区别很重要：
+
+        * ``True`` —— Telegram 权威名单里确实有他，可以放行；
+        * ``False`` —— Telegram 权威名单里**没有**他（已被撤权 / 已退群），必须拒绝；
+        * ``None`` —— 这次**没问成**（无 bot 能力 / 超时 / 限流 / 异常），调用方按
+          「离线降级」处理，继续沿用本地 ``Admin`` 表的判断。
+
+        三态而不是二值，是因为把「查不到」和「确认没有」混为一谈会在两种方向上出错：
+        混成「确认没有」会在 Telegram 抖动时把管理员锁在面板外（报告明确点名的回归
+        风险），混成「还有」就等于本条 finding 白修。
+
+        结果按 (群, 人) 缓存一个短 TTL，避免每个请求都打一次 ``getChatAdministrators``。
+        """
+        cache_key = (int(group_id), int(user_id))
+        now = time.monotonic()
+        cached = _ADMIN_REVALIDATION_CACHE.get(cache_key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        get_admins = getattr(bot, "get_chat_administrators", None)
+        if not callable(get_admins):
+            return None
+        try:
+            members = await _await_member_identity_lookup(
+                lambda: get_admins(group_id),
+                timeout_seconds=5.0,
+            )
+        except Exception:
+            log.info(
+                "admin revalidation unavailable | group=%s user=%s", group_id, user_id
+            )
+            return None
+        is_admin = False
+        for member in members or []:
+            member_user = getattr(member, "user", None)
+            if member_user is None:
+                continue
+            try:
+                if int(getattr(member_user, "id", 0) or 0) != int(user_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            status = str(getattr(member, "status", "") or "").strip().lower()
+            if status in {"creator", "administrator"}:
+                is_admin = True
+            break
+        _ADMIN_REVALIDATION_CACHE[cache_key] = (
+            now + _ADMIN_REVALIDATION_TTL_SECONDS,
+            is_admin,
+        )
+        if len(_ADMIN_REVALIDATION_CACHE) > _ADMIN_REVALIDATION_CACHE_MAX:
+            _ADMIN_REVALIDATION_CACHE.clear()
+        return is_admin
+
     async def _require_group_access(group_id: int, user_id: int) -> None:
         allowed = await _allowed_group_ids(user_id)
         if allowed is not None and group_id not in allowed:
             raise _APIError(403, "group_access_denied", "你没有该群的管理权限。")
+        if allowed is None:
+            return  # 最高管理员：不受本判定约束（与既有行为一致）。
+        # 本地表说「有权限」，但它可能已经过期：用户在 Telegram 侧被撤权或已退群时，
+        # 超管清理掉那行 `Admin` 之前，Mini App 的**全部**权限（封禁/解封成员、篡改
+        # 群规与关键词回复、改群设置、触发全群巡检）都还在。`bot_present` 只表示
+        # 「bot 在不在群里」，**不表示「人还是不是管理员」」（D3-18）。
+        if await _telegram_admin_revalidated(group_id, user_id) is False:
+            raise _APIError(403, "group_access_denied", "你在该群的管理权限已被撤销。")
 
     async def _ensure_group_row(session: AsyncSession, group_id: int) -> Group:
         row = await session.get(Group, group_id)
@@ -1942,6 +2021,8 @@ def register_settings_routes(
                     "管理员授权发生并发冲突，请重试。",
                 ) from exc
         mark_privileged_operator(body.user_id, group_id=group_id)
+        # 新授权/改角色：作废旧的交叉校验结论，别让被撤销过的用户被负缓存卡住。
+        _forget_admin_revalidation(group_id, body.user_id)
         return _success_response({"created": True})
 
     @authenticated
@@ -1957,6 +2038,7 @@ def register_settings_routes(
                 await session.delete(row)
             await session.commit()
         unmark_privileged_operator(user_id, group_id=group_id)
+        _forget_admin_revalidation(group_id, user_id)
         return _success_response({"deleted": row is not None})
 
     def _global_registry_query(request: web.Request) -> tuple[int, int, str]:
