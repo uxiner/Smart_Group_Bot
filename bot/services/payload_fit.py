@@ -78,9 +78,12 @@ def context_layer_for_history_row(row: Any) -> str:
     """把一条装配期的历史行映射到最终载荷里的层。
 
     * ``memory_source='search_record'`` → 检索留档层；
-    * ``memory_source='recalled_archive_index'`` → 记忆召回层；
+    * ``memory_source='recalled_archive_index'`` / ``'long_term_fact'`` → 记忆召回层；
     * 系统角色（头部说明/来源声明）→ 核心层（**永不裁**）；
     * 其它（真实对话历史）→ 历史层（最先被裁）。
+
+    ``long_term_fact``（B-33）必须显式打标：长期记忆行是 ``role='user'`` 的围栏正文
+    （B-31 之后），没有来源标记就会落进「历史」层，被**优先于检索留档**丢掉。
     """
 
     if not isinstance(row, Mapping):
@@ -88,7 +91,7 @@ def context_layer_for_history_row(row: Any) -> str:
     source = str(row.get("memory_source") or "").strip().lower()
     if source == "search_record":
         return LAYER_SEARCH_RECORDS
-    if source == "recalled_archive_index":
+    if source in {"recalled_archive_index", "long_term_fact"}:
         return LAYER_MEMORY_RECALL
     if str(row.get("role") or "").strip().lower() == "system":
         return LAYER_CORE

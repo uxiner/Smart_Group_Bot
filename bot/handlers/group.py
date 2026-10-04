@@ -6310,6 +6310,11 @@ async def _inject_group_long_term_memory(
     fact_messages = render_facts_block(records)
     if not fact_messages:
         return history
+    # B-33：长期记忆行必须带来源标记。否则最终请求闸门（``payload_fit``）按 role 分层时
+    # 会把它们当成普通历史（``role='user'``），**优先于检索留档**丢掉——与
+    # 「历史 → 检索留档 → 记忆召回」的口径正好相反。
+    for fact_item in fact_messages:
+        fact_item["memory_source"] = "long_term_fact"
 
     search_layer: list[dict] = []
     header_layer: list[dict] = []
