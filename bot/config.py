@@ -264,6 +264,10 @@ class BotConfig(BaseModel):
     memory_recall_limit: int = 8
     memory_event_ttl_days: int = 30
     memory_deleted_retention_days: int = 30
+    # B-39 / P4-9：每日提炼次数台账（进程内 dict）的保留天数。默认 1 = 只留当天，
+    # 与改前**额度口径完全一致**（读侧只按自然日过滤，历史条目本来就不参与判定）。
+    # 调大只是让运维在进程内多留几天分作用域计数便于排查。
+    memory_extract_ledger_retention_days: int = 1
 
     # 第②项：后台群摘要（默认关闭；与 legacy 热历史压缩完全独立，不会自动打开旧开关）。
     # 原文/归档/私聊一条都不删，摘要只是"旧内容的低信任资料"，前台只读已发布的摘要。
@@ -1093,6 +1097,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "memory_recall_limit",
             "memory_event_ttl_days",
             "memory_deleted_retention_days",
+            # B-39 / P4-9：台账保留期（只在 [bot] 段可配，不进 runtime_config/UI）。
+            "memory_extract_ledger_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
