@@ -2477,6 +2477,37 @@ def _review_card_link(html_text: str) -> str:
     return match.group(1).strip()
 
 
+#: 判定理由那一行的展示上限。
+_REASON_DISPLAY_LIMIT = 120
+#: 判定理由里的链接一律换成这个固定占位符：Telegram 会把裸 URL **自动变成可点
+#: 链接**，而这一行是给人读的证据，不是一个入口。
+_REASON_URL_PLACEHOLDER = "[链接]"
+_REASON_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
+def _sanitize_model_reason(reason: object) -> str:
+    """F-020：模型写的 ``判定理由`` 在**展示前**按固定格式净化。
+
+    **只动展示**：审核判定、置信度、动作一个字都不改（调用点在把 ``reason``
+    拼进交接卡那几行之前调用它）。净化三件事：
+
+    1. **剥 URL** —— Telegram 会把裸 URL 自动变链接，证据卡里不该冒出一个
+       可点入口（模型自由文本，这是唯一可控的收口点）；
+    2. **去换行** —— 这张卡是"一行一个字段"，换行会把版式和后面的消息回链、
+       @机器人 提示全部打乱；
+    3. **限长** —— 模型偶尔会一整段写下来。
+
+    干净的短理由**原样保留**（只做空白规范化，不改一个字）。
+    """
+
+    text = _REASON_URL_RE.sub(_REASON_URL_PLACEHOLDER, str(reason or ""))
+    text = re.sub(r"[\r\n\u2028\u2029]+", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    if len(text) > _REASON_DISPLAY_LIMIT:
+        text = text[:_REASON_DISPLAY_LIMIT].rstrip() + "…"
+    return text
+
+
 async def _release_member_restriction_for_review(*, bot, session, violation) -> bool:
     """人工放行时「只做解禁那一半」。
 
@@ -2733,8 +2764,12 @@ async def _send_review_handover(
     if not confidence:
         raw_confidence = getattr(violation, "confidence", None)
         confidence = "—" if raw_confidence is None else f"{float(raw_confidence):.2f}"
-    reason = _review_card_field(card, "判定理由") or str(
-        getattr(violation, "verdict_reason", "") or "—"
+    # F-020：判定理由是**模型自由文本**，展示前按固定格式净化（剥 URL / 去换行 /
+    # 限长）。净化只发生在这里——拼进下面 ``lines`` 之前，判定与动作不受影响，
+    # 卡片其余字段一行都没动。
+    reason = _sanitize_model_reason(
+        _review_card_field(card, "判定理由")
+        or str(getattr(violation, "verdict_reason", "") or "—")
     )
     submitted = _review_card_field(card, "送审原文") or _truncate_alert_text(
         getattr(violation, "message_text", "") or ""
