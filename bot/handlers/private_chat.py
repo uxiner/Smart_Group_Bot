@@ -204,9 +204,7 @@ async def _image_description(message: Message, llm) -> str:
         return ""
 
 
-def _split_for_telegram(
-    text: str, *, limit: int | None = MAX_REPLY_CHARS
-) -> list[str]:
+def _split_for_telegram(text: str, *, limit: int | None = None) -> list[str]:
     """按行切分长回复；单行超长时硬切。
 
     ``limit=None`` = 现取运行时配置。显式传值只给测试/内部调用。

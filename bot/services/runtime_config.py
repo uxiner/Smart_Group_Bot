@@ -1358,6 +1358,30 @@ class RuntimeConfig(StrictModel):
                 raise ValueError(f"embed fallback provider does not exist: {fallback.provider}")
         return self
 
+    def restart_changed_paths(self, previous: "RuntimeConfig") -> list[str]:
+        """这次保存里**真正变了**且属于 restart 字段的路径（只给字段名）。
+
+        用来在 ``PUT /api/v1/settings`` 的响应里明确告诉管理员"这些要重启"，
+        而不是让页面自己猜。**只回字段名，不回任何值**（值里可能混着 secret）。
+        """
+
+        changed: list[str] = []
+        for path in _restart_required_paths():
+            section, _, name = path.rpartition(".")
+            if section == "bot" and name == "parse_mode":
+                if previous.bot.parse_mode != self.bot.parse_mode:
+                    changed.append(path)
+                continue
+            if section != "resources":
+                continue
+            before = previous.resources
+            after = self.resources
+            if before is None or after is None:
+                continue
+            if getattr(before, name, None) != getattr(after, name, None):
+                changed.append(path)
+        return sorted(changed)
+
     def secret_paths(self) -> set[str]:
         paths = set(_STATIC_SECRET_PATHS)
         paths.update(f"providers.{provider.name}.api_key" for provider in self.models.providers)
@@ -2142,6 +2166,8 @@ class RuntimeConfigManager:
         self._revision = 0
         self._lock = asyncio.Lock()
         self._on_applied: ConfigAppliedCallback | None = None
+        #: 上一次保存里"改了但要重启才生效"的字段名（只存名字，不存值）。
+        self._restart_pending: list[str] = []
 
     @property
     def config(self) -> RuntimeConfig:
@@ -2382,6 +2408,7 @@ class RuntimeConfigManager:
 
             candidate.apply_to_settings(self.settings)
             policy_runtime.bind(self.settings)
+            self._restart_pending = candidate.restart_changed_paths(current)
             self._config = candidate
             self._revision = revision
             await self._notify_applied(candidate)
@@ -2400,7 +2427,10 @@ class RuntimeConfigManager:
                 "database_url": _redact_database_url(self.settings.database_url),
                 "master_key_configured": self._cipher.configured,
             },
+            # 契约分两半：``restart_required_paths`` = 全部需要重启的字段；
+            # ``restart_pending`` = **刚才这次保存**里真的改了的那几个。
             "restart_required_paths": list(RESTART_REQUIRED_PATHS),
+            "restart_pending": list(self._restart_pending),
         }
 
 

@@ -156,7 +156,7 @@ class BuildContextTests(unittest.IsolatedAsyncioTestCase):
         lines, _block = await build_moderation_context(
             self._session(),
             group_id=-100,
-            anchor_text="先加我id 硬代码就行\n[reply_to_user] id:601298409 username:@uxiner",
+            anchor_text="先加我id 硬代码就行\n[reply_to_user] id:100000001 username:@owner_demo",
             exclude_text="先加我id 硬代码就行",
         )
 

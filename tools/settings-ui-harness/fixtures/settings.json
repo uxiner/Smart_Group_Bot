@@ -188,7 +188,7 @@
     "admin_moderation_enabled": false,
     "admin_alert_super_admin_enabled": true,
     "log_channel_enabled": true,
-    "log_channel_id": -1004337744233,
+    "log_channel_id": -1000000000001,
     "review_confirm_seconds": 300,
     "llm_call_cap_per_hour": 0
    },

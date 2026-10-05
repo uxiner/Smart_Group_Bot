@@ -58,7 +58,7 @@ def _quoted_message(
     *,
     user_id: int = QUOTED_AUTHOR_ID,
     message_id: int = QUOTED_MESSAGE_ID,
-    text: str = "探花招募族 加V 私聊",
+    text: str = "兼职招募 加V 私聊",
     sent_at=None,
     is_bot: bool = False,
     sender_chat=None,
@@ -662,7 +662,7 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
         """F-001 的另一边：引文正文单独复核确实违规时，追溯路径必须照常生效。"""
 
         store = _ViolationStore()
-        quoted = _quoted_message(text="探花招募族 加V 私聊")
+        quoted = _quoted_message(text="兼职招募 加V 私聊")
         begin = AsyncMock(return_value=True)
         outer = self._violated(match_source="semantic")
         evaluate = AsyncMock(return_value=outer)
@@ -673,7 +673,7 @@ class QuotedAuthorPunishmentTests(unittest.IsolatedAsyncioTestCase):
             verdict=outer,
             evaluate=evaluate,
             begin=begin,
-            **self._reply_context_patch("[reply_to:text] 探花招募族 加V 私聊"),
+            **self._reply_context_patch("[reply_to:text] 兼职招募 加V 私聊"),
         )
 
         self.assertIn(QUOTED_AUTHOR_ID, store.users())

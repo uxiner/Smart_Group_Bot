@@ -33,13 +33,13 @@ from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.payload_fit import CTX_LAYER_KEY, LAYER_HISTORY
 
-GATEWAY = "http://gw.internal:8080/v1"
+GATEWAY = "http://gw.test.internal:8080/v1"
 
 
 def _gateway_model(*, fallbacks: list[ChatEndpointConfig] | None = None) -> ModelConfig:
     return ModelConfig(
-        model="home_work2api/cn:deepseek-v4.1-flash",
-        provider="home_work2api",
+        model="work_gateway/cn:deepseek-v4.1-flash",
+        provider="work_gateway",
         api_key="sk-super-secret",
         api_base=GATEWAY,
         max_tokens=2048,
@@ -55,7 +55,7 @@ def _small_fallback() -> ChatEndpointConfig:
         model="pipio/gemini-3.8-flash-high",
         provider="pipio",
         api_key="sk-super-secret",
-        api_base="http://pipio.internal:9000/v1",
+        api_base="http://llm.test.internal:9000/v1",
         max_tokens=2048,
         retry_attempts=1,
         retry_backoff_sec=0.0,
@@ -91,7 +91,7 @@ class _StubLLM:
     """最小替身：让 MemoryService 走"按配置/注册表解析窗口"的那条路。"""
 
     class main:
-        model = "home_work2api/cn:deepseek-v4.1-flash"
+        model = "work_gateway/cn:deepseek-v4.1-flash"
 
 
 def _long_history_messages(
@@ -509,7 +509,7 @@ class LlmEndpointBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [call.kwargs["model"] for call in mock.await_args_list],
             [
-                "home_work2api/cn:deepseek-v4.1-flash",
+                "work_gateway/cn:deepseek-v4.1-flash",
                 "pipio/gemini-3.8-flash-high",
             ],
         )
@@ -1095,7 +1095,7 @@ class MemoryContextWindowSyncTests(unittest.IsolatedAsyncioTestCase):
         async def refresh() -> dict[str, Any]:
             # 网关这一轮宣告 3M：周期刷新负责把它写进缓存。
             ml.MODEL_LIMITS.record(settings.bot.main_model, total_window=100_000)
-            return {"home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
+            return {"work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
 
         refresher = ml.PeriodicModelMetadataRefresh(
             refresh,
@@ -1126,7 +1126,7 @@ class MemoryContextWindowSyncTests(unittest.IsolatedAsyncioTestCase):
         async def slow_refresh() -> dict[str, Any]:
             await release.wait()
             ml.MODEL_LIMITS.record(_gateway_model(), total_window=100_000)
-            return {"home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
+            return {"work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash": ml.LIMIT_SOURCE_GATEWAY}
 
         llm = SimpleNamespace(
             refresh_model_limits=slow_refresh,

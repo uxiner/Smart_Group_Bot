@@ -42,10 +42,10 @@ from bot.db.engine import (
     init_db,
 )
 
-#: 生产部署里 id=6 那条硬规则（regex + ban，「探花招募族」）的正文。
-#: 按生产库实测抄录（63 字符，指纹 ``e9d32f1e00b0e9e2``）——**不是审计报告里那句截断转述**。
+#: 原部署里 id=6 那条硬规则（regex + ban，一条泛化的「招募/收买资源类」广告正则）的正文。
+#: 按原部署实测抄录（52 字符，指纹 ``2330dcb38ee014e3``）——**不是审计报告里那句截断转述**。
 PRODUCTION_RULE_6_PATTERN = (
-    r"(?i)(招募?探花|收探花|探花(视频|资源)|提供设备[^\n。]{0,12}(收|买|收购|结算)|(收|买)探花视频)"
+    r"(?i)(招募|招收|收|买|收购|出售)[^\n。]{0,12}(资源|视频|账号|设备|脚本|代练)"
 )
 
 _LEGACY_RULES_DDL = (
@@ -133,7 +133,7 @@ class ProductionRuleUpgradeTests(_LegacyRuleCase):
         _row_values(1, "keyword", "秒杀", "delete"),
         _row_values(5, "regex", "秒杀|优惠券", "delete"),
         _row_values(6, "regex", PRODUCTION_RULE_6_PATTERN, "ban"),
-        _row_values(7, "regex", "探花", "warn"),
+        _row_values(7, "regex", "兼职接单", "warn"),
     )
 
     async def test_matching_rule_is_still_upgraded(self) -> None:
@@ -202,7 +202,7 @@ class ForeignRuleSixIsNotTouchedTests(_LegacyRuleCase):
         _row_values(1, "keyword", "秒杀", "delete"),
         # id=6，但这是**别的**部署里的一条完全不同的规则。
         _row_values(6, "regex", r"赌博|博彩|代开发票", "ban"),
-        _row_values(7, "regex", "探花", "warn"),
+        _row_values(7, "regex", "兼职接单", "warn"),
     )
 
     async def test_same_id_different_pattern_is_not_upgraded(self) -> None:
@@ -267,8 +267,8 @@ class FingerprintContractTests(unittest.TestCase):
     """指纹口径本身：不折叠中间空白（宁可对不上，也不要误升级别人）。"""
 
     def test_case_and_outer_whitespace_are_ignored(self) -> None:
-        base = expected_fingerprint("探花|招募")
-        self.assertEqual(base, expected_fingerprint(" 探花|招募 "))
+        base = expected_fingerprint("招募|兼职")
+        self.assertEqual(base, expected_fingerprint(" 招募|兼职 "))
         self.assertEqual(len(base), 16)
 
     def test_inner_whitespace_is_significant(self) -> None:
@@ -276,7 +276,7 @@ class FingerprintContractTests(unittest.TestCase):
 
     def test_content_changes_change_the_fingerprint(self) -> None:
         self.assertNotEqual(
-            expected_fingerprint("探花|招募"), expected_fingerprint("探花招募")
+            expected_fingerprint("招募|兼职"), expected_fingerprint("招募兼职")
         )
 
 

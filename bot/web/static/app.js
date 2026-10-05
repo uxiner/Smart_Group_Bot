@@ -30,6 +30,7 @@
     { id: "safety", label: "审核验证", icon: "shield-check", subtitle: "内容审核与入群验证", group: "Bot 能力" },
     { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸", group: "Bot 能力" },
     { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息服务接入", group: "Bot 能力" },
+    { id: "operations", label: "运营参数", icon: "coins", subtitle: "积分、活跃、私聊与提醒", group: "Bot 能力" },
     { id: "groups", label: "群组设置", icon: "users", subtitle: "逐群行为、群规与自动化", group: "群组管理" },
     { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局名单", group: "群组管理" },
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转", group: "系统" },
@@ -644,6 +645,57 @@
     refreshIcons();
   }
 
+  function rewardEditor(path, options = {}) {
+    const rows = Array.isArray(getPath(state.config, path)) ? getPath(state.config, path) : [];
+    const totalWeight = rows.reduce((sum, row) => sum + (Number(row?.weight) || 0), 0);
+    const expectation = totalWeight
+      ? rows.reduce((sum, row) => sum + (Number(row?.payout) || 0) * (Number(row?.weight) || 0), 0) / totalWeight
+      : 0;
+    const body = rows.map((row, index) => `
+      <div class="reward-row" data-reward-index="${index}">
+        <label class="reward-cell">
+          <span>中奖积分</span>
+          <input type="number" min="0" max="1000000" step="1" required inputmode="numeric"
+                 data-reward-path="${attr(path)}" data-reward-index="${index}" data-reward-key="payout"
+                 value="${attr(row?.payout ?? 0)}">
+        </label>
+        <label class="reward-cell">
+          <span>权重</span>
+          <input type="number" min="1" max="1000000" step="1" required inputmode="numeric"
+                 data-reward-path="${attr(path)}" data-reward-index="${index}" data-reward-key="weight"
+                 value="${attr(row?.weight ?? 1)}">
+        </label>
+        <label class="reward-cell reward-cell-wide">
+          <span>标签</span>
+          <input type="text" maxlength="32" data-reward-path="${attr(path)}" data-reward-index="${index}" data-reward-key="label"
+                 value="${attr(row?.label ?? "")}" placeholder="给用户看的名字">
+        </label>
+        <button class="icon-button danger" type="button" data-reward-remove="${attr(path)}" data-reward-index="${index}"
+                aria-label="删除这一档"${rows.length <= 1 ? " disabled" : ""}>${icon("trash-2")}</button>
+      </div>`).join("");
+    return `
+      <div class="reward-editor" data-reward-editor="${attr(path)}">
+        <div class="reward-editor-head">
+          <strong>${escapeHtml(options.label || "奖池档位")}</strong>
+          <span class="badge info">总权重 ${escapeHtml(totalWeight)}</span>
+          <span class="badge info">期望 ${escapeHtml(expectation.toFixed(2))} 分/次</span>
+          <button class="secondary-button" type="button" data-reward-add="${attr(path)}">${icon("plus")}加一档</button>
+        </div>
+        ${body}
+        ${options.hint ? `<span class="field-hint">${escapeHtml(options.hint)}</span>` : ""}
+      </div>`;
+  }
+
+  function readRewardEditor(input) {
+    const path = input.dataset.rewardPath;
+    const rows = Array.isArray(getPath(state.config, path)) ? getPath(state.config, path).map(row => ({ ...row })) : [];
+    const index = Number(input.dataset.rewardIndex);
+    const key = input.dataset.rewardKey;
+    if (!rows[index] || !key) return rows;
+    rows[index][key] = key === "label" ? input.value : Number(input.value || 0);
+    return rows;
+  }
+
   function pageHead(title, description, actions = "") {
     return `
       <div class="page-head">
@@ -888,9 +940,11 @@
 
         <section class="settings-section">
           ${sectionHead("重启项", "其余运行时设置保存后无需重启。")}
+          ${(state.document.restart_pending || []).length ? `
+            <div class="notice warning">${icon("triangle-alert")}<span>刚刚保存的改动里有这些字段要重启才生效：<strong>${escapeHtml((state.document.restart_pending || []).join("、"))}</strong></span></div>` : ""}
           <div class="item-list">
             ${restartPaths.map(path => `
-              <div class="notice info">${icon("rotate-ccw")}<span><strong>${escapeHtml(pathLabels[path] || path)}</strong><br>${escapeHtml(path)}</span></div>`).join("") || `<div class="empty-state empty-state-compact">${icon("circle-check")}<p>当前没有重启项</p></div>`}
+              <div class="notice info${(state.document.restart_pending || []).includes(path) ? " warning" : ""}">${icon("rotate-ccw")}<span><strong>${escapeHtml(pathLabels[path] || path)}</strong><br>${escapeHtml(path)}</span></div>`).join("") || `<div class="empty-state empty-state-compact">${icon("circle-check")}<p>当前没有重启项</p></div>`}
           </div>
         </section>
       </div>`;
@@ -1202,6 +1256,9 @@
             ${field("moderation.quoted_author_max_age_seconds", "引用追溯上限（秒）", { type: "number", min: 0, max: 31536000, step: 1, required: true, hint: "被引用消息超过该时长不再追溯原作者（只记日志），默认 604800 秒 = 7 天" })}
             ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "默认关闭，需要在此显式打开。", false, "开启后，除最高管理员外的管理员与群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询、不封禁、不禁言、不累计警告。最高管理员与手动豁免名单始终完全跳过。关闭后恢复为只审核普通成员。")}
             ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据。", false, "证据包含对象、时间、命中规则、置信度、判定理由、送审原文与已执行动作，带图时附上图片。尽力发送，不会刷屏；普通成员违规不发送私聊。")}
+            ${toggle("moderation.log_channel_enabled", "证据投递到频道", "开启后每条命中单独发一条证据卡（带「人工放行 / 确认封禁」按钮）；关闭后回到私聊最高管理员的老路径（含聚合）。")}
+            ${field("moderation.log_channel_id", "证据频道 ID", { type: "number", min: -1009999999999, max: 0, step: 1, required: true, hint: "0 = 未配置：不会向任何频道投递，命中证据按原路径私聊最高管理员。填 -100 开头的频道 id 才会启用频道投递。", help: "Telegram 频道 chat id 恒为 -100 开头的负数。填 0（或留空按 0 处理）表示未配置；此时「证据投递到频道」开关打开也没有投递目标，行为与关闭时一致——这是安全默认，公开部署不会误投到任何人的私人频道。", helpLabel: "为什么默认是 0" })}
+            ${field("moderation.review_handover_mention", "交接对象", { maxlength: 33, placeholder: "@your_bot", hint: "留空 = 不 @ 任何人，只发交接文案。必须是合法 Telegram 用户名（@ 开头，字母开头，5-32 位字母数字下划线）。", help: "审核规则需要调整时，证据卡末尾会 @ 这个账号并附一条 mention 实体。留空时不会出现任何 @；页面上也不会用「对空串做 rfind」之类的写法凭空造出一个假 mention。", helpLabel: "交接 mention 的行为" })}
           </div>
         </section>
         <section class="settings-section">
@@ -1264,6 +1321,157 @@
             ${field("raid_guard.lookback_seconds", "追溯窗口（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "触发前该时间段内进群的成员将被要求真人质询" })}
             ${field("raid_guard.challenge_timeout_seconds", "质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "超时未完成质询将被移出群聊（可重新加入）" })}
           </div>
+        </section>
+      </div>`;
+  }
+
+  function renderOperations() {
+    const restartNotice = restartChanges().length
+      ? `<div class="notice info">${icon("rotate-ccw")}<span>本页带「需重启」标记的字段保存后要重启进程才生效；其余字段下一次动作即生效。</span></div>`
+      : "";
+    return `
+      ${pageHead("运营参数", "积分、活跃激励、私聊额度、签到提醒与对外文案。全部由最高管理员编辑，保存后立即生效。")}
+      ${restartNotice}
+      <div class="section-stack">
+        <section class="settings-section">
+          ${sectionHead("签到与积分", "签到每日奖励封顶、积分榜、审核质询免除价。免除价不能设为 0——0 等于免费绕过质询。")}
+          <div class="field-grid three">
+            ${field("economy.checkin_daily_point_cap", "签到每日封顶（分）", { type: "number", min: 1, max: 100, step: 1, required: true, hint: "连续第 N 天得 N 分，到该值后封顶" })}
+            ${field("economy.checkin_rank_limit", "积分榜名次", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${field("economy.checkin_violation_window_days", "违规统计窗口（天）", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "个人档案里「近 N 天被审核命中」" })}
+            ${field("economy.challenge_skip_cost", "免除质询价（分）", { type: "number", min: 1, max: 1000, step: 1, required: true, hint: "下界固定为 1，不提供 0（免费绕过）" })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("头衔与置顶", "价格单位是积分。头衔长度上限 16 字是 Telegram 原生协议，不能放开；防冒充词表固定在代码里，不在这里配置。")}
+          <div class="field-grid three">
+            ${field("economy.tag_price_7d", "头衔 7 天价（分）", { type: "number", min: 0, max: 100000, step: 1, required: true })}
+            ${field("economy.tag_days_7d", "头衔 7 天时长（天）", { type: "number", min: 1, max: 3650, step: 1, required: true })}
+            ${field("economy.tag_price_30d", "头衔 30 天价（分）", { type: "number", min: 0, max: 100000, step: 1, required: true })}
+            ${field("economy.tag_days_30d", "头衔 30 天时长（天）", { type: "number", min: 1, max: 3650, step: 1, required: true })}
+            ${field("economy.pin_price", "置顶价（分）", { type: "number", min: 0, max: 100000, step: 1, required: true })}
+            ${field("economy.pin_hours", "置顶时长（小时）", { type: "number", min: 1, max: 720, step: 1, required: true })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("抽奖奖池", "每行 = 中奖积分 / 权重 / 标签。权重是相对值，总权重由各行相加得到；期望值会在下方实时算给你看。")}
+          <div id="lottery-editor">${rewardEditor("economy.lottery_prizes", { label: "奖池档位", hint: "至少保留一档；总权重由各档相加自动得到，不需要另外填写。保存时后端会校验权重之和大于 0。" })}</div>
+          ${advancedPanel("economy.lottery-table", "奖池明细", "默认 7 档、总权重 10000，期望值 6.00 分/次", `
+            <div class="field-grid three">
+              ${field("economy.lottery_price", "抽奖价（分）", { type: "number", min: 1, max: 100000, step: 1, required: true })}
+              ${field("economy.lottery_daily_limit", "每日次数上限", { type: "number", min: 1, max: 1000, step: 1, required: true })}
+            </div>
+            <div id="lottery-editor-advanced"></div>`)}
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("活跃激励", "每周榜单的奖励向量：下标 0 = 第 1 名。榜单长度与周奖励总额都由这个向量派生，不会出现两处数字互相矛盾。得分公式（发言 + 活跃天数×2 + 被回复次数）不随本页变化。")}
+          <div class="field-grid three">
+            ${field("activity.min_message_text_length", "有效发言最小长度（字符）", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${field("activity.max_daily_messages", "每天计入上限（条）", { type: "number", min: 1, max: 500, step: 1, required: true, hint: "写入时就封顶，防刷屏" })}
+            ${field("activity.min_active_days", "参与门槛 · 活跃天数", { type: "number", min: 1, max: 365, step: 1, required: true })}
+            ${field("activity.min_weekly_messages", "参与门槛 · 发言条数", { type: "number", min: 1, max: 100000, step: 1, required: true })}
+            ${field("activity.weekly_reward_points", "每周奖励向量（分）", { kind: "array", full: true, hint: "逗号分隔，从第 1 名开始。默认 25, 12, 12, 4, 4, 4, 4, 4, 4, 4（10 名、合计 77）", help: "向量长度 = 榜单名次数，向量求和 = 本周奖励总额。两者都从这里派生，不再单独存一份，避免互相矛盾。", helpLabel: "为什么不再单独填「总额」" })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("私聊额度", "只对最高管理员开放。普通成员与群管理员是两套独立档位，各有单人上限与全局上限，互不占用。")}
+          <div class="field-grid three">
+            ${field("private_chat.per_user_daily_limit", "普通成员 · 每人每天（条）", { type: "number", min: 1, max: 100000, step: 1, required: true })}
+            ${field("private_chat.admin_per_user_daily_limit", "群管理员 · 每人每天（条）", { type: "number", min: 1, max: 100000, step: 1, required: true })}
+            ${field("private_chat.global_daily_limit", "普通成员 · 全网每天（条）", { type: "number", min: 1, max: 10000000, step: 1, required: true })}
+            ${field("private_chat.admin_global_daily_limit", "群管理员 · 全网每天（条）", { type: "number", min: 1, max: 10000000, step: 1, required: true })}
+            ${field("private_chat.input_max_chars", "单条输入上限（字符）", { type: "number", min: 1, max: 4096, step: 1, required: true })}
+            ${field("private_chat.reply_max_chars", "单条回复分片（字符）", { type: "number", min: 512, max: 4096, step: 1, required: true, hint: "上界 4096 是 Telegram 协议硬上限，不能放开" })}
+            ${field("private_chat.vision_budget_seconds", "识图预算（秒）", { type: "number", min: 5, max: 120, step: 0.5, required: true })}
+            ${field("private_chat.memory_turns", "内存兜底轮数", { type: "number", min: 1, max: 200, step: 1, required: true, hint: "只在读库失败时兜底；真正的历史按 token 预算从库里读" })}
+            ${field("private_chat.access_ttl_seconds", "成员准入缓存（秒）", { type: "number", min: 1, max: 60, step: 1, required: true, hint: "上界 60：调大会放大越权窗口，所以只能收紧", help: "缓存里除了档位还带着「已确认他在哪些授权群里」。被踢出群之后这个集合要尽快过期，所以 TTL 的上界被钉在今天的 60 秒——这不是保守，是不允许通过调大配置延长越权窗口。", helpLabel: "为什么只能调小" })}
+            ${field("private_chat.search_daily_limit", "私聊检索保险丝（次/天）", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "热改不会重置当天已消耗的次数；午夜滚动" })}
+            ${field("private_chat.voice_max_segments", "单条语音最多段数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("签到提醒", "时段只约束命令/CLI 接受哪些 --slot；真正几点发由外部 cron 决定，改这里不会改 cron 的时间表。")}
+          <div class="field-grid three">
+            ${field("checkin_reminder.slots", "提醒时段（本地小时）", { kind: "array", hint: "逗号分隔的整点小时，默认 9, 12, 15, 18。必须 0-23 且去重排序。", help: "调度由外部 cron 决定（bot/tools/checkin_reminder.py 的 docstring 里有样例 crontab）。改完这一项后，部署侧必须同步改 crontab，否则只影响「命令是否接受这个 --slot」。", helpLabel: "与 cron 的关系" })}
+            ${field("checkin_reminder.slot_greetings", "时段问候语", { kind: "json-object", full: true, rows: 4, hint: "形如 {\"9\": \"早上好\"}；键必须落在上面的时段里，值不能含 HTML 标签。" })}
+            ${field("checkin_reminder.auto_delete_seconds", "发出后自动删除（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "0 = 不自动删除" })}
+            ${field("checkin_reminder.roster_max_names", "名单最多昵称数", { type: "number", min: 1, max: 200, step: 1, required: true })}
+            ${field("checkin_reminder.stale_grace_seconds", "空占位宽限（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "必须远大于一次「claim → 读名单 → 发消息」的正常耗时" })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("对外文案", "只改用户看得见的字。callback_data（checkin:v1）、深链前缀（shop_）是协议标识，不可配。人设提示词在 Prompts 页单独编辑，这里不会另造一份人格。")}
+          <div class="field-grid three">
+            ${field("display.bot_display_name", "显示名", { maxlength: 32, required: true, hint: "用于联网检索时剥掉问句里的称呼" })}
+            ${field("display.private_voice_title", "私聊语音条标题", { maxlength: 64, required: true })}
+            ${field("display.checkin_button_text", "签到按钮文字", { maxlength: 64, required: true })}
+            ${field("display.shop_button_text", "商店按钮文字", { maxlength: 64, required: true })}
+            ${field("display.search_query_prefixes", "检索唤醒前缀", { kind: "array", hint: "逗号分隔；显示名会自动并入一起剥离" })}
+            ${field("display.private_not_member_notice", "私聊 · 非成员提示", { type: "textarea", rows: 2, maxlength: 2000, full: true })}
+            ${field("display.private_limit_notice", "私聊 · 本人超限提示", { type: "textarea", rows: 2, maxlength: 2000, full: true })}
+            ${field("display.private_global_limit_notice", "私聊 · 全局超限提示", { type: "textarea", rows: 2, maxlength: 2000, full: true })}
+            ${field("display.private_media_unsupported_notice", "私聊 · 不支持的媒体提示", { type: "textarea", rows: 2, maxlength: 2000, full: true })}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("高级资源", "进程级预算。标量保存后下一次动作生效；带「需重启」标记的是绑在模块级闸门上的并发容量，改完必须重启。默认全部等于今天真实生效的值。")}
+          ${advancedPanel("resources.all", "展开高级资源", "并发闸门、超时、批量、维护间隔", `
+            <div class="field-grid three">
+              ${field("resources.llm_request_capacity", "LLM 总容量", { type: "number", min: 2, max: 64, step: 1, required: true })}
+              ${field("resources.llm_request_noncritical_capacity", "LLM 非关键容量", { type: "number", min: 1, max: 64, step: 1, required: true, hint: "必须 < 总容量：至少留 1 个关键名额" })}
+              ${field("resources.llm_request_normal_capacity", "LLM 普通容量", { type: "number", min: 1, max: 64, step: 1, required: true })}
+              ${field("resources.llm_request_background_capacity", "LLM 背景容量", { type: "number", min: 1, max: 64, step: 1, required: true, hint: "必须 ≤ 普通容量 − 2" })}
+              ${field("resources.llm_tokenizer_concurrency", "分词线程数", { type: "number", min: 1, max: 8, step: 1, required: true })}
+              ${field("resources.llm_stage_deadlines", "LLM 阶段预算（秒）", { kind: "json-object", full: true, rows: 9, hint: "形如 {\"decision\": 35, \"moderation\": 35, ...}。角色上显式设置的总预算仍然优先。" })}
+              ${field("resources.telegram_total_capacity", "Telegram 总容量", { type: "number", min: 8, max: 512, step: 1, required: true })}
+              ${field("resources.telegram_noncritical_capacity", "Telegram 非关键容量", { type: "number", min: 4, max: 512, step: 1, required: true })}
+              ${field("resources.telegram_normal_capacity", "Telegram 普通容量", { type: "number", min: 2, max: 512, step: 1, required: true })}
+              ${field("resources.pending_reply_execution_capacity", "群待回复并发", { type: "number", min: 1, max: 32, step: 1, required: true })}
+              ${field("resources.pending_reply_timeout_seconds", "群待回复预算（秒）", { type: "number", min: 5, max: 120, step: 0.5, required: true, hint: "群级设置优先，这里是兜底默认值" })}
+              ${field("resources.tts_synthesis_concurrency", "TTS 合成并发", { type: "number", min: 1, max: 8, step: 1, required: true })}
+              ${field("resources.tts_transcode_concurrency", "TTS 转码并发", { type: "number", min: 1, max: 8, step: 1, required: true })}
+              ${field("resources.tts_private_concurrency", "私聊 TTS 并发", { type: "number", min: 1, max: 8, step: 1, required: true })}
+              ${field("resources.tts_max_segments_per_message", "单条最多合成段数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+              ${field("resources.tts_transcode_timeout_seconds", "转码超时（秒）", { type: "number", min: 5, max: 300, step: 1, required: true })}
+              ${field("resources.tts_max_http_timeout_seconds", "TTS http 上限（秒）", { type: "number", min: 5, max: 600, step: 1, required: true })}
+              ${field("resources.av_query_concurrency", "AV 查询并发", { type: "number", min: 1, max: 8, step: 1, required: true })}
+              ${field("resources.av_query_deadline_seconds", "AV 查询预算（秒）", { type: "number", min: 5, max: 300, step: 0.5, required: true })}
+              ${field("resources.av_query_admission_timeout_seconds", "AV 准入等待（秒）", { type: "number", min: 0.1, max: 60, step: 0.1, required: true })}
+              ${field("resources.av_star_name_cache_max", "AV 名字缓存条数", { type: "number", min: 64, max: 8192, step: 1, required: true })}
+              ${field("resources.admin_alert_window_seconds", "管理员告警窗口（秒）", { type: "number", min: 10, max: 86400, step: 1, required: true })}
+              ${field("resources.admin_alert_aggregate_after", "管理员告警合并阈值", { type: "number", min: 2, max: 1000, step: 1, required: true })}
+              ${field("resources.admin_alert_state_limit", "管理员告警状态上限", { type: "number", min: 16, max: 65536, step: 1, required: true })}
+              ${field("resources.admin_alert_text_limit", "管理员告警截断字数", { type: "number", min: 100, max: 4000, step: 1, required: true })}
+              ${field("resources.moderation_throttle_burst", "送审整形 burst", { type: "number", min: 1, max: 64, step: 1, required: true, hint: "不改变默认行为；改它不会关掉任何本地规则" })}
+              ${field("resources.moderation_throttle_spacing_seconds", "送审整形间隔（秒）", { type: "number", min: 0.1, max: 120, step: 0.1, required: true })}
+              ${field("resources.moderation_throttle_max_wait_seconds", "送审整形单条最多等（秒）", { type: "number", min: 0.1, max: 120, step: 0.1, required: true })}
+              ${field("resources.moderation_throttle_max_waiters", "送审整形等待者上限", { type: "number", min: 1, max: 256, step: 1, required: true })}
+              ${field("resources.decision_history_token_budget", "判定历史 token 预算", { type: "number", min: 512, max: 1000000, step: 1, required: true })}
+              ${field("resources.decision_history_max_messages", "判定历史条数上限", { type: "number", min: 1, max: 1000, step: 1, required: true })}
+              ${field("resources.memory_max_facts_per_extraction", "单次提炼最多事实数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+              ${field("resources.memory_extract_input_token_limit", "提炼输入上限（token）", { type: "number", min: 512, max: 200000, step: 1, required: true })}
+              ${field("resources.memory_extract_scope_limit", "每轮作用域上限", { type: "number", min: 1, max: 200, step: 1, required: true })}
+              ${field("resources.memory_candidate_row_limit", "召回候选行上限", { type: "number", min: 10, max: 5000, step: 1, required: true })}
+              ${field("resources.memory_private_group_fanout", "私聊参考群数上限", { type: "number", min: 1, max: 20, step: 1, required: true })}
+              ${field("resources.memory_tool_subject_daily_cap", "单人 remember 每日上限", { type: "number", min: 1, max: 200, step: 1, required: true })}
+              ${field("resources.memory_maintenance_interval_seconds", "记忆维护间隔（秒）", { type: "number", min: 300, max: 86400, step: 1, required: true })}
+              ${field("resources.search_prune_interval_seconds", "检索留档清理间隔（秒）", { type: "number", min: 300, max: 86400, step: 1, required: true })}
+              ${field("resources.search_record_recall_limit", "检索留档召回条数", { type: "number", min: 1, max: 50, step: 1, required: true })}
+              ${field("resources.archive_batch_size", "向量归档批大小", { type: "number", min: 1, max: 512, step: 1, required: true })}
+              ${field("resources.archive_backfill_per_pass", "向量回填每轮条数", { type: "number", min: 1, max: 5000, step: 1, required: true })}
+              ${field("resources.archive_scan_limit", "向量扫描上限", { type: "number", min: 100, max: 100000, step: 1, required: true })}
+              ${field("resources.archive_candidate_limit", "向量候选上限", { type: "number", min: 1, max: 5000, step: 1, required: true })}
+              ${field("resources.archive_query_timeout_seconds", "向量查询超时（秒）", { type: "number", min: 0.5, max: 120, step: 0.5, required: true })}
+              ${field("resources.archive_maintenance_interval_seconds", "向量维护间隔（秒）", { type: "number", min: 0.5, max: 600, step: 0.5, required: true })}
+              ${field("resources.archive_indexing_lease_seconds", "索引租约（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "必须不短于查询超时，否则会重复写" })}
+            </div>`)}
         </section>
       </div>`;
   }
@@ -2919,6 +3127,7 @@
       bot: renderBot,
       safety: renderSafety,
       media: renderMedia,
+      operations: renderOperations,
       integrations: renderIntegrations,
       logging: renderLogging,
       prompts: renderPrompts,
@@ -3050,7 +3259,7 @@
       if (settingsResult?.status === "rejected") throw settingsResult.reason;
       if (settingsResult?.status === "fulfilled") applySettingsDocument(settingsResult.value);
       else {
-        state.document = { revision: 0, bootstrap: {}, restart_required_paths: [] };
+        state.document = { revision: 0, bootstrap: {}, restart_required_paths: [], restart_pending: [] };
         state.config = {};
         state.baseline = {};
       }
@@ -3556,6 +3765,7 @@
         configured_secrets: savedDocument.configured_secrets || [...state.configuredSecrets],
         bootstrap: savedDocument.bootstrap || state.document.bootstrap,
         restart_required_paths: savedDocument.restart_required_paths || state.document.restart_required_paths,
+        restart_pending: savedDocument.restart_pending || [],
       });
     } else {
       applySecretResults();
@@ -3748,9 +3958,13 @@
       const prefix = successCount ? `已保存 ${successCount} 项，` : "";
       showToast(`${prefix}${failures.length} 项失败并已保留草稿：${failures.join("；")}`, "error", 9000);
     } else if (successCount) {
+      const pendingRestart = state.document?.restart_pending || [];
+      const restartTail = pendingRestart.length
+        ? `需要重启才生效：${pendingRestart.join("、")}`
+        : "重启项将在 Bot 重启后生效";
       showToast(restartSaved
-        ? `已保存全部 ${successCount} 项更改；重启项将在 Bot 重启后生效`
-        : `已保存全部 ${successCount} 项更改`, restartSaved ? "warning" : "success", 5600);
+        ? `已保存全部 ${successCount} 项更改；${restartTail}`
+        : `已保存全部 ${successCount} 项更改`, restartSaved ? "warning" : "success", 8000);
     }
   }
 
@@ -3817,6 +4031,23 @@
     if (kind === "lower-string") return target.value.trim().toLowerCase();
     if (kind === "json-object") return parseJsonObjectValue(target.value);
     return target.value;
+  }
+
+  function updateRewardControl(target) {
+    const rows = readRewardEditor(target);
+    setPath(state.config, target.dataset.rewardPath, rows);
+    const editor = target.closest("[data-reward-editor]");
+    const head = editor?.querySelector(".reward-editor-head");
+    if (head) {
+      const total = rows.reduce((sum, row) => sum + (Number(row?.weight) || 0), 0);
+      const expectation = total
+        ? rows.reduce((sum, row) => sum + (Number(row?.payout) || 0) * (Number(row?.weight) || 0), 0) / total
+        : 0;
+      const badges = head.querySelectorAll(".badge.info");
+      if (badges[0]) badges[0].textContent = `总权重 ${total}`;
+      if (badges[1]) badges[1].textContent = `期望 ${expectation.toFixed(2)} 分/次`;
+    }
+    updateChrome();
   }
 
   function updatePathControl(target) {
@@ -3933,6 +4164,10 @@
     }
     if (handlePermissionControl(target)) return;
     if (handleGroupTemplateButtonsControl(target)) return;
+    if (target.matches("[data-reward-key]")) {
+      updateRewardControl(target);
+      return;
+    }
     if (target.matches("[data-auto-delete-seconds]")) {
       const category = target.dataset.autoDeleteSeconds;
       const overrides = { ...(state.config.bot.auto_delete_category_seconds || {}) };
@@ -4017,6 +4252,10 @@
     }
     if (handlePermissionControl(target)) return;
     if (handleGroupTemplateButtonsControl(target)) return;
+    if (target.matches("[data-reward-key]")) {
+      updateRewardControl(target);
+      return;
+    }
     if (target.matches("[data-call-admin-target]")) {
       const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
       if (!group || state.groupSaving.has(String(group.id))) return;
@@ -4104,6 +4343,31 @@
   }, true);
 
   content.addEventListener("click", async event => {
+    const rewardAdd = event.target.closest("[data-reward-add]");
+    if (rewardAdd) {
+      const target = rewardAdd.dataset.rewardAdd;
+      const rows = Array.isArray(getPath(state.config, target)) ? [...getPath(state.config, target)] : [];
+      rows.push({ payout: 0, weight: 1, label: "" });
+      setPath(state.config, target, rows);
+      renderContent();
+      updateChrome();
+      return;
+    }
+    const rewardRemove = event.target.closest("[data-reward-remove]");
+    if (rewardRemove) {
+      const target = rewardRemove.dataset.rewardRemove;
+      const index = Number(rewardRemove.dataset.rewardIndex);
+      const rows = Array.isArray(getPath(state.config, target)) ? [...getPath(state.config, target)] : [];
+      if (rows.length > 1 && rows[index]) {
+        rows.splice(index, 1);
+        setPath(state.config, target, rows);
+        renderContent();
+        updateChrome();
+      } else {
+        showToast("奖池至少保留一档", "error", 3000);
+      }
+      return;
+    }
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const action = button.dataset.action;

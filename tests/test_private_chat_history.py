@@ -33,7 +33,7 @@ from bot.services import private_chat as dm
 from bot.services.dm_search import RESULT_BLOCK
 from bot.utils.timezone import now_shanghai_naive
 
-SUPER_ADMIN = 601298409
+SUPER_ADMIN = 100000001
 MEDIA_ATTRS = (
     "photo",
     "document",

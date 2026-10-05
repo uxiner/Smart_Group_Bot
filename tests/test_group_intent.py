@@ -52,18 +52,18 @@ class GroupIntentServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reply_style_memory_add_is_allowed(self) -> None:
         llm = _DummyLLM(
-            '{"intent":"memory_manage","memory_action":"add","memory_content":"Sanite&Ava | Resting","memory_target":"","rule_instruction":""}'
+            '{"intent":"memory_manage","memory_action":"add","memory_content":"Demo User | Resting","memory_target":"","rule_instruction":""}'
         )
         svc = GroupIntentService(llm)
 
         intent = await svc.detect(
-            "这个写入永久记忆\n[reply_to:text] Sanite&Ava | Resting",
+            "这个写入永久记忆\n[reply_to:text] Demo User | Resting",
             surface_text="这个写入永久记忆",
         )
 
         self.assertEqual(intent.intent, "memory_manage")
         self.assertEqual(intent.memory_action, "add")
-        self.assertEqual(intent.memory_content, "Sanite&Ava | Resting")
+        self.assertEqual(intent.memory_content, "Demo User | Resting")
         self.assertEqual(llm.calls, 1)
 
     async def test_explicit_rule_add_still_works(self) -> None:

@@ -33,7 +33,7 @@ FAKE_TOKEN = "123456789:AAFakeTokenForTestsOnly_0123456789abc"
 @pytest.fixture()
 def bootstrap_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOT_TOKEN", FAKE_TOKEN)
-    monkeypatch.setenv("SUPER_ADMIN_ID", "601298409")
+    monkeypatch.setenv("SUPER_ADMIN_ID", "100000001")
     monkeypatch.setenv("CONFIG_MASTER_KEY", "0" * 64)
 
 

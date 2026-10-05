@@ -260,6 +260,17 @@ class ReservedCapacityGate:
         for semaphore in reversed(acquired):
             semaphore.release()
 
+    def in_use(self) -> bool:
+        """当前有没有请求占着 slot、或者有人在等。
+
+        用来回答"能不能换掉这个闸门"：进程级闸门在有活动请求时**不能**热替换
+        （旧的 slot 会被漏掉，新的又和旧的重叠），所以启动装配要先问这一句。
+        """
+
+        if any(count > 0 for count in self._active.values()):
+            return True
+        return any(count > 0 for count in self._waiting.values())
+
     @asynccontextmanager
     async def slot(
         self,

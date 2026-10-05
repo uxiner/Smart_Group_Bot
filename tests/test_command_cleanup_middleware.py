@@ -104,7 +104,7 @@ class ManagementCommandCleanupTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_bot_suffixed_and_argument_forms_are_recognized(self) -> None:
-        for text in ("/ban@xatongxue_bot 123 广告", "/mute all", "/exemptlist", "/modlist"):
+        for text in ("/ban@your_bot 123 广告", "/mute all", "/exemptlist", "/modlist"):
             with self.subTest(text=text):
                 _, schedule, _ = await self._run(_message(text))
                 self.assertEqual(schedule.await_count, 1, text)
@@ -253,7 +253,7 @@ class ManagementCommandCleanupTests(unittest.IsolatedAsyncioTestCase):
 
     def test_bare_command_parsing(self) -> None:
         self.assertEqual(bare_command("/mute all"), "mute")
-        self.assertEqual(bare_command("/mute@xatongxue_bot"), "mute")
+        self.assertEqual(bare_command("/mute@your_bot"), "mute")
         self.assertEqual(bare_command("/exemptlist（别名 /modlist）"), "exemptlist")
         self.assertEqual(bare_command("/lm replace <#ID> => <新内容>"), "lm")
         self.assertEqual(bare_command("普通消息"), "")

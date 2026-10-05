@@ -231,7 +231,7 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             id=14,
             group_id=-100,
             rule_type="regex",
-            pattern=r"^(?:lucky_checkin|aq_lucky_bot)$",
+            pattern=r"^(?:lucky_checkin|checkin_helper_bot)$",
             action="delete",
             enabled=True,
         )
@@ -241,7 +241,7 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         verdict = await service.evaluate(
             self.session,
             -100,
-            "/lucky_checkin@aq_lucky_bot",
+            "/lucky_checkin@checkin_helper_bot",
         )
 
         self.assertTrue(verdict.violated)
@@ -265,7 +265,7 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         verdict = await service.evaluate(
             self.session,
             -100,
-            "/lucky_checkin@aq_lucky_bot",
+            "/lucky_checkin@checkin_helper_bot",
         )
 
         self.assertTrue(verdict.violated)
@@ -288,7 +288,7 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         verdict = await service.evaluate(
             self.session,
             -100,
-            "prefix /lucky_checkin@aq_lucky_bot suffix",
+            "prefix /lucky_checkin@checkin_helper_bot suffix",
         )
 
         self.assertFalse(verdict.violated)

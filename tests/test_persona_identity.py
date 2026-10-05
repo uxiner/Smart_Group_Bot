@@ -188,7 +188,7 @@ class PersonaIdentityTests(unittest.TestCase):
     def test_default_persona_render_has_no_hardcoded_bot_handle(self) -> None:
         rendered = with_persona("task")
         self.assertIn("小爱同学", rendered)
-        for leaked in ("@xatongxue_bot", "gansini", "Sanite_Ava"):
+        for leaked in ("@example_bot", "legacy_bot_name", "Sanite_Ava"):
             with self.subTest(leaked=leaked):
                 self.assertNotIn(leaked, rendered)
 
@@ -204,14 +204,14 @@ class PrivateChatModeTests(unittest.TestCase):
 
     def test_owner_dm_marks_is_owner_yes(self) -> None:
         messages = build_private_chat_messages(
-            "在吗", sender_user_id=601298409, sender_username="ismoka", sender_is_owner=True
+            "在吗", sender_user_id=100000001, sender_username="owner_demo", sender_is_owner=True
         )
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertIn("is_owner: yes", blob)
 
     def test_member_dm_marks_is_owner_no(self) -> None:
         messages = build_private_chat_messages(
-            "在吗", sender_user_id=9757123, sender_username="someone", sender_is_owner=False
+            "在吗", sender_user_id=200000002, sender_username="someone", sender_is_owner=False
         )
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertIn("is_owner: no", blob)
@@ -219,7 +219,7 @@ class PrivateChatModeTests(unittest.TestCase):
 
     def test_owner_dm_gets_the_closeness_mode_block(self) -> None:
         messages = build_private_chat_messages(
-            "在吗", sender_user_id=601298409, sender_username="uxiner", sender_is_owner=True
+            "在吗", sender_user_id=100000001, sender_username="owner_demo", sender_is_owner=True
         )
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertIn("[OWNER DM MODE]", blob)
@@ -229,7 +229,7 @@ class PrivateChatModeTests(unittest.TestCase):
 
     def test_member_dm_never_gets_the_closeness_mode_block(self) -> None:
         messages = build_private_chat_messages(
-            "在吗", sender_user_id=9757123, sender_username="nasfan_member", sender_is_owner=False
+            "在吗", sender_user_id=200000002, sender_username="member_demo", sender_is_owner=False
         )
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertNotIn("[OWNER DM MODE]", blob, "亲密档只给最高管理员，别人一个字都不给")
@@ -237,7 +237,7 @@ class PrivateChatModeTests(unittest.TestCase):
     def test_owner_with_last_contact_gets_the_attendance_block(self) -> None:
         messages = build_private_chat_messages(
             "在吗",
-            sender_user_id=601298409,
+            sender_user_id=100000001,
             sender_is_owner=True,
             last_contact="2026-10-02 21:03",
         )
@@ -248,7 +248,7 @@ class PrivateChatModeTests(unittest.TestCase):
 
     def test_no_attendance_block_without_a_real_record(self) -> None:
         messages = build_private_chat_messages(
-            "在吗", sender_user_id=601298409, sender_is_owner=True, last_contact=""
+            "在吗", sender_user_id=100000001, sender_is_owner=True, last_contact=""
         )
         blob = "\n".join(str(m.get("content") or "") for m in messages)
         self.assertNotIn("[CLINGY_ATTENDANCE]", blob, "没有真实记录就不给考勤台词")
@@ -268,7 +268,7 @@ class PrivateChatModeTests(unittest.TestCase):
     def test_non_owner_never_gets_the_attendance_block(self) -> None:
         messages = build_private_chat_messages(
             "在吗",
-            sender_user_id=9757123,
+            sender_user_id=200000002,
             sender_is_owner=False,
             last_contact="2026-10-02 21:03",
         )

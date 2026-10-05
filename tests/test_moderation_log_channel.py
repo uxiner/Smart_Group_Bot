@@ -41,7 +41,7 @@ from bot.services.moderation import ModerationVerdict
 from bot.utils.timezone import now_shanghai_naive
 
 GROUP_ID = -1001234567890
-CHANNEL_ID = -1004337744233
+CHANNEL_ID = -1000000000001
 OWNER_ID = 1
 ADMIN_ID = 7
 MEMBER_ID = 42
@@ -439,7 +439,7 @@ class LogChannelEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 message=_message(user_id=MEMBER_ID),
                 settings=_settings(),
-                verdict=_verdict(action="ban", rule_id=6, pattern="招募探花"),
+                verdict=_verdict(action="ban", rule_id=6, pattern="兼职招募"),
             )
 
         begin.assert_awaited_once()
@@ -622,7 +622,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("case：99", handover.kwargs["text"])
         self.assertIn("已删除的群内消息不补回", handover.kwargs["text"])
-        self.assertIn("@Ming_GPT_bot", handover.kwargs["text"])
+        self.assertIn("@your_bot", handover.kwargs["text"])
         entities = handover.kwargs["entities"]
         self.assertEqual(len(entities), 1)
         self.assertEqual(entities[0].type, "mention")
@@ -630,7 +630,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         utf16 = text.encode("utf-16-le")
         start = entities[0].offset * 2
         end = start + entities[0].length * 2
-        self.assertEqual(utf16[start:end].decode("utf-16-le"), "@Ming_GPT_bot")
+        self.assertEqual(utf16[start:end].decode("utf-16-le"), "@your_bot")
         edited = second.bot.edit_message_text.await_args.kwargs
         self.assertIn("🟢 已人工放行 · 已解除该成员限制 · 待规则调整", edited["text"])
         self.assertEqual(second.answered[-1][0], "已放行，正在交接给规则调整")

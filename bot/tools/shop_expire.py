@@ -2,9 +2,9 @@
 
 用法（容器内）：
 
-    docker exec smart_group_bot-bot-1 python -m bot.tools.shop_expire
-    docker exec smart_group_bot-bot-1 python -m bot.tools.shop_expire --dry-run
-    docker exec smart_group_bot-bot-1 python -m bot.tools.shop_expire --no-notify
+    docker exec smart_group_bot python -m bot.tools.shop_expire
+    docker exec smart_group_bot python -m bot.tools.shop_expire --dry-run
+    docker exec smart_group_bot python -m bot.tools.shop_expire --no-notify
 
 **重复执行安全（幂等）**：这里扫的是 ``member_entitlements`` 里 ``expires_at <= now``
 的行，撤下动作（把 tag 设成空字符串 / 取消置顶）本身就是幂等的，而且只有动作跑过之后

@@ -1,6 +1,6 @@
 """B-01 / C4-02 / D3-38：审核日志频道的**默认值、注释与文档披露**必须自洽。
 
-用户 2026-10 裁定：`log_channel_id` **保留现有默认值**（`-1004337744233` 就是有意
+用户 2026-10 裁定：`log_channel_id` **保留现有默认值**（`-1000000000001` 就是有意
 为之的默认值，不是占位符，也不改成 0），只把注释与文档改对。
 
 原状（审计记的三处缺陷，本文件逐条钉住"已修好"）：
@@ -13,7 +13,7 @@
 
 本文件锁定的口径：
 
-- 默认值仍然是 ``-1004337744233``（不许被顺手改成 0）；``0`` 才表示"未配置"；
+- 默认值仍然是 ``-1000000000001``（不许被顺手改成 0）；``0`` 才表示"未配置"；
 - ``_admin_log_channel_id`` 把 0 视为不可用 → 频道路由整体关闭、回退私聊老路径；
 - 注释/README 必须写出默认频道 id 与三种覆盖入口的真实能力。
 """
@@ -29,12 +29,12 @@ from bot.handlers import group
 from bot.services.runtime_config import ModerationSettingsConfig
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_EXPECTED_DEFAULT = -1004337744233
+_EXPECTED_DEFAULT = -1000000000001
 
 
 class LogChannelDefaultTests(unittest.TestCase):
     def test_default_value_is_kept(self) -> None:
-        """裁定：默认值保留 ``-1004337744233``，**不改**。"""
+        """裁定：默认值保留 ``-1000000000001``，**不改**。"""
 
         settings = Settings(_env_file=None)
         self.assertEqual(settings.moderation.log_channel_id, _EXPECTED_DEFAULT)

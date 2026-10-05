@@ -379,25 +379,25 @@ def moderation_handover_policy() -> ModerationPolicySnapshot:
 #: 字段路径 → 真实读侧（``file:symbol``，用 ``:`` 分隔多个）。
 CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     # --- 私聊 ---------------------------------------------------------------
-    "private_chat.per_user_daily_limit": ("bot/services/private_chat.py:quota_limits"),
+    "private_chat.per_user_daily_limit": ("bot/services/private_chat.py:quota_limits",),
     "private_chat.admin_per_user_daily_limit": (
         "bot/services/private_chat.py:quota_limits",
     ),
-    "private_chat.global_daily_limit": ("bot/services/private_chat.py:quota_limits"),
+    "private_chat.global_daily_limit": ("bot/services/private_chat.py:quota_limits",),
     "private_chat.admin_global_daily_limit": (
         "bot/services/private_chat.py:quota_limits",
     ),
-    "private_chat.input_max_chars": ("bot/services/private_chat.py:normalize_input"),
-    "private_chat.reply_max_chars": ("bot/handlers/private_chat.py:split_for_telegram"),
+    "private_chat.input_max_chars": ("bot/services/private_chat.py:build_private_chat_messages",),
+    "private_chat.reply_max_chars": ("bot/handlers/private_chat.py:_split_for_telegram",),
     "private_chat.vision_budget_seconds": (
-        "bot/handlers/private_chat.py:describe_image",
+        "bot/handlers/private_chat.py:_image_description",
     ),
-    "private_chat.memory_turns": ("bot/services/private_chat.py:remember_exchange"),
+    "private_chat.memory_turns": ("bot/services/private_chat.py:PrivateHistoryStore",),
     "private_chat.access_ttl_seconds": (
-        "bot/services/private_chat.py:MemberAccessCache.__init__",
+        "bot/services/private_chat.py:MemberAccessCache",
     ),
-    "private_chat.search_daily_limit": ("bot/services/dm_search.py:SearchBudget"),
-    "private_chat.voice_max_segments": ("bot/services/private_tts.py:build_segments"),
+    "private_chat.search_daily_limit": ("bot/services/dm_search.py:SearchBudget",),
+    "private_chat.voice_max_segments": ("bot/services/private_tts.py:max_private_tts_segments",),
     # --- 经济 ---------------------------------------------------------------
     "economy.checkin_daily_point_cap": ("bot/services/checkin.py:award_for_streak",),
     "economy.checkin_rank_limit": ("bot/services/checkin.py:build_rank",),
@@ -405,24 +405,24 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
         "bot/services/checkin.py:build_rank",
     ),
     "economy.challenge_skip_cost": ("bot/services/checkin.py:challenge_skip_cost",),
-    "economy.tag_price_7d": ("bot/services/point_shop.py:buy_tag",),
-    "economy.tag_days_7d": ("bot/services/point_shop.py:buy_tag",),
-    "economy.tag_price_30d": ("bot/services/point_shop.py:buy_tag",),
-    "economy.tag_days_30d": ("bot/services/point_shop.py:buy_tag",),
+    "economy.tag_price_7d": ("bot/services/point_shop.py:buy_member_tag",),
+    "economy.tag_days_7d": ("bot/services/point_shop.py:buy_member_tag",),
+    "economy.tag_price_30d": ("bot/services/point_shop.py:buy_member_tag",),
+    "economy.tag_days_30d": ("bot/services/point_shop.py:buy_member_tag",),
     "economy.pin_price": ("bot/services/point_shop.py:buy_pin",),
     "economy.pin_hours": ("bot/services/point_shop.py:buy_pin",),
-    "economy.lottery_price": ("bot/services/point_shop.py:draw_lottery",),
-    "economy.lottery_daily_limit": ("bot/services/point_shop.py:draw_lottery",),
+    "economy.lottery_price": ("bot/services/point_shop.py:play_lottery",),
+    "economy.lottery_daily_limit": ("bot/services/point_shop.py:play_lottery",),
     "economy.lottery_prizes": ("bot/services/point_shop.py:draw_prize",),
-    "economy.tag_max_length": ("bot/services/point_shop.py:validate_tag_text",),
+    "economy.tag_max_length": ("bot/services/point_shop.py:check_tag_text",),
     "economy.expiry_check_seconds": (
-        "bot/services/point_shop.py:expiry_worker",
+        "bot/services/point_shop.py:ShopExpiryService",
     ),
     "economy.expiry_pass_deadline_seconds": (
-        "bot/services/point_shop.py:expiry_worker",
+        "bot/services/point_shop.py:ShopExpiryService",
     ),
-    "economy.expiry_batch_limit": ("bot/services/point_shop.py:expiry_worker",),
-    "economy.expiry_retry_seconds": ("bot/services/point_shop.py:expiry_worker",),
+    "economy.expiry_batch_limit": ("bot/services/point_shop.py:ShopExpiryService",),
+    "economy.expiry_retry_seconds": ("bot/services/point_shop.py:ShopExpiryService",),
     # --- 活跃 ---------------------------------------------------------------
     "activity.min_message_text_length": (
         "bot/services/activity.py:is_countable_message",
@@ -436,29 +436,29 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
         "bot/services/activity.py:reward_points_for_rank",
     ),
     # --- 签到提醒 -----------------------------------------------------------
-    "checkin_reminder.slots": ("bot/services/checkin_reminder.py:normalize_slot",),
+    "checkin_reminder.slots": ("bot/services/checkin_reminder.py:reminder_slots",),
     "checkin_reminder.slot_greetings": (
-        "bot/services/checkin_reminder.py:render_checkin_reminder",
+        "bot/services/checkin_reminder.py:reminder_auto_delete_seconds",
     ),
     "checkin_reminder.auto_delete_seconds": (
-        "bot/services/checkin_reminder.py:render_checkin_reminder",
+        "bot/services/checkin_reminder.py:reminder_auto_delete_seconds",
     ),
     "checkin_reminder.roster_max_names": (
         "bot/services/checkin_reminder.py:render_checkin_roster",
     ),
     "checkin_reminder.stale_grace_seconds": (
-        "bot/services/checkin_reminder.py:release_reminder_slot",
+        "bot/services/checkin_reminder.py:reap_stale_reminder_slots",
     ),
     # --- 显示 ---------------------------------------------------------------
     "display.bot_display_name": ("bot/services/dm_search.py:build_search_query",),
     "display.private_voice_title": (
-        "bot/services/private_tts.py:send_private_voice",
+        "bot/services/private_tts.py:audio_title",
     ),
     "display.checkin_button_text": (
-        "bot/services/checkin.py:build_checkin_keyboard",
+        "bot/services/checkin.py:checkin_button_text",
     ),
     "display.shop_button_text": (
-        "bot/services/checkin_reminder.py:build_checkin_reminder_keyboard",
+        "bot/services/checkin_reminder.py:shop_button_text",
     ),
     "display.search_query_prefixes": (
         "bot/services/dm_search.py:build_search_query",
@@ -467,10 +467,10 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
         "bot/handlers/private_chat.py:not_member_notice",
     ),
     "display.private_limit_notice": (
-        "bot/handlers/private_chat.py:quota_notice",
+        "bot/services/private_chat.py:quota_notice",
     ),
     "display.private_global_limit_notice": (
-        "bot/handlers/private_chat.py:quota_notice",
+        "bot/services/private_chat.py:quota_notice",
     ),
     "display.private_media_unsupported_notice": (
         "bot/handlers/private_chat.py:unsupported_media_notice",
@@ -524,61 +524,61 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     ),
     "resources.llm_stage_deadlines": ("bot/services/llm.py:stage_deadline_seconds",),
     "resources.telegram_critical_admission_timeout_seconds": (
-        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/services/startup_resources.py:telegram_session_limits",
     ),
     "resources.telegram_high_admission_timeout_seconds": (
-        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/services/startup_resources.py:telegram_session_limits",
     ),
     "resources.telegram_normal_admission_timeout_seconds": (
-        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/services/startup_resources.py:telegram_session_limits",
     ),
     "resources.telegram_privileged_timeout_seconds": (
-        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/services/startup_resources.py:telegram_session_limits",
     ),
     "resources.pending_reply_timeout_seconds": (
-        "bot/handlers/group.py:deliver_pending_replies",
+        "bot/handlers/group.py:_pending_reply_timeout_seconds",
     ),
     "resources.admin_alert_window_seconds": (
-        "bot/handlers/group.py:send_admin_violation_alert",
+        "bot/handlers/group.py:_admin_alert_limits",
     ),
     "resources.admin_alert_aggregate_after": (
-        "bot/handlers/group.py:send_admin_violation_alert",
+        "bot/handlers/group.py:_admin_alert_limits",
     ),
     "resources.admin_alert_state_limit": (
-        "bot/handlers/group.py:send_admin_violation_alert",
+        "bot/handlers/group.py:_admin_alert_limits",
     ),
     "resources.admin_alert_text_limit": (
-        "bot/handlers/group.py:send_admin_violation_alert",
+        "bot/handlers/group.py:_admin_alert_limits",
     ),
     "resources.moderation_throttle_burst": (
-        "bot/services/moderation_throttle.py:admit",
+        "bot/services/moderation_throttle.py:throttle_limits",
     ),
     "resources.moderation_throttle_spacing_seconds": (
-        "bot/services/moderation_throttle.py:admit",
+        "bot/services/moderation_throttle.py:throttle_limits",
     ),
     "resources.moderation_throttle_max_wait_seconds": (
-        "bot/services/moderation_throttle.py:admit",
+        "bot/services/moderation_throttle.py:throttle_limits",
     ),
     "resources.moderation_throttle_max_waiters": (
-        "bot/services/moderation_throttle.py:admit",
+        "bot/services/moderation_throttle.py:throttle_limits",
     ),
     "resources.tts_max_segments_per_message": (
-        "bot/services/doubao_tts.py:build_segments",
+        "bot/services/doubao_tts.py:max_segments_per_message",
     ),
     "resources.tts_transcode_timeout_seconds": (
-        "bot/services/doubao_tts.py:transcode",
+        "bot/services/doubao_tts.py:tts_limits",
     ),
     "resources.tts_max_http_timeout_seconds": (
-        "bot/services/doubao_tts.py:request",
+        "bot/services/doubao_tts.py:tts_limits",
     ),
     "resources.av_query_deadline_seconds": (
-        "bot/services/av_search.py:run_av_query_bounded",
+        "bot/services/av_search.py:av_query_limits",
     ),
     "resources.av_query_admission_timeout_seconds": (
-        "bot/services/av_search.py:run_av_query_bounded",
+        "bot/services/av_search.py:av_query_limits",
     ),
     "resources.av_star_name_cache_max": (
-        "bot/services/av_search.py:star_name_cache",
+        "bot/services/av_search.py:av_query_limits",
     ),
     "resources.decision_history_token_budget": (
         "bot/services/group_context.py:decision_history_budget",
@@ -587,50 +587,50 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
         "bot/services/group_context.py:decision_history_budget",
     ),
     "resources.memory_max_facts_per_extraction": (
-        "bot/services/long_term_memory.py:parse_extraction",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_extract_input_token_limit": (
-        "bot/services/long_term_memory.py:build_extraction_input",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_extract_scope_limit": (
-        "bot/services/long_term_memory.py:iter_extraction_scopes",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_candidate_row_limit": (
-        "bot/services/long_term_memory.py:rank_candidates",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_private_group_fanout": (
-        "bot/services/long_term_memory.py:render_private_facts",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_tool_subject_daily_cap": (
-        "bot/services/long_term_memory.py:remember_fact",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.memory_maintenance_interval_seconds": (
-        "bot/services/long_term_memory.py:start_maintenance",
+        "bot/services/long_term_memory.py:memory_limits",
     ),
     "resources.search_prune_interval_seconds": (
-        "bot/services/search_memory.py:prune_loop",
+        "bot/services/search_memory.py:search_memory_limits",
     ),
     "resources.search_record_recall_limit": (
-        "bot/services/search_memory.py:render_search_record_messages",
+        "bot/services/search_memory.py:search_memory_limits",
     ),
     "resources.archive_batch_size": (
-        "bot/services/archive_vector.py:SQLiteArchiveVectorRecallProvider",
+        "bot/services/archive_vector.py:archive_limits",
     ),
     "resources.archive_backfill_per_pass": (
-        "bot/services/archive_vector.py:backfill_once",
+        "bot/services/archive_vector.py:archive_limits",
     ),
-    "resources.archive_scan_limit": ("bot/services/archive_vector.py:scan_once",),
+    "resources.archive_scan_limit": ("bot/services/archive_vector.py:archive_limits",),
     "resources.archive_candidate_limit": (
-        "bot/services/archive_vector.py:recall",
+        "bot/services/archive_vector.py:archive_limits",
     ),
     "resources.archive_query_timeout_seconds": (
-        "bot/services/archive_vector.py:recall",
+        "bot/services/archive_vector.py:archive_limits",
     ),
     "resources.archive_maintenance_interval_seconds": (
-        "bot/services/archive_vector.py:index_once",
+        "bot/services/archive_vector.py:archive_limits",
     ),
     "resources.archive_indexing_lease_seconds": (
-        "bot/services/archive_vector.py:acquire_lease",
+        "bot/services/archive_vector.py:archive_limits",
     ),
 }
 

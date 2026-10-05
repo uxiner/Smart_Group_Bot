@@ -81,7 +81,7 @@ class BotIdentityTests(unittest.TestCase):
         from bot.utils.prompts import DECISION_SYSTEM, PERSONA_SYSTEM
 
         for prompt_text in (PERSONA_SYSTEM, DECISION_SYSTEM):
-            self.assertNotIn("gansini", prompt_text.lower())
+            self.assertNotIn("legacy_bot_name", prompt_text.lower())
             self.assertNotIn("感思你", prompt_text)
 
     def test_decision_context_includes_identity_when_set(self) -> None:

@@ -119,9 +119,26 @@ def apply_startup_resources(config: "RuntimeConfig") -> StartupResourceReport:
         resources.llm_request_normal_capacity,
         resources.llm_request_background_capacity,
     ):
-        busy = _busy_reason(llm_module._LLM_REQUEST_SEMAPHORE, name="llm_gate")
-        if busy is not None:
-            raise StartupResourceBusy(f"LLM 准入闸门还有活动请求，拒绝重配：{busy}")
+        gate = llm_module._LLM_PRIORITY_GATE
+        snapshot = gate.snapshot()
+        in_flight = sum(
+            int(snapshot.get(key) or 0)
+            for key in ("active_critical", "active_high", "active_normal", "active_background")
+        )
+        waiters = sum(
+            int(snapshot.get(key) or 0)
+            for key in (
+                "waiting_critical",
+                "waiting_high",
+                "waiting_normal",
+                "waiting_background",
+            )
+        )
+        if in_flight or waiters or llm_module._LLM_REQUEST_SEMAPHORE._value <= 0:
+            raise StartupResourceBusy(
+                "LLM 准入闸门还有活动请求，拒绝重配："
+                f"llm_gate(in_flight={in_flight}, waiters={waiters})"
+            )
         llm_module._LLM_REQUEST_CAPACITY = resources.llm_request_capacity
         llm_module._LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(
             resources.llm_request_capacity

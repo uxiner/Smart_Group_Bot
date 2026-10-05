@@ -51,7 +51,7 @@ from bot.services.checkin import (
     summarize,
 )
 
-GROUP_ID = -1001364206062
+GROUP_ID = -1000000000002
 # 2026-09-28 是周一、2026-09-21 是上一个周一：用固定的"上周"，免得测试跟着真实日期漂
 WEEK_MONDAY = date(2026, 9, 28)
 LAST_WEEK_MONDAY = date(2026, 9, 21)

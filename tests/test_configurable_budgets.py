@@ -29,15 +29,15 @@ from bot.utils.budget import (
     validate_group_history_max_messages,
 )
 
-GATEWAY = "http://gw.internal:8080/v1"
+GATEWAY = "http://gw.test.internal:8080/v1"
 
 
 def _model(*, window: int | None = 1_000_000):
     from bot.config import ModelConfig
 
     return ModelConfig(
-        model="home_work2api/cn:deepseek-v4.1-flash",
-        provider="home_work2api",
+        model="work_gateway/cn:deepseek-v4.1-flash",
+        provider="work_gateway",
         api_key="k",
         api_base=GATEWAY,
         max_tokens=2048,
@@ -63,7 +63,7 @@ def _bot_config(*, window: int | None = 1_000_000, **overrides) -> BotConfig:
 
 class _StubLLM:
     class main:
-        model = "home_work2api/cn:deepseek-v4.1-flash"
+        model = "work_gateway/cn:deepseek-v4.1-flash"
 
 
 def _settings(**overrides) -> SimpleNamespace:

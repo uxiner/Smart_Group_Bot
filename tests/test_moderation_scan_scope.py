@@ -113,7 +113,7 @@ class ScanScopeParsingTests(unittest.TestCase):
 
 class SplitModerationTextTests(unittest.TestCase):
     def test_marker_free_text_is_returned_byte_identical(self) -> None:
-        for raw in ("/lucky_checkin@aq_lucky_bot", "  prefix\n\nsuffix  ", ""):
+        for raw in ("/lucky_checkin@checkin_helper_bot", "  prefix\n\nsuffix  ", ""):
             with self.subTest(raw=raw):
                 segments = split_moderation_text(raw)
                 self.assertEqual(segments.own, raw)
@@ -126,8 +126,8 @@ class SplitModerationTextTests(unittest.TestCase):
             "[image-vision]\n"
             "图为88VIP音乐会员页面，含专属秒杀\n"
             "以及精选活动信息。\n"
-            "[reply_to_user] id:601298409 username:@uxiner\n"
-            "[reply_to:text] 探花招募 加V\n"
+            "[reply_to_user] id:100000001 username:@owner_demo\n"
+            "[reply_to:text] 兼职招募 加V\n"
             "[reply_quote] 秒杀 优惠券"
         )
         segments = split_moderation_text(raw)
@@ -136,8 +136,8 @@ class SplitModerationTextTests(unittest.TestCase):
             segments.vision, "图为88VIP音乐会员页面，含专属秒杀\n以及精选活动信息。"
         )
         # 身份标记（用户名/ID）整行丢弃，正文标记只剥标记本身。
-        self.assertEqual(segments.quote, "探花招募 加V\n秒杀 优惠券")
-        self.assertNotIn("601298409", segments.own + segments.quote + segments.vision)
+        self.assertEqual(segments.quote, "兼职招募 加V\n秒杀 优惠券")
+        self.assertNotIn("100000001", segments.own + segments.quote + segments.vision)
 
     def test_external_reply_markers_are_quote_content(self) -> None:
         raw = (
@@ -186,7 +186,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict.match_source, "own")
 
     async def test_quoted_ad_is_ignored_by_default_scope(self) -> None:
-        text = "v\n[reply_to:text] 探花招募族 加V 私聊"
+        text = "v\n[reply_to:text] 兼职招募 加V 私聊"
         rule = _rule(pattern="招募", scan_scope="message")
 
         verdict = await _service().evaluate(_session([rule]), -100, text)
@@ -194,7 +194,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(verdict.violated)
 
     async def test_quoted_ad_matches_with_message_plus_quote(self) -> None:
-        text = "v\n[reply_to_user] id:1 username:@ad\n[reply_to:text] 探花招募族 加V 私聊"
+        text = "v\n[reply_to_user] id:1 username:@ad\n[reply_to:text] 兼职招募 加V 私聊"
         rule = _rule(pattern="招募", scan_scope="message+quote")
 
         verdict = await _service().evaluate(_session([rule]), -100, text)
@@ -207,7 +207,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
 
         text = (
             "v\n"
-            "[reply_to_user] id:601298409 username:@u13800138000\n"
+            "[reply_to_user] id:100000001 username:@user_demo\n"
             "[reply_to_chat] -1001234567890"
         )
         rule = _rule(pattern=r"\d{11,}", scan_scope="message+quote")
@@ -217,7 +217,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(verdict.violated)
 
     async def test_keyword_rule_respects_scope(self) -> None:
-        text = "v\n[reply_to:text] 探花招募族"
+        text = "v\n[reply_to:text] 兼职招募"
         default_rule = _rule(
             rule_id=1, rule_type="keyword", pattern="招募", scan_scope="message"
         )
@@ -233,7 +233,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quoted_verdict.match_source, "quote")
 
     async def test_default_scope_still_matches_when_rule_has_no_scope_set(self) -> None:
-        text = "v\n[reply_to:text] 探花招募族"
+        text = "v\n[reply_to:text] 兼职招募"
         legacy_rule = _rule(pattern="招募", scan_scope=None)
 
         verdict = await _service().evaluate(_session([legacy_rule]), -100, text)
@@ -294,7 +294,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         verdict = await _service().evaluate(
-            _session([rule]), -100, "prefix /lucky_checkin@aq_lucky_bot suffix"
+            _session([rule]), -100, "prefix /lucky_checkin@checkin_helper_bot suffix"
         )
 
         self.assertFalse(verdict.violated)
@@ -332,7 +332,7 @@ class ScanScopeEvaluationTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_segment_quote_hit_still_reports_quote(self) -> None:
         """F-004 的另一边：引文段自己就能定位到命中时，归属仍然如实报 quote。"""
 
-        text = "v\n[reply_to:text] 探花招募族 加V 私聊"
+        text = "v\n[reply_to:text] 兼职招募 加V 私聊"
         rule = _rule(pattern="招募", scan_scope="message+quote")
 
         verdict = await _service().evaluate(_session([rule]), -100, text)
@@ -358,7 +358,7 @@ _LEGACY_RULES = (
     # 规则正文**必须**与 `bot/db/engine.py` 里那条生产规则的真值一致：F-011 之后升级要
     # 核对内容指纹，fixture 自己编一个正文就会让这两条用例变成"测一个不存在的部署"。
     (6, -100, "regex", _PRODUCTION_RULE_6_PATTERN, "ban", 1),
-    (7, -100, "regex", "探花", "warn", 1),
+    (7, -100, "regex", "兼职接单", "warn", 1),
 )
 
 

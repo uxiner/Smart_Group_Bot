@@ -7,7 +7,7 @@ from bot.utils.prompts import COMPRESS_SYSTEM, DECISION_SYSTEM, PERSONA_SYSTEM
 from bot.utils.runtime_context import build_owner_identity_context
 
 
-def _owner_settings(owner_id: int = 5105038894):
+def _owner_settings(owner_id: int = 100000001):
     from bot.config import Settings
 
     settings = Settings(_env_file=None)
@@ -58,7 +58,7 @@ class OwnerIdentityPromptTests(unittest.TestCase):
     def test_prompts_do_not_hardcode_owner_account(self) -> None:
         for prompt in (PERSONA_SYSTEM, DECISION_SYSTEM, COMPRESS_SYSTEM):
             self.assertNotIn("Sanite_Ava", prompt)
-            self.assertNotIn("5105038894", prompt)
+            self.assertNotIn("100000001", prompt)
 
         self.assertIn("is_owner", PERSONA_SYSTEM)
         self.assertIn("is_owner:yes", COMPRESS_SYSTEM)

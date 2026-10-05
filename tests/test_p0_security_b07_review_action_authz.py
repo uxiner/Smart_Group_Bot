@@ -28,7 +28,7 @@ from bot.db.models import AuthorizedGroup, Violation
 from bot.handlers import group
 
 GROUP_ID = -1001234567890
-CHANNEL_ID = -1004337744233
+CHANNEL_ID = -1000000000001
 OTHER_CHANNEL_ID = -1009999999999
 SUPER_ADMIN_ID = 1
 ADMIN_ID = 7

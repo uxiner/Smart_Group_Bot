@@ -4,7 +4,7 @@
 - **基线**：`bc2b4972a631cd18b1383d5308e8883af02273fa`
 - **版本**：第三版（第二轮验收 2 个剩余阻断项修正 + 一处文档事实更正）。
   版本沿革：**首版 `947ffd8`** → **第二版 `632f61a`** → **第三版 `e82753c`**（当前）
-- **解释器**：`/Users/ismoka/Desktop/DSH/Smart_Bot_FullAudit/.venv-d1/bin/python`（Python 3.12.13）
+- **解释器**：`/opt/venvs/bot/bin/python`（Python 3.12.13）
 - **本代理未 push、未部署、未改任何 `.env`／生产密钥、未碰工作区外文件**
 - **验收状态**：父代理已独立验收 `e82753c9`——Linux 同生产依赖镜像 **334 passed / 110
   subtests**；真实主模型四项媒介选择、晓伊真 MP3 与 Opus、隐私主动降级全部通过，生产正在上线。

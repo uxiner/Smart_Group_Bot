@@ -3553,3 +3553,86 @@ input[type="radio"] {
     border-bottom: 1px solid CanvasText;
   }
 }
+/* ---------------------------------------------------------------------------
+   运营参数页：奖池结构化编辑器
+   --------------------------------------------------------------------------- */
+
+.reward-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-muted, transparent);
+}
+
+.reward-editor-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.reward-editor-head strong {
+  margin-inline-end: auto;
+}
+
+.reward-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.reward-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.reward-cell > span {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.reward-cell input {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+}
+
+/* 触达目标不小于 44px；键盘焦点必须可见。 */
+.reward-row .icon-button,
+.reward-editor-head .secondary-button {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.reward-cell input:focus-visible,
+.reward-row .icon-button:focus-visible,
+.reward-editor-head .secondary-button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+  /* 窄屏改成两列，标签独占一行；不产生横向溢出。 */
+  .reward-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .reward-cell-wide {
+    grid-column: 1 / -1;
+  }
+
+  .reward-row .icon-button {
+    justify-self: start;
+  }
+}

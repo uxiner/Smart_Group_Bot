@@ -36,8 +36,8 @@ from bot.handlers import private_chat as dm_handler
 from bot.services import private_chat as dm
 from bot.services import private_tts
 
-SUPER_ADMIN = 601298409
-GROUP_ID = -1001364206062
+SUPER_ADMIN = 100000001
+GROUP_ID = -1000000000002
 MEDIA_ATTRS = (
     "photo",
     "document",

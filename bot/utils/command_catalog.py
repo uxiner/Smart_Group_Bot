@@ -223,7 +223,7 @@ def _declared_aliases(entry: CommandEntry) -> frozenset[str]:
 def bare_command(text: str) -> str:
     """The plain command name in ``text`` (``/mute all`` -> ``mute``).
 
-    Handles the group form ``/mute@xatongxue_bot`` and the catalog's documented
+    Handles the group form ``/mute@your_bot`` and the catalog's documented
     argument forms (``/lm replace <...>``, ``/exemptlist（别名 /modlist）``).
     """
     stripped = (text or "").strip()

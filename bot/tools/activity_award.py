@@ -2,10 +2,10 @@
 
 用法（容器内）：
 
-    docker exec smart_group_bot-bot-1 python -m bot.tools.activity_award
-    docker exec smart_group_bot-bot-1 python -m bot.tools.activity_award --dry-run
-    docker exec smart_group_bot-bot-1 python -m bot.tools.activity_award --week 2026-W40
-    docker exec smart_group_bot-bot-1 python -m bot.tools.activity_award --group -1001364206062
+    docker exec smart_group_bot python -m bot.tools.activity_award
+    docker exec smart_group_bot python -m bot.tools.activity_award --dry-run
+    docker exec smart_group_bot python -m bot.tools.activity_award --week 2026-W40
+    docker exec smart_group_bot python -m bot.tools.activity_award --group -1000000000002
 
 不传 ``--week`` 就是"最近一个完整自然周"（上周一 ~ 上周日，Asia/Shanghai）。
 

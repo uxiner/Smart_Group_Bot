@@ -8,7 +8,7 @@
   的固定话术顶上。这一期的口径是「**上限按实际模型自动匹配**」，272K 只作为**没有
   任何元数据时的保守降级**，不再压住已知模型。
 * 取数只走**已经配置好、且已经带认证信息**的 endpoint（本仓部署是本地/内网桥：
-  ``home_work2api``、``pipio``）。没有 ``api_base`` 的官方 provider 一律不探测——
+  ``work_gateway``、``pipio``）。没有 ``api_base`` 的官方 provider 一律不探测——
   不在启动时给第三方打真实请求。
 * 缓存键是 ``(provider, api_base, model)``；成功 TTL 6 小时，失败/未知短 TTL 5 分钟。
   回复/审核主链路**永远不查网络**：:meth:`ModelLimitRegistry.resolve` 是纯同步的

@@ -28,10 +28,10 @@ from bot.services import model_limits as ml
 
 def _endpoint(
     *,
-    model: str = "home_work2api/cn:deepseek-v4.1-flash",
-    api_base: str = "http://gw.internal:8080/v1",
+    model: str = "work_gateway/cn:deepseek-v4.1-flash",
+    api_base: str = "http://gw.test.internal:8080/v1",
     api_key: str | None = "sk-super-secret",
-    provider: str = "home_work2api",
+    provider: str = "work_gateway",
 ) -> ChatEndpointConfig:
     return ChatEndpointConfig(
         model=model,
@@ -103,8 +103,8 @@ class ParseModelsPayloadTests(unittest.TestCase):
 
     def test_credential_bearing_api_base_is_redacted(self) -> None:
         self.assertEqual(
-            ml.redact_base("http://user:pass@gw.internal:8080/v1"),
-            "http://gw.internal:8080",
+            ml.redact_base("http://user:pass@gw.test.internal:8080/v1"),
+            "http://gw.test.internal:8080",
         )
         self.assertEqual(ml.redact_base(""), "")
 
@@ -137,8 +137,8 @@ class ParseModelsPayloadTests(unittest.TestCase):
     def test_unparsable_port_is_dropped_instead_of_raising(self) -> None:
         """``parts.port`` 的属性访问会抛 ValueError，且过去在 ``try`` 之外。"""
 
-        self.assertEqual(ml.redact_base("http://gw.internal:70000/v1"), "")
-        self.assertEqual(ml.redact_base("gw.internal:not-a-port/v1"), "")
+        self.assertEqual(ml.redact_base("http://gw.test.internal:70000/v1"), "")
+        self.assertEqual(ml.redact_base("gw.test.internal:not-a-port/v1"), "")
 
 
 class AuthHeaderTests(unittest.TestCase):
@@ -160,7 +160,7 @@ class AuthHeaderTests(unittest.TestCase):
         cfg = _endpoint(
             model="pipio/gemini-3.8-flash-high",
             provider="gemini",
-            api_base="http://pipio.internal:9000/v1",
+            api_base="http://llm.test.internal:9000/v1",
         )
 
         headers = ml._auth_headers(cfg)
@@ -175,8 +175,8 @@ class AuthHeaderTests(unittest.TestCase):
 class MatchingTests(unittest.TestCase):
     def test_exact_id_wins_over_the_provider_stripped_id(self) -> None:
         self.assertEqual(
-            ml.candidate_model_ids("home_work2api/cn:deepseek-v4.1-flash"),
-            ["home_work2api/cn:deepseek-v4.1-flash", "cn:deepseek-v4.1-flash"],
+            ml.candidate_model_ids("work_gateway/cn:deepseek-v4.1-flash"),
+            ["work_gateway/cn:deepseek-v4.1-flash", "cn:deepseek-v4.1-flash"],
         )
 
     def test_unknown_alias_is_never_mapped_to_another_model(self) -> None:
@@ -206,7 +206,7 @@ class MatchingTests(unittest.TestCase):
 class ResolveFallbackTests(unittest.TestCase):
     def test_unknown_model_declines_to_infinity_and_uses_the_conservative_value(self) -> None:
         registry = ml.ModelLimitRegistry()
-        cfg = _endpoint(model="home_work2api/nope")
+        cfg = _endpoint(model="work_gateway/nope")
 
         limits = registry.resolve(cfg, legacy_total_window=300_000)
 
@@ -292,12 +292,12 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
 
         report = await registry.refresh([cfg])
 
-        self.assertEqual(report["home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"], ml.LIMIT_SOURCE_GATEWAY)
+        self.assertEqual(report["work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash"], ml.LIMIT_SOURCE_GATEWAY)
         limits = registry.resolve(cfg)
         self.assertTrue(limits.known)
         self.assertEqual(limits.total_window, 1_000_000)
         self.assertEqual(limits.matched_id, "cn:deepseek-v4.1-flash")
-        self.assertEqual(calls, ["http://gw.internal:8080/v1/models"])
+        self.assertEqual(calls, ["http://gw.test.internal:8080/v1/models"])
 
     async def test_success_is_cached_and_force_refetches_after_a_route_change(self) -> None:
         hits = 0
@@ -342,7 +342,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
 
         report = await registry.refresh([cfg])
 
-        self.assertEqual(report["home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"], "gateway_unavailable")
+        self.assertEqual(report["work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash"], "gateway_unavailable")
         limits = registry.resolve(cfg, legacy_total_window=278_528)
         self.assertEqual(limits.source, ml.LIMIT_SOURCE_UNKNOWN)
         self.assertEqual(limits.total_window, 278_528)
@@ -355,11 +355,11 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
             return _catalog_response([{"id": "another-model", "context_length": 1_000_000}])
 
         registry = self._registry(handler)
-        cfg = _endpoint(model="home_work2api/not-announced")
+        cfg = _endpoint(model="work_gateway/not-announced")
 
         report = await registry.refresh([cfg])
 
-        key = "home_work2api|http://gw.internal:8080|home_work2api/not-announced"
+        key = "work_gateway|http://gw.test.internal:8080|work_gateway/not-announced"
         self.assertEqual(report[key], "model_id_missing")
         limits = registry.resolve(cfg, legacy_total_window=278_528)
         self.assertEqual(limits.source, ml.LIMIT_SOURCE_UNKNOWN)
@@ -388,7 +388,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.resolve(cfg).total_window, 1_000_000)
 
         degraded = await registry.refresh([cfg], force=True)
-        key = "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"
+        key = "work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash"
         self.assertEqual(degraded[key], "gateway_unavailable_keeping_cached")
         kept = registry.resolve(cfg, legacy_total_window=278_528)
         self.assertEqual(kept.total_window, 1_000_000)
@@ -509,7 +509,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         report = await registry.refresh([cfg])
 
         self.assertEqual(
-            report["home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"],
+            report["work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash"],
             "gateway_unavailable",
         )
 
@@ -528,7 +528,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
 
         registry = self._registry(handler)
         main = _endpoint()
-        fallback = _endpoint(model="home_work2api/cn:deepseek-v4.1-mini")
+        fallback = _endpoint(model="work_gateway/cn:deepseek-v4.1-mini")
 
         await registry.refresh([main, fallback])
 
@@ -562,7 +562,7 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
             )
 
         registry = self._registry(handler)
-        broken = _endpoint(model="broken/model", api_base="http://gw.internal:70000/v1")
+        broken = _endpoint(model="broken/model", api_base="http://gw.test.internal:70000/v1")
         healthy = _endpoint()
 
         report = await registry.refresh([broken, healthy])
@@ -573,8 +573,8 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
             sorted(
                 [
                     # 坏端口只让**它自己**的标签少了 host，其余 endpoint 的续期不受影响
-                    "home_work2api||broken/model",
-                    "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash",
+                    "work_gateway||broken/model",
+                    "work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash",
                 ]
             ),
         )
@@ -615,7 +615,7 @@ class PeriodicRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refresher.ticks, 4)
         self.assertEqual(
             refresher.last_report[
-                "home_work2api|http://gw.internal:8080|home_work2api/cn:deepseek-v4.1-flash"
+                "work_gateway|http://gw.test.internal:8080|work_gateway/cn:deepseek-v4.1-flash"
             ],
             ml.LIMIT_SOURCE_GATEWAY,
         )
@@ -762,10 +762,10 @@ class ConfigReaderTests(unittest.TestCase):
         ml.reset_model_limits_for_tests()
         try:
             model = ModelConfig(
-                model="home_work2api/cn:deepseek-v4.1-flash",
-                provider="home_work2api",
+                model="work_gateway/cn:deepseek-v4.1-flash",
+                provider="work_gateway",
                 api_key="k",
-                api_base="http://gw.internal:8080/v1",
+                api_base="http://gw.test.internal:8080/v1",
             )
             settings = SimpleNamespace(
                 bot=SimpleNamespace(
@@ -792,15 +792,15 @@ class ConfigReaderTests(unittest.TestCase):
 
     def test_configured_endpoints_deduplicates_and_skips_empty_roles(self) -> None:
         model = ModelConfig(
-            model="home_work2api/a",
-            provider="home_work2api",
-            api_base="http://gw.internal:8080/v1",
+            model="work_gateway/a",
+            provider="work_gateway",
+            api_base="http://gw.test.internal:8080/v1",
             api_key="k",
             fallbacks=[
                 ChatEndpointConfig(
-                    model="home_work2api/b",
-                    provider="home_work2api",
-                    api_base="http://gw.internal:8080/v1",
+                    model="work_gateway/b",
+                    provider="work_gateway",
+                    api_base="http://gw.test.internal:8080/v1",
                     api_key="k",
                 )
             ],
@@ -818,7 +818,7 @@ class ConfigReaderTests(unittest.TestCase):
 
         models = [cfg.model for cfg in ml.configured_endpoints(settings)]
 
-        self.assertEqual(models, ["home_work2api/a", "home_work2api/b"])
+        self.assertEqual(models, ["work_gateway/a", "work_gateway/b"])
 
     def test_conservative_estimate_matches_the_shared_cjk_metric(self) -> None:
         """最终闸门与装配链路必须用同一个口径（事故根因就是两边不一致）。"""

@@ -36,7 +36,7 @@ CLEAN_REASON = "命中正则规则"
 
 def _settings() -> Settings:
     settings = Settings(_env_file=None)
-    settings.moderation.log_channel_id = -1004337744233
+    settings.moderation.log_channel_id = -1000000000001
     return settings
 
 
@@ -148,7 +148,7 @@ class HandoverCardReasonTests(unittest.IsolatedAsyncioTestCase):
         # 净化不得改判定与动作本身。
         self.assertIn("动作：ban", text)
         self.assertIn("置信度：0.97", text)
-        # mention 实体偏移仍然指向 @Ming_GPT_bot 本身（净化换行不能把它带偏）。
+        # mention 实体偏移仍然指向 @your_bot 本身（净化换行不能把它带偏）。
         entities = kwargs["entities"]
         self.assertEqual(len(entities), 1)
         mention = group._REVIEW_HANDOVER_MENTION

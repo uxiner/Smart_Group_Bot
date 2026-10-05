@@ -2,7 +2,7 @@
 
 用法（容器内）：
 
-    docker exec smart_group_bot-bot-1 python -m bot.tools.weekly_report [天数] [--dry-run]
+    docker exec smart_group_bot python -m bot.tools.weekly_report [天数] [--dry-run]
 
 由定时任务调用。发不出去只打印错误，不影响机器人本体。
 

@@ -52,29 +52,29 @@ class AnthropicApiBaseTests(unittest.TestCase):
     def test_v1_suffix_is_stripped(self) -> None:
         resolved = LLMService._resolve_request_api_base(
             provider="anthropic",
-            api_base="http://10.0.0.53/v1",
+            api_base="http://10.0.0.9/v1",
             endpoint_path="/v1/messages",
             model="anthropic/claude-sonnet-4-6",
         )
-        self.assertEqual(resolved, "http://10.0.0.53")
+        self.assertEqual(resolved, "http://10.0.0.9")
 
     def test_messages_suffix_is_kept(self) -> None:
         resolved = LLMService._resolve_request_api_base(
             provider="anthropic",
-            api_base="http://10.0.0.53/v1/messages",
+            api_base="http://10.0.0.9/v1/messages",
             endpoint_path="/v1/messages",
             model="anthropic/claude-sonnet-4-6",
         )
-        self.assertEqual(resolved, "http://10.0.0.53/v1/messages")
+        self.assertEqual(resolved, "http://10.0.0.9/v1/messages")
 
     def test_provider_inferred_from_model_prefix(self) -> None:
         resolved = LLMService._resolve_request_api_base(
             provider="",
-            api_base="http://10.0.0.53/v1",
+            api_base="http://10.0.0.9/v1",
             endpoint_path="/v1/messages",
             model="anthropic/claude-sonnet-4-6",
         )
-        self.assertEqual(resolved, "http://10.0.0.53")
+        self.assertEqual(resolved, "http://10.0.0.9")
 
     def test_official_base_untouched(self) -> None:
         resolved = LLMService._resolve_request_api_base(

@@ -1,0 +1,1680 @@
+{
+  "schema_version": 1,
+  "generated_by": "python -m bot.tools.config_catalog",
+  "api_role_note": "global sections are editable by the super admin only; group admins cannot read or write /api/v1/settings",
+  "restart_required_paths": [
+    "bot.parse_mode",
+    "resources.av_query_concurrency",
+    "resources.llm_request_background_capacity",
+    "resources.llm_request_capacity",
+    "resources.llm_request_noncritical_capacity",
+    "resources.llm_request_normal_capacity",
+    "resources.llm_tokenizer_concurrency",
+    "resources.pending_reply_execution_capacity",
+    "resources.telegram_noncritical_capacity",
+    "resources.telegram_normal_capacity",
+    "resources.telegram_total_capacity",
+    "resources.tts_private_concurrency",
+    "resources.tts_synthesis_concurrency",
+    "resources.tts_transcode_concurrency"
+  ],
+  "fields": [
+    {
+      "path": "activity.max_daily_messages",
+      "type": "integer",
+      "default": 20,
+      "bounds": {
+        "ge": 1,
+        "le": 500
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/activity.py:record_message_activity"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "activity.min_active_days",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 365
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/activity.py:meets_threshold"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "activity.min_message_text_length",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 100
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/activity.py:is_countable_message"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "activity.min_weekly_messages",
+      "type": "integer",
+      "default": 10,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/activity.py:meets_threshold"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "activity.weekly_reward_points",
+      "type": "array",
+      "default": [
+        25,
+        12,
+        12,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/activity.py:reward_points_for_rank"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_activity_incentive.py"
+    },
+    {
+      "path": "checkin_reminder.auto_delete_seconds",
+      "type": "integer",
+      "default": 600,
+      "bounds": {
+        "ge": 0,
+        "le": 86400
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:reminder_auto_delete_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "checkin_reminder.roster_max_names",
+      "type": "integer",
+      "default": 20,
+      "bounds": {
+        "ge": 1,
+        "le": 200
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:render_checkin_roster"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "checkin_reminder.slot_greetings",
+      "type": "object",
+      "default": {
+        "9": "早上好",
+        "12": "中午好",
+        "15": "下午好",
+        "18": "晚上好"
+      },
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:reminder_auto_delete_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "checkin_reminder.slots",
+      "type": "array",
+      "default": [
+        9,
+        12,
+        15,
+        18
+      ],
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:reminder_slots"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "checkin_reminder.stale_grace_seconds",
+      "type": "integer",
+      "default": 900,
+      "bounds": {
+        "ge": 60,
+        "le": 86400
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:reap_stale_reminder_slots"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.bot_display_name",
+      "type": "string",
+      "default": "助手",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/dm_search.py:build_search_query"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.checkin_button_text",
+      "type": "string",
+      "default": "✅ 一键签到",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin.py:checkin_button_text"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.private_global_limit_notice",
+      "type": "string",
+      "default": "",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_notice"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.private_limit_notice",
+      "type": "string",
+      "default": "",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_notice"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.private_media_unsupported_notice",
+      "type": "string",
+      "default": "",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/private_chat.py:unsupported_media_notice"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.private_not_member_notice",
+      "type": "string",
+      "default": "",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/private_chat.py:not_member_notice"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.private_voice_title",
+      "type": "string",
+      "default": "语音回复",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_tts.py:audio_title"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.search_query_prefixes",
+      "type": "array",
+      "default": [
+        "诶",
+        "嗯哼",
+        "呀",
+        "欸"
+      ],
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/dm_search.py:build_search_query"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "display.shop_button_text",
+      "type": "string",
+      "default": "🛒 积分商店",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin_reminder.py:shop_button_text"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.challenge_skip_cost",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 1000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin.py:challenge_skip_cost"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.checkin_daily_point_cap",
+      "type": "integer",
+      "default": 10,
+      "bounds": {
+        "ge": 1,
+        "le": 100
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin.py:award_for_streak"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.checkin_rank_limit",
+      "type": "integer",
+      "default": 10,
+      "bounds": {
+        "ge": 1,
+        "le": 100
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin.py:build_rank"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.checkin_violation_window_days",
+      "type": "integer",
+      "default": 30,
+      "bounds": {
+        "ge": 1,
+        "le": 365
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/checkin.py:build_rank"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.expiry_batch_limit",
+      "type": "integer",
+      "default": 200,
+      "bounds": {
+        "ge": 1,
+        "le": 5000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:ShopExpiryService"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.expiry_check_seconds",
+      "type": "number",
+      "default": 300.0,
+      "bounds": {
+        "ge": 30.0,
+        "le": 86400.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:ShopExpiryService"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.expiry_pass_deadline_seconds",
+      "type": "number",
+      "default": 120.0,
+      "bounds": {
+        "ge": 10.0,
+        "le": 3600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:ShopExpiryService"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.expiry_retry_seconds",
+      "type": "number",
+      "default": 900.0,
+      "bounds": {
+        "ge": 30.0,
+        "le": 86400.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:ShopExpiryService"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.lottery_daily_limit",
+      "type": "integer",
+      "default": 10,
+      "bounds": {
+        "ge": 1,
+        "le": 1000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:play_lottery"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.lottery_price",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:play_lottery"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.lottery_prizes",
+      "type": "array",
+      "default": [
+        {
+          "payout": 0,
+          "weight": 3900,
+          "label": "谢谢参与"
+        },
+        {
+          "payout": 3,
+          "weight": 2000,
+          "label": "3 分"
+        },
+        {
+          "payout": 5,
+          "weight": 1600,
+          "label": "5 分"
+        },
+        {
+          "payout": 8,
+          "weight": 1000,
+          "label": "8 分"
+        },
+        {
+          "payout": 12,
+          "weight": 1000,
+          "label": "12 分"
+        },
+        {
+          "payout": 40,
+          "weight": 400,
+          "label": "40 分"
+        },
+        {
+          "payout": 100,
+          "weight": 100,
+          "label": "100 分"
+        }
+      ],
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:draw_prize"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_point_shop.py"
+    },
+    {
+      "path": "economy.pin_hours",
+      "type": "integer",
+      "default": 6,
+      "bounds": {
+        "ge": 1,
+        "le": 720
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_pin"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.pin_price",
+      "type": "integer",
+      "default": 20,
+      "bounds": {
+        "ge": 0,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_pin"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.tag_days_30d",
+      "type": "integer",
+      "default": 30,
+      "bounds": {
+        "ge": 1,
+        "le": 3650
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_member_tag"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.tag_days_7d",
+      "type": "integer",
+      "default": 7,
+      "bounds": {
+        "ge": 1,
+        "le": 3650
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_member_tag"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.tag_max_length",
+      "type": "integer",
+      "default": 16,
+      "bounds": {
+        "ge": 1,
+        "le": 16
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:check_tag_text"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.tag_price_30d",
+      "type": "integer",
+      "default": 80,
+      "bounds": {
+        "ge": 0,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_member_tag"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "economy.tag_price_7d",
+      "type": "integer",
+      "default": 30,
+      "bounds": {
+        "ge": 0,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/point_shop.py:buy_member_tag"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "moderation.log_channel_id",
+      "type": "integer",
+      "default": 0,
+      "bounds": {
+        "allowed": [
+          0,
+          "(-1009999999999, -1000000000000]"
+        ]
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_admin_log_channel_id"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_moderation_log_channel_docs.py"
+    },
+    {
+      "path": "moderation.review_handover_mention",
+      "type": "string",
+      "default": "",
+      "bounds": {},
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_send_review_handover"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_moderation_log_channel.py"
+    },
+    {
+      "path": "private_chat.access_ttl_seconds",
+      "type": "number",
+      "default": 60.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:MemberAccessCache"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.admin_global_daily_limit",
+      "type": "integer",
+      "default": 100000,
+      "bounds": {
+        "ge": 1,
+        "le": 10000000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.admin_per_user_daily_limit",
+      "type": "integer",
+      "default": 500,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.global_daily_limit",
+      "type": "integer",
+      "default": 20000,
+      "bounds": {
+        "ge": 1,
+        "le": 10000000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.input_max_chars",
+      "type": "integer",
+      "default": 1000,
+      "bounds": {
+        "ge": 1,
+        "le": 4096
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:build_private_chat_messages"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.memory_turns",
+      "type": "integer",
+      "default": 12,
+      "bounds": {
+        "ge": 1,
+        "le": 200
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:PrivateHistoryStore"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.per_user_daily_limit",
+      "type": "integer",
+      "default": 100,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_chat.py:quota_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.reply_max_chars",
+      "type": "integer",
+      "default": 3800,
+      "bounds": {
+        "ge": 512,
+        "le": 4096
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/private_chat.py:_split_for_telegram"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.search_daily_limit",
+      "type": "integer",
+      "default": 2000,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/dm_search.py:SearchBudget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.vision_budget_seconds",
+      "type": "number",
+      "default": 30.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/private_chat.py:_image_description"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "private_chat.voice_max_segments",
+      "type": "integer",
+      "default": 6,
+      "bounds": {
+        "ge": 1,
+        "le": 20
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/private_tts.py:max_private_tts_segments"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.admin_alert_aggregate_after",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 2,
+        "le": 1000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_admin_alert_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.admin_alert_state_limit",
+      "type": "integer",
+      "default": 512,
+      "bounds": {
+        "ge": 16,
+        "le": 65536
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_admin_alert_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.admin_alert_text_limit",
+      "type": "integer",
+      "default": 900,
+      "bounds": {
+        "ge": 100,
+        "le": 4000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_admin_alert_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.admin_alert_window_seconds",
+      "type": "number",
+      "default": 600.0,
+      "bounds": {
+        "ge": 10.0,
+        "le": 86400.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_admin_alert_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_backfill_per_pass",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 1,
+        "le": 5000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_batch_size",
+      "type": "integer",
+      "default": 8,
+      "bounds": {
+        "ge": 1,
+        "le": 512
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_candidate_limit",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 1,
+        "le": 5000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_indexing_lease_seconds",
+      "type": "number",
+      "default": 120.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 3600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_maintenance_interval_seconds",
+      "type": "number",
+      "default": 5.0,
+      "bounds": {
+        "ge": 0.5,
+        "le": 600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_query_timeout_seconds",
+      "type": "number",
+      "default": 8.0,
+      "bounds": {
+        "ge": 0.5,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.archive_scan_limit",
+      "type": "integer",
+      "default": 4096,
+      "bounds": {
+        "ge": 100,
+        "le": 100000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/archive_vector.py:archive_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.av_query_admission_timeout_seconds",
+      "type": "number",
+      "default": 2.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/av_search.py:av_query_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.av_query_concurrency",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 8
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.av_query_deadline_seconds",
+      "type": "number",
+      "default": 45.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 300.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/av_search.py:av_query_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.av_star_name_cache_max",
+      "type": "integer",
+      "default": 512,
+      "bounds": {
+        "ge": 64,
+        "le": 8192
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/av_search.py:av_query_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.decision_history_max_messages",
+      "type": "integer",
+      "default": 80,
+      "bounds": {
+        "ge": 1,
+        "le": 1000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/group_context.py:decision_history_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.decision_history_token_budget",
+      "type": "integer",
+      "default": 8192,
+      "bounds": {
+        "ge": 512,
+        "le": 1000000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/group_context.py:decision_history_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.llm_request_background_capacity",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 64
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.llm_request_capacity",
+      "type": "integer",
+      "default": 8,
+      "bounds": {
+        "ge": 2,
+        "le": 64
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_startup_resources.py"
+    },
+    {
+      "path": "resources.llm_request_noncritical_capacity",
+      "type": "integer",
+      "default": 7,
+      "bounds": {
+        "ge": 1,
+        "le": 64
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.llm_request_normal_capacity",
+      "type": "integer",
+      "default": 4,
+      "bounds": {
+        "ge": 1,
+        "le": 64
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.llm_stage_deadlines",
+      "type": "object",
+      "default": {
+        "decision": 35.0,
+        "moderation": 35.0,
+        "embed": 60.0,
+        "compress": 90.0,
+        "vision": 90.0,
+        "main": 120.0,
+        "skill": 120.0,
+        "synopsis": 20.0,
+        "group_summary": 15.0
+      },
+      "bounds": {
+        "default_from_factory": true
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/llm.py:stage_deadline_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.llm_tokenizer_concurrency",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 8
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_candidate_row_limit",
+      "type": "integer",
+      "default": 200,
+      "bounds": {
+        "ge": 10,
+        "le": 5000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_extract_input_token_limit",
+      "type": "integer",
+      "default": 12000,
+      "bounds": {
+        "ge": 512,
+        "le": 200000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_extract_scope_limit",
+      "type": "integer",
+      "default": 20,
+      "bounds": {
+        "ge": 1,
+        "le": 200
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_maintenance_interval_seconds",
+      "type": "integer",
+      "default": 21600,
+      "bounds": {
+        "ge": 300,
+        "le": 86400
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_max_facts_per_extraction",
+      "type": "integer",
+      "default": 6,
+      "bounds": {
+        "ge": 1,
+        "le": 20
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_private_group_fanout",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 20
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.memory_tool_subject_daily_cap",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 1,
+        "le": 200
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/long_term_memory.py:memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.moderation_throttle_burst",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 64
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/moderation_throttle.py:throttle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.moderation_throttle_max_wait_seconds",
+      "type": "number",
+      "default": 6.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/moderation_throttle.py:throttle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.moderation_throttle_max_waiters",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 256
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/moderation_throttle.py:throttle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.moderation_throttle_spacing_seconds",
+      "type": "number",
+      "default": 4.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/moderation_throttle.py:throttle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.pending_reply_execution_capacity",
+      "type": "integer",
+      "default": 4,
+      "bounds": {
+        "ge": 1,
+        "le": 32
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.pending_reply_timeout_seconds",
+      "type": "number",
+      "default": 45.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:_pending_reply_timeout_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.search_prune_interval_seconds",
+      "type": "integer",
+      "default": 21600,
+      "bounds": {
+        "ge": 300,
+        "le": 86400
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/search_memory.py:search_memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.search_record_recall_limit",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 1,
+        "le": 50
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/search_memory.py:search_memory_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_critical_admission_timeout_seconds",
+      "type": "number",
+      "default": 1.5,
+      "bounds": {
+        "ge": 0.1,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:telegram_session_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_high_admission_timeout_seconds",
+      "type": "number",
+      "default": 4.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:telegram_session_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_noncritical_capacity",
+      "type": "integer",
+      "default": 60,
+      "bounds": {
+        "ge": 4,
+        "le": 512
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_normal_admission_timeout_seconds",
+      "type": "number",
+      "default": 15.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:telegram_session_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_normal_capacity",
+      "type": "integer",
+      "default": 44,
+      "bounds": {
+        "ge": 2,
+        "le": 512
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_privileged_timeout_seconds",
+      "type": "number",
+      "default": 8.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:telegram_session_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.telegram_total_capacity",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 8,
+        "le": 512
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_max_http_timeout_seconds",
+      "type": "number",
+      "default": 60.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/doubao_tts.py:tts_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_max_segments_per_message",
+      "type": "integer",
+      "default": 6,
+      "bounds": {
+        "ge": 1,
+        "le": 20
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/doubao_tts.py:max_segments_per_message"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_private_concurrency",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 8
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_synthesis_concurrency",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 8
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_transcode_concurrency",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 8
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/startup_resources.py:apply_startup_resources"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.tts_transcode_timeout_seconds",
+      "type": "number",
+      "default": 30.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 300.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/doubao_tts.py:tts_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    }
+  ]
+}

@@ -73,7 +73,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
                 message_id=555,
                 html_text=(
                     "<b>内容审核 · 已警告</b>\n\n<blockquote>"
-                    "<b>用户</b>　<code>@aLnTpu</code>\n"
+                    "<b>用户</b>　<code>@demo_user</code>\n"
                     "<b>处理结果</b>　已删除违规消息并发出警告</blockquote>\n\n"
                     "<blockquote expandable>"
                     "<b>警告次数</b>　<code>1/3</code>\n"
@@ -796,7 +796,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("手动封禁", text)
         # The original automated outcome line must be gone, other lines kept.
         self.assertNotIn("已删除违规消息并发出警告", text)
-        self.assertIn("<b>用户</b>　<code>@aLnTpu</code>", text)
+        self.assertIn("<b>用户</b>　<code>@demo_user</code>", text)
         self.assertIn("<blockquote expandable>", text)
 
     async def test_false_positive_undo_rewrites_notice(self) -> None:
