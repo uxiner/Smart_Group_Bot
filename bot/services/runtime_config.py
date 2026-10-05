@@ -518,26 +518,31 @@ class ModerationSettingsConfig(StrictModel):
     bot_screening_enabled: bool = True
     bot_screening_message_count: int = Field(default=5, ge=1, le=100)
     # 群内露骨色情图片处置（删图 + @警告 + 质询）。
-    # F-024：默认关闭（opt-in）；关掉后视觉提示词不再要求 NSFW 判定，也不会有
-    # 任何处置动作。开启状态会在启动日志里列出，避免"升级后行为静默改变"。
-    nsfw_image_guard_enabled: bool = True
+    # F-024 / 用户裁定（2026-10）：默认关闭（opt-in）；关掉后视觉提示词不再要求
+    # NSFW 判定，也不会有任何处置动作。开启状态会在启动日志里逐条列出，避免
+    # "升级后行为静默改变"。生产环境需显式打开。
+    nsfw_image_guard_enabled: bool = False
     # 引用/转发广告：除转发者外，被引用消息的原作者同样处置。
-    # F-024：默认关闭（opt-in）；默认开启等于升级后静默扩大执法范围。
-    punish_quoted_author_enabled: bool = True
+    # F-024 / 用户裁定（2026-10）：默认关闭（opt-in）；默认开启等于升级后静默
+    # 扩大执法范围。生产环境需显式打开。
+    punish_quoted_author_enabled: bool = False
     # 被引用消息的追溯上限（秒）。默认 7 天；更老的消息只记日志不处置。
     quoted_author_max_age_seconds: int = Field(
         default=7 * 24 * 60 * 60, ge=0, le=365 * 24 * 60 * 60
     )
     # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 +
     # 记违规，不质询/不封禁/不禁言/不累计。
-    # F-024：默认关闭（opt-in，即回到"整段跳过"的旧行为）。
-    admin_moderation_enabled: bool = True
+    # F-024 / 用户裁定（2026-10）：默认关闭（opt-in，即回到"整段跳过"的旧行为）。
+    # 生产环境需显式打开。
+    admin_moderation_enabled: bool = False
     # 管理员命中违规时私聊最高管理员一份完整证据（best-effort、限流合并）。
     admin_alert_super_admin_enabled: bool = True
     # 审核命中证据投递频道（取代私聊最高管理员）：每条命中单独发一条证据卡，
     # 带「人工放行 / 放行收回」按钮。默认开启；关掉回到私聊老路径（含聚合）。
     log_channel_enabled: bool = True
-    # 证据频道 id；0 表示未配置（频道投递不可用，回退私聊老路径）。
+    # 证据频道 id。默认就是下面那个频道（有意为之）；0 = 未配置 → 频道投递不可用，
+    # 回退私聊老路径。覆盖入口见 bot/config.py 的同名注释（运行时配置 API 为主；
+    # env 无效；config.toml 仅一次性导入）。
     log_channel_id: int = -1004337744233
     # 「人工放行 / 确认封禁」双击确认窗口（秒）：第一次点击只 arm，第二次同键
     # 点击且间隔 <= 该窗口才真正执行。默认 300。

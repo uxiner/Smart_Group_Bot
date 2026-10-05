@@ -1006,20 +1006,21 @@
             ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
             ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
-            ${toggle("bot.memory_recall_enabled", "启用记忆召回（第 3 期）", "按当前问题从本群**原始档案**里检索相关消息。⚠️ 它**不是**长期记忆（第 4 期）的总开关——关掉它，第 4 期照样写库提炼，见下一节「长期记忆（第 4 期）」")}
+            ${toggle("bot.group_can_read_private_history", "允许群聊读取私聊历史", "默认关闭（隐私红线：群→私聊允许，私聊→群默认禁止）。本期只保证关闭时绝不读取，打开后的读取逻辑尚未实现")}
+            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "⚠️ 不是长期记忆的总开关：它只管「按当前问题从本群原始消息档案里检索相关消息」。第 ④ 期长期记忆（user_facts）的提炼/注入/写入由下面的「长期记忆总开关」控制，关掉它第 ④ 期照样提炼照样写库")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("长期记忆（第 ④ 期）", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定…）。D3-39：这一整块 11 个开关此前可 PUT、可落库、有 revision 保护，但 Mini App 完全无入口——其中 memory_facts_enabled / memory_tool_enabled 是真·总开关，关不掉。")}
+          ${sectionHead("长期记忆（第 ④ 期）", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定…）。D3-39：这一整块 11 个开关此前可 PUT、可落库、有 revision 保护，但 Mini App 完全无入口——其中 memory_facts_enabled / memory_tool_enabled 是真·总开关，关不掉。下方开关热生效：保存后立即影响提炼、注入与写入，无需重启。")}
           <div class="field-grid three">
-            ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "D3-39：**总开关**。关掉 = 不提炼、不注入、不写入（群聊注入 / 私聊召回 / /memory 命令都先判它）。关闭后已写入的事实不再注入，库里的行保留")}
+            ${toggle("bot.memory_facts_enabled", "长期记忆总开关", "**总开关**，关掉 = 不提炼、不注入、不写入（群聊注入 / 私聊召回 / /memory 命令都先判它）。关闭后已写入的事实不再注入，库里的行保留，需要时去群组页「永久记忆」手工清理")}
             ${toggle("bot.memory_extract_enabled", "启用后台提炼", "从群聊/私聊原文里被动提炼事实；关掉后不再有新的提炼，已有事实仍会被召回注入")}
             ${field("bot.memory_extract_interval_minutes", "提炼巡检间隔（分钟）", { type: "number", min: 5, max: 1440, step: 1, required: true, hint: "默认 30" })}
             ${field("bot.memory_extract_min_messages", "触发提炼所需最少新消息", { type: "number", min: 5, max: 500, step: 1, required: true, hint: "默认 20；未达到就跳过这一轮（游标不前移）" })}
             ${field("bot.memory_extract_daily_cap", "每天最多提炼次数", { type: "number", min: 0, max: 500, step: 1, required: true, hint: "默认 48；0 = 不限。防成本失控" })}
             ${field("bot.memory_extract_batch_max", "单批最大条数", { type: "number", min: 20, max: 1000, step: 10, required: true, hint: "默认 200；超 token 预算时从最旧一端整条丢弃（会留日志）" })}
-            ${toggle("bot.memory_tool_enabled", "启用模型主动记忆（remember 工具）", "D3-39：模型可以主动写一条关于**当前说话人本人**的稳定事实。关掉后 remember 工具不写库（仍可被调用，只是不落库）")}
+            ${toggle("bot.memory_tool_enabled", "允许模型主动写入（remember 工具）", "模型可以主动写一条关于**当前说话人本人**的稳定事实；总开关关闭时本项无效。关掉后模型只能读、不能写（仍可被调用，只是不落库）")}
             ${field("bot.memory_tool_daily_cap", "remember 工具每日上限", { type: "number", min: 0, max: 200, step: 1, required: true, hint: "默认 30（每作用域每天，0 = 不限）。群作用域另有一道「每个成员每天」的闸，普通成员不能独占全群额度（B-34）" })}
             ${field("bot.memory_recall_limit", "注入条数上限", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "默认 8；每轮注入的事实条数与字符数都不超它" })}
             ${field("bot.memory_event_ttl_days", "有期限事实的保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；category=event 的事实到期后不再注入并标删除" })}
@@ -1055,10 +1056,10 @@
             ${field("moderation.challenge_timeout_seconds", "ban 质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
-            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
-            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
+            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "默认关闭（opt-in），需在此显式打开。复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
+            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "默认关闭（opt-in），需在此显式打开。引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
             ${field("moderation.quoted_author_max_age_seconds", "引用追溯上限（秒）", { type: "number", min: 0, max: 31536000, step: 1, required: true, hint: "被引用消息超过该时长不再追溯原作者（只记日志），默认 604800 秒 = 7 天" })}
-            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
+            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "默认关闭（opt-in），需在此显式打开。除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
             ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据（对象/时间/规则/置信度/理由/送审原文/已执行动作，带图附图片，best-effort 不刷屏）；普通成员违规不发")}
           </div>
         </section>

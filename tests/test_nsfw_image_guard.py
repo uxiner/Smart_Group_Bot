@@ -1567,19 +1567,20 @@ class BotNeverPostsNsfwMediaTests(unittest.IsolatedAsyncioTestCase):
 
 class NsfwGuardConfigTests(unittest.TestCase):
     def test_runtime_config_exposes_the_switch_and_defaults_to_off(self) -> None:
-        """NSFW 图片守卫必须默认开启（用户底线：任何群都不许发 NSFW 图片/视频）。
+        """NSFW 图片守卫默认**关闭**（opt-in）。
 
-        交付方一度把这里改成 ``assertFalse``（opt-in 关闭）。已改回：底线不能靠
-        "默认值"关掉，运维想关必须显式去关；"行为可见"由 bot/config.py 的
-        ``log_enforcement_switch_state`` 在启动日志里逐条列出，两者不冲突。
+        用户 2026-10 裁定：这是对群成员可见的执法行为，必须由运维显式打开；
+        代码默认值、运行时模型默认值、读取兜底值三处一致为 False。生产侧在
+        Mini App「审核设置 → 群内色情图片处置」显式打开，启动日志会以 WARNING
+        逐条列出（``log_enforcement_switch_state``）。
         """
 
         from bot.services.runtime_config import ModerationSettingsConfig, RuntimeConfig
 
-        self.assertTrue(ModerationSettingsConfig().nsfw_image_guard_enabled)
+        self.assertFalse(ModerationSettingsConfig().nsfw_image_guard_enabled)
 
         config = RuntimeConfig()
-        self.assertTrue(config.moderation.nsfw_image_guard_enabled)
+        self.assertFalse(config.moderation.nsfw_image_guard_enabled)
 
         settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
         config.moderation.nsfw_image_guard_enabled = True
@@ -1588,9 +1589,14 @@ class NsfwGuardConfigTests(unittest.TestCase):
 
     def test_settings_default_keeps_the_guard_off_until_opted_in(self) -> None:
         settings = Settings(_env_file=None, bot_token="42:TEST", super_admin_id=42)
-        # 默认开启：底线开关不允许默认关闭（理由见上一条用例）。
-        self.assertTrue(settings.moderation.nsfw_image_guard_enabled)
+        self.assertFalse(settings.moderation.nsfw_image_guard_enabled)
+        # 读取函数也必须跟着关（不再有"缺字段就当开启"的隐藏默认）。
+        self.assertFalse(group._nsfw_image_guard_enabled(settings))
         self.assertIsInstance(settings.bot.main_model, ModelConfig)
+
+        # 显式打开之后才真的生效。
+        settings.moderation.nsfw_image_guard_enabled = True
+        self.assertTrue(group._nsfw_image_guard_enabled(settings))
 
 
 if __name__ == "__main__":
