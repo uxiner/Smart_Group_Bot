@@ -256,6 +256,27 @@ class MusicSearchSkill:
         }
 
     @staticmethod
+    def _apply_matched_source(results: list[dict[str, Any]], *, source: str) -> None:
+        """Pin every row to the source that actually answered the query.
+
+        The upstream payload may omit ``source`` entirely, and follow-up
+        ``get_url`` / ``send_audio`` calls must reuse the provider whose id
+        space produced ``track_id``. Leaving it empty would silently resolve a
+        fallback match (for example a netease id) against the default source.
+        """
+        for item in results:
+            declared = clean_text(str(item.get("source", "")), max_len=32).lower()
+            if declared == source:
+                continue
+            if declared:
+                log.debug(
+                    "music search row source overridden by matched source: declared=%s matched=%s",
+                    declared,
+                    source,
+                )
+            item["source"] = source
+
+    @staticmethod
     def _strip_lrc_timestamps(text: str) -> str:
         plain = clean_multiline_text(text, max_len=8000)
         plain = _LRC_TIMESTAMP_RE.sub("", plain)
@@ -293,6 +314,37 @@ class MusicSearchSkill:
         except aiohttp.ClientError as exc:
             raise _MusicAPIError("音乐接口连接失败", exc.__class__.__name__) from exc
 
+    async def _search_one_source(
+        self,
+        *,
+        source: str,
+        keyword: str,
+        count: int,
+        page: int,
+    ) -> list[dict[str, Any]]:
+        """Query one source and keep only rows carrying a usable ``track_id``.
+
+        Raises:
+            _MusicAPIError: the source could not be queried at all (HTTP error,
+                timeout, connection failure, oversized or unparsable payload).
+            An empty, non-list, or id-less answer is reported as an empty list
+            so the caller can keep trying the remaining stable sources.
+        """
+        data = await self._request_json(
+            {
+                "types": "search",
+                "source": source,
+                "name": keyword,
+                "count": count,
+                "pages": page,
+            }
+        )
+        if not isinstance(data, list):
+            return []
+
+        results = [self._normalize_track(item) for item in data]
+        return [item for item in results if item["track_id"]]
+
     async def _search(self, arguments: dict[str, Any]) -> SkillRunResult:
         keyword = clean_text(str(arguments.get("keyword", "")), max_len=120)
         if not keyword:
@@ -302,25 +354,52 @@ class MusicSearchSkill:
         count = self._normalize_int(arguments.get("count", 5), default=5, minimum=1, maximum=10)
         page = self._normalize_int(arguments.get("page", 1), default=1, minimum=1, maximum=50)
         attempted_sources = self._build_search_sources(requested_source)
+        # An explicit source stays explicit: a failing provider is reported to
+        # the caller instead of being silently replaced by another one.
+        allow_fallback = requested_source == "auto"
+        failures: list[str] = []
 
         for source in attempted_sources:
-            data = await self._request_json(
-                {
-                    "types": "search",
-                    "source": source,
-                    "name": keyword,
-                    "count": count,
-                    "pages": page,
-                }
-            )
-            if not isinstance(data, list):
+            try:
+                results = await self._search_one_source(
+                    source=source,
+                    keyword=keyword,
+                    count=count,
+                    page=page,
+                )
+            except _MusicAPIError as exc:
+                if not allow_fallback:
+                    raise
+                failures.append(f"{source}:{exc.code}")
+                log.warning(
+                    "music search source failed, trying next stable source: "
+                    "source=%s code=%s keyword=%s",
+                    source,
+                    exc.code,
+                    keyword,
+                )
+                continue
+            except Exception as exc:
+                # One unhealthy source must never escalate into a whole-search
+                # failure while other stable sources are still untried.
+                if not allow_fallback:
+                    raise
+                failures.append(f"{source}:{exc.__class__.__name__}")
+                log.warning(
+                    "music search source raised unexpectedly, trying next stable source: "
+                    "source=%s error=%s keyword=%s",
+                    source,
+                    exc.__class__.__name__,
+                    keyword,
+                )
                 continue
 
-            results = [self._normalize_track(item) for item in data]
-            results = [item for item in results if item["track_id"]]
             if not results:
+                failures.append(f"{source}:empty")
+                log.debug("music search source returned no usable track: source=%s", source)
                 continue
 
+            self._apply_matched_source(results, source=source)
             return SkillRunResult(
                 ok=True,
                 skill=self.name,
@@ -337,6 +416,12 @@ class MusicSearchSkill:
                 },
             )
 
+        if failures:
+            log.warning(
+                "music search found no usable result after trying sources: keyword=%s attempts=%s",
+                keyword,
+                ",".join(failures),
+            )
         return SkillRunResult(
             ok=False,
             skill=self.name,

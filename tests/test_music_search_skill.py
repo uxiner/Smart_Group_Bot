@@ -1,8 +1,29 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from bot.services.skills.music_search import MusicSearchSkill
+import aiohttp
+
+from bot.services.skills.music_search import MusicSearchSkill, _MusicAPIError
+from bot.services.skills.platform_common import (
+    InvalidJsonResponseError,
+    ResponseTooLargeError,
+)
+
+
+def _track(track_id: str = "1", *, source: str = "") -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": track_id,
+        "name": "稻香",
+        "artist": ["周杰伦"],
+        "album": "魔杰座",
+        "pic_id": "p1",
+        "lyric_id": "l1",
+    }
+    if source:
+        row["source"] = source
+    return row
 
 
 class MusicSearchSkillTests(unittest.IsolatedAsyncioTestCase):
@@ -49,6 +70,200 @@ class MusicSearchSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.payload["results"][0]["track_id"], "1")
         self.assertEqual(result.payload["results"][0]["artist_text"], "周杰伦")
         self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(request_mock.await_args_list[0].args[0]["source"], "kuwo")
+        self.assertEqual(request_mock.await_args_list[1].args[0]["source"], "netease")
+
+    async def test_search_auto_falls_back_after_first_source_http_error(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease,joox")
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(
+                side_effect=[
+                    _MusicAPIError("音乐接口请求失败: HTTP 400", "http_400"),
+                    [_track("5257138", source="netease")],
+                ]
+            ),
+        ) as request_mock:
+            result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.payload["source"], "netease")
+        self.assertEqual(result.payload["results"][0]["source"], "netease")
+        self.assertEqual(result.payload["results"][0]["track_id"], "5257138")
+        self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(request_mock.await_args_list[0].args[0]["source"], "kuwo")
+        self.assertEqual(request_mock.await_args_list[1].args[0]["source"], "netease")
+
+    async def test_search_auto_falls_back_after_upstream_http_status_error(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+        requested: list[str] = []
+
+        async def _fake_fetch(url: str, *, params: dict, **_: object) -> tuple[int, object, str]:
+            requested.append(str(params.get("source")))
+            if params.get("source") == "kuwo":
+                return 400, {"code": 400, "msg": "bad request"}, url
+            return 200, [_track("5257138", source="netease")], url
+
+        with patch(
+            "bot.services.skills.music_search.fetch_json",
+            new=AsyncMock(side_effect=_fake_fetch),
+        ) as fetch_mock:
+            result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.payload["source"], "netease")
+        self.assertEqual(requested, ["kuwo", "netease"])
+        self.assertEqual(fetch_mock.await_count, 2)
+
+    async def test_search_auto_falls_back_on_transport_level_failures(self) -> None:
+        cases: tuple[tuple[str, object], ...] = (
+            ("timeout", asyncio.TimeoutError()),
+            ("connection", aiohttp.ClientConnectionError("connection reset by peer")),
+            (
+                "invalid_json",
+                InvalidJsonResponseError(
+                    url="https://music-api.gdstudio.xyz/api.php?token=SECRET-TOKEN",
+                    status=200,
+                    content_type="text/html",
+                    body_preview="<html>rate limited</html>",
+                ),
+            ),
+            ("response_too_large", ResponseTooLargeError("response_too_large")),
+            ("unexpected_oserror", OSError("socket closed")),
+        )
+
+        for case, failure in cases:
+            with self.subTest(case=case):
+                skill = self._skill(music_api_stable_sources="kuwo,netease")
+
+                async def _fake_fetch(url: str, *, params: dict, **_: object) -> tuple[int, object, str]:
+                    if params.get("source") == "kuwo":
+                        raise failure
+                    return 200, [_track("5257138", source="netease")], url
+
+                with patch(
+                    "bot.services.skills.music_search.fetch_json",
+                    new=AsyncMock(side_effect=_fake_fetch),
+                ) as fetch_mock:
+                    result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+                self.assertTrue(result.ok)
+                self.assertEqual(result.payload["source"], "netease")
+                self.assertEqual(result.payload["results"][0]["track_id"], "5257138")
+                self.assertEqual(fetch_mock.await_count, 2)
+
+    async def test_search_auto_falls_back_when_first_source_has_no_usable_rows(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(
+                side_effect=[
+                    [{"name": "没有 id 的行", "artist": ["周杰伦"]}, {"id": "  ", "name": "空 id 行"}],
+                    [_track("5257138", source="netease")],
+                ]
+            ),
+        ) as request_mock:
+            result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.payload["source"], "netease")
+        self.assertEqual(result.payload["results"][0]["track_id"], "5257138")
+        self.assertEqual(request_mock.await_count, 2)
+
+    async def test_search_auto_keeps_the_source_that_actually_answered(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease,joox")
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(
+                side_effect=[
+                    [],
+                    {"code": 400, "msg": "unexpected payload shape"},
+                    [_track("5257138", source="netease")],
+                ]
+            ),
+        ) as request_mock:
+            result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request_mock.await_count, 3)
+        self.assertEqual(result.payload["source"], "joox")
+        self.assertEqual(result.payload["results"][0]["source"], "joox")
+        self.assertEqual(result.payload["results"][0]["track_id"], "5257138")
+
+    async def test_search_auto_returns_no_results_when_every_source_fails(self) -> None:
+        skill = self._skill()
+        leaky = "音乐接口请求失败: HTTP 400 https://music-api.gdstudio.xyz/api.php?key=SECRET-TOKEN"
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(side_effect=_MusicAPIError(leaky, "http_400")),
+        ) as request_mock:
+            with self.assertLogs("bot.services.skills.music_search", level="DEBUG") as captured:
+                result = await skill.run({"action": "search", "keyword": "周杰伦 晴天"}, context=SimpleNamespace())
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "no_results")
+        self.assertEqual(result.summary, "没有找到与“周杰伦 晴天”相关的歌曲")
+        self.assertEqual(request_mock.await_count, 4)
+        logs = "\n".join(captured.output)
+        self.assertNotIn("SECRET-TOKEN", logs)
+        self.assertNotIn("gdstudio", logs)
+        self.assertNotIn("SECRET-TOKEN", result.summary)
+        self.assertNotIn("gdstudio", result.summary)
+
+    async def test_search_auto_does_not_rethrow_unexpected_source_error(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+
+        with patch.object(skill, "_request_json", new=AsyncMock(side_effect=RuntimeError("boom"))) as request_mock:
+            result = await skill._search({"keyword": "周杰伦 晴天"})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "no_results")
+        self.assertEqual(result.summary, "没有找到与“周杰伦 晴天”相关的歌曲")
+        self.assertEqual(request_mock.await_count, 2)
+
+    async def test_search_explicit_source_error_is_reported_without_fallback(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(side_effect=_MusicAPIError("音乐接口请求失败: HTTP 400", "http_400")),
+        ) as request_mock:
+            result = await skill.run(
+                {"action": "search", "keyword": "周杰伦 晴天", "source": "netease"},
+                context=SimpleNamespace(),
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "http_400")
+        self.assertEqual(request_mock.await_count, 1)
+        self.assertEqual(request_mock.await_args.args[0]["source"], "netease")
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(side_effect=_MusicAPIError("音乐接口请求失败: HTTP 400", "http_400")),
+        ):
+            with self.assertRaises(_MusicAPIError):
+                await skill._search({"keyword": "周杰伦 晴天", "source": "netease"})
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            # An explicit source never degrades into a silent source swap, so
+            # an unexpected upstream error is still surfaced to the caller.
+            with self.assertRaises(RuntimeError):
+                await skill._search({"keyword": "周杰伦 晴天", "source": "netease"})
 
     async def test_get_url_returns_link_payload(self) -> None:
         skill = self._skill()
@@ -170,6 +385,64 @@ class MusicSearchSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.payload["requested_quality"], 320)
         self.assertEqual(request_mock.await_count, 2)
         self.assertEqual(request_mock.await_args_list[1].args[0]["br"], 320)
+
+    async def test_send_audio_auto_search_falls_back_and_reuses_matched_source(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+        message = SimpleNamespace(
+            reply_audio=AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=-10001), message_id=10)),
+            answer_audio=AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=-10001), message_id=11)),
+        )
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(
+                side_effect=[
+                    _MusicAPIError("音乐接口请求失败: HTTP 400", "http_400"),
+                    # The fallback source omits "source" in its rows.
+                    [_track("5257138")],
+                    {"url": "https://example.com/song.mp3", "br": 320, "size": 12345},
+                ]
+            ),
+        ) as request_mock:
+            result = await skill.run(
+                {"action": "send_audio", "keyword": "周杰伦 晴天"},
+                context=SimpleNamespace(message=message, bot=None, chat_id=0, handled=False),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request_mock.await_count, 3)
+        self.assertEqual(result.payload["source"], "netease")
+        self.assertEqual(result.payload["track_id"], "5257138")
+        self.assertEqual(result.payload["title"], "稻香")
+        url_request = request_mock.await_args_list[2].args[0]
+        self.assertEqual(url_request["types"], "url")
+        self.assertEqual(url_request["source"], "netease")
+        self.assertEqual(url_request["id"], "5257138")
+        message.reply_audio.assert_awaited_once()
+
+    async def test_send_audio_reports_no_results_when_all_auto_sources_fail(self) -> None:
+        skill = self._skill(music_api_stable_sources="kuwo,netease")
+        message = SimpleNamespace(
+            reply_audio=AsyncMock(),
+            answer_audio=AsyncMock(),
+        )
+
+        with patch.object(
+            skill,
+            "_request_json",
+            new=AsyncMock(side_effect=_MusicAPIError("音乐接口请求失败: HTTP 400", "http_400")),
+        ) as request_mock:
+            result = await skill.run(
+                {"action": "send_audio", "keyword": "周杰伦 晴天"},
+                context=SimpleNamespace(message=message, bot=None, chat_id=0, handled=False),
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "no_results")
+        self.assertEqual(request_mock.await_count, 2)
+        message.reply_audio.assert_not_awaited()
+        message.answer_audio.assert_not_awaited()
 
     async def test_send_audio_ignores_lossless_request_and_still_uses_320(self) -> None:
         skill = self._skill()
