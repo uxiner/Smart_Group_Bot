@@ -22,13 +22,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from bot.services.checkin import local_today
+from bot.services import policy_runtime
 from bot.services.search_memory import SCOPE_PRIVATE, record_search_for_result
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.websearch import WebSearchSkill
 
 log = logging.getLogger(__name__)
 
-#: 每天全局搜索次数保险丝（进程内计数，跨零点重置，重启清零）
+#: 每天全局搜索次数保险丝（进程内计数，跨零点重置，重启清零）。
+#: 真实值来自 ``runtime_config.private_chat.search_daily_limit``（默认 2000）。
 DAILY_SEARCH_LIMIT = 2000
 
 #: 检索结果注入块的名字（提示词里按这个名字解释它）
@@ -66,10 +68,16 @@ class SearchAnswer:
 class SearchBudget:
     """进程内的「每日搜索次数」保险丝。"""
 
-    def __init__(self, limit: int = DAILY_SEARCH_LIMIT) -> None:
-        self.limit = int(limit)
+    def __init__(self, limit: int | None = None) -> None:
+        self._limit_override = None if limit is None else int(limit)
         self._day = ""
         self._used = 0
+
+    @property
+    def limit(self) -> int:
+        """当前上限（显式构造值优先，否则现取配置）。"""
+
+        return self.effective_limit
 
     def _roll(self) -> None:
         today = str(local_today())
@@ -84,17 +92,30 @@ class SearchBudget:
             self._day = today
             self._used = 0
 
+    @property
+    def effective_limit(self) -> int:
+        """本次判定用的上限。
+
+        构造时没显式传 limit（= 模块级单例的常态）就现取配置。**热改不会重置
+        当天已消耗的计数**：``_used`` 只按自然日滚动，与上限无关。
+        """
+
+        if self._limit_override is not None:
+            return self._limit_override
+        return policy_runtime.private_chat_policy().search_daily_limit
+
     def available(self) -> bool:
         self._roll()
-        return self._used < self.limit
+        return self._used < self.effective_limit
 
     def take(self) -> bool:
         self._roll()
-        if self._used >= self.limit:
+        limit = self.effective_limit
+        if self._used >= limit:
             log.warning(
                 "私聊搜索：当日全局保险丝已触发，本轮不搜 | used=%d limit=%d",
                 self._used,
-                self.limit,
+                limit,
             )
             return False
         self._used += 1
@@ -129,11 +150,25 @@ def needs_search(text: str) -> bool:
     return bool(_FRESH_RE.search(body))
 
 
+def search_query_prefixes() -> tuple[str, ...]:
+    """检索时要剥掉的称呼前缀（可配）+ 当前显示名。
+
+    两侧一起改才不会出现"换了显示名但查询词剥不掉旧称呼"的漂移。
+    """
+
+    display = policy_runtime.display_policy()
+    parts = [*display.search_query_prefixes, display.bot_display_name]
+    return tuple(dict.fromkeys(part for part in parts if part))
+
+
 def build_search_query(text: str) -> str:
     """把闲聊式问法收拾成搜索词（去掉称呼/客套前缀）。"""
 
     body = re.sub(r"\s+", " ", str(text or "")).strip()
-    prefix = re.compile(r"^(?:诶--?|嗯哼|呀|欸|亲爱的|小爱同学|小爱|宝宝|喂)[，,、\s]*")
+    alternatives = "|".join(
+        re.escape(item) for item in search_query_prefixes()
+    )
+    prefix = re.compile(rf"^(?:{alternatives}|亲爱的|宝宝|喂)[，,、\s]*")
     for _ in range(4):  # 反复剥：可能连着几个称呼/语气词
         stripped = prefix.sub("", body)
         if stripped == body:

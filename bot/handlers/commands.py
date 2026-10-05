@@ -52,7 +52,7 @@ from bot.services.long_term_memory import (
     soft_delete_fact,
 )
 from bot.services.checkin import (
-    CHALLENGE_SKIP_COST,
+    challenge_skip_cost,
     CHECKIN_CALLBACK_DATA,
     MemberProfile,
     RankBoard,
@@ -3055,7 +3055,7 @@ async def cmd_points(
         f"可用 <b>{outcome.available_points}</b> 分{spent_line}\n"
         f"连续 {outcome.streak} 天｜共签到 {outcome.total_days} 天\n"
         f"{today_line}\n"
-        f"广告质询时可用 {CHALLENGE_SKIP_COST} 积分直接免除。",
+        f"广告质询时可用 {challenge_skip_cost()} 积分直接免除。",
     )
 
 

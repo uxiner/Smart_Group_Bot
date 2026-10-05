@@ -50,7 +50,7 @@ from bot.services.join_screening import (
     screen_member_profile_verbose,
 )
 from bot.services.checkin import (
-    CHALLENGE_SKIP_COST,
+    challenge_skip_cost,
     SPEND_REASON_CHALLENGE,
     spend_points,
 )
@@ -1830,7 +1830,7 @@ async def _handle_verification_spend_callback(
 
     group_id = int(record.group_id)
     verification_id = int(record.id)
-    cost = CHALLENGE_SKIP_COST
+    cost = challenge_skip_cost()
     spend_ref = await _next_challenge_spend_ref(
         session,
         group_id=group_id,

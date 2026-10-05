@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
 
+from bot.services import startup_resources
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -47,10 +48,34 @@ _LIVE_SESSIONS: weakref.WeakSet[PriorityAiohttpSession] = weakref.WeakSet()
 class PriorityAiohttpSession(AiohttpSession):
     """Aiohttp session with reserved capacity and connector self-healing."""
 
-    def __init__(self, *, timeout: float, limit: int = TELEGRAM_TOTAL_CAPACITY) -> None:
-        total = max(8, int(limit))
-        noncritical = max(4, total - min(4, total // 4))
-        normal = max(2, noncritical - min(16, max(2, total // 4)))
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        limit: int | None = None,
+        noncritical_capacity: int | None = None,
+        normal_capacity: int | None = None,
+    ) -> None:
+        # 显式传参优先（测试）；否则读启动配置。连接池上限与准入容量在**建 Bot
+        # 时**定死 —— 所以它们是 restart 字段（见 RESTART_REQUIRED_PATHS）。
+        limits = startup_resources.telegram_session_limits()
+        total = max(8, int(limit if limit is not None else limits["total_capacity"]))
+        noncritical = max(
+            4,
+            int(
+                noncritical_capacity
+                if noncritical_capacity is not None
+                else limits["noncritical_capacity"]
+            ),
+        )
+        normal = max(
+            2,
+            int(
+                normal_capacity
+                if normal_capacity is not None
+                else limits["normal_capacity"]
+            ),
+        )
         super().__init__(timeout=timeout, limit=total)
         self._capacity_gate = ReservedCapacityGate(
             total_capacity=total,
@@ -69,11 +94,18 @@ class PriorityAiohttpSession(AiohttpSession):
 
     @staticmethod
     def _admission_timeout(priority: ExecutionPriority) -> float:
+        """各优先级的准入等待上限（秒）。
+
+        这是**超时**不是容量：每次请求现取，改完下一次请求生效，不需要重启
+        （需要重启的只有连接池/准入容量那三项）。
+        """
+
+        limits = startup_resources.telegram_session_limits()
         if priority <= ExecutionPriority.CRITICAL:
-            return TELEGRAM_CRITICAL_ADMISSION_TIMEOUT_SECONDS
+            return float(limits["critical_admission_timeout_seconds"])
         if priority <= ExecutionPriority.HIGH:
-            return TELEGRAM_HIGH_ADMISSION_TIMEOUT_SECONDS
-        return TELEGRAM_NORMAL_ADMISSION_TIMEOUT_SECONDS
+            return float(limits["high_admission_timeout_seconds"])
+        return float(limits["normal_admission_timeout_seconds"])
 
     async def _reset_connector_if_idle(self) -> None:
         if not self._reset_requested or self._active_requests:
@@ -106,7 +138,11 @@ class PriorityAiohttpSession(AiohttpSession):
         if priority <= ExecutionPriority.CRITICAL and timeout is None:
             effective_timeout = min(
                 float(self.timeout),
-                TELEGRAM_PRIVILEGED_TIMEOUT_SECONDS,
+                float(
+                    startup_resources.telegram_session_limits()[
+                        "privileged_timeout_seconds"
+                    ]
+                ),
             )
 
         try:

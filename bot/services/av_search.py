@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 import aiohttp
 
 from bot.config import Settings
+from bot.services import policy_runtime
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.platform_common import fetch_text
 
@@ -49,6 +50,17 @@ _STAR_NAME_CACHE_MAX = 512
 _AV_QUERY_CONCURRENCY = 3
 _AV_QUERY_DEADLINE_SECONDS = 45.0
 _AV_QUERY_ADMISSION_TIMEOUT_SECONDS = 2.0
+def av_query_limits() -> tuple[float, float, int]:
+    """AV 查询的 ``(业务 deadline, 准入等待, 名字缓存上限)``（现取配置）。"""
+
+    resources = policy_runtime.resources_policy()
+    return (
+        resources.av_query_deadline_seconds,
+        resources.av_query_admission_timeout_seconds,
+        resources.av_star_name_cache_max,
+    )
+
+
 _AV_QUERY_SEMAPHORE = asyncio.Semaphore(_AV_QUERY_CONCURRENCY)
 _AV_RESULT = TypeVar("_AV_RESULT")
 
@@ -68,11 +80,11 @@ async def _run_av_query_bounded(
     """
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _AV_QUERY_DEADLINE_SECONDS
+    deadline = loop.time() + av_query_limits()[0]
     acquired = False
     try:
         admission_budget = min(
-            _AV_QUERY_ADMISSION_TIMEOUT_SECONDS,
+            av_query_limits()[1],
             max(0.01, deadline - loop.time()),
         )
         try:
@@ -119,7 +131,7 @@ register_resource_health_provider("av_search", av_resource_health_snapshot)
 def _cache_star_name(star_id: str, name: str) -> None:
     if star_id in _STAR_NAME_CACHE:
         _STAR_NAME_CACHE.pop(star_id, None)
-    elif len(_STAR_NAME_CACHE) >= _STAR_NAME_CACHE_MAX:
+    elif len(_STAR_NAME_CACHE) >= av_query_limits()[2]:
         oldest = next(iter(_STAR_NAME_CACHE), None)
         if oldest is not None:
             _STAR_NAME_CACHE.pop(oldest, None)

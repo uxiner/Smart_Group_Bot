@@ -58,7 +58,35 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(
             dm_search.build_search_query("亲爱的，帮我查查 5090 的价格"), "帮我查查 5090 的价格"
         )
-        self.assertEqual(dm_search.build_search_query("诶--  小爱同学 最近显卡新闻"), "最近显卡新闻")
+        # 称呼前缀来自 ``display.search_query_prefixes``；显示名也一并被剥掉，
+        # 所以部署者换品牌后不需要改代码。用合成名，不在公开树里种任何人设。
+        self.assertEqual(
+            dm_search.build_search_query("诶--  小助手 最近显卡新闻"), "最近显卡新闻"
+        )
+
+    def test_configured_wake_prefixes_and_display_name_are_stripped(self) -> None:
+        from bot.config import Settings
+        from bot.services import policy_runtime
+
+        settings = Settings(_env_file=None)
+        settings.display = settings.display.model_copy(
+            update={
+                "bot_display_name": "示例助手",
+                "search_query_prefixes": ["喂喂", "示例助手"],
+            }
+        )
+        previous = policy_runtime.bound_settings()
+        policy_runtime.bind(settings)
+        try:
+            self.assertIn("示例助手", dm_search.search_query_prefixes())
+            self.assertEqual(
+                dm_search.build_search_query("示例助手，喂喂 查一下 5090 价格"),
+                "查一下 5090 价格",
+            )
+        finally:
+            policy_runtime.bind(previous) if previous is not None else (
+                policy_runtime.unbind()
+            )
 
 
 class SearchFlowTests(unittest.IsolatedAsyncioTestCase):

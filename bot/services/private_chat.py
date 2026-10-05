@@ -51,6 +51,7 @@ from bot.services.long_term_memory import (
     LONG_TERM_MEMORY_HEADER_BLOCK,
     render_facts_block,
 )
+from bot.services import policy_runtime
 from bot.services.model_limits import (
     auto_window_for,
     business_total_window,
@@ -100,7 +101,24 @@ GLOBAL_COUNTER_USER_ID = 0
 #: 群管理员合计行的哨兵 user_id（真实 Telegram 用户 id 恒为正；本人行也恒为正）
 ADMIN_GLOBAL_COUNTER_USER_ID = -1
 
-#: 阶梯配额（用户口径 2026-10-03）
+def quota_limits() -> tuple[int, int, int, int]:
+    """四档配额的当前值 ``(普通单人, 管理员单人, 普通全局, 管理员全局)``。
+
+    唯一存储源 = ``runtime_config.private_chat``（默认 100/500/20000/100000，
+    与改造前逐字相同）。一次取快照，整条"先扣再用 / 退款 / 提示"流程都用它。
+    """
+
+    policy = policy_runtime.private_chat_policy()
+    return (
+        policy.per_user_daily_limit,
+        policy.admin_per_user_daily_limit,
+        policy.global_daily_limit,
+        policy.admin_global_daily_limit,
+    )
+
+
+#: 未绑定运行时配置时的模块级常量（= schema 默认值，测试与纯函数直调用）。
+#: 真实运行期一律走 :func:`quota_limits`，不要直接引用下面这些名字。
 DEFAULT_PER_USER_DAILY_LIMIT = 100        # 普通成员：每人每天
 ADMIN_PER_USER_DAILY_LIMIT = 500          # 群管理员：每人每天
 DEFAULT_GLOBAL_DAILY_LIMIT = 20_000       # 普通成员合计
@@ -210,21 +228,39 @@ class MemberAccessCache:
     def __init__(
         self,
         *,
-        ttl_seconds: float = MEMBER_ACCESS_TTL_SECONDS,
+        ttl_seconds: float | None = None,
         max_users: int = 4096,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        # ``None`` = 每次判定现取运行时配置（模块级单例是在 import 期建的，
+        # 不能在建实例时把 TTL 拍死，否则热更对存量条目无效）。显式传值只给测试。
+        self._ttl_override = None if ttl_seconds is None else float(ttl_seconds)
         self.max_users = max(16, int(max_users))
         self._clock = clock or time.monotonic
         self._entries: dict[int, tuple[str, float, tuple[int, ...]]] = {}
+
+    @property
+    def ttl_seconds(self) -> float:
+        """当前生效的 TTL：显式覆盖优先，否则现取配置，且**永不超过 60 秒**。
+
+        上界来自 ``MEMBER_ACCESS_TTL_SECONDS``（= 今天的值，也是 schema 的 ``le``）：
+        调大等于放大越权窗口，所以这个旋钮只允许收紧。
+        """
+
+        if self._ttl_override is not None:
+            candidate = self._ttl_override
+        else:
+            candidate = policy_runtime.private_chat_policy().access_ttl_seconds
+        return max(1.0, min(MEMBER_ACCESS_TTL_SECONDS, float(candidate)))
 
     def _live(self, user_id: int) -> tuple[str, tuple[int, ...]] | None:
         entry = self._entries.get(int(user_id))
         if entry is None:
             return None
-        tier, expires_at, group_ids = entry
-        if expires_at <= self._clock():
+        tier, stored_at, group_ids = entry
+        # 按**当前** TTL 重新判龄，而不是按写入时算好的 expires_at：TTL 热调小
+        # 之后老条目必须立刻过期，不能让已被移出授权群的成员继续可用。
+        if stored_at + self.ttl_seconds <= self._clock():
             self._entries.pop(int(user_id), None)
             return None
         return tier, group_ids
@@ -254,7 +290,7 @@ class MemberAccessCache:
             groups = ()
         self._entries[int(user_id)] = (
             str(tier),
-            self._clock() + self.ttl_seconds,
+            self._clock(),
             groups,
         )
 
@@ -586,14 +622,13 @@ async def consume_daily_quota(
 
     uid = int(user_id)
     tier = TIER_ADMIN if is_admin else TIER_MEMBER
+    default_user, default_admin_user, default_global, default_admin_global = (
+        quota_limits()
+    )
     if per_user_limit is None:
-        per_user_limit = (
-            ADMIN_PER_USER_DAILY_LIMIT if is_admin else DEFAULT_PER_USER_DAILY_LIMIT
-        )
+        per_user_limit = default_admin_user if is_admin else default_user
     if global_limit is None:
-        global_limit = (
-            ADMIN_GLOBAL_DAILY_LIMIT if is_admin else DEFAULT_GLOBAL_DAILY_LIMIT
-        )
+        global_limit = default_admin_global if is_admin else default_global
     global_row = ADMIN_GLOBAL_COUNTER_USER_ID if is_admin else GLOBAL_COUNTER_USER_ID
     stamp = stamp or now_shanghai_naive()
     key = str(day or local_day_key(stamp))
@@ -675,9 +710,10 @@ async def refund_daily_quota(
 def quota_notice(outcome: QuotaOutcome) -> str:
     """超限时回哪句话（全局超限和本人超限分开说，免得让人以为自己被针对）。"""
 
+    display = policy_runtime.display_policy()
     if outcome.reason == "global_limit":
-        return GLOBAL_LIMIT_NOTICE
-    return LIMIT_NOTICE
+        return display.private_global_limit_notice or GLOBAL_LIMIT_NOTICE
+    return display.private_limit_notice or LIMIT_NOTICE
 
 
 # ---------------------------------------------------------------------------
@@ -748,9 +784,12 @@ class PrivateHistoryStore:
         uid = int(user_id)
         if uid not in self._turns and len(self._turns) >= self.max_users:
             self._turns.clear()
+        # 轮数现取（默认 12 = 改造前）。上限热更后立刻生效：buffer 变短时
+        # 只丢最老的（deque 语义），不新建实例、不占用新 slot。
+        limit = max(1, policy_runtime.private_chat_policy().memory_turns) * 2
         buf = self._turns.get(uid)
-        if buf is None:
-            buf = deque(maxlen=HISTORY_MAX_TURNS * 2)
+        if buf is None or buf.maxlen != limit:
+            buf = deque(buf or (), maxlen=limit)
             self._turns[uid] = buf
         buf.append((str(role), turn))
 
@@ -1260,9 +1299,10 @@ def build_private_chat_messages(
     本轮消息永远不裁。不传这些层时输出与改造前逐字一致。
     """
 
-    normalized = clean_multiline_text(str(text or ""), max_len=PRIVATE_INPUT_LIMIT)
+    input_limit = policy_runtime.private_chat_policy().input_max_chars
+    normalized = clean_multiline_text(str(text or ""), max_len=input_limit)
     description = clean_multiline_text(
-        str(image_description or ""), max_len=PRIVATE_INPUT_LIMIT
+        str(image_description or ""), max_len=input_limit
     )
 
     history_messages: list[dict[str, Any]] = []
@@ -1411,7 +1451,7 @@ def build_private_chat_messages(
             {
                 "role": "user",
                 "content": wrap_untrusted_multiline(
-                    "user_message", body, max_len=PRIVATE_INPUT_LIMIT * 2
+                    "user_message", body, max_len=input_limit * 2
                 ),
             }
         ]
@@ -1420,7 +1460,7 @@ def build_private_chat_messages(
             {
                 "role": "user",
                 "content": wrap_untrusted_multiline(
-                    "user_message", normalized, max_len=PRIVATE_INPUT_LIMIT
+                    "user_message", normalized, max_len=input_limit
                 ),
             }
         ]

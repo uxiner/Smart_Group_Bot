@@ -15,14 +15,21 @@ from typing import Any, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.fields import FieldInfo
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import (
+    ActivityPolicyConfig,
+    CheckinReminderPolicyConfig,
+    DisplayPolicyConfig,
+    EconomyPolicyConfig,
     EmbedConfig,
     ModelConfig,
     ModerationConfig,
+    PrivateChatPolicyConfig,
     ProviderProfile,
+    ResourcesPolicyConfig,
     Settings,
     _build_chat_config,
     _build_embed_config,
@@ -44,6 +51,7 @@ from bot.utils.budget import (
     validate_business_budget,
     validate_group_history_max_messages,
 )
+from bot.services import policy_runtime
 from bot.utils.prompts import load_prompt_defaults, set_runtime_prompts
 
 log = logging.getLogger(__name__)
@@ -96,6 +104,12 @@ _STATIC_SECRET_PATHS = (
     "movie_info.imdb_aws_secret_access_key",
     "movie_info.imdb_aws_session_token",
 )
+
+#: ``json_schema_extra`` 标记：改完**下一次动作**就生效（热读）。
+_HOT: dict[str, Any] = {"reload_kind": "hot"}
+#: ``json_schema_extra`` 标记：绑在模块级 Semaphore / gate / aiohttp Session 上，
+#: 只在启动时装配一次，**改完必须重启**（见 ``bot.services.startup_resources``）。
+_RESTART: dict[str, Any] = {"reload_kind": "restart"}
 
 
 class StrictModel(BaseModel):
@@ -540,10 +554,19 @@ class ModerationSettingsConfig(StrictModel):
     # 审核命中证据投递频道（取代私聊最高管理员）：每条命中单独发一条证据卡，
     # 带「人工放行 / 放行收回」按钮。默认开启；关掉回到私聊老路径（含聚合）。
     log_channel_enabled: bool = True
-    # 证据频道 id。默认就是下面那个频道（有意为之）；0 = 未配置 → 频道投递不可用，
-    # 回退私聊老路径。覆盖入口见 bot/config.py 的同名注释（运行时配置 API 为主；
-    # env 无效；config.toml 仅一次性导入）。
-    log_channel_id: int = -1004337744233
+    # 证据频道 id。**默认 0 = 未配置**：公开 fork 开箱即用时不会向任何频道投递
+    # （含任何私人频道），命中证据按既有 fallback 路径回退私聊最高管理员。
+    # 部署者用 Mini App / `PUT /api/v1/settings` 显式写入本字段后热生效。
+    # ``config.toml`` 的 ``[moderation]`` 段只在 ``runtime_config`` 行还不存在时
+    # 做一次性导入；环境变量对本段无效（``ModerationConfig`` 是普通 ``BaseModel``，
+    # ``Settings`` 没有 ``env_nested_delimiter``，也没有扁平字段）。
+    log_channel_id: int = 0
+    # 审核规则交接时 @ 的对象（人工审核侧的对端 bot / 管理员）。**默认空 = 不
+    # @任何人**，只发交接文案；空值时绝不构造 mention 实体（否则会退化成
+    # ``rfind('')`` 这种"在开头造出一个假 mention"的 bug）。
+    # 必须是合法 Telegram 用户名 ``@name``（5-32 位字母数字下划线、字母开头）；
+    # 含换行 / HTML 的一律拒绝。
+    review_handover_mention: str = ""
     # 「人工放行 / 确认封禁」双击确认窗口（秒）：第一次点击只 arm，第二次同键
     # 点击且间隔 <= 该窗口才真正执行。默认 300。
     review_confirm_seconds: int = Field(default=300, ge=1, le=86400)
@@ -551,6 +574,35 @@ class ModerationSettingsConfig(StrictModel):
     # 今天逐字一致）。超限时只跑本地确定性规则并记为"未送审"（conclusive=False），
     # 与"模型调用失败"同口径，绝不静默放行。作用域：仅成员触发的送审。
     llm_call_cap_per_hour: int = Field(default=0, ge=0, le=1000000)
+
+    @field_validator("log_channel_id", mode="before")
+    @classmethod
+    def _validate_log_channel_id(cls, value: object) -> int:
+        try:
+            channel_id = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("审核日志频道 id 必须是整数（0 = 未配置）") from exc
+        if channel_id == 0:
+            return 0
+        if not (
+            _TELEGRAM_CHANNEL_ID_MIN <= channel_id <= _TELEGRAM_CHANNEL_ID_MAX
+        ):
+            raise ValueError(
+                "审核日志频道 id 必须是 0（未配置）或以 -100 开头的频道 id"
+            )
+        return channel_id
+
+    @field_validator("review_handover_mention", mode="before")
+    @classmethod
+    def _validate_handover_mention(cls, value: object) -> str:
+        mention = str(value or "").strip()
+        if not mention:
+            return ""
+        if not re.fullmatch(_TELEGRAM_MENTION_PATTERN, mention):
+            raise ValueError(
+                "审核交接对象必须是合法的 Telegram 用户名（例如 @your_bot）"
+            )
+        return mention
 
 
 class PatrolSettingsConfig(StrictModel):
@@ -754,6 +806,455 @@ class StickerSettingsConfig(StrictModel):
     fallback_file_ids: list[str] = Field(default_factory=list)
 
 
+#: 审核命中证据的频道 id 合法区间：Telegram 频道/超级群 chat id 一律是
+#: ``-100…`` 开头的 13 位负数。0 单独表示"未配置"。
+_TELEGRAM_CHANNEL_ID_MIN = -1_009_999_999_999
+_TELEGRAM_CHANNEL_ID_MAX = -1_000_000_000_000
+#: Telegram 用户名的合法形状（5-32 位字母数字下划线，必须字母开头）。
+_TELEGRAM_MENTION_PATTERN = r"^@[A-Za-z][A-Za-z0-9_]{3,31}$"
+
+
+class PrivateChatSettingsConfig(StrictModel):
+    """1 对 1 私聊的运营参数。
+
+    唯一存储源 = ``runtime_config.private_chat``；读侧 = ``bot.config.
+    PrivateChatPolicyConfig``（``apply_to_settings`` 写下去）→
+    ``bot.services.policy_runtime.private_chat_policy()`` 快照 → 消费者。
+    """
+
+    per_user_daily_limit: int = Field(default=100, ge=1, le=100_000)
+    admin_per_user_daily_limit: int = Field(default=500, ge=1, le=100_000)
+    global_daily_limit: int = Field(default=20_000, ge=1, le=10_000_000)
+    admin_global_daily_limit: int = Field(default=100_000, ge=1, le=10_000_000)
+    input_max_chars: int = Field(
+        default=1000, ge=1, le=4096, json_schema_extra=_HOT
+    )
+    reply_max_chars: int = Field(
+        default=3800, ge=512, le=4096, json_schema_extra=_HOT
+    )
+    vision_budget_seconds: float = Field(
+        default=30.0, ge=5.0, le=120.0, allow_inf_nan=False, json_schema_extra=_HOT
+    )
+    memory_turns: int = Field(default=12, ge=1, le=200, json_schema_extra=_HOT)
+    #: 上界 60 = 今天真实生效的值。**只能调小**：TTL 调大等于让已被移出授权群
+    #: 的人继续用私聊，是一个越权窗口，不能当运营参数放开。
+    access_ttl_seconds: float = Field(
+        default=60.0, ge=1.0, le=60.0, allow_inf_nan=False, json_schema_extra=_HOT
+    )
+    search_daily_limit: int = Field(default=2000, ge=1, le=100_000, json_schema_extra=_HOT)
+    voice_max_segments: int = Field(default=6, ge=1, le=20, json_schema_extra=_HOT)
+
+    @model_validator(mode="after")
+    def _validate_tier_relations(self) -> "PrivateChatSettingsConfig":
+        if self.global_daily_limit < self.per_user_daily_limit:
+            raise ValueError("普通成员全局上限不能小于单人上限")
+        if self.admin_global_daily_limit < self.admin_per_user_daily_limit:
+            raise ValueError("群管理员全局上限不能小于单人上限")
+        return self
+
+
+class LotteryPrizeConfig(StrictModel):
+    """奖池的一项：``payout`` 是中奖积分，``weight`` 是相对权重。"""
+
+    payout: int = Field(default=0, ge=0, le=1_000_000)
+    weight: int = Field(default=1, ge=1, le=1_000_000)
+    label: str = Field(default="", max_length=32)
+
+
+class EconomySettingsConfig(StrictModel):
+    """签到 / 积分商店的运营参数。价格、时长、奖池都在这里，是财务口径的唯一起点。"""
+
+    checkin_daily_point_cap: int = Field(default=10, ge=1, le=100)
+    checkin_rank_limit: int = Field(default=10, ge=1, le=100)
+    checkin_violation_window_days: int = Field(default=30, ge=1, le=365)
+    #: 下界 1：0 = 免费绕过审核质询，不是运营旋钮。
+    challenge_skip_cost: int = Field(default=2, ge=1, le=1000)
+
+    tag_price_7d: int = Field(default=30, ge=0, le=100_000)
+    tag_days_7d: int = Field(default=7, ge=1, le=3650)
+    tag_price_30d: int = Field(default=80, ge=0, le=100_000)
+    tag_days_30d: int = Field(default=30, ge=1, le=3650)
+    pin_price: int = Field(default=20, ge=0, le=100_000)
+    pin_hours: int = Field(default=6, ge=1, le=720)
+    lottery_price: int = Field(default=5, ge=1, le=100_000)
+    lottery_daily_limit: int = Field(default=10, ge=1, le=1000)
+    lottery_prizes: list[LotteryPrizeConfig] = Field(
+        default_factory=lambda: [
+            LotteryPrizeConfig(payout=0, weight=3900, label="谢谢参与"),
+            LotteryPrizeConfig(payout=3, weight=2000, label="3 分"),
+            LotteryPrizeConfig(payout=5, weight=1600, label="5 分"),
+            LotteryPrizeConfig(payout=8, weight=1000, label="8 分"),
+            LotteryPrizeConfig(payout=12, weight=1000, label="12 分"),
+            LotteryPrizeConfig(payout=40, weight=400, label="40 分"),
+            LotteryPrizeConfig(payout=100, weight=100, label="100 分"),
+        ],
+        min_length=1,
+        max_length=32,
+    )
+    #: Telegram 原生头衔长度上限（协议常量，不可放开）。
+    tag_max_length: int = Field(default=16, ge=1, le=16)
+
+    expiry_check_seconds: float = Field(
+        default=300.0, ge=30.0, le=86_400.0, allow_inf_nan=False
+    )
+    expiry_pass_deadline_seconds: float = Field(
+        default=120.0, ge=10.0, le=3600.0, allow_inf_nan=False
+    )
+    expiry_batch_limit: int = Field(default=200, ge=1, le=5000)
+    expiry_retry_seconds: float = Field(
+        default=900.0, ge=30.0, le=86_400.0, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def _validate_lottery_table(self) -> "EconomySettingsConfig":
+        if sum(prize.weight for prize in self.lottery_prizes) <= 0:
+            raise ValueError("奖池总权重必须大于 0")
+        if self.lottery_price <= 0:
+            raise ValueError("抽奖价格必须大于 0")
+        return self
+
+    @property
+    def lottery_total_weight(self) -> int:
+        """总权重由奖池派生——不另存一份，避免两个来源互相矛盾。"""
+
+        return sum(prize.weight for prize in self.lottery_prizes)
+
+
+class ActivitySettingsConfig(StrictModel):
+    """每周活跃激励的运营参数。"""
+
+    min_message_text_length: int = Field(default=2, ge=1, le=100)
+    max_daily_messages: int = Field(default=20, ge=1, le=500)
+    min_active_days: int = Field(default=3, ge=1, le=365)
+    min_weekly_messages: int = Field(default=10, ge=1, le=100_000)
+    #: 每周奖励向量（下标 0 = 第 1 名）。榜单长度与周总额都从它派生。
+    weekly_reward_points: list[int] = Field(
+        default_factory=lambda: [25, 12, 12, 4, 4, 4, 4, 4, 4, 4],
+        min_length=1,
+        max_length=100,
+    )
+
+    @field_validator("weekly_reward_points", mode="after")
+    @classmethod
+    def _bound_reward_points(cls, value: list[int]) -> list[int]:
+        for points in value:
+            if int(points) < 0 or int(points) > 100_000:
+                raise ValueError("每周奖励积分必须在 0-100000 之间")
+        if sum(int(item) for item in value) <= 0:
+            raise ValueError("每周奖励总额必须大于 0")
+        return [int(item) for item in value]
+
+    @property
+    def weekly_top_n(self) -> int:
+        return len(self.weekly_reward_points)
+
+    @property
+    def weekly_total_points(self) -> int:
+        return sum(int(item) for item in self.weekly_reward_points)
+
+
+class CheckinReminderSettingsConfig(StrictModel):
+    """签到提醒的运营参数。"""
+
+    slots: list[int] = Field(
+        default_factory=lambda: [9, 12, 15, 18], min_length=1, max_length=12
+    )
+    slot_greetings: dict[int, str] = Field(
+        default_factory=lambda: {9: "早上好", 12: "中午好", 15: "下午好", 18: "晚上好"}
+    )
+    auto_delete_seconds: int = Field(default=600, ge=0, le=86_400)
+    roster_max_names: int = Field(default=20, ge=1, le=200)
+    stale_grace_seconds: int = Field(default=900, ge=60, le=86_400)
+
+    @field_validator("slots", mode="after")
+    @classmethod
+    def _normalize_slots(cls, value: list[int]) -> list[int]:
+        slots = sorted({int(hour) for hour in value})
+        for hour in slots:
+            if hour < 0 or hour > 23:
+                raise ValueError("提醒时段必须是 0-23 的整点小时")
+        return slots
+
+    @field_validator("slot_greetings", mode="before")
+    @classmethod
+    def _coerce_greeting_keys(cls, value: object) -> dict[int, str]:
+        if not isinstance(value, dict):
+            raise ValueError("时段问候语必须是 {小时: 文案} 的映射")
+        result: dict[int, str] = {}
+        for raw_hour, raw_text in value.items():
+            try:
+                hour = int(raw_hour)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("时段问候语的键必须是整点小时") from exc
+            text = str(raw_text or "").strip()
+            if not text:
+                raise ValueError("时段问候语不能为空")
+            if len(text) > 32:
+                raise ValueError("时段问候语最多 32 个字符")
+            if "<" in text or ">" in text or "&" in text:
+                raise ValueError("时段问候语不能包含 HTML 标签或实体")
+            result[hour] = text
+        return result
+
+    @model_validator(mode="after")
+    def _validate_greetings(self) -> "CheckinReminderSettingsConfig":
+        unknown = sorted(set(self.slot_greetings) - set(self.slots))
+        if unknown:
+            raise ValueError(
+                "时段问候语的键 " + "、".join(str(hour) for hour in unknown) + " 不在提醒时段里"
+            )
+        return self
+
+
+class DisplaySettingsConfig(StrictModel):
+    """用户可见的品牌与文案。协议标识（callback_data / start payload）刻意不在这里。"""
+
+    bot_display_name: str = Field(default="助手", min_length=1, max_length=32)
+    private_voice_title: str = Field(default="语音回复", min_length=1, max_length=64)
+    checkin_button_text: str = Field(default="✅ 一键签到", min_length=1, max_length=64)
+    shop_button_text: str = Field(default="🛒 积分商店", min_length=1, max_length=64)
+    search_query_prefixes: list[str] = Field(
+        default_factory=lambda: ["诶", "嗯哼", "呀", "欸"], max_length=32
+    )
+    private_not_member_notice: str = Field(default="", max_length=2000)
+    private_limit_notice: str = Field(default="", max_length=2000)
+    private_global_limit_notice: str = Field(default="", max_length=2000)
+    private_media_unsupported_notice: str = Field(default="", max_length=2000)
+
+    @field_validator(
+        "bot_display_name",
+        "private_voice_title",
+        "checkin_button_text",
+        "shop_button_text",
+        mode="before",
+    )
+    @classmethod
+    def _clean_label(cls, value: object) -> str:
+        return str(value or "").strip()
+
+    @field_validator("search_query_prefixes", mode="before")
+    @classmethod
+    def _clean_prefixes(cls, value: object) -> list[str]:
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError("检索唤醒前缀必须是字符串列表")
+        prefixes: list[str] = []
+        for raw in value:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            if len(text) > 16:
+                raise ValueError("检索唤醒前缀最多 16 个字符")
+            if any(ch in text for ch in "<>&\n\r"):
+                raise ValueError("检索唤醒前缀不能包含换行或 HTML 标记")
+            if text not in prefixes:
+                prefixes.append(text)
+        return prefixes
+
+    @model_validator(mode="after")
+    def _ensure_fallbacks(self) -> "DisplaySettingsConfig":
+        # 提示文案在旧库/旧 payload 里可能是空串（新增字段还没写过），
+        # 这里回落到中性默认，绝不出现"提示语变成空消息"。
+        defaults = DisplayPolicyConfig()
+        for name, fallback in (
+            ("private_not_member_notice", defaults.private_not_member_notice),
+            ("private_limit_notice", defaults.private_limit_notice),
+            (
+                "private_global_limit_notice",
+                defaults.private_global_limit_notice,
+            ),
+            (
+                "private_media_unsupported_notice",
+                defaults.private_media_unsupported_notice,
+            ),
+        ):
+            if not str(getattr(self, name) or "").strip():
+                setattr(self, name, fallback)
+        return self
+
+
+class ResourceSettingsConfig(StrictModel):
+    """高级资源与进程级预算。
+
+    这里是"进程资源"而不是"运营参数"：默认全部等于今天真实生效的值，不配就
+    逐字等于改造前。生效时机分两种，见 ``bot.services.startup_resources``：
+
+    * ``json_schema_extra["reload_kind"] == "restart"``：模块级 Semaphore /
+      gate / aiohttp Session 在 import 或建 Bot 时固化，**只在启动时装配一次**；
+      改完必须重启，API 与 UI 会回 ``restart_fields``。
+    * ``hot``：每次动作现取（超时、批量、阈值这类），改完下一次动作生效。
+    """
+
+    # --- 启动时装配（restart） -------------------------------------------------
+    llm_request_capacity: int = Field(
+        default=8, ge=2, le=64, json_schema_extra=_RESTART
+    )
+    llm_request_noncritical_capacity: int = Field(
+        default=7, ge=1, le=64, json_schema_extra=_RESTART
+    )
+    llm_request_normal_capacity: int = Field(
+        default=4, ge=1, le=64, json_schema_extra=_RESTART
+    )
+    llm_request_background_capacity: int = Field(
+        default=2, ge=1, le=64, json_schema_extra=_RESTART
+    )
+    llm_tokenizer_concurrency: int = Field(
+        default=2, ge=1, le=8, json_schema_extra=_RESTART
+    )
+    telegram_total_capacity: int = Field(
+        default=64, ge=8, le=512, json_schema_extra=_RESTART
+    )
+    telegram_noncritical_capacity: int = Field(
+        default=60, ge=4, le=512, json_schema_extra=_RESTART
+    )
+    telegram_normal_capacity: int = Field(
+        default=44, ge=2, le=512, json_schema_extra=_RESTART
+    )
+    pending_reply_execution_capacity: int = Field(
+        default=4, ge=1, le=32, json_schema_extra=_RESTART
+    )
+    tts_synthesis_concurrency: int = Field(
+        default=3, ge=1, le=8, json_schema_extra=_RESTART
+    )
+    tts_transcode_concurrency: int = Field(
+        default=2, ge=1, le=8, json_schema_extra=_RESTART
+    )
+    tts_private_concurrency: int = Field(
+        default=2, ge=1, le=8, json_schema_extra=_RESTART
+    )
+    av_query_concurrency: int = Field(
+        default=3, ge=1, le=8, json_schema_extra=_RESTART
+    )
+
+    # --- 热读（每次动作现取）--------------------------------------------------
+    llm_stage_deadlines: dict[str, float] = Field(
+        default_factory=lambda: {
+            "decision": 35.0,
+            "moderation": 35.0,
+            "embed": 60.0,
+            "compress": 90.0,
+            "vision": 90.0,
+            "main": 120.0,
+            "skill": 120.0,
+            "synopsis": 20.0,
+            "group_summary": 15.0,
+        }
+    )
+    telegram_critical_admission_timeout_seconds: float = Field(
+        default=1.5, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_high_admission_timeout_seconds: float = Field(
+        default=4.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_normal_admission_timeout_seconds: float = Field(
+        default=15.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_privileged_timeout_seconds: float = Field(
+        default=8.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    pending_reply_timeout_seconds: float = Field(
+        default=45.0, ge=5.0, le=120.0, allow_inf_nan=False
+    )
+    admin_alert_window_seconds: float = Field(
+        default=600.0, ge=10.0, le=86_400.0, allow_inf_nan=False
+    )
+    admin_alert_aggregate_after: int = Field(default=5, ge=2, le=1000)
+    admin_alert_state_limit: int = Field(default=512, ge=16, le=65_536)
+    admin_alert_text_limit: int = Field(default=900, ge=100, le=4000)
+    moderation_throttle_burst: int = Field(default=3, ge=1, le=64)
+    moderation_throttle_spacing_seconds: float = Field(
+        default=4.0, ge=0.1, le=120.0, allow_inf_nan=False
+    )
+    moderation_throttle_max_wait_seconds: float = Field(
+        default=6.0, ge=0.1, le=120.0, allow_inf_nan=False
+    )
+    moderation_throttle_max_waiters: int = Field(default=3, ge=1, le=256)
+    tts_max_segments_per_message: int = Field(default=6, ge=1, le=20)
+    tts_transcode_timeout_seconds: float = Field(
+        default=30.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    tts_max_http_timeout_seconds: float = Field(
+        default=60.0, ge=5.0, le=600.0, allow_inf_nan=False
+    )
+    av_query_deadline_seconds: float = Field(
+        default=45.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    av_query_admission_timeout_seconds: float = Field(
+        default=2.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    av_star_name_cache_max: int = Field(default=512, ge=64, le=8192)
+    decision_history_token_budget: int = Field(default=8192, ge=512, le=1_000_000)
+    decision_history_max_messages: int = Field(default=80, ge=1, le=1000)
+    memory_max_facts_per_extraction: int = Field(default=6, ge=1, le=20)
+    memory_extract_input_token_limit: int = Field(
+        default=12_000, ge=512, le=200_000
+    )
+    memory_extract_scope_limit: int = Field(default=20, ge=1, le=200)
+    memory_candidate_row_limit: int = Field(default=200, ge=10, le=5000)
+    memory_private_group_fanout: int = Field(default=3, ge=1, le=20)
+    memory_tool_subject_daily_cap: int = Field(default=5, ge=1, le=200)
+    memory_maintenance_interval_seconds: int = Field(
+        default=21_600, ge=300, le=86_400
+    )
+    search_prune_interval_seconds: int = Field(default=21_600, ge=300, le=86_400)
+    search_record_recall_limit: int = Field(default=5, ge=1, le=50)
+    archive_batch_size: int = Field(default=8, ge=1, le=512)
+    archive_backfill_per_pass: int = Field(default=64, ge=1, le=5000)
+    archive_scan_limit: int = Field(default=4096, ge=100, le=100_000)
+    archive_candidate_limit: int = Field(default=64, ge=1, le=5000)
+    archive_query_timeout_seconds: float = Field(
+        default=8.0, ge=0.5, le=120.0, allow_inf_nan=False
+    )
+    archive_maintenance_interval_seconds: float = Field(
+        default=5.0, ge=0.5, le=600.0, allow_inf_nan=False
+    )
+    archive_indexing_lease_seconds: float = Field(
+        default=120.0, ge=5.0, le=3600.0, allow_inf_nan=False
+    )
+
+    @field_validator("llm_stage_deadlines", mode="before")
+    @classmethod
+    def _validate_stage_deadlines(cls, value: object) -> dict[str, float]:
+        if not isinstance(value, dict) or not value:
+            raise ValueError("LLM 阶段 deadline 必须是非空的 {阶段: 秒} 映射")
+        result: dict[str, float] = {}
+        for raw_stage, raw_seconds in value.items():
+            stage = str(raw_stage or "").strip()
+            if not stage or len(stage) > 32:
+                raise ValueError("LLM 阶段名非法")
+            try:
+                seconds = float(raw_seconds)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"阶段 {stage} 的 deadline 必须是秒数") from exc
+            if not 1.0 <= seconds <= 900.0:
+                raise ValueError(f"阶段 {stage} 的 deadline 必须在 1-900 秒之间")
+            result[stage] = seconds
+        return result
+
+    @model_validator(mode="after")
+    def _validate_reserved_capacity(self) -> "ResourceSettingsConfig":
+        """保留容量的不变式：关键名额 ≥1、背景 ≤ 普通 − 2、三级容量严格递减。"""
+
+        total = self.llm_request_capacity
+        noncritical = self.llm_request_noncritical_capacity
+        normal = self.llm_request_normal_capacity
+        background = self.llm_request_background_capacity
+        if not (1 <= background <= normal - 2):
+            raise ValueError("LLM 背景容量必须满足 1 ≤ background ≤ normal − 2")
+        if not (1 <= normal <= noncritical):
+            raise ValueError("LLM 普通容量必须满足 1 ≤ normal ≤ noncritical")
+        if not (1 <= noncritical < total):
+            raise ValueError("LLM 非关键容量必须满足 1 ≤ noncritical < total（至少留 1 个关键名额）")
+        if not (2 <= self.telegram_normal_capacity <= self.telegram_noncritical_capacity):
+            raise ValueError("Telegram 普通容量必须落在 2..noncritical 之间")
+        if not (
+            self.telegram_noncritical_capacity < self.telegram_total_capacity
+        ):
+            raise ValueError("Telegram 非关键容量必须小于总容量（至少留 1 个关键名额）")
+        if self.archive_indexing_lease_seconds < self.archive_query_timeout_seconds:
+            raise ValueError("归档索引租约不能短于查询 deadline，否则会重复写")
+        return self
+
+
 class LoggingSettingsConfig(StrictModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     third_party_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
@@ -817,6 +1318,16 @@ class RuntimeConfig(StrictModel):
     stickers: StickerSettingsConfig = Field(default_factory=StickerSettingsConfig)
     logging: LoggingSettingsConfig = Field(default_factory=LoggingSettingsConfig)
     prompts: PromptSettingsConfig = Field(default_factory=PromptSettingsConfig.defaults)
+    private_chat: PrivateChatSettingsConfig = Field(
+        default_factory=PrivateChatSettingsConfig
+    )
+    economy: EconomySettingsConfig = Field(default_factory=EconomySettingsConfig)
+    activity: ActivitySettingsConfig = Field(default_factory=ActivitySettingsConfig)
+    checkin_reminder: CheckinReminderSettingsConfig = Field(
+        default_factory=CheckinReminderSettingsConfig
+    )
+    display: DisplaySettingsConfig = Field(default_factory=DisplaySettingsConfig)
+    resources: ResourceSettingsConfig = Field(default_factory=ResourceSettingsConfig)
 
     @model_validator(mode="after")
     def _validate_model_references(self) -> RuntimeConfig:
@@ -1286,6 +1797,18 @@ class RuntimeConfig(StrictModel):
         settings.av_dmm_base_url = self.av.dmm_base_url
         settings.av_fc2_base_url = self.av.fc2_base_url
         settings.skill_sticker_file_ids = ",".join(self.stickers.fallback_file_ids)
+        settings.private_chat = PrivateChatPolicyConfig(
+            **self.private_chat.model_dump()
+        )
+        settings.economy = EconomyPolicyConfig(
+            **_economy_policy_payload(self.economy)
+        )
+        settings.activity = ActivityPolicyConfig(**self.activity.model_dump())
+        settings.checkin_reminder = CheckinReminderPolicyConfig(
+            **self.checkin_reminder.model_dump()
+        )
+        settings.display = DisplayPolicyConfig(**self.display.model_dump())
+        settings.resources = ResourcesPolicyConfig(**self.resources.model_dump())
         if apply_prompts:
             set_runtime_prompts(self.prompts.model_dump())
 
@@ -1727,6 +2250,8 @@ class RuntimeConfigManager:
                         )
 
             config.apply_to_settings(self.settings)
+            # 热更之后，所有没有依赖注入的服务都从这里现取快照。
+            policy_runtime.bind(self.settings)
             self._config = config
             self._revision = revision
             return config
@@ -1856,6 +2381,7 @@ class RuntimeConfigManager:
                 revision = expected + 1
 
             candidate.apply_to_settings(self.settings)
+            policy_runtime.bind(self.settings)
             self._config = candidate
             self._revision = revision
             await self._notify_applied(candidate)
@@ -1874,10 +2400,52 @@ class RuntimeConfigManager:
                 "database_url": _redact_database_url(self.settings.database_url),
                 "master_key_configured": self._cipher.configured,
             },
-            "restart_required_paths": [
-                "bot.parse_mode",
-            ],
+            "restart_required_paths": list(RESTART_REQUIRED_PATHS),
         }
+
+
+def _economy_policy_payload(config: EconomySettingsConfig) -> dict[str, Any]:
+    """运行时 ``economy`` 段 → ``bot.config.EconomyPolicyConfig`` 的入参。
+
+    读侧把奖池摊成 ``(payout, weight, label)`` 三元组（点服务里已有 ``LotteryPrize``
+    这样的 frozen dataclass，用元组可以避免两套结构互相 import）。
+    """
+
+    payload = config.model_dump()
+    payload["lottery_prizes"] = [
+        (prize.payout, prize.weight, prize.label) for prize in config.lottery_prizes
+    ]
+    return payload
+
+
+def _iter_model_fields(model: type[BaseModel], prefix: str = "") -> list[tuple[str, Any]]:
+    yield prefix.rstrip("."), model
+    for name, field in model.model_fields.items():
+        annotation = field.annotation
+        child_prefix = f"{prefix}{name}."
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            yield from _iter_model_fields(annotation, child_prefix)
+        else:
+            yield f"{prefix}{name}".rstrip("."), field
+
+
+def _restart_required_paths() -> list[str]:
+    """列出所有"改完必须重启"的字段路径（模块级 Semaphore / gate / Session）。
+
+    单一来源 = 字段自己的 ``json_schema_extra["reload_kind"]``；``bot.parse_mode``
+    是历史遗留（Bot 构造时固化），显式补上。返回值排序稳定，UI 与 API 都用它。
+    """
+
+    paths = {"bot.parse_mode"}
+    for name, field in _iter_model_fields(ResourceSettingsConfig, "resources."):
+        extra = field.json_schema_extra if isinstance(field, FieldInfo) else None
+        if isinstance(extra, dict) and extra.get("reload_kind") == "restart":
+            paths.add(name)
+    return sorted(paths)
+
+
+#: 需要重启才生效的字段（只含字段名，不含任何值）。
+RESTART_REQUIRED_PATHS: tuple[str, ...] = tuple(_restart_required_paths())
 
 
 def _redact_database_url(url: str) -> str:

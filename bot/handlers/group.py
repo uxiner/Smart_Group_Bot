@@ -41,7 +41,7 @@ from bot.db.models import (
     VoteBanSession,
 )
 from bot.db.sqlite_session import is_database_locked_error
-from bot.services import activity, group_context, memory_holder
+from bot.services import activity, group_context, memory_holder, policy_runtime
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.at_reply import is_at_reply_enabled
 from bot.services.authz import (
@@ -2797,24 +2797,30 @@ async def _send_review_handover(
     for extra in extra_lines:
         if str(extra).strip():
             lines.append(str(extra))
+    # 一次交接钉一份快照：正文与 mention 实体都从同一个 mention 串构造。
+    # 空值时**不**做任何 rfind —— ``rfind("")`` 会返回 0，凭空造一个假 mention。
+    mention = _review_handover_mention()
     lines.append("")
-    lines.append(
-        str(mention_tail)
-        if mention_tail
-        else f"请 {_REVIEW_HANDOVER_MENTION} 处理规则调整。"
-    )
+    if mention_tail:
+        lines.append(str(mention_tail))
+    elif mention:
+        lines.append(f"请 {mention} 处理规则调整。")
+    else:
+        lines.append("请人工审核侧处理规则调整。")
     text = "\n".join(lines)
-    mention_index = text.rfind(_REVIEW_HANDOVER_MENTION)
     entities = None
-    if mention_index >= 0:
-        offset = len(text[:mention_index].encode("utf-16-le")) // 2
-        entities = [
-            MessageEntity(
-                type="mention",
-                offset=offset,
-                length=len(_REVIEW_HANDOVER_MENTION),
-            )
-        ]
+    if mention:
+        mention_index = text.rfind(mention)
+        if mention_index >= 0:
+            # Telegram 的 entity offset 是 **UTF-16 code unit**，不是字符数。
+            offset = len(text[:mention_index].encode("utf-16-le")) // 2
+            entities = [
+                MessageEntity(
+                    type="mention",
+                    offset=offset,
+                    length=len(mention),
+                )
+            ]
     try:
         if entities is None:
             sent = await send_message(
@@ -3055,7 +3061,7 @@ async def _review_do_ban(
             violation=violation,
             header=_REVIEW_BAN_HEADER,
             extra_lines=(f"⚠️ 封禁未完成：{failure}", "无需调整规则。"),
-            mention_tail=f"请 {_REVIEW_HANDOVER_MENTION} 登记：无需调整规则。",
+            mention_tail=_handover_tail("登记"),
         )
         await callback.answer(f"封禁未完成：{failure}", show_alert=True)
         return
@@ -3076,7 +3082,7 @@ async def _review_do_ban(
         violation=violation,
         header=_REVIEW_BAN_HEADER,
         extra_lines=("已封禁并作废该成员的质询资格；无需调整规则。",),
-        mention_tail=f"请 {_REVIEW_HANDOVER_MENTION} 登记：无需调整规则。",
+        mention_tail=_handover_tail("登记"),
     )
     log.info(
         "manual review confirmed ban | violation=%s operator=%s target=%s",
@@ -6770,8 +6776,8 @@ async def _process_pending_reply_batch(
             decision_history = _exclude_batch_messages(
                 await memory.load_group_history_by_budget(
                     group_id,
-                    budget_tokens=group_context.DECISION_HISTORY_TOKEN_BUDGET,
-                    max_messages=group_context.DECISION_HISTORY_MAX_MESSAGES,
+                    budget_tokens=group_context.decision_history_budget()[0],
+                    max_messages=group_context.decision_history_budget()[1],
                 ),
                 memory_entries,
                 message_keys=batch_message_keys,
@@ -7558,9 +7564,16 @@ async def _await_hard_deadline(awaitable: Any, *, timeout_seconds: float) -> Any
 
 
 def _pending_reply_timeout_seconds(settings: Settings) -> float:
+    """一批待回复的硬预算（秒）。
+
+    群级 ``bot.reply_batch_timeout_seconds`` 仍然是第一优先（群管理员可配）；
+    它没配时用 ``resources.pending_reply_timeout_seconds``（默认 45 = 改造前）。
+    容量（并发闸门）是 restart 字段，这里只管超时。
+    """
+
     configured = getattr(settings.bot, "reply_batch_timeout_seconds", None)
     if configured is None:
-        return _PENDING_REPLY_DEFAULT_TIMEOUT_SECONDS
+        configured = _PENDING_REPLY_DEFAULT_TIMEOUT_SECONDS
     return min(120.0, max(5.0, float(configured)))
 
 
@@ -8394,6 +8407,18 @@ _ADMIN_ALERT_STATE_LIMIT = 512
 _ADMIN_ALERT_TEXT_LIMIT = 900
 
 
+def _admin_alert_limits() -> tuple[float, int, int, int]:
+    """管理员告警的 ``(窗口秒, 汇总阈值, 状态上限, 截断字数)``（现取配置）。"""
+
+    resources = policy_runtime.resources_policy()
+    return (
+        resources.admin_alert_window_seconds,
+        resources.admin_alert_aggregate_after,
+        resources.admin_alert_state_limit,
+        resources.admin_alert_text_limit,
+    )
+
+
 @dataclass(slots=True)
 class _AdminAlertState:
     events: deque = field(default_factory=deque)
@@ -8451,7 +8476,27 @@ _EVIDENCE_TITLE_ADMIN = "管理员违规 · 证据"
 _REVIEW_RELEASE_HEADER = "🟢 人工放行 · 待调整规则"
 _REVIEW_REVOKE_HEADER = "🔴 放行收回 · 无需调整"
 _REVIEW_BAN_HEADER = "🔴 确认封禁 · 判定准确"
-_REVIEW_HANDOVER_MENTION = "@Ming_GPT_bot"
+#: 审核交接时 @ 的对象。**默认空 = 不 @ 任何人**：公开 fork 开箱即用时不会
+#: @ 到任何人的 bot。部署者在 Mini App 审核面板 / ``PUT /api/v1/settings`` 写入
+#: ``moderation.review_handover_mention``（合法 Telegram 用户名）后热生效。
+_REVIEW_HANDOVER_MENTION = ""
+
+
+def _review_handover_mention() -> str:
+    """本次交接要 @ 的对象（空串 = 不 @，只发文案）。"""
+
+    return str(
+        policy_runtime.moderation_handover_policy().review_handover_mention or ""
+    ).strip()
+
+
+def _handover_tail(action: str) -> str:
+    """封禁场景的结尾句；有交接对象就 @，没有就只说动作。"""
+
+    mention = _review_handover_mention()
+    if mention:
+        return f"请 {mention} {action}：无需调整规则。"
+    return f"请人工审核侧{action}：无需调整规则。"
 _REVIEW_STATE_NONE = "none"
 _REVIEW_STATE_RELEASED = "released"
 _REVIEW_STATE_REVOKED = "revoked"
@@ -8490,9 +8535,9 @@ def _log_channel_enabled(settings: Settings) -> bool:
 def _admin_log_channel_id(settings: Settings) -> int:
     """证据频道 id。
 
-    配置里**默认就有**一个具体频道（见 ``bot/config.py`` 的 ``log_channel_id``），
-    所以"取不到 id"只在两种情况下发生：显式配成 0，或老 payload 里没有这个键。
-    这两种都按"未配置"处理 → 频道投递不可用，回退私聊老路径。
+    **默认 0 = 未配置**（见 ``bot/config.py`` 的 ``log_channel_id``）：公开 fork
+    开箱即用时不会向任何频道投递命中证据。老 payload 里没有这个键时同样取不到 id。
+    这两种都按"未配置"处理 → 频道投递不可用，回退私聊最高管理员的老路径。
     """
 
     moderation = getattr(settings, "moderation", None)
@@ -8741,7 +8786,9 @@ def _admin_alert_attachment(message: Message) -> tuple[str, str] | None:
     return None
 
 
-def _truncate_alert_text(text: object, *, limit: int = _ADMIN_ALERT_TEXT_LIMIT) -> str:
+def _truncate_alert_text(text: object, *, limit: int | None = None) -> str:
+    if limit is None:
+        limit = _admin_alert_limits()[3]
     clean = str(text or "").strip()
     if len(clean) <= limit:
         return clean
@@ -8757,21 +8804,22 @@ def _admin_alert_aggregation(
     汇总，之后窗口内不再逐条发；窗口清空后自动恢复逐条提醒。
     """
 
+    window_seconds, aggregate_after, state_limit, _ = _admin_alert_limits()
     key = (int(group_id), int(user_id))
     moment = time.monotonic() if now is None else float(now)
     state = _ADMIN_ALERT_STATE.get(key)
     if state is None:
-        if len(_ADMIN_ALERT_STATE) >= _ADMIN_ALERT_STATE_LIMIT:
+        if len(_ADMIN_ALERT_STATE) >= state_limit:
             _ADMIN_ALERT_STATE.clear()
         state = _AdminAlertState()
         _ADMIN_ALERT_STATE[key] = state
-    while state.events and moment - state.events[0] > _ADMIN_ALERT_WINDOW_SECONDS:
+    while state.events and moment - state.events[0] > window_seconds:
         state.events.popleft()
     if not state.events:
         state.summary_sent = False
     state.events.append(moment)
     count = len(state.events)
-    if count > _ADMIN_ALERT_AGGREGATE_AFTER:
+    if count > aggregate_after:
         if state.summary_sent:
             return False, 0
         state.summary_sent = True
@@ -8856,7 +8904,7 @@ def _render_admin_violation_summary(
         summary=[
             card_field(
                 "提示",
-                f"10 分钟内 ≥{_ADMIN_ALERT_AGGREGATE_AFTER + 1} 次，已合并为汇总；"
+                f"{int(_admin_alert_limits()[0] // 60)} 分钟内 ≥{_admin_alert_limits()[1] + 1} 次，已合并为汇总；"
                 "窗口内的后续违规不再逐条私聊。",
             )
         ],

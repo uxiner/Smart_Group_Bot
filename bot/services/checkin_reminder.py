@@ -38,9 +38,10 @@ from bot.db.models import (
     MemberCheckin,
     TelegramDeleteJob,
 )
+from bot.services import policy_runtime
 from bot.services.checkin import (
-    CHECKIN_BUTTON_TEXT,
     CHECKIN_CALLBACK_DATA,
+    checkin_button_text,
     local_today,
 )
 from bot.utils.timezone import now_shanghai_naive
@@ -85,6 +86,35 @@ TELEGRAM_MESSAGE_MAX_CHARS = 4096
 CHECKIN_ROSTER_EMPTY_TEXT = "还没有人签到，来抢第一个 ☝️"
 
 
+def _rem():
+    """当前生效的签到提醒快照（默认 = 改造前逐字相同）。"""
+
+    return policy_runtime.checkin_reminder_policy()
+
+
+def reminder_slots() -> tuple[int, ...]:
+    """当前允许的提醒时段（本地小时）。
+
+    **这只约束「命令/CLI 接受哪些 --slot」**；真正"几点发"由**外部 cron** 决定
+    （``bot/tools/checkin_reminder.py`` 的 docstring 里有样例 crontab）。改了这里
+    不会让 cron 自己改时间，必须同步改 crontab——见 docs/configuration.md。
+    """
+
+    return _rem().slots
+
+
+def reminder_auto_delete_seconds() -> int:
+    """提醒发出后多久自动删除（0 = 不自动删）。"""
+
+    return _rem().auto_delete_seconds
+
+
+def shop_button_text() -> str:
+    """商店按钮文字（可配文案；``shop_`` start payload 是协议常量，不可配）。"""
+
+    return policy_runtime.display_policy().shop_button_text or SHOP_BUTTON_TEXT
+
+
 def normalize_slot(slot: object) -> int | None:
     """把时段收敛成 9/12/15/18；非法（含 None、"abc"）返回 None。"""
 
@@ -92,7 +122,7 @@ def normalize_slot(slot: object) -> int | None:
         value = int(slot)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    return value if value in REMINDER_SLOTS else None
+    return value if value in reminder_slots() else None
 
 
 def slot_key(day: date, slot: int) -> str:
@@ -121,7 +151,7 @@ def render_checkin_roster(*, checked_in: int, names: Sequence[str] = ()) -> str:
     total = max(total, len(listed))
     if not listed:
         return "" if total > 0 else CHECKIN_ROSTER_EMPTY_TEXT
-    shown = listed[:CHECKIN_ROSTER_MAX_NAMES]
+    shown = listed[: _rem().roster_max_names]
     body = "、".join(escape(name) for name in shown)
     hidden = total - len(shown)
     if hidden > 0:
@@ -160,7 +190,9 @@ def render_checkin_reminder(
     """
 
     normalized = normalize_slot(slot)
-    greeting = SLOT_GREETINGS.get(normalized if normalized is not None else 0, "你好")
+    greeting = (
+        _rem().greeting_for(normalized if normalized is not None else 0) or "你好"
+    )
     roster = tuple(names)
     text = _compose_checkin_reminder(
         greeting=greeting, checked_in=checked_in, names=roster
@@ -222,13 +254,15 @@ def build_checkin_reminder_keyboard(
 
     buttons = [
         InlineKeyboardButton(
-            text=CHECKIN_BUTTON_TEXT,
+            text=checkin_button_text(),
             callback_data=CHECKIN_CALLBACK_DATA,
         )
     ]
     url = shop_deep_link(bot_username=bot_username, group_id=group_id)
     if url:
-        buttons.append(InlineKeyboardButton(text=SHOP_BUTTON_TEXT, url=url))
+        buttons.append(
+            InlineKeyboardButton(text=shop_button_text(), url=url)
+        )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
@@ -267,7 +301,7 @@ async def today_checkin_roster(
     *,
     group_id: int,
     day: date | None = None,
-    limit: int = CHECKIN_ROSTER_MAX_NAMES,
+    limit: int | None = None,
 ) -> CheckinRoster:
     """今天本群的签到人数 + 昵称名单（一次查全，渲染层不用自己拼）。
 
@@ -282,6 +316,7 @@ async def today_checkin_roster(
       ``render_checkin_roster`` 折成「…等 N 人」）。
     """
 
+    limit = _rem().roster_max_names if limit is None else int(limit)
     today = (day or local_today()).isoformat()
     gid = int(group_id)
     count = await count_checkins_today(session, group_id=gid, day=day)
@@ -358,7 +393,7 @@ STALE_REMINDER_GRACE_SECONDS = 15 * 60
 async def reap_stale_reminder_slots(
     session: AsyncSession,
     *,
-    grace_seconds: int = STALE_REMINDER_GRACE_SECONDS,
+    grace_seconds: int | None = None,
     now: Any | None = None,
 ) -> list[tuple[int, str]]:
     """清理「claim 了但从没送达」的空占位，返回被释放的 ``(group_id, slot_key)``。
@@ -368,6 +403,10 @@ async def reap_stale_reminder_slots(
     这样「刚 claim 正在发」的行不会被误删。腾出来的时段会在同一轮里被
     :func:`claim_reminder_slot` 正常认领并补发。
     """
+
+    grace_seconds = (
+        _rem().stale_grace_seconds if grace_seconds is None else int(grace_seconds)
+    )
 
     stamp = now or now_shanghai_naive()
     cutoff = stamp - timedelta(seconds=max(0, int(grace_seconds)))

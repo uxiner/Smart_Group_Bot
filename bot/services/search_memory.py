@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterable
 from sqlalchemy import delete, select
 
 from bot.db.models import SearchResultRecord
+from bot.services import policy_runtime
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -108,6 +109,20 @@ SEARCH_RECORDS_BLOCK = "[SEARCH_RECORDS]"
 
 #: 留存清理的巡检间隔（秒），与私聊历史巡检同一节奏（一天几次足够）。
 _SEARCH_PRUNE_INTERVAL_SECONDS = 6 * 3600
+
+
+def search_memory_limits() -> dict[str, int]:
+    """检索留档的运维参数（现取配置，默认与模块常量逐字相同）。
+
+    注意：幂等时间窗（``SEARCH_RECORD_IDEMPOTENCY_WINDOW_SECONDS``）**不在这里**。
+    它决定"两次同样的查询算不算同一次"，属于正确性不变式，不提供开关。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "recall_limit": resources.search_record_recall_limit,
+        "prune_interval_seconds": resources.search_prune_interval_seconds,
+    }
 
 #: 价格类信号（决定 kind=price）
 _PRICE_RE = re.compile(
@@ -548,7 +563,7 @@ async def load_search_records(
     *,
     scope: str,
     scope_id: int,
-    limit: int = SEARCH_RECORD_RECALL_LIMIT,
+    limit: int | None = None,
     now: Any | None = None,
     max_age_days: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -561,7 +576,13 @@ async def load_search_records(
 
     normalized_scope = normalize_scope(scope)
     sid = int(scope_id)
-    count = max(1, min(50, int(limit)))
+    count = max(
+        1,
+        min(
+            50,
+            int(limit if limit is not None else search_memory_limits()["recall_limit"]),
+        ),
+    )
     stamp = now or now_shanghai_naive()
     days = (
         bounded_search_record_retention_days(max_age_days)
@@ -760,7 +781,7 @@ def render_search_records_block(
     *,
     now: Any | None = None,
     windows: dict[str, int] | None = None,
-    max_records: int = SEARCH_RECORD_RECALL_LIMIT,
+    max_records: int | None = None,
     digest_max_chars: int = SEARCH_RECORD_DIGEST_MAX_CHARS,
 ) -> str:
     """把留档渲染成注入用的资料块；没有留档时返回空串。
@@ -774,9 +795,14 @@ def render_search_records_block(
     items = [item for item in (records or []) if isinstance(item, dict)]
     if not items:
         return ""
+    keep = (
+        max_records
+        if max_records is not None
+        else search_memory_limits()["recall_limit"]
+    )
     table = windows or DEFAULT_FRESHNESS_HOURS
     body: list[str] = []
-    for item in items[-max(1, int(max_records)) :]:
+    for item in items[-max(1, int(keep)) :]:
         body.extend(
             _record_lines(
                 item,
@@ -793,7 +819,7 @@ def render_search_record_messages(
     *,
     now: Any | None = None,
     windows: dict[str, int] | None = None,
-    max_records: int = SEARCH_RECORD_RECALL_LIMIT,
+    max_records: int | None = None,
     digest_max_chars: int = SEARCH_RECORD_DIGEST_MAX_CHARS,
 ) -> list[dict[str, Any]]:
     """把留档渲染成**一条留档一条消息**（不含头部）。
@@ -850,7 +876,7 @@ async def run_search_record_maintenance(
     session_factory: Any,
     *,
     retention_days_getter: Callable[[], int] | None = None,
-    interval_seconds: float = _SEARCH_PRUNE_INTERVAL_SECONDS,
+    interval_seconds: float | None = None,
 ) -> None:
     """常驻巡检：按保留期清理检索留档（与私聊历史巡检同一套路）。
 
@@ -858,7 +884,14 @@ async def run_search_record_maintenance(
     所以运行时改了配置下一轮就生效。
     """
 
-    interval = max(60.0, float(interval_seconds))
+    interval = max(
+        60.0,
+        float(
+            interval_seconds
+            if interval_seconds is not None
+            else search_memory_limits()["prune_interval_seconds"]
+        ),
+    )
     while True:
         try:
             days = (

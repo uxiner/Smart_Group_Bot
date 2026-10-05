@@ -78,6 +78,13 @@ from bot.services.runtime_config import (
     turnstile_key_configuration_issue,
 )
 from bot.services.scheduled_messages import ScheduledMessageService
+from bot.services.archive_vector import archive_limits
+from bot.services.search_memory import search_memory_limits
+from bot.services.long_term_memory import memory_limits
+from bot.services.startup_resources import (
+    StartupResourceBusy,
+    apply_startup_resources,
+)
 from bot.services.skills.service import flush_skill_execution_tasks
 from bot.services.telegram_cleanup import TelegramCleanupScheduler
 from bot.services.vote_ban import flush_vote_ban_tasks, restore_vote_ban_tasks
@@ -460,6 +467,16 @@ async def _initialize_runtime_services(
     )
     await runtime_config.initialize()
     configure_logging(force=True, config=runtime_config.config.logging)
+    # 进程级资源（并发闸门 / 保留容量 / tokenizer 槽位）在**这里**按保存下来的
+    # 配置装配一次。必须排在模型元数据预取、建 Bot、任何收发消息之前：这些闸门
+    # 一旦握着 slot 就不能热替换（有活动请求时 apply_startup_resources 会直接
+    # 抛 StartupResourceBusy，而不是硬拆闸门）。改完这些字段需要重启才生效，
+    # 字段名见 api_document()["restart_required_paths"]。
+    try:
+        apply_startup_resources(runtime_config.config)
+    except StartupResourceBusy as exc:
+        log.error("启动资源装配被拒绝：%s", exc)
+        raise
 
     llm = LLMService(
         settings.bot.main_model,
@@ -513,8 +530,10 @@ async def _initialize_runtime_services(
             # batch can wait several seconds.  The built-in 2.5s query deadline
             # silently returned zero hits; 8s keeps recall reliable while the
             # indexer is busy, and smaller batches keep each wait short.
-            query_timeout_seconds=8.0,
-            batch_size=8,
+            # 这两个值现在是 ``resources.archive_*``（默认仍是 8.0 / 8，与本部署
+            # 改造前逐字相同），schema 校验保证租约不短于查询 deadline。
+            query_timeout_seconds=float(archive_limits()["query_timeout_seconds"]),
+            batch_size=int(archive_limits()["batch_size"]),
         )
         if settings.bot.memory_recall_enabled
         else None
@@ -1008,6 +1027,9 @@ async def main() -> None:
                     retention_days_getter=lambda: search_record_retention_days(
                         settings
                     ),
+                    interval_seconds=float(
+                        search_memory_limits()["prune_interval_seconds"]
+                    ),
                 ),
                 name="search-record-maintenance",
             )
@@ -1031,6 +1053,9 @@ async def main() -> None:
                     session_factory,
                     retention_days_getter=lambda: memory_deleted_retention_days(
                         settings
+                    ),
+                    interval_seconds=float(
+                        memory_limits()["maintenance_interval_seconds"]
                     ),
                 ),
                 name="long-term-memory-maintenance",

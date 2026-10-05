@@ -40,6 +40,7 @@ from bot.services.payload_fit import (
     fit_messages_to_input_budget,
     strip_internal_message_keys,
 )
+from bot.services import policy_runtime
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -2001,7 +2002,27 @@ class LLMService:
         override = float(getattr(cfg, "total_deadline_sec", 0.0) or 0.0)
         if override > 0:
             return override
-        return _LLM_STAGE_DEADLINES.get(label, 120.0)
+        return stage_deadline_seconds(label)
+
+
+def stage_deadline_seconds(label: str) -> float:
+    """某个阶段的默认总预算（秒）。
+
+    单一来源 = ``runtime_config.resources.llm_stage_deadlines``（默认表与改造前
+    逐字相同：decision/moderation 35、embed 60、compress/vision 90、main/skill 120、
+    synopsis 20、group_summary 15）。每次调用现取，所以改表立刻对下一次调用生效。
+    未登记的阶段沿用 ``main`` 的量级（120s），不会凭空多出第三份默认值。
+    """
+
+    configured = policy_runtime.resources_policy().llm_stage_deadlines
+    value = configured.get(str(label))
+    if value is None:
+        value = configured.get("main", 120.0)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):  # pragma: no cover - schema 已挡掉
+        return 120.0
+    return seconds if seconds > 0 else 120.0
 
     @staticmethod
     def _circuit_key(

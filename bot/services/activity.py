@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import MemberActivityDaily, MemberPointAward
 from bot.db.sqlite_session import is_database_locked_error
+from bot.services import policy_runtime
 from bot.services.checkin import local_today
 from bot.utils.timezone import now_shanghai_naive
 
@@ -72,13 +73,24 @@ AWARD_REASON_WEEKLY_ACTIVITY = "weekly_activity"
 AWARD_REF_PREFIX = "weekly-activity"
 
 
-def reward_points_for_rank(rank: int) -> int:
-    """第 N 名能拿多少分；不在这 10 名里返回 0。"""
+def _act():
+    """当前生效的活跃激励快照（默认 = 改造前逐字相同）。"""
 
+    return policy_runtime.activity_policy()
+
+
+def reward_points_for_rank(rank: int) -> int:
+    """第 N 名能拿多少分；不在奖励向量长度之内返回 0。
+
+    奖励向量是唯一起点：榜单长度 (``weekly_top_n``) 与周总额
+    (``weekly_total_points``) 都由它派生，不再单独存一份会互相矛盾的值。
+    """
+
+    policy = _act()
     position = int(rank)
-    if position < 1 or position > WEEKLY_TOP_N:
+    if position < 1 or position > policy.weekly_top_n:
         return 0
-    return HEAD_REWARD_POINTS.get(position, TAIL_REWARD_POINTS)
+    return policy.weekly_reward_points[position - 1]
 
 
 def activity_score(*, messages: int, active_days: int, replies_received: int) -> int:
@@ -88,9 +100,13 @@ def activity_score(*, messages: int, active_days: int, replies_received: int) ->
 
 
 def meets_threshold(*, messages: int, active_days: int) -> bool:
-    """参与门槛：至少活跃 3 天且累计发言 10 条。"""
+    """参与门槛：至少活跃 N 天且累计发言 M 条。"""
 
-    return int(active_days) >= MIN_ACTIVE_DAYS and int(messages) >= MIN_WEEKLY_MESSAGES
+    policy = _act()
+    return (
+        int(active_days) >= policy.min_active_days
+        and int(messages) >= policy.min_weekly_messages
+    )
 
 
 def is_countable_message(
@@ -112,7 +128,7 @@ def is_countable_message(
     if str(message_type or "").strip().lower() != COUNTED_MESSAGE_TYPE:
         return False
     body = str(text or "").strip()
-    if len(body) < MIN_MESSAGE_TEXT_LENGTH:
+    if len(body) < _act().min_message_text_length:
         return False
     # 命令（/rank、/me …）不是聊天内容
     if body.startswith("/"):
@@ -142,7 +158,7 @@ async def _upsert_daily(
     ``min(x, 20)`` 交给 SQLite 算，读取和写入之间没有可以被插队的窗口。
     """
 
-    added_messages = max(0, min(int(messages), MAX_DAILY_MESSAGES))
+    added_messages = max(0, min(int(messages), _act().max_daily_messages))
     added_replies = max(0, int(replies_received))
     stamp = updated_at or now_shanghai_naive()
     values: dict[str, object] = {
@@ -158,7 +174,7 @@ async def _upsert_daily(
     updates: dict[str, object] = {
         # 当天的 20 条上限就在这里生效：第 21 条之后 messages 不再增长
         "messages": func.min(
-            MemberActivityDaily.messages + added_messages, MAX_DAILY_MESSAGES
+            MemberActivityDaily.messages + added_messages, _act().max_daily_messages
         ),
         "replies_received": MemberActivityDaily.replies_received + added_replies,
         "updated_at": stamp,
@@ -492,7 +508,7 @@ def rank_week(
     scored.sort(key=lambda item: (-item.score, -item.messages, item.user_id))
     return [
         replace(item, rank=position, points=reward_points_for_rank(position))
-        for position, item in enumerate(scored[:WEEKLY_TOP_N], start=1)
+        for position, item in enumerate(scored[: _act().weekly_top_n], start=1)
     ]
 
 

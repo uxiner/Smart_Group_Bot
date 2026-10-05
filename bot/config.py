@@ -371,22 +371,25 @@ class ModerationConfig(BaseModel):
     # 的命中都单独发一条完整证据卡（带「人工放行 / 放行收回」按钮）。默认开启；
     # 关掉后回到私聊最高管理员的老路径（含 10 分钟聚合抑制）。
     log_channel_enabled: bool = True
-    # 证据频道 id。**默认值就是下面那个频道**（有意为之，不是占位符）；把「未配置」
-    # 的语义留给 0：``_admin_log_channel_id`` 把 0 视为"不可用"，此时频道投递整体
-    # 关闭、回退私聊最高管理员的老路径（含 10 分钟聚合抑制）。
+    # 证据频道 id。**默认 0 = 未配置**：公开 fork 开箱即用时不会向任何频道（含
+    # 任何私人频道）投递命中证据，回退私聊最高管理员的老路径（含 10 分钟聚合抑制）。
+    # 部署者用 Mini App 审核面板 / ``PUT /api/v1/settings`` 显式写入后热生效。
     #
     # 覆盖入口（按代码实际能力，与 README 的披露一致）：
     #   * 运行时配置（**主要入口**）：Mini App 后端 ``PUT /api/v1/settings``，
     #     body ``{"config": {"moderation": {"log_channel_id": <id>}}, "revision": <n>}``，
     #     落库到 ``runtime_config`` 表并热生效（``apply_to_settings``）。
-    #     注意 Mini App 界面**目前没有**这个控件，需要用 API 或直接改库。
     #   * ``config.toml`` 的 ``[moderation]`` 段：**仅**在 ``runtime_config`` 行还不
     #     存在时做一次性导入（之后该文件被忽略）。
     #   * 环境变量：**无效**。``ModerationConfig`` 是普通 ``BaseModel``，``Settings``
     #     没有 ``env_nested_delimiter``，也没有扁平的 ``moderation_log_channel_id``
     #     字段，所以 ``MODERATION__LOG_CHANNEL_ID`` 读不到（tests/
     #     test_moderation_log_channel_docs.py 把这条钉住）。
-    log_channel_id: int = -1004337744233
+    log_channel_id: int = 0
+    # 审核规则交接时 @ 的对象（人工审核侧的对端 bot / 管理员）。**默认空 = 不 @ 任何人**，
+    # 只发交接文案；空值时绝不构造 mention 实体（否则会退化成 ``rfind('')`` 那种
+    # "凭空造一个假 mention"的 bug）。必须是合法 Telegram 用户名。
+    review_handover_mention: str = ""
     # 证据卡上的「人工放行 / 确认封禁」必须**按两次**才生效：两次点击的间隔必须
     # <= 该窗口（秒），第一次点击只 arm（落库 pending_action/pending_at），第二次
     # 同键点击才真正执行。窗口过期后重新按两次。默认 300 秒。
@@ -402,6 +405,341 @@ class ModerationConfig(BaseModel):
     # 作用域与整形闸一致：只作用于**成员触发**的送审；申诉复核 / 资料巡检 / 入群
     # 筛查 / /report 这些人工与低频路径不受影响（否则一次人工复核可能被刷屏挤掉）。
     llm_call_cap_per_hour: int = 0
+
+
+class PrivateChatPolicyConfig(BaseModel):
+    """1 对 1 私聊的运营参数（热生效）。
+
+    这一段是 ``runtime_config`` 里 ``private_chat`` 段的**读侧视图**：
+    ``RuntimeConfig.apply_to_settings()`` 用保存后的值整体替换本对象，模块级
+    消费者（``bot.services.private_chat`` / ``bot.handlers.private_chat`` /
+    ``bot.services.dm_search``）在**每次动作开始时**现取一个不可变快照。
+
+    字段默认值必须与 ``bot.services.runtime_config.PrivateChatSettingsConfig``
+    的默认值逐个相等——``tests/test_configurable_policy_catalog.py`` 会钉住这条
+    不变式（两边不一致会让"没绑定运行时配置的进程"跑出另一套口径）。
+    """
+
+    #: 普通成员：每人每天的私聊条数上限
+    per_user_daily_limit: int = 100
+    #: 群管理员：每人每天的私聊条数上限
+    admin_per_user_daily_limit: int = 500
+    #: 普通成员：全网合计的每日上限（独立档位，不占管理员额度）
+    global_daily_limit: int = 20_000
+    #: 群管理员：全网合计的每日上限（独立档位，不占普通成员额度）
+    admin_global_daily_limit: int = 100_000
+    #: 单条私聊正文的长度上限（字符）
+    input_max_chars: int = 1000
+    #: 单条机器人回复的分片长度上限（字符，上界受 Telegram 4096 协议限制）
+    reply_max_chars: int = 3800
+    #: 视觉识别的总预算（秒）
+    vision_budget_seconds: float = 30.0
+    #: 内存兜底缓冲保留的对话轮数（读库失败时用，进程重启即空）
+    memory_turns: int = 12
+    #: 成员准入结果的缓存 TTL（秒）。**上界 60 = 不放大越权窗口**：调大等于让
+    #: 已被移出授权群的人继续用私聊，所以只允许调小。
+    access_ttl_seconds: float = 60.0
+    #: 私聊联网检索的每日全局保险丝（次）
+    search_daily_limit: int = 2000
+    #: 一条私聊回复最多合成几段语音
+    voice_max_segments: int = 6
+
+
+class EconomyPolicyConfig(BaseModel):
+    """签到 / 积分商店的运营参数（热生效，一份快照走完整条交易）。"""
+
+    #: 连续签到每日奖励的封顶分
+    checkin_daily_point_cap: int = 10
+    #: 积分榜默认展示的名次数
+    checkin_rank_limit: int = 10
+    #: 档案里"近 N 天被审核命中"的统计窗口（天）
+    checkin_violation_window_days: int = 30
+    #: 免除一次审核质询要花的积分。**下界 1**：0 会变成"免费绕过质询"。
+    challenge_skip_cost: int = 2
+
+    #: 头衔 7 天档价格 / 时长
+    tag_price_7d: int = 30
+    tag_days_7d: int = 7
+    #: 头衔 30 天档价格 / 时长
+    tag_price_30d: int = 80
+    tag_days_30d: int = 30
+    #: 置顶的价格 / 时长
+    pin_price: int = 20
+    pin_hours: int = 6
+    #: 抽奖的单次价格 / 每日次数上限
+    lottery_price: int = 5
+    lottery_daily_limit: int = 10
+    #: 奖池：``(payout, weight, label)``。``weight`` 是相对权重，整表权重之和
+    #: 由 ``LotteryPrizeConfig`` 列表求和得到——不另存"总权重"以免两个来源打架。
+    lottery_prizes: list[tuple[int, int, str]] = [
+        (0, 3900, "谢谢参与"),
+        (3, 2000, "3 分"),
+        (5, 1600, "5 分"),
+        (8, 1000, "8 分"),
+        (12, 1000, "12 分"),
+        (40, 400, "40 分"),
+        (100, 100, "100 分"),
+    ]
+    #: 头衔文字的协议长度上限（Telegram 原生 16，不可放开）
+    tag_max_length: int = 16
+
+    #: 到期权益撤销扫描的间隔 / 单轮 deadline / 单轮批量 / 失败重推间隔
+    expiry_check_seconds: float = 300.0
+    expiry_pass_deadline_seconds: float = 120.0
+    expiry_batch_limit: int = 200
+    expiry_retry_seconds: float = 900.0
+
+
+class ActivityPolicyConfig(BaseModel):
+    """每周活跃激励的运营参数（热生效；结算时取一次快照）。"""
+
+    #: 有效发言的最小长度（去空白后按字符数）
+    min_message_text_length: int = 2
+    #: 每天累计有效发言的封顶（写入时封顶，防刷屏）
+    max_daily_messages: int = 20
+    #: 参与门槛：活跃天数 / 发言条数
+    min_active_days: int = 3
+    min_weekly_messages: int = 10
+    #: 每周榜单的奖励向量：下标 0 = 第 1 名。榜单长度与周奖励总额**都从这里派生**
+    #: （``top_n = len(vector)``、``total = sum(vector)``），不再单独存一份。
+    weekly_reward_points: list[int] = [25, 12, 12, 4, 4, 4, 4, 4, 4, 4]
+
+
+class CheckinReminderPolicyConfig(BaseModel):
+    """签到提醒的运营参数（热生效；渲染时取一次快照）。"""
+
+    #: 每天的提醒时段（本地小时，Asia/Shanghai）
+    slots: list[int] = [9, 12, 15, 18]
+    #: 每个时段的开场白；键必须落在 ``slots`` 里
+    slot_greetings: dict[int, str] = {
+        9: "早上好",
+        12: "中午好",
+        15: "下午好",
+        18: "晚上好",
+    }
+    #: 提醒发出后多久自动删除（秒；0 = 不自动删除）
+    auto_delete_seconds: int = 600
+    #: 名单最多列出的昵称个数
+    roster_max_names: int = 20
+    #: "今天已签到"回执的过期宽限（秒）
+    stale_grace_seconds: int = 900
+
+
+class DisplayPolicyConfig(BaseModel):
+    """用户可见的品牌与文案（热生效）。协议标识（callback_data / start payload）不在这里。"""
+
+    #: 对外显示名。用在检索查询词的称呼剥离、群公告签名等中性位置。
+    bot_display_name: str = "助手"
+    #: 私聊语音条上的标题
+    private_voice_title: str = "语音回复"
+    #: 签到按钮的文字（callback_data 固定为 ``checkin:v1``，不可配）
+    checkin_button_text: str = "✅ 一键签到"
+    #: 商店按钮的文字（start payload 前缀 ``shop_`` 固定，不可配）
+    shop_button_text: str = "🛒 积分商店"
+    #: 联网检索时从问句里剥掉的称呼前缀（会额外并入 ``bot_display_name``）
+    search_query_prefixes: list[str] = ["诶", "嗯哼", "呀", "欸"]
+    #: 私聊的固定提示文案（默认逐字等于改造前的模块常量）
+    private_not_member_notice: str = (
+        "抱歉，私聊只对已授权的群里成员开放。\n"
+        "如果你是群成员，请先在群里发一条消息，再回来私聊我试试。"
+    )
+    private_limit_notice: str = "今天聊得有点多啦，先休息一下——明天再继续吧。"
+    private_global_limit_notice: str = "今天找我聊天的人有点多，我有点跟不上了，明天再聊吧。"
+    private_media_unsupported_notice: str = (
+        "私聊里我目前只能看文字和图片，视频/文件/语音还看不了。"
+    )
+
+
+class ResourcesPolicyConfig(BaseModel):
+    """高级资源与进程级预算（读侧视图）。
+
+    唯一存储源仍是 ``runtime_config.resources``。注意这里的"读"分两种：
+    **热读**字段（超时 / 批量 / 阈值）每次动作现取；**启动装配**字段
+    （并发闸门 / 保留容量）只在启动时装配一次，改完必须重启——见
+    ``bot.services.startup_resources`` 与 ``RESTART_REQUIRED_PATHS``。
+    """
+
+
+    """高级资源与进程级预算。
+
+    这里是"进程资源"而不是"运营参数"：默认全部等于今天真实生效的值，不配就
+    逐字等于改造前。生效时机分两种，见 ``bot.services.startup_resources``：
+
+    * ``json_schema_extra["reload_kind"] == "restart"``：模块级 Semaphore /
+      gate / aiohttp Session 在 import 或建 Bot 时固化，**只在启动时装配一次**；
+      改完必须重启，API 与 UI 会回 ``restart_fields``。
+    * ``hot``：每次动作现取（超时、批量、阈值这类），改完下一次动作生效。
+    """
+
+    # --- 启动时装配（restart） -------------------------------------------------
+    llm_request_capacity: int = Field(
+        default=8, ge=2, le=64
+    )
+    llm_request_noncritical_capacity: int = Field(
+        default=7, ge=1, le=64
+    )
+    llm_request_normal_capacity: int = Field(
+        default=4, ge=1, le=64
+    )
+    llm_request_background_capacity: int = Field(
+        default=2, ge=1, le=64
+    )
+    llm_tokenizer_concurrency: int = Field(
+        default=2, ge=1, le=8
+    )
+    telegram_total_capacity: int = Field(
+        default=64, ge=8, le=512
+    )
+    telegram_noncritical_capacity: int = Field(
+        default=60, ge=4, le=512
+    )
+    telegram_normal_capacity: int = Field(
+        default=44, ge=2, le=512
+    )
+    pending_reply_execution_capacity: int = Field(
+        default=4, ge=1, le=32
+    )
+    tts_synthesis_concurrency: int = Field(
+        default=3, ge=1, le=8
+    )
+    tts_transcode_concurrency: int = Field(
+        default=2, ge=1, le=8
+    )
+    tts_private_concurrency: int = Field(
+        default=2, ge=1, le=8
+    )
+    av_query_concurrency: int = Field(
+        default=3, ge=1, le=8
+    )
+
+    # --- 热读（每次动作现取）--------------------------------------------------
+    llm_stage_deadlines: dict[str, float] = Field(
+        default_factory=lambda: {
+            "decision": 35.0,
+            "moderation": 35.0,
+            "embed": 60.0,
+            "compress": 90.0,
+            "vision": 90.0,
+            "main": 120.0,
+            "skill": 120.0,
+            "synopsis": 20.0,
+            "group_summary": 15.0,
+        }
+    )
+    telegram_critical_admission_timeout_seconds: float = Field(
+        default=1.5, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_high_admission_timeout_seconds: float = Field(
+        default=4.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_normal_admission_timeout_seconds: float = Field(
+        default=15.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    telegram_privileged_timeout_seconds: float = Field(
+        default=8.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    pending_reply_timeout_seconds: float = Field(
+        default=45.0, ge=5.0, le=120.0, allow_inf_nan=False
+    )
+    admin_alert_window_seconds: float = Field(
+        default=600.0, ge=10.0, le=86_400.0, allow_inf_nan=False
+    )
+    admin_alert_aggregate_after: int = Field(default=5, ge=2, le=1000)
+    admin_alert_state_limit: int = Field(default=512, ge=16, le=65_536)
+    admin_alert_text_limit: int = Field(default=900, ge=100, le=4000)
+    moderation_throttle_burst: int = Field(default=3, ge=1, le=64)
+    moderation_throttle_spacing_seconds: float = Field(
+        default=4.0, ge=0.1, le=120.0, allow_inf_nan=False
+    )
+    moderation_throttle_max_wait_seconds: float = Field(
+        default=6.0, ge=0.1, le=120.0, allow_inf_nan=False
+    )
+    moderation_throttle_max_waiters: int = Field(default=3, ge=1, le=256)
+    tts_max_segments_per_message: int = Field(default=6, ge=1, le=20)
+    tts_transcode_timeout_seconds: float = Field(
+        default=30.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    tts_max_http_timeout_seconds: float = Field(
+        default=60.0, ge=5.0, le=600.0, allow_inf_nan=False
+    )
+    av_query_deadline_seconds: float = Field(
+        default=45.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    av_query_admission_timeout_seconds: float = Field(
+        default=2.0, ge=0.1, le=60.0, allow_inf_nan=False
+    )
+    av_star_name_cache_max: int = Field(default=512, ge=64, le=8192)
+    decision_history_token_budget: int = Field(default=8192, ge=512, le=1_000_000)
+    decision_history_max_messages: int = Field(default=80, ge=1, le=1000)
+    memory_max_facts_per_extraction: int = Field(default=6, ge=1, le=20)
+    memory_extract_input_token_limit: int = Field(
+        default=12_000, ge=512, le=200_000
+    )
+    memory_extract_scope_limit: int = Field(default=20, ge=1, le=200)
+    memory_candidate_row_limit: int = Field(default=200, ge=10, le=5000)
+    memory_private_group_fanout: int = Field(default=3, ge=1, le=20)
+    memory_tool_subject_daily_cap: int = Field(default=5, ge=1, le=200)
+    memory_maintenance_interval_seconds: int = Field(
+        default=21_600, ge=300, le=86_400
+    )
+    search_prune_interval_seconds: int = Field(default=21_600, ge=300, le=86_400)
+    search_record_recall_limit: int = Field(default=5, ge=1, le=50)
+    archive_batch_size: int = Field(default=8, ge=1, le=512)
+    archive_backfill_per_pass: int = Field(default=64, ge=1, le=5000)
+    archive_scan_limit: int = Field(default=4096, ge=100, le=100_000)
+    archive_candidate_limit: int = Field(default=64, ge=1, le=5000)
+    archive_query_timeout_seconds: float = Field(
+        default=8.0, ge=0.5, le=120.0, allow_inf_nan=False
+    )
+    archive_maintenance_interval_seconds: float = Field(
+        default=5.0, ge=0.5, le=600.0, allow_inf_nan=False
+    )
+    archive_indexing_lease_seconds: float = Field(
+        default=120.0, ge=5.0, le=3600.0, allow_inf_nan=False
+    )
+
+    @field_validator("llm_stage_deadlines", mode="before")
+    @classmethod
+    def _validate_stage_deadlines(cls, value: object) -> dict[str, float]:
+        if not isinstance(value, dict) or not value:
+            raise ValueError("LLM 阶段 deadline 必须是非空的 {阶段: 秒} 映射")
+        result: dict[str, float] = {}
+        for raw_stage, raw_seconds in value.items():
+            stage = str(raw_stage or "").strip()
+            if not stage or len(stage) > 32:
+                raise ValueError("LLM 阶段名非法")
+            try:
+                seconds = float(raw_seconds)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"阶段 {stage} 的 deadline 必须是秒数") from exc
+            if not 1.0 <= seconds <= 900.0:
+                raise ValueError(f"阶段 {stage} 的 deadline 必须在 1-900 秒之间")
+            result[stage] = seconds
+        return result
+
+    @model_validator(mode="after")
+    def _validate_reserved_capacity(self) -> "ResourceSettingsConfig":
+        """保留容量的不变式：关键名额 ≥1、背景 ≤ 普通 − 2、三级容量严格递减。"""
+
+        total = self.llm_request_capacity
+        noncritical = self.llm_request_noncritical_capacity
+        normal = self.llm_request_normal_capacity
+        background = self.llm_request_background_capacity
+        if not (1 <= background <= normal - 2):
+            raise ValueError("LLM 背景容量必须满足 1 ≤ background ≤ normal − 2")
+        if not (1 <= normal <= noncritical):
+            raise ValueError("LLM 普通容量必须满足 1 ≤ normal ≤ noncritical")
+        if not (1 <= noncritical < total):
+            raise ValueError("LLM 非关键容量必须满足 1 ≤ noncritical < total（至少留 1 个关键名额）")
+        if not (2 <= self.telegram_normal_capacity <= self.telegram_noncritical_capacity):
+            raise ValueError("Telegram 普通容量必须落在 2..noncritical 之间")
+        if not (
+            self.telegram_noncritical_capacity < self.telegram_total_capacity
+        ):
+            raise ValueError("Telegram 非关键容量必须小于总容量（至少留 1 个关键名额）")
+        if self.archive_indexing_lease_seconds < self.archive_query_timeout_seconds:
+            raise ValueError("归档索引租约不能短于查询 deadline，否则会重复写")
+        return self
 
 
 class Settings(BaseSettings):
@@ -685,6 +1023,15 @@ class Settings(BaseSettings):
 
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
+    # 运营策略段（热生效）。唯一存储源是 runtime_config 表里的同名字段；这四个
+    # 对象是 apply_to_settings 写下来的**读侧视图**，消费者一律经
+    # ``bot.services.policy_runtime`` 取不可变快照，不直接读可变对象。
+    private_chat: PrivateChatPolicyConfig = PrivateChatPolicyConfig()
+    economy: EconomyPolicyConfig = EconomyPolicyConfig()
+    activity: ActivityPolicyConfig = ActivityPolicyConfig()
+    checkin_reminder: CheckinReminderPolicyConfig = CheckinReminderPolicyConfig()
+    display: DisplayPolicyConfig = DisplayPolicyConfig()
+    resources: ResourcesPolicyConfig = ResourcesPolicyConfig()
 
 
 # Common vendor names people type that map onto litellm's native provider ids.

@@ -94,7 +94,7 @@ from bot.utils.telegram import (
 )
 from bot.utils.timezone import now_shanghai_naive
 from bot.services.checkin import (
-    CHALLENGE_SKIP_COST,
+    challenge_skip_cost,
     available_points,
 )
 
@@ -4450,9 +4450,11 @@ async def _begin_moderation_challenge_locked(
                     exc_info=True,
                 )
                 affordable = 0
+        # 一次判定用一份快照：提示里写的价与实际扣的价必须一致。
+        _skip_price = challenge_skip_cost()
         skip_cost = (
-            CHALLENGE_SKIP_COST
-            if allow_points_skip and affordable >= CHALLENGE_SKIP_COST
+            _skip_price
+            if allow_points_skip and affordable >= _skip_price
             else 0
         )
         sent = await bot.send_message(

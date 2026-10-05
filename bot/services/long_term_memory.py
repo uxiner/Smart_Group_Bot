@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterable
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
 
+from bot.services import policy_runtime
 from bot.db.models import (
     GroupMessageArchive,
     MemoryExtractCursor,
@@ -211,6 +212,25 @@ EXTRACT_SYSTEM_PROMPT = (
 
 #: 维护巡检间隔（秒）：一天几次足够
 MAINTENANCE_INTERVAL_SECONDS = 6 * 3600
+
+
+def memory_limits() -> dict[str, int]:
+    """长期记忆的运维参数（现取配置，默认与模块常量逐字相同）。
+
+    提炼的防注入、隐私与 subject provenance 规则**不**在这里：那是安全不变量，
+    不提供任何开关。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "max_facts_per_extraction": resources.memory_max_facts_per_extraction,
+        "extract_input_token_limit": resources.memory_extract_input_token_limit,
+        "extract_scope_limit": resources.memory_extract_scope_limit,
+        "candidate_row_limit": resources.memory_candidate_row_limit,
+        "private_group_fanout": resources.memory_private_group_fanout,
+        "tool_subject_daily_cap": resources.memory_tool_subject_daily_cap,
+        "maintenance_interval_seconds": resources.memory_maintenance_interval_seconds,
+    }
 
 #: 送入模型的消息行格式（发送者名 + 正文；发送者 id 在输入开头的名单里给全）
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -1631,7 +1651,7 @@ async def run_extraction_round(
     *,
     llm: Any,
     settings: Any,
-    scope_limit: int = EXTRACT_SCOPE_LIMIT,
+    scope_limit: int | None = None,
     now: Any | None = None,
 ) -> int:
     """跑一轮提炼（常驻循环与单测都用它），返回有实际写入的作用域个数。"""
@@ -1640,7 +1660,14 @@ async def run_extraction_round(
         return 0
     stamp = now or now_shanghai_naive()
     cap = memory_extract_daily_cap(settings)
-    scopes = await _list_extraction_scopes(session_factory, scope_limit=scope_limit)
+    scopes = await _list_extraction_scopes(
+        session_factory,
+        scope_limit=(
+            scope_limit
+            if scope_limit is not None
+            else memory_limits()["extract_scope_limit"]
+        ),
+    )
     touched = 0
     for scope, scope_id in scopes:
         if cap > 0 and extraction_runs_today(now=stamp) >= cap:
@@ -1688,7 +1715,7 @@ async def run_long_term_memory_extraction(
     llm: Any,
     settings: Any,
     interval_seconds: float | None = None,
-    scope_limit: int = EXTRACT_SCOPE_LIMIT,
+    scope_limit: int | None = None,
 ) -> None:
     """常驻被动提炼循环（写法照 ``run_search_record_maintenance``）。
 
@@ -1700,7 +1727,14 @@ async def run_long_term_memory_extraction(
     while True:
         try:
             await run_extraction_round(
-                session_factory, llm=llm, settings=settings, scope_limit=scope_limit
+                session_factory,
+                llm=llm,
+                settings=settings,
+                scope_limit=(
+                    scope_limit
+                    if scope_limit is not None
+                    else memory_limits()["extract_scope_limit"]
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -1928,7 +1962,7 @@ async def load_private_chat_facts(
     query: str,
     limit: int | None = None,
     titles: dict[int, str] | None = None,
-    max_groups: int = PRIVATE_GROUP_FANOUT,
+    max_groups: int | None = None,
     now: Any | None = None,
 ) -> list[dict[str, Any]]:
     """私聊装配用的长期记忆：**本人 private 事实 + 该用户可访问群的 group 事实**。
@@ -1970,7 +2004,12 @@ async def load_private_chat_facts(
             continue
         if group_id not in group_list:
             group_list.append(group_id)
-    for group_id in group_list[: max(1, int(max_groups))]:
+    fanout = (
+        max_groups
+        if max_groups is not None
+        else memory_limits()["private_group_fanout"]
+    )
+    for group_id in group_list[: max(1, int(fanout))]:
         if len(records) >= count:
             break
         group_records = await load_relevant_facts(

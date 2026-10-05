@@ -19,6 +19,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, Message
 
 from bot.config import Settings
+from bot.services import policy_runtime
 from bot.db.models import Group
 from bot.services.resource_health import register_resource_health_provider
 from bot.utils.telegram import (
@@ -86,6 +87,21 @@ _TTS_TRANSCODE_CONCURRENCY = 2
 _TTS_MAX_SEGMENTS_PER_MESSAGE = 6
 _TTS_SYNTHESIS_ADMISSION_TIMEOUT_SECONDS = 2.0
 _TTS_TRANSCODE_ADMISSION_TIMEOUT_SECONDS = 2.0
+def tts_limits() -> tuple[int, float, float]:
+    """TTS 的 ``(每条最多几段, 转码超时, http 上限)``（现取配置）。"""
+
+    resources = policy_runtime.resources_policy()
+    return (
+        resources.tts_max_segments_per_message,
+        resources.tts_transcode_timeout_seconds,
+        resources.tts_max_http_timeout_seconds,
+    )
+
+
+def max_segments_per_message() -> int:
+    return tts_limits()[0]
+
+
 _TTS_SYNTHESIS_SEMAPHORE = asyncio.Semaphore(_TTS_SYNTHESIS_CONCURRENCY)
 _TTS_TRANSCODE_SEMAPHORE = asyncio.Semaphore(_TTS_TRANSCODE_CONCURRENCY)
 _TTS_SYNTHESIS_SLOT_HELD: ContextVar[bool] = ContextVar(
@@ -790,7 +806,7 @@ class DoubaoTTSService:
         request_id = str(uuid.uuid4())
         timeout = aiohttp.ClientTimeout(
             total=min(
-                _TTS_MAX_HTTP_TIMEOUT_SECONDS,
+                tts_limits()[2],
                 max(5.0, self.http_timeout_sec),
             )
         )
@@ -983,7 +999,7 @@ class DoubaoTTSService:
     @staticmethod
     async def _convert_mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _TTS_TRANSCODE_TIMEOUT_SECONDS
+        deadline = loop.time() + tts_limits()[1]
         acquired = False
         try:
             try:
@@ -1036,7 +1052,7 @@ class DoubaoTTSService:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            async with asyncio.timeout(_TTS_TRANSCODE_TIMEOUT_SECONDS):
+            async with asyncio.timeout(tts_limits()[1]):
                 output, stderr = await proc.communicate(input=mp3_bytes)
         except BaseException:
             if proc.returncode is None:
@@ -1277,7 +1293,7 @@ class DoubaoTTSService:
         segments = tuple(self.split_text(text))
         if not segments:
             return TTSDeliveryResult(error="empty_text")
-        if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
+        if len(segments) > max_segments_per_message():
             log.warning("tts message has too many segments: %d", len(segments))
             return TTSDeliveryResult(
                 requested_segments=segments,
@@ -1400,7 +1416,7 @@ class DoubaoTTSService:
         segments = tuple(self.split_text(text))
         if not segments:
             return TTSDeliveryResult(error="empty_text")
-        if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
+        if len(segments) > max_segments_per_message():
             log.warning("tts message has too many segments: %d", len(segments))
             return TTSDeliveryResult(
                 requested_segments=segments,

@@ -54,8 +54,8 @@ from bot.config import Settings
 from bot.db.engine import init_db
 from bot.services.checkin import local_today
 from bot.services.checkin_reminder import (
-    REMINDER_AUTO_DELETE_SECONDS,
-    REMINDER_SLOTS,
+    reminder_auto_delete_seconds,
+    reminder_slots,
     backfill_durable_auto_delete,
     build_checkin_reminder_keyboard,
     claim_reminder_slot,
@@ -80,7 +80,7 @@ log = logging.getLogger(__name__)
 
 _USAGE = (
     "用法：python -m bot.tools.checkin_reminder --slot "
-    + "|".join(str(slot) for slot in REMINDER_SLOTS)
+    + "|".join(str(slot) for slot in reminder_slots())
     + " [--dry-run]"
 )
 
@@ -210,7 +210,7 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                         # 10 分钟后自动删除：写 telegram_delete_jobs，重启不丢任务。
                         # 排不上队只报警，不重发已经发出去的消息。
                         queued = await schedule_message_auto_delete_durable(
-                            sent_message, REMINDER_AUTO_DELETE_SECONDS
+                            sent_message, reminder_auto_delete_seconds()
                         )
                         if not queued:
                             log.error(
@@ -227,7 +227,7 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                                     getattr(sent_message, "message_id", 0) or 0
                                 ),
                                 due_at=now_shanghai_naive()
-                                + timedelta(seconds=REMINDER_AUTO_DELETE_SECONDS),
+                                + timedelta(seconds=reminder_auto_delete_seconds()),
                             )
                             if not backfilled:
                                 print(
@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         if arg in {"--slot", "-s"} and index + 1 < len(args):
             slot = normalize_slot(args[index + 1])
             if slot is None:
-                print(f"--slot 只允许 {'/'.join(str(s) for s in REMINDER_SLOTS)}：{args[index + 1]}")
+                print(f"--slot 只允许 {'/'.join(str(s) for s in reminder_slots())}：{args[index + 1]}")
                 return 1
             index += 2
             continue

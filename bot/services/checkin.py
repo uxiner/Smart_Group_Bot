@@ -26,6 +26,7 @@ from bot.db.models import (
     UserWarning,
     Violation,
 )
+from bot.services import policy_runtime
 from bot.utils.timezone import now_shanghai_naive
 
 # 连续第 N 天得 N 分，第 10 天起封顶；断签一天后重新从 1 分开始。
@@ -69,10 +70,43 @@ def local_today(now: object = None) -> date:
     return moment.date() if hasattr(moment, "date") else moment
 
 
-def award_for_streak(streak: int) -> int:
-    """连续第 N 天得 min(N, 10) 分。断签后 streak 归 1，自然回到 1 分。"""
+def daily_point_cap() -> int:
+    """连续签到每日奖励的封顶分（现取配置；默认 10 = 改造前）。"""
 
-    return max(1, min(int(streak), MAX_DAILY_POINTS))
+    return policy_runtime.economy_policy().checkin_daily_point_cap
+
+
+def challenge_skip_cost() -> int:
+    """免除一次审核质询要花的积分（现取配置；默认 2）。
+
+    schema 的下界是 1：0 会变成"免费绕过质询"，不是运营旋钮。
+    """
+
+    return policy_runtime.economy_policy().challenge_skip_cost
+
+
+def rank_limit() -> int:
+    """积分榜默认名次数（现取配置；默认 10 = 改造前）。"""
+
+    return policy_runtime.economy_policy().checkin_rank_limit
+
+
+def violation_window_days() -> int:
+    """档案里"近 N 天被审核命中"的统计窗口（现取配置；默认 30 天）。"""
+
+    return policy_runtime.economy_policy().checkin_violation_window_days
+
+
+def checkin_button_text() -> str:
+    """签到按钮文字（可配文案；callback_data ``checkin:v1`` 是协议常量，不可配）。"""
+
+    return policy_runtime.display_policy().checkin_button_text or CHECKIN_BUTTON_TEXT
+
+
+def award_for_streak(streak: int) -> int:
+    """连续第 N 天得 min(N, 封顶) 分。断签后 streak 归 1，自然回到 1 分。"""
+
+    return max(1, min(int(streak), daily_point_cap()))
 
 
 async def _dates(session: AsyncSession, group_id: int, user_id: int) -> set[str]:
@@ -175,7 +209,7 @@ async def summarize(
         total_days=total_days,
         streak=streak,
         next_award=award_for_streak(streak + 1) if streak else 1,
-        capped=streak >= MAX_DAILY_POINTS,
+        capped=streak >= daily_point_cap(),
     )
 
 
@@ -607,7 +641,7 @@ async def build_rank_board(
     user_id: int,
     week: bool = False,
     now: object = None,
-    limit: int = RANK_LIMIT,
+    limit: int | None = None,
 ) -> RankBoard:
     """排本群积分榜，并算出调用者自己的名次。
 
@@ -616,6 +650,7 @@ async def build_rank_board(
     多的在前，再按 user_id 稳定排序。调用者即使不在榜内也会拿到名次：没有任何记录
     时排在所有有效记录之后（榜里不会出现这条合成记录，它只出现在"你：第 X 名"那行）。
     """
+    limit = rank_limit() if limit is None else int(limit)
 
     gid, uid = int(group_id), int(user_id)
     overall = await _earned_by_user(session, gid)
@@ -704,7 +739,7 @@ def _violation_cutoff(now: object = None) -> datetime:
         moment = now - timedelta(hours=8)
     else:
         moment = datetime.combine(now, time.min) - timedelta(hours=8)
-    return moment - timedelta(days=VIOLATION_WINDOW_DAYS)
+    return moment - timedelta(days=violation_window_days())
 
 
 async def member_profile(
@@ -751,7 +786,7 @@ async def member_profile(
         next_award=outcome.next_award,
         warning_count=int(getattr(warning, "count", 0) or 0),
         recent_violations=int(recent or 0),
-        window_days=VIOLATION_WINDOW_DAYS,
+        window_days=violation_window_days(),
         group_banned=bool(getattr(warning, "is_banned", False)),
         globally_banned=bool(globally),
     )

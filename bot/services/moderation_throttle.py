@@ -68,6 +68,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from bot.services import policy_runtime
+
 log = logging.getLogger(__name__)
 
 #: 桶容量：一个成员在 ``spacing_seconds`` 窗口内的前 ``burst`` 条消息零延迟送审。
@@ -86,6 +88,23 @@ DEFAULT_MAX_WAIT_SECONDS = 6.0
 DEFAULT_MAX_WAITERS = 3
 #: 状态字典上限（超过先清空闲 key）。
 DEFAULT_MAX_KEYS = 4096
+
+
+def throttle_limits() -> tuple[int, float, float, int]:
+    """整形闸的 ``(burst, spacing, max_wait, max_waiters)``（现取配置）。
+
+    每次准入判定取一次：有界 key 状态与「全局等待者上限」这两条安全不变式
+    **不受配置影响**——可调的只是「一个成员连发几条零延迟」「每条之间隔多久」
+    「单条最多多等多久」这三个业务节奏值。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return (
+        resources.moderation_throttle_burst,
+        resources.moderation_throttle_spacing_seconds,
+        resources.moderation_throttle_max_wait_seconds,
+        resources.moderation_throttle_max_waiters,
+    )
 #: 同一个 key 的"整形饱和"告警最小间隔，避免刷屏式连发把日志也刷爆。
 _BYPASS_WARN_INTERVAL_SECONDS = 30.0
 
@@ -129,23 +148,30 @@ class ModerationAdmissionGate:
     def __init__(
         self,
         *,
-        burst: int = DEFAULT_BURST,
-        spacing_seconds: float = DEFAULT_SPACING_SECONDS,
-        max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
-        max_waiters: int = DEFAULT_MAX_WAITERS,
+        burst: int | None = None,
+        spacing_seconds: float | None = None,
+        max_wait_seconds: float | None = None,
+        max_waiters: int | None = None,
         max_keys: int = DEFAULT_MAX_KEYS,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], object] | None = None,
     ) -> None:
-        self.burst = max(1, int(burst))
-        self.spacing_seconds = max(0.0, float(spacing_seconds))
-        self.max_wait_seconds = max(0.0, float(max_wait_seconds))
-        self.max_waiters = max(0, int(max_waiters))
+        defaults = throttle_limits()
+        self.burst = max(1, int(burst if burst is not None else defaults[0]))
+        self.spacing_seconds = max(
+            0.0, float(spacing_seconds if spacing_seconds is not None else defaults[1])
+        )
+        self.max_wait_seconds = max(
+            0.0,
+            float(max_wait_seconds if max_wait_seconds is not None else defaults[2]),
+        )
+        self.max_waiters = max(
+            0, int(max_waiters if max_waiters is not None else defaults[3])
+        )
         self.max_keys = max(16, int(max_keys))
         self._clock = clock or time.monotonic
         self._sleep = sleep or asyncio.sleep
-        # 桶容量换算成时间容忍度：前 burst 条消息的 tat 落后于 now 也不会产生延迟。
-        self._tolerance = (self.burst - 1) * self.spacing_seconds
+        self._refresh_tolerance()
         self._states: dict[tuple[int, int], _KeyState] = {}
         self._waiters = 0
         # 观测计数（测试与排查用）
@@ -155,6 +181,35 @@ class ModerationAdmissionGate:
         self.max_observed_wait = 0.0
 
     # -- 状态 ------------------------------------------------------------- #
+
+    def _refresh_tolerance(self) -> None:
+        # 桶容量换算成时间容忍度：前 burst 条消息的 tat 落后于 now 也不会产生延迟。
+        self._tolerance = (self.burst - 1) * self.spacing_seconds
+
+    def apply_runtime_limits(self) -> bool:
+        """把整形闸热调到当前配置。返回是否真的变了。
+
+        只改**节奏**（burst / spacing / 等待上限），**不重置任何进行中的桶**：
+        已有的 ``_KeyState`` 原样保留，只按新 burst 重算容差，绝不会出现"改一次
+        配置就把正在整形的成员放行"。有界 key 状态与"全局等待者上限"这两条
+        安全不变式仍然成立。
+        """
+
+        burst, spacing, max_wait, max_waiters = throttle_limits()
+        changed = (
+            burst != self.burst
+            or abs(spacing - self.spacing_seconds) > 1e-9
+            or abs(max_wait - self.max_wait_seconds) > 1e-9
+            or max_waiters != self.max_waiters
+        )
+        if not changed:
+            return False
+        self.burst = max(1, int(burst))
+        self.spacing_seconds = max(0.0, float(spacing))
+        self.max_wait_seconds = max(0.0, float(max_wait))
+        self.max_waiters = max(0, int(max_waiters))
+        self._refresh_tolerance()
+        return True
 
     def _state_for(self, key: tuple[int, int], now: float) -> _KeyState | None:
         """取（必要时新建）桶；**字典已达硬上限且腾不出位置时返回 ``None``**。

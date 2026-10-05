@@ -39,7 +39,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import MemberEntitlement, MemberPointAward, MemberPointSpend
 from bot.services.background_health import record_background_failure
+from bot.services import policy_runtime
 from bot.services.checkin import available_points, local_today, spend_points
+from bot.services.policy_runtime import EconomySnapshot, pinned_section
+from bot.services.policy_runtime import EconomySnapshot
+from bot.services.policy_runtime import EconomySnapshot
 from bot.utils.timezone import now_shanghai_naive, now_shanghai_naive_precise
 
 log = logging.getLogger(__name__)
@@ -84,6 +88,12 @@ _SHOP_EXPIRY_BATCH_LIMIT = 200
 #: 到期撤销失败后的重试间隔：把 expires_at 往后推这么多，下次扫描再试。
 #: 既不会每轮都撞同一条失败记录，也不会让付费头衔永远留在群里没人管（F-052）。
 _SHOP_EXPIRY_RETRY_SECONDS = 900
+
+def _econ():
+    """当前生效的经济参数快照（未绑定时 = schema 默认值 = 改造前逐字相同）。"""
+
+    return policy_runtime.economy_policy()
+
 
 _ADMIN_STATUSES = ("administrator", "creator")
 #: 取消置顶时这些报错说明"本来就没置顶"，当成功处理
@@ -156,16 +166,19 @@ class TagCheck:
     reason: str = ""
 
 
-def check_tag_text(raw: object) -> TagCheck:
+def check_tag_text(
+    raw: object, *, policy: EconomySnapshot | None = None
+) -> TagCheck:
     """校验头衔文字；不合格时给一句用户看得懂的原因（不扣分）。"""
 
+    econ = policy or _econ()
     text = str(raw or "").strip()
     if not text:
         return TagCheck(False, reason="头衔不能是空白，请输入 1-16 个字。")
-    if len(text) > TAG_MAX_LENGTH:
+    if len(text) > econ.tag_max_length:
         return TagCheck(
             False,
-            reason=f"头衔最多 {TAG_MAX_LENGTH} 个字，你这条有 {len(text)} 个字。",
+            reason=f"头衔最多 {econ.tag_max_length} 个字，你这条有 {len(text)} 个字。",
         )
     if contains_emoji(text):
         return TagCheck(False, reason="头衔里不能有表情符号。")
@@ -186,37 +199,46 @@ class TagRequest:
     """``/tag`` 的参数：头衔文字 + 买几天，以及对应的价钱。"""
 
     text: str = ""
-    days: int = TAG_DAYS_7D
-    price: int = TAG_PRICE_7D
+    days: int = 0      # 0 = 用当前配置里的默认档位（见 parse_tag_request）
+    price: int = 0
     error: str = ""
 
 
-def tag_price(days: int) -> int:
-    """7 天 30 分、30 天 80 分。"""
+def tag_price(days: int, *, policy: EconomySnapshot | None = None) -> int:
+    """长租档（``days >= tag_days_30d``）与短租档的价格。"""
 
-    return TAG_PRICE_30D if int(days) >= TAG_DAYS_30D else TAG_PRICE_7D
+    econ = policy or _econ()
+    return econ.tag_price_30d if int(days) >= econ.tag_days_30d else econ.tag_price_7d
 
 
-def parse_tag_request(raw: object) -> TagRequest:
-    """解析 ``/tag`` 后面的文字：末尾的 ``30天`` / ``30d`` / ``--30`` 表示买长租。"""
+def parse_tag_request(raw: object, *, policy: EconomySnapshot | None = None) -> TagRequest:
+    """解析 ``/tag`` 后面的文字：末尾的 ``30天`` / ``30d`` / ``--30`` 表示买长租。
 
+    一次解析只用一份快照：菜单里显示的价与实际扣的价永远一致。
+    """
+
+    econ = policy or _econ()
     body = str(raw or "").strip()
-    days = TAG_DAYS_7D
+    days = econ.tag_days_7d
     parts = body.split()
     if len(parts) == 1 and parts[0].lower() in TAG_LONG_MARKERS:
         # 只写了时长没写头衔：按"忘了写文字"提示，不要真把头衔设成 "30天"
         return TagRequest(
-            days=TAG_DAYS_30D,
-            price=TAG_PRICE_30D,
+            days=econ.tag_days_30d,
+            price=econ.tag_price_30d,
             error="请先写头衔文字，例如：/tag 摸鱼冠军 30天",
         )
     if len(parts) > 1 and parts[-1].lower() in TAG_LONG_MARKERS:
-        days = TAG_DAYS_30D
+        days = econ.tag_days_30d
         body = " ".join(parts[:-1])
-    check = check_tag_text(body)
+    check = check_tag_text(body, policy=econ)
     if not check.ok:
-        return TagRequest(days=days, price=tag_price(days), error=check.reason)
-    return TagRequest(text=check.text, days=days, price=tag_price(days))
+        return TagRequest(
+            days=days, price=tag_price(days, policy=econ), error=check.reason
+        )
+    return TagRequest(
+        text=check.text, days=days, price=tag_price(days, policy=econ)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,26 +270,50 @@ LOTTERY_TABLE: tuple[LotteryPrize, ...] = (
 LOTTERY_TOTAL_WEIGHT = 10000
 
 
-def expected_lottery_value() -> float:
-    """长期期望值（正好 6.00 分/次；2026-10-01 管理员指定）。"""
+def lottery_table(
+    *, policy: EconomySnapshot | None = None
+) -> tuple[LotteryPrize, ...]:
+    """当前奖池。``weight`` 是**相对权重**，总权重由表内求和派生（不另存第二份）。"""
 
-    return sum(prize.points * prize.weight for prize in LOTTERY_TABLE) / LOTTERY_TOTAL_WEIGHT
+    econ = policy or _econ()
+    return tuple(
+        LotteryPrize(points=item.points, weight=item.weight, label=item.label)
+        for item in econ.lottery_prizes
+    )
 
 
-def draw_prize(randbelow=None) -> LotteryPrize:
-    """按奖池权重开一次奖；随机源默认是加密安全的 ``secrets.randbelow``。"""
+def expected_lottery_value(*, policy: EconomySnapshot | None = None) -> float:
+    """长期期望值（默认配置下正好 6.00 分/次）。"""
 
+    econ = policy or _econ()
+    total = econ.lottery_total_weight
+    if not total:
+        return 0.0
+    table = lottery_table(policy=econ)
+    return sum(prize.points * prize.weight for prize in table) / total
+
+
+def draw_prize(randbelow=None, *, policy: EconomySnapshot | None = None) -> LotteryPrize:
+    """按奖池权重开一次奖；随机源默认是加密安全的 ``secrets.randbelow``。
+
+    随机算法逐字未变：仍是「一次 ``randbelow(总权重)`` + 前缀和」，只是权重表来自
+    快照而不是模块常量。财务幂等（``lottery_spend_ref`` / ``lottery_prize_ref``）
+    完全不受影响。
+    """
+
+    econ = policy or _econ()
+    table = lottery_table(policy=econ)
     roller = randbelow if randbelow is not None else secrets.randbelow
-    roll = int(roller(LOTTERY_TOTAL_WEIGHT))
+    roll = int(roller(econ.lottery_total_weight))
     if roll < 0:
         roll = 0
     accumulated = 0
-    for prize in LOTTERY_TABLE:
+    for prize in table:
         accumulated += prize.weight
         if roll < accumulated:
             return prize
-    # 只有随机源返回 >= 10000 时才可能走到这里
-    return LOTTERY_TABLE[-1]
+    # 只有随机源返回 >= 总权重 时才可能走到这里
+    return table[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +369,7 @@ def purchase_stamp(now: datetime | None = None) -> str:
 def tag_spend_ref(
     *, group_id: int, user_id: int, days: int, stamp: str
 ) -> str:
-    sku = "shop-tag-30d" if int(days) >= TAG_DAYS_30D else "shop-tag-7d"
+    sku = "shop-tag-30d" if int(days) >= _econ().tag_days_30d else "shop-tag-7d"
     return f"{sku}:{int(group_id)}:{int(user_id)}:{stamp}"
 
 
@@ -774,7 +820,7 @@ def _tag_usage_text() -> str:
 def _pin_usage_text() -> str:
     return (
         "用法：先长按你自己发的那条消息 → 回复 → 发送 /top，"
-        f"机器人会把那条消息置顶 {PIN_HOURS} 小时（{PIN_PRICE} 分）。"
+        f"机器人会把那条消息置顶 {_econ().pin_hours} 小时（{_econ().pin_price} 分）。"
     )
 
 
@@ -798,15 +844,17 @@ async def buy_member_tag(
     到期时间"算续费时长，第二笔买到的天数会被第一笔的写入覆盖掉（F-006）。
     """
 
-    async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_TAG):
-        return await _buy_member_tag_locked(
-            session,
-            bot=bot,
-            group_id=group_id,
-            user_id=user_id,
-            raw_text=raw_text,
-            now=now,
-        )
+    # 一次购买钉一份价格快照：菜单、扣费、退款、回执全部用同一份。
+    with pinned_section("economy"):
+        async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_TAG):
+            return await _buy_member_tag_locked(
+                session,
+                bot=bot,
+                group_id=group_id,
+                user_id=user_id,
+                raw_text=raw_text,
+                now=now,
+            )
 
 
 async def _buy_member_tag_locked(
@@ -1101,15 +1149,16 @@ async def buy_pin(
     看到"还没有生效中的置顶"，各自扣一次 20 分，只得到一个置顶（F-006）。
     """
 
-    async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_PIN):
-        return await _buy_pin_locked(
-            session,
-            bot=bot,
-            group_id=group_id,
-            user_id=user_id,
-            target=target,
-            now=now,
-        )
+    with pinned_section("economy"):
+        async with _purchase_lock(group_id=group_id, user_id=user_id, kind=KIND_PIN):
+            return await _buy_pin_locked(
+                session,
+                bot=bot,
+                group_id=group_id,
+                user_id=user_id,
+                target=target,
+                now=now,
+            )
 
 
 async def _buy_pin_locked(
@@ -1165,10 +1214,10 @@ async def _buy_pin_locked(
             available=available,
             expires_at=existing.expires_at,
         )
-    if available < PIN_PRICE:
+    if available < _econ().pin_price:
         return ShopReply(
             "insufficient",
-            _insufficient_text(price=PIN_PRICE, available=available),
+            _insufficient_text(price=_econ().pin_price, available=available),
             available=available,
         )
 
@@ -1177,7 +1226,7 @@ async def _buy_pin_locked(
     # purchase_stamp 自己去拿不截断的时钟。
     stamp = purchase_stamp(now)
     ref = pin_spend_ref(group_id=gid, user_id=uid, stamp=stamp)
-    expires_at = moment + timedelta(hours=PIN_HOURS)
+    expires_at = moment + timedelta(hours=_econ().pin_hours)
     # F-053：购买前先留一份权益快照（这里正常情况下为空，但置顶行可能刚好被
     # 到期清理漏掉，保留快照让回滚是精确的）。
     previous_entitlement = await entitlement_snapshot(
@@ -1187,7 +1236,7 @@ async def _buy_pin_locked(
         session,
         group_id=gid,
         user_id=uid,
-        points=PIN_PRICE,
+        points=_econ().pin_price,
         reason=SPEND_REASON_PIN,
         ref=ref,
     )
@@ -1214,11 +1263,11 @@ async def _buy_pin_locked(
             "shop pin entitlement write failed | group=%s user=%s ref=%s", gid, uid, ref
         )
         refunded = await _refund_and_reload(
-            session, group_id=gid, user_id=uid, points=PIN_PRICE, ref=ref
+            session, group_id=gid, user_id=uid, points=_econ().pin_price, ref=ref
         )
         remaining = await available_points(session, group_id=gid, user_id=uid)
         head = (
-            f"商店记账失败，已退回 {PIN_PRICE} 分。"
+            f"商店记账失败，已退回 {_econ().pin_price} 分。"
             if refunded
             else "商店记账失败，退款也失败了，请联系管理员核账。"
         )
@@ -1257,14 +1306,14 @@ async def _buy_pin_locked(
             session,
             group_id=gid,
             user_id=uid,
-            points=PIN_PRICE,
+            points=_econ().pin_price,
             ref=ref,
             revert_kind=KIND_PIN,
             revert_to=previous_entitlement,
         )
         remaining = await available_points(session, group_id=gid, user_id=uid)
         head = (
-            f"置顶失败（可能机器人没有置顶权限），已退回 {PIN_PRICE} 分。"
+            f"置顶失败（可能机器人没有置顶权限），已退回 {_econ().pin_price} 分。"
             if refunded
             else "置顶失败，退款也失败了，请联系管理员核账。"
         )
@@ -1279,7 +1328,7 @@ async def _buy_pin_locked(
     when = expires_at.strftime("%Y-%m-%d %H:%M")
     return ShopReply(
         "ok",
-        f"<b>置顶成功</b>\n你的这条消息会一直置顶到 {when}（{PIN_HOURS} 小时后自动取消）。\n"
+        f"<b>置顶成功</b>\n你的这条消息会一直置顶到 {when}（{_econ().pin_hours} 小时后自动取消）。\n"
         f"当前可用 {remaining} 分。",
         available=remaining,
         expires_at=expires_at,
@@ -1334,7 +1383,7 @@ def lottery_daily_guard(*, group_id: int, user_id: int, day: str):
         )
         .scalar_subquery()
     )
-    return today_rows < int(LOTTERY_DAILY_LIMIT)
+    return today_rows < int(_econ().lottery_daily_limit)
 
 
 async def play_lottery(
@@ -1355,6 +1404,28 @@ async def play_lottery(
     SELECT`` 里判完，整条语句跑在 SQLite 的写锁之下。
     """
 
+    with pinned_section("economy") as econ:
+        return await _play_lottery(
+            session,
+            econ=econ,
+            group_id=group_id,
+            user_id=user_id,
+            now=now,
+            randbelow=randbelow,
+        )
+
+
+async def _play_lottery(
+    session: AsyncSession,
+    *,
+    econ: EconomySnapshot,
+    group_id: int,
+    user_id: int,
+    now: datetime | None = None,
+    randbelow=None,
+) -> ShopReply:
+    """``play_lottery`` 的实现体；``econ`` 是本次抽奖钉住的那份快照。"""
+
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
     gid, uid = int(group_id), int(user_id)
     available = await available_points(session, group_id=gid, user_id=uid)
@@ -1362,17 +1433,17 @@ async def play_lottery(
 
     # 快速路径：已经用满就直接回话，不必再走写语句。真正的闸门在下面的扣分里。
     used = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
-    if used >= LOTTERY_DAILY_LIMIT:
+    if used >= _econ().lottery_daily_limit:
         return ShopReply(
             "daily_limit",
-            f"今天已经抽了 {used} 次，每天最多 {LOTTERY_DAILY_LIMIT} 次，明天再来吧。"
+            f"今天已经抽了 {used} 次，每天最多 {_econ().lottery_daily_limit} 次，明天再来吧。"
             f"当前可用 {available} 分，这次没有扣分。",
             available=available,
         )
-    if available < LOTTERY_PRICE:
+    if available < _econ().lottery_price:
         return ShopReply(
             "insufficient",
-            _insufficient_text(price=LOTTERY_PRICE, available=available),
+            _insufficient_text(price=_econ().lottery_price, available=available),
             available=available,
         )
 
@@ -1385,7 +1456,7 @@ async def play_lottery(
         session,
         group_id=gid,
         user_id=uid,
-        points=LOTTERY_PRICE,
+        points=_econ().lottery_price,
         reason=SPEND_REASON_LOTTERY,
         ref=ref,
         extra_guard=lottery_daily_guard(group_id=gid, user_id=uid, day=day),
@@ -1399,18 +1470,18 @@ async def play_lottery(
         # 今日次数已满（并发下别人抢先）、余额被别处扣光、同一 ref 已经扣过。
         # 逐个说清楚，别一律报「已经处理过了」——那句话会让人以为被重复扣过款。
         after = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
-        if after >= LOTTERY_DAILY_LIMIT:
+        if after >= _econ().lottery_daily_limit:
             return ShopReply(
                 "daily_limit",
-                f"今天已经抽了 {after} 次，每天最多 {LOTTERY_DAILY_LIMIT} 次，明天再来吧。"
+                f"今天已经抽了 {after} 次，每天最多 {_econ().lottery_daily_limit} 次，明天再来吧。"
                 f"当前可用 {available} 分，这次没有扣分。",
                 available=available,
             )
         remaining_now = await available_points(session, group_id=gid, user_id=uid)
-        if remaining_now < LOTTERY_PRICE:
+        if remaining_now < _econ().lottery_price:
             return ShopReply(
                 "insufficient",
-                _insufficient_text(price=LOTTERY_PRICE, available=remaining_now),
+                _insufficient_text(price=_econ().lottery_price, available=remaining_now),
                 available=remaining_now,
             )
         return ShopReply(
@@ -1439,11 +1510,11 @@ async def play_lottery(
                 "shop lottery prize failed | group=%s user=%s ref=%s", gid, uid, ref
             )
             refunded = await _refund_and_reload(
-                session, group_id=gid, user_id=uid, points=LOTTERY_PRICE, ref=ref
+                session, group_id=gid, user_id=uid, points=_econ().lottery_price, ref=ref
             )
             remaining = await available_points(session, group_id=gid, user_id=uid)
             head = (
-                f"开奖时出了点问题，已退回 {LOTTERY_PRICE} 分。"
+                f"开奖时出了点问题，已退回 {_econ().lottery_price} 分。"
                 if refunded
                 else "开奖时出了点问题，退款也失败了，请联系管理员核账。"
             )
@@ -1455,12 +1526,12 @@ async def play_lottery(
             )
 
     remaining = await available_points(session, group_id=gid, user_id=uid)
-    net = int(prize.points) - LOTTERY_PRICE
+    net = int(prize.points) - _econ().lottery_price
     net_text = f"+{net}" if net >= 0 else str(net)
     # 重新数一次而不是用 `used + 1`：并发下 `used` 是这一笔之前的旧读数，
     # 报出去的「今天还能抽 N 次」会偏大。
     used_now = await lottery_draws_today(session, group_id=gid, user_id=uid, day=day)
-    left = max(0, LOTTERY_DAILY_LIMIT - used_now)
+    left = max(0, _econ().lottery_daily_limit - used_now)
     return ShopReply(
         "ok",
         f"🎲 抽奖结果：{prize.label}（本次净 {net_text} 分，当前可用 {remaining} 分）\n"
@@ -1482,22 +1553,22 @@ def render_shop_menu(*, available: int) -> str:
         f"当前可用 <b>{int(available)}</b> 分。积分靠签到攒：每天在群里发 /checkin，"
         "或点群里的签到提醒按钮。\n"
         "\n"
-        f"<b>① 自定义头衔 · {TAG_DAYS_7D} 天 —— {TAG_PRICE_7D} 分</b>\n"
+        f"<b>① 自定义头衔 · {_econ().tag_days_7d} 天 —— {_econ().tag_price_7d} 分</b>\n"
         "用法：发 /tag 你的头衔\n"
         "例：/tag 摸鱼冠军\n"
         "\n"
-        f"<b>② 自定义头衔 · {TAG_DAYS_30D} 天 —— {TAG_PRICE_30D} 分</b>\n"
+        f"<b>② 自定义头衔 · {_econ().tag_days_30d} 天 —— {_econ().tag_price_30d} 分</b>\n"
         "用法：发 /tag 你的头衔 30天\n"
         "例：/tag 摸鱼冠军 30天\n"
         "\n"
-        f"<b>③ 置顶自己的求助 · {PIN_HOURS} 小时 —— {PIN_PRICE} 分</b>\n"
+        f"<b>③ 置顶自己的求助 · {_econ().pin_hours} 小时 —— {_econ().pin_price} 分</b>\n"
         "用法：长按你自己发的那条消息 → 回复 → 发送 /top\n"
         "\n"
-        f"<b>④ 抽奖一次 —— {LOTTERY_PRICE} 分</b>\n"
+        f"<b>④ 抽奖一次 —— {_econ().lottery_price} 分</b>\n"
         "用法：发 /draw（每人每天最多 10 次）\n"
         "奖池：谢谢参与 39%、3 分 20%、5 分 16%、8 分 10%、12 分 10%、40 分 4%、100 分 1%\n"
         "\n"
-        f"<i>头衔 1-{TAG_MAX_LENGTH} 个字、不能带表情、不能和别人重名；到期会自动清除。"
+        f"<i>头衔 1-{_econ().tag_max_length} 个字、不能带表情、不能和别人重名；到期会自动清除。"
         "还没到期就再买一次，时间会往后接着算，不会白花钱。</i>"
     )
 
@@ -1560,10 +1631,11 @@ async def due_entitlements(
     session: AsyncSession,
     *,
     now: datetime | None = None,
-    limit: int = _SHOP_EXPIRY_BATCH_LIMIT,
+    limit: int | None = None,
 ) -> list[MemberEntitlement]:
     """到期（``expires_at <= now``）的权益，按到期时间从早到晚。"""
 
+    limit = _econ().expiry_batch_limit if limit is None else int(limit)
     moment = now if isinstance(now, datetime) else now_shanghai_naive()
     rows = await session.execute(
         select(MemberEntitlement)
@@ -1741,7 +1813,7 @@ async def expire_due_entitlements(
     now: datetime | None = None,
     dry_run: bool = False,
     notify: bool = True,
-    limit: int = _SHOP_EXPIRY_BATCH_LIMIT,
+    limit: int | None = None,
 ) -> list[ExpiryOutcome]:
     """扫描到期的权益 → 清头衔 / 取消置顶 → 删行。
 
@@ -1795,7 +1867,7 @@ async def expire_due_entitlements(
             # 等于既没清干净、也没有任何东西再重试——付费头衔会永远留在群里。
             # 把到期时间往后推一个重试间隔：下次扫描接着撤，同时避免这条记录
             # 每一轮都占住批量的最前面（due_entitlements 按 expires_at 排序）。
-            retry_at = moment + timedelta(seconds=_SHOP_EXPIRY_RETRY_SECONDS)
+            retry_at = moment + timedelta(seconds=_econ().expiry_retry_seconds)
             deferred = await _defer_if_unchanged(
                 session, row, snapshot_expires_at, retry_at
             )
@@ -1839,13 +1911,23 @@ class ShopExpiryService:
         *,
         bot: object,
         session_factory: async_sessionmaker[AsyncSession],
-        check_interval_seconds: float = _SHOP_EXPIRY_CHECK_SECONDS,
-        batch_limit: int = _SHOP_EXPIRY_BATCH_LIMIT,
+        check_interval_seconds: float | None = None,
+        batch_limit: int | None = None,
     ) -> None:
+        econ = _econ()
         self.bot = bot
         self.session_factory = session_factory
-        self.check_interval_seconds = max(5.0, float(check_interval_seconds))
-        self.batch_limit = max(1, int(batch_limit))
+        self.check_interval_seconds = max(
+            5.0,
+            float(
+                econ.expiry_check_seconds
+                if check_interval_seconds is None
+                else check_interval_seconds
+            ),
+        )
+        self.batch_limit = max(
+            1, econ.expiry_batch_limit if batch_limit is None else int(batch_limit)
+        )
 
     async def run_once(self, *, now: datetime | None = None) -> list[ExpiryOutcome]:
         async with self.session_factory() as session:
@@ -1861,7 +1943,7 @@ class ShopExpiryService:
         consecutive_failures = 0
         while True:
             try:
-                async with asyncio.timeout(_SHOP_EXPIRY_PASS_DEADLINE_SECONDS):
+                async with asyncio.timeout(_econ().expiry_pass_deadline_seconds):
                     outcomes = await self.run_once()
                 if outcomes:
                     log.info("shop expiry pass | expired=%d", len(outcomes))

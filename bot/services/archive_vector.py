@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import GroupMessageArchive, GroupMessageArchiveEmbedding
 from bot.services.llm import EmbeddingBatchResult, LLMService
+from bot.services import policy_runtime
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,26 @@ _DEFAULT_CANDIDATE_LIMIT = 64
 _DEFAULT_QUERY_TIMEOUT_SECONDS = 2.5
 _DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 5.0
 _INDEXING_LEASE_SECONDS = 120.0
+
+
+def archive_limits() -> dict[str, float | int]:
+    """向量归档的运维参数（现取配置）。
+
+    租约（``indexing_lease_seconds``）与查询 deadline 有硬关联：schema 校验保证
+    ``lease >= query_timeout``，否则一个慢查询会在租约过期后被第二个 worker 抢走
+    同一批消息，造成重复写。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "batch_size": resources.archive_batch_size,
+        "backfill_per_pass": resources.archive_backfill_per_pass,
+        "scan_limit": resources.archive_scan_limit,
+        "candidate_limit": resources.archive_candidate_limit,
+        "query_timeout_seconds": resources.archive_query_timeout_seconds,
+        "maintenance_interval_seconds": resources.archive_maintenance_interval_seconds,
+        "indexing_lease_seconds": resources.archive_indexing_lease_seconds,
+    }
 _RETRY_BASE_SECONDS = 30.0
 _RETRY_MAX_SECONDS = 60.0 * 60.0
 _FLOAT16_BYTES = 2
@@ -279,7 +300,9 @@ class SQLiteArchiveVectorRecallProvider:
     ) -> tuple[list[_IndexSource], int]:
         now = now_shanghai_naive()
         cutoff = now - timedelta(days=self.retention_days)
-        lease_until = now + timedelta(seconds=_INDEXING_LEASE_SECONDS)
+        lease_until = now + timedelta(
+            seconds=float(archive_limits()["indexing_lease_seconds"])
+        )
         retry_ready = or_(
             GroupMessageArchiveEmbedding.next_attempt_at.is_(None),
             GroupMessageArchiveEmbedding.next_attempt_at <= now,

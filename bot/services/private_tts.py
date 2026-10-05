@@ -87,6 +87,7 @@ from aiogram.types import BufferedInputFile
 from sqlalchemy import select
 
 from bot.db.models import PrivateChatMessage
+from bot.services import policy_runtime
 from bot.utils.telegram import schedule_message_auto_delete_durable
 
 log = logging.getLogger(__name__)
@@ -829,12 +830,24 @@ class PrivateDeliveryOutcome:
 #: 超出就不合成，直接走文字——长文不该被无限合成。
 MAX_PRIVATE_TTS_SEGMENTS = 6
 
+
+def max_private_tts_segments() -> int:
+    """一条私聊回复最多合成几段语音（现取配置；默认 6 = 改造前）。"""
+
+    return policy_runtime.private_chat_policy().voice_max_segments
+
 #: 私聊自己的合成准入闸门。语音服务内部已有全局并发上限，私聊再加一道小的：
 #: 私聊连发不会把群聊那边的合成额度吃光，等不到就直接让位（回文字），不排队。
 PRIVATE_TTS_CONCURRENCY = 2
 PRIVATE_TTS_ADMISSION_TIMEOUT_SECONDS = 2.0
 
-_AUDIO_TITLE = "小爱语音"
+_AUDIO_TITLE = "语音回复"
+
+
+def audio_title() -> str:
+    """语音条标题（可配品牌文案；默认中性值，不绑定任何个人身份）。"""
+
+    return policy_runtime.display_policy().private_voice_title or _AUDIO_TITLE
 
 _private_tts_semaphore = asyncio.Semaphore(PRIVATE_TTS_CONCURRENCY)
 
@@ -908,7 +921,10 @@ async def _send_audio_segment(
     while attempt <= 2:
         try:
             file_obj = BufferedInputFile(audio_bytes, filename=f"dm_tts_{index + 1}.mp3")
-            sent = await message.answer_audio(audio=file_obj, title=_AUDIO_TITLE)
+            sent = await message.answer_audio(
+                audio=file_obj,
+                title=audio_title(),
+            )
             receipt.add(spoken_text)
             try:
                 await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
@@ -1067,7 +1083,7 @@ async def deliver_private_reply(
         return await _text_out("split_failed")
     if not segments:
         return await _text_out("empty_segments")
-    if len(segments) > MAX_PRIVATE_TTS_SEGMENTS:
+    if len(segments) > max_private_tts_segments():
         # 长文不该被无限合成：超上限直接走文字。
         log.info("private tts: 段数超上限，转文字 | segments=%d", len(segments))
         return await _text_out("too_many_segments", segments=segments)

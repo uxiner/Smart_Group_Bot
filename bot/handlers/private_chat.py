@@ -43,6 +43,7 @@ from bot.services.long_term_memory import (
     memory_facts_enabled,
     memory_recall_limit,
 )
+from bot.services import policy_runtime
 from bot.services.private_chat import (
     ACCESS_UNKNOWN_NOTICE,
     BUSY_NOTICE,
@@ -164,14 +165,33 @@ def _image_file_info(message: Message):
     return None
 
 
+def not_member_notice() -> str:
+    """「你不是授权群成员」提示（可配文案；回落到模块常量）。"""
+
+    return policy_runtime.display_policy().private_not_member_notice or (
+        NOT_MEMBER_NOTICE
+    )
+
+
+def unsupported_media_notice() -> str:
+    """「私聊只支持文字/图片」提示（可配文案；回落到模块常量）。"""
+
+    return policy_runtime.display_policy().private_media_unsupported_notice or (
+        MEDIA_UNSUPPORTED_NOTICE
+    )
+
+
 async def _image_description(message: Message, llm) -> str:
     from bot.handlers.group import _build_vision_data_uri
 
     info = _image_file_info(message)
     if not info:
         return ""
+    # 预算现取：一次认图从下载到视觉调用共用同一个值，途中改配置不会让
+    # "下载用 30s、调用用 5s" 这种拼接。
+    budget = policy_runtime.private_chat_policy().vision_budget_seconds
     try:
-        async with asyncio.timeout(VISION_BUDGET_SEC):
+        async with asyncio.timeout(budget):
             data_uri = await _build_vision_data_uri(message, *info)
             if not data_uri:
                 return ""
@@ -184,9 +204,19 @@ async def _image_description(message: Message, llm) -> str:
         return ""
 
 
-def _split_for_telegram(text: str, *, limit: int = MAX_REPLY_CHARS) -> list[str]:
-    """按行切分长回复；单行超长时硬切。"""
+def _split_for_telegram(
+    text: str, *, limit: int | None = MAX_REPLY_CHARS
+) -> list[str]:
+    """按行切分长回复；单行超长时硬切。
 
+    ``limit=None`` = 现取运行时配置。显式传值只给测试/内部调用。
+    """
+
+    limit = int(
+        limit
+        if limit is not None
+        else policy_runtime.private_chat_policy().reply_max_chars
+    )
     body = str(text or "").strip()
     if not body:
         return []
@@ -280,7 +310,9 @@ async def on_private_message(
         await _send_notice(message, ACCESS_UNKNOWN_NOTICE, "access_unknown")
         return
     if not verdict.allowed:
-        await _send_notice(message, NOT_MEMBER_NOTICE, "not_member")
+        await _send_notice(
+            message, not_member_notice(), "not_member"
+        )
         return
 
     # 2) 配额：先扣再用（每人 + 本档全局两道闸门）。最高管理员不设限、不计数。
@@ -336,7 +368,9 @@ async def on_private_message(
     if _has_media(message):
         if _image_file_info(message) is None:
             await give_the_quota_back("unsupported_media")
-            await _send_notice(message, MEDIA_UNSUPPORTED_NOTICE, "media")
+            await _send_notice(
+                message, unsupported_media_notice(), "media"
+            )
             return
         llm = _reply_llm(settings)
         image_description = await _image_description(message, llm)

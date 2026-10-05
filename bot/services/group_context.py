@@ -29,6 +29,7 @@ from bot.services.model_limits import (
     configured_reserve_tokens,
     loose_budget_tokens,
 )
+from bot.services import policy_runtime
 from bot.utils.tokens import estimate_text_tokens
 
 #: 群聊历史装配的默认 token 预算：272K = 278528（全项目统一用这个精确数字）。
@@ -73,6 +74,20 @@ GROUP_HISTORY_MESSAGE_TOKEN_OVERHEAD = 12
 DECISION_HISTORY_TOKEN_BUDGET = 8192
 #: 参与判定单次读取的条数上限（尾部够用即可；预算通常先咬住）。
 DECISION_HISTORY_MAX_MESSAGES = 80
+
+
+def decision_history_budget() -> tuple[int, int]:
+    """判定阶段的 ``(token 预算, 条数上限)``（现取配置）。
+
+    与群历史预算是**两个不同的东西**：群历史由 ``bot.group_history_*`` 控制（群
+    管理员可配），这里只管"要不要回复"那一步需要看到的最近几条。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return (
+        resources.decision_history_token_budget,
+        resources.decision_history_max_messages,
+    )
 
 #: 单条超长消息被截断时补的说明（截断必须留痕，不能让人以为对方只说了这半句）。
 #: 文案与第 1 期私聊保持一致，两个通道对同一件事说同一句话。
