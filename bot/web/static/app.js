@@ -1352,7 +1352,15 @@
             ${field("economy.tag_days_30d", "头衔 30 天时长（天）", { type: "number", min: 1, max: 3650, step: 1, required: true })}
             ${field("economy.pin_price", "置顶价（分）", { type: "number", min: 0, max: 100000, step: 1, required: true })}
             ${field("economy.pin_hours", "置顶时长（小时）", { type: "number", min: 1, max: 720, step: 1, required: true })}
+            ${field("economy.tag_max_length", "头衔字数上限", { type: "number", min: 1, max: 16, step: 1, required: true, hint: "上界固定为 16（Telegram 原生协议，不能放开）；防冒充词表固定在代码里，不在这里配置", help: "头衔长度是 Telegram 的原生规则，不是运营旋钮。防冒充管理员的词表（管理员/群主/admin/官方…）同样固定在源码里，配置不能删掉它——否则部署者可以让任何人买一个「官方」头衔。", helpLabel: "为什么这两项不给自由配" })}
           </div>
+          ${advancedPanel("economy.expiry", "到期权益清理", "扫描间隔、单轮预算、批量与失败重推", `
+            <div class="field-grid three">
+              ${field("economy.expiry_check_seconds", "扫描间隔（秒）", { type: "number", min: 30, max: 86400, step: 1, required: true })}
+              ${field("economy.expiry_pass_deadline_seconds", "单轮预算（秒）", { type: "number", min: 10, max: 3600, step: 1, required: true, hint: "一轮扫太久会挤占事件循环" })}
+              ${field("economy.expiry_batch_limit", "单轮批量（条）", { type: "number", min: 1, max: 5000, step: 1, required: true })}
+              ${field("economy.expiry_retry_seconds", "失败重推间隔（秒）", { type: "number", min: 30, max: 86400, step: 1, required: true, hint: "撤不下来时把到期时间往后推这么多，下次扫描再试" })}
+            </div>`)}
         </section>
 
         <section class="settings-section">
@@ -1430,6 +1438,10 @@
               ${field("resources.llm_request_background_capacity", "LLM 背景容量", { type: "number", min: 1, max: 64, step: 1, required: true, hint: "必须 ≤ 普通容量 − 2" })}
               ${field("resources.llm_tokenizer_concurrency", "分词线程数", { type: "number", min: 1, max: 8, step: 1, required: true })}
               ${field("resources.llm_stage_deadlines", "LLM 阶段预算（秒）", { kind: "json-object", full: true, rows: 9, hint: "形如 {\"decision\": 35, \"moderation\": 35, ...}。角色上显式设置的总预算仍然优先。" })}
+              ${field("resources.telegram_critical_admission_timeout_seconds", "关键请求准入等待（秒）", { type: "number", min: 0.1, max: 60, step: 0.1, required: true, hint: "热生效：每次请求现取" })}
+              ${field("resources.telegram_high_admission_timeout_seconds", "高优请求准入等待（秒）", { type: "number", min: 0.1, max: 60, step: 0.1, required: true })}
+              ${field("resources.telegram_normal_admission_timeout_seconds", "普通请求准入等待（秒）", { type: "number", min: 0.1, max: 60, step: 0.1, required: true })}
+              ${field("resources.telegram_privileged_timeout_seconds", "特权请求 HTTP 上限（秒）", { type: "number", min: 0.1, max: 60, step: 0.1, required: true })}
               ${field("resources.telegram_total_capacity", "Telegram 总容量", { type: "number", min: 8, max: 512, step: 1, required: true })}
               ${field("resources.telegram_noncritical_capacity", "Telegram 非关键容量", { type: "number", min: 4, max: 512, step: 1, required: true })}
               ${field("resources.telegram_normal_capacity", "Telegram 普通容量", { type: "number", min: 2, max: 512, step: 1, required: true })}
