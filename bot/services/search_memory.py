@@ -832,9 +832,14 @@ def render_search_record_messages(
     items = [item for item in (records or []) if isinstance(item, dict)]
     if not items:
         return []
+    keep = (
+        max_records
+        if max_records is not None
+        else search_memory_limits()["recall_limit"]
+    )
     table = windows or DEFAULT_FRESHNESS_HOURS
     messages: list[dict[str, Any]] = []
-    for item in items[-max(1, int(max_records)) :]:
+    for item in items[-max(1, int(keep)) :]:
         lines = _record_lines(
             item,
             now=now,

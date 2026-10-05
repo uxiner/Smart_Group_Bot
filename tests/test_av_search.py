@@ -176,17 +176,21 @@ class AVSearchServiceTests(unittest.TestCase):
 
 class AVResourceAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_saturated_query_slot_fails_fast(self) -> None:
+        from bot.config import Settings
+        from bot.services import policy_runtime
+
         service = _make_service()
         blocked = asyncio.Semaphore(0)
         started = asyncio.get_running_loop().time()
-        with (
-            patch.object(av_search_module, "_AV_QUERY_SEMAPHORE", blocked),
-            patch.object(
-                av_search_module,
-                "_AV_QUERY_ADMISSION_TIMEOUT_SECONDS",
-                0.01,
-            ),
-        ):
+        # 准入超时现在是运行时配置（``resources.av_query_admission_timeout_seconds``），
+        # 所以走同一条读路径把它调小——顺便证明"配了就真的被读"。
+        settings = Settings(_env_file=None)
+        settings.resources = settings.resources.model_copy(
+            update={"av_query_admission_timeout_seconds": 0.01}
+        )
+        policy_runtime.bind(settings)
+        self.addCleanup(policy_runtime.unbind)
+        with patch.object(av_search_module, "_AV_QUERY_SEMAPHORE", blocked):
             result = await service.search("ABC-123")
 
         self.assertEqual(result, [])
