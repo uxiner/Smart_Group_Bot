@@ -1217,6 +1217,7 @@ def build_private_chat_messages(
     sender_is_tg_admin: bool = False,
     image_description: str = "",
     last_contact: str = "",
+    tts_preference: str = "",
     search_records: list[dict[str, Any]] | None = None,
     group_public_records: list[dict[str, Any]] | None = None,
     long_term_facts: list[dict[str, Any]] | None = None,
@@ -1234,6 +1235,12 @@ def build_private_chat_messages(
 
     ``sender_is_owner`` 由调用方按 ``settings.super_admin_id`` 传入（最高管理员），
     私聊里同样触发亲密档；成员可控正文一律走 ``user`` 角色 + 不可信围栏。
+
+    ``tts_preference`` 由调用方（handler）用
+    :func:`bot.services.private_tts.build_private_tts_preference` 生成：全局 TTS 不可用
+    时它是空串，这里就**一个字都不注入**。它进的是 system 位置，但内容是我们自己写的
+    媒介说明 + 最高管理员指示的**归一化结果**（``text`` / ``voice`` 两个词），不是对方
+    的原话，所以不存在把成员可控文本抬进 system 的风险。
 
     第 3 期新增两层的注入（都**只读**、都带来源/时效标注）：
 
@@ -1343,6 +1350,10 @@ def build_private_chat_messages(
             ),
         }
     )
+    # 私聊语音：只有全局 TTS 可用（或最高管理员下了媒介指示）时才有这一块。空串
+    # 时一个字节都不注入——模型不会知道有语音这回事，也就不会说出「只能打字」。
+    if str(tts_preference or "").strip():
+        messages.append({"role": "system", "content": tts_preference.strip()})
     if sender_is_owner:
         # 亲密档：只在「最高管理员私聊」这条路注入，群里与别人私聊都拿不到这一段。
         messages.append(

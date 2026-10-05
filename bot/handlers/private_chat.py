@@ -9,6 +9,14 @@
 **注册顺序**：这个 router 必须排在 ``group.router`` **之前**——群消息处理器用的是
 ``F.text | F.photo | ...`` 这种宽泛过滤，且靠函数体里 ``is_group()`` 早退，谁先注册
 谁先吃消息。排它前面才能保证私聊消息不会被群处理器吃掉。
+
+**文字还是语音（2026-10-06）**：和群聊一样由模型**自主**决定这一条发文字还是发语音——不是
+关键词命中才准发语音，也不是每条都强制语音，更没有固定随机概率。做法是在同一次主回复的
+最前面带一行严格信封 ``[[DM_DELIVERY: text|voice]]``（传输标记，**发给用户前剥掉、
+绝不落库**）。私聊这条路径当前是 plain chat（``answer_with_search`` → ``llm.chat``，
+一次调用出正文），这里沿用它，不为每条私聊增加一次工具循环或一次额外的 LLM 分类调用。最高管理员本轮的明确
+文字/语音指示按**真实鉴权结果**（``verdict.is_super``）优先于自主选择；正文里自称超管
+不算数。投递、拒收降级、配额与取消的语义全在 :mod:`bot.services.private_tts`。
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from bot.config import Settings
 from bot.services.authz import list_authorized_groups
 from bot.services.context_gate import context_token_budget
 from bot.services.dm_search import answer_with_search
+from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.group_public_context import (
     load_group_titles,
     load_user_public_group_context,
@@ -55,6 +64,14 @@ from bot.services.private_chat import (
     record_contact,
     record_private_turn,
     resolve_access,
+)
+from bot.services.private_tts import (
+    DeliveryReceipt,
+    build_private_tts_preference,
+    deliver_private_reply,
+    load_owner_delivery_state,
+    parse_dm_delivery,
+    resolve_delivery_directive,
 )
 from bot.services.search_memory import SCOPE_PRIVATE, load_search_records
 
@@ -94,6 +111,22 @@ def _reply_llm(settings: Settings):
         business_context_tokens=getattr(bot_cfg, "context_budget_tokens", None),
         context_reserve_tokens=getattr(bot_cfg, "context_reserve_tokens", None),
     )
+
+
+def _tts_service(settings: Settings):
+    """私聊这一轮能不能用语音。构造失败 / 没配 / 全局关掉 → ``None``（纯文字）。
+
+    私聊没有自己的 TTS 开关，口径就是**全局那一个**：``DoubaoTTSService(settings)`` 的
+    ``available`` 已经把 ``doubao_tts_enabled`` 与供应商凭据一起判完了。所以不需要任何
+    新配置项，也就不会影响群里现有的 ``tts_mode`` 行为。
+    """
+
+    try:
+        service = DoubaoTTSService(settings)
+    except Exception as exc:
+        log.warning("private chat: 语音服务构造失败（本轮按纯文字处理） | error=%s", exc)
+        return None
+    return service if service.available else None
 
 
 def _message_text(message: Message) -> str:
@@ -190,9 +223,22 @@ async def _send_notice(message: Message, text: str, key: str) -> None:
         log.warning("private chat: 提示发送失败 | user=%s | error=%s", user.id, exc)
 
 
-async def _send_reply(message: Message, text: str) -> None:
+async def _send_reply(
+    message: Message,
+    text: str,
+    receipt: DeliveryReceipt | None = None,
+) -> None:
+    """把正文分段发出去，**每确认一条送达就立刻记回执**。
+
+    长回复会被切成多条，第 2 条失败时第 1 条其实已经发到对方那里了。第一版这里是「要么
+    全部成功、要么整段当失败」，于是调用方退配额 + 历史缺失，而对方明明已经收到了一条。
+    现在分段逐条上账：抛异常只说明**还没发的那部分**没发出去。
+    """
+
     for chunk in _split_for_telegram(text):
         await message.answer(chunk, parse_mode=None)
+        if receipt is not None:
+            receipt.add(chunk)
 
 
 def _stored_user_turn(text: str, image_description: str) -> str:
@@ -354,6 +400,37 @@ async def on_private_message(
             titles=group_titles,
         )
 
+    # 私聊语音：和群聊一样由模型**自主**决定这一条发文字还是发语音——不是关键词命中
+    # 才准发语音，也不是每条都强制语音。
+    #   * 全局 TTS 不可用时不给模型任何提示，它就自然回文字，也不会说「只能打字」；
+    #   * 最高管理员本轮的明确指示按**真实鉴权结果**（verdict.is_super）才生效。
+    #     正文里自称「我是最高管理员」不算数——那只是正文，不是鉴权结论。
+    #   * 指示分「本轮」与「持续」：「这次用文字」只管这一轮；「以后都用语音」是持续
+    #     指示，由**他自己私聊历史里的原话**折叠出来（不新增任何表 / 全局配置），最新一次
+    #     有效修改或解除优先。群公开资料、检索留档、助手自己说过的话都不参与。
+    tts_service = _tts_service(settings)
+    owner_directive = ""
+    directive_source = ""
+    if verdict.is_super:
+        try:
+            persistent_directive = await load_owner_delivery_state(session, user.id)
+        except Exception as exc:  # 读不到就当没有持续指示，绝不猜
+            log.warning(
+                "private chat: 读取最高管理员媒介偏好失败（本轮按自主选择） | user=%s | error=%s",
+                user.id,
+                exc,
+            )
+            persistent_directive = ""
+        owner_directive, directive_source = resolve_delivery_directive(
+            text=text,
+            persistent=persistent_directive,
+            is_super=True,
+        )
+    tts_preference = build_private_tts_preference(
+        service_ready=tts_service is not None,
+        owner_directive=owner_directive,
+    )
+
     messages = build_private_chat_messages(
         text,
         history=history,
@@ -363,6 +440,7 @@ async def on_private_message(
         sender_is_tg_admin=verdict.is_admin,
         image_description=image_description,
         last_contact=last_contact,
+        tts_preference=tts_preference,
         search_records=search_records,
         group_public_records=group_public_records,
         long_term_facts=long_term_facts,
@@ -385,47 +463,118 @@ async def on_private_message(
             session=session,
             scope_id=user.id,
         )
-        reply = str(answer.text or "").strip()
+        # 投递信封：模型在最前面带一行 [[DM_DELIVERY: text|voice]]。它是传输标记，
+        # **绝不发出去、绝不落库**。畸形信封剥掉壳退回文字，正文一个字都不丢。
+        plan = parse_dm_delivery(str(answer.text or ""))
     except Exception as exc:
         await session.rollback()
         log.warning("private chat: 回复失败 | user=%s | error=%s", user.id, exc)
         await give_the_quota_back("model_failed")
         await _send_notice(message, BUSY_NOTICE, "busy")
         return
+
+    reply = plan.text
+    delivery = plan.delivery
+    delivery_source = "model"
+    if owner_directive:
+        # 最高管理员的媒介指示优先于模型的自主选择。``directive_source`` 说清这是
+        # 本轮说的（turn）、历史里持续有效的（history）、还是被撤销了（autonomy/released）。
+        delivery = owner_directive
+        delivery_source = f"owner:{directive_source}"
     if not reply:
         await give_the_quota_back("empty_reply")
         await _send_notice(message, BUSY_NOTICE, "busy")
         return
 
-    try:
-        await _send_reply(message, reply)
-    except Exception as exc:
-        log.warning("private chat: 发送失败 | user=%s | error=%s", user.id, exc)
-        await give_the_quota_back("send_failed")
-        return
-
-    store = history_store()
-    user_turn = _stored_user_turn(text, image_description)
-    store.append(user.id, "user", user_turn)
-    store.append(user.id, "assistant", reply)
-    # 落库：这一轮两行（用户 + 回复）。幂等键来自入站 message_id，Telegram 重投递
-    # 同一轮不会写出第二份；写失败只记日志，绝不影响这次已经发出去的回复。
-    await record_private_turn(
-        session,
-        user_id=user.id,
-        user_content=user_turn,
-        assistant_content=reply,
-        message_id=getattr(message, "message_id", None),
-    )
     log.info(
-        "private chat: 已回复 | user=%s | 档=%s | 今日=%s | 本档全局=%s | 日=%s | chars=%d",
+        "private chat: 投递选择 | user=%s | medium=%s | 依据=%s | chars=%d | 信封畸形=%s",
         user.id,
-        verdict.tier,
-        f"{outcome.user_used}/{outcome.per_user_limit}" if outcome else "不限",
-        f"{outcome.global_used}/{outcome.global_limit}" if outcome else "不限",
-        local_day_key(),
+        delivery,
+        delivery_source,
         len(reply),
+        plan.malformed,
     )
+
+    # 回执由这里持有：每确认一次 Telegram 送达就立刻记一笔。它决定「算不算回上话」
+    # （配额）和「历史写什么」，与后面抛不抛异常、是不是取消**全都无关**。
+    receipt = DeliveryReceipt()
+
+    async def _send_text(body: str, book: DeliveryReceipt) -> None:
+        await _send_reply(message, body, book)
+
+    async def finalize(medium: str, *, complete: bool) -> bool:
+        """把这一轮的账结完：回上话就落历史（不退配额），否则退款。
+
+        ``complete`` 为真表示请求的每一段都送到了 → 历史写全文（正文原样，保留 markdown
+        等只在屏幕上好看的东西）；为假表示只送出了一部分 → 历史**只写已送达的那部分**，
+        绝不把没播出、连文字兜底也失败的尾巴写成助手说过的话。
+        """
+
+        if not receipt.delivered:
+            return False
+        store = history_store()
+        user_turn = _stored_user_turn(text, image_description)
+        store.append(user.id, "user", user_turn)
+        # 落进历史的是**对方真正看到/听到的那段正文**（信封、提示词、合成报错都不算）。
+        store.append(user.id, "assistant", reply if complete else receipt.text)
+        # 落库：这一轮两行（用户 + 回复）。幂等键来自入站 message_id，Telegram 重投递
+        # 同一轮不会写出第二份；写失败只记日志，绝不影响这次已经发出去的回复。
+        await record_private_turn(
+            session,
+            user_id=user.id,
+            user_content=user_turn,
+            assistant_content=reply if complete else receipt.text,
+            message_id=getattr(message, "message_id", None),
+        )
+        log.info(
+            "private chat: 已回复 | user=%s | 档=%s | 今日=%s | 本档全局=%s | 日=%s | chars=%d | 媒介=%s",
+            user.id,
+            verdict.tier,
+            f"{outcome.user_used}/{outcome.per_user_limit}" if outcome else "不限",
+            f"{outcome.global_used}/{outcome.global_limit}" if outcome else "不限",
+            local_day_key(),
+            len(reply if complete else receipt.text),
+            medium,
+        )
+        return True
+
+    try:
+        delivery_outcome = await deliver_private_reply(
+            message,
+            text=reply,
+            delivery=delivery,
+            service=tts_service,
+            send_text=_send_text,
+            receipt=receipt,
+            uid=str(user.id),
+        )
+    except asyncio.CancelledError:
+        # 取消照原样抛出，但不能凭取消把「已经送出去了」抹掉：先按回执结账再重抛。
+        if await finalize("cancelled", complete=False):
+            log.info(
+                "private chat: 投递被取消，但已有 %d 段送达（照常计费、照常落历史）",
+                len(receipt.parts),
+            )
+        else:
+            await give_the_quota_back("cancelled_before_delivery")
+        raise
+    except Exception as exc:  # pragma: no cover - 投递编排对普通异常不再外抛
+        log.warning("private chat: 投递异常 | user=%s | error=%s", user.id, exc)
+        if not await finalize("exception", complete=False):
+            await give_the_quota_back("send_failed")
+        return
+    if not await finalize(
+        delivery_outcome.medium, complete=delivery_outcome.complete
+    ):
+        # 一条都没发出去 = 这一轮没回上话，按原语义退还当日配额。
+        log.info(
+            "private chat: 本轮没有任何可见回复 | user=%s | 选中=%s | error=%s",
+            user.id,
+            delivery,
+            delivery_outcome.error,
+        )
+        await give_the_quota_back("delivery_failed")
+        return
     if answer.searches:
         log.info(
             "private chat: 本轮联网检索 %d 次 | user=%s | 保险丝已触发=%s",
