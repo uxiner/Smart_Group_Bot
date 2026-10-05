@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -1821,24 +1823,112 @@ async def _sqlite_migrate_telegram_delete_jobs(conn) -> None:
         )
 
 
+# 生产规则 #6 的规则正文。**只用于算指纹**（见 ``_ScanScopeUpgrade``）：升级前必须
+# 核对"这一行确实是这条规则"，而不是只看自增 id。
+_PRODUCTION_RULE_6_PATTERN = "探花|招募"
+
+
+def moderation_rule_pattern_fingerprint(pattern: str) -> str:
+    """规则正文的指纹，用来确认"这一行确实是那条生产规则"。
+
+    归一化只做 ``strip()`` + ``casefold()``：本地匹配一律带 ``IGNORECASE``，所以
+    大小写差异本来就不是另一条规则；空白只去首尾，**不折叠中间的空白**——``"a  b"``
+    和 ``"a b"`` 在正则里并不等价，宁可对不上（跳过）也不误升级别人。
+    """
+
+    normalized = str(pattern or "").strip().casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class _ScanScopeUpgrade:
+    """一条"必须升级扫描范围"的规则，连同**确认它是它自己**所需的全部条件。"""
+
+    rule_id: int
+    rule_type: str
+    action: str
+    scope: str
+    #: ``moderation_rule_pattern_fingerprint`` 算出的规则正文指纹
+    pattern_fingerprint: str
+
+
 # 一次性生产配置升级：规则 #6 是部署时用 Mini App 建的硬规则（regex + ban，
 # 「探花招募族」），它必须同时扫「被引用的正文」和「机器人生成的图片描述」——
 # 广告正文常常只存在于被引用/转发的消息或截图里。列默认值仍是 ``message``，
-# 其余老规则（#1–#5 等）行为不变。只匹配 id + 类型 + 动作，避免误伤别的规则。
-_MODERATION_SCAN_SCOPE_UPGRADES: tuple[tuple[int, str, str, str], ...] = (
-    (6, "regex", "ban", "message+quote+vision"),
+# 其余老规则（#1–#5 等）行为不变。
+#
+# F-011：原来这里只按 **id + 类型 + 动作** 匹配，于是**在 id=6 含义不同的部署里**
+# 会把别人的规则静默升级成"正文 + 引用 + 图片描述"；引文里常含广告词，等于批量
+# 误删/误封。现在每条升级都多一道**内容核对**：类型、动作和规则正文指纹三者全中
+# 才动手，对不上就跳过并留 INFO 说明跳过原因。整体还可以用
+# ``Settings.legacy_scan_scope_migration_enabled``（默认 True = 今天的行为）显式关掉。
+_MODERATION_SCAN_SCOPE_UPGRADES: tuple[_ScanScopeUpgrade, ...] = (
+    _ScanScopeUpgrade(
+        rule_id=6,
+        rule_type="regex",
+        action="ban",
+        scope="message+quote+vision",
+        pattern_fingerprint=moderation_rule_pattern_fingerprint(
+            _PRODUCTION_RULE_6_PATTERN
+        ),
+    ),
 )
 
 
-async def _sqlite_upgrade_moderation_rule_scan_scopes(conn) -> int:
+async def _sqlite_upgrade_moderation_rule_scan_scopes(
+    conn, *, enabled: bool = True
+) -> int:
     """把已知的生产规则升级到需要的扫描范围（幂等，可重复启动）。
 
     返回被升级的行数，方便启动日志与迁移测试断言。只动仍是默认值
     （``message``/NULL/空）的行，已经手工配置过的规则不会被覆盖。
+
+    ``enabled=False`` 时一段写入都不做（显式开关；默认 ``True``，与今天一致）。
+
+    F-011：动手之前先**核对这一行确实是那条生产规则**——``id`` 只用来定位候选行，
+    真正的判据是 类型 + 动作 + 规则正文指纹。对不上的行一律跳过，并且只记
+    指纹（不记规则正文，规则正文是管理员自由文本）。
     """
 
+    if not enabled:
+        log.info(
+            "审核规则扫描范围的一次性升级已通过开关关闭"
+            "（legacy_scan_scope_migration_enabled=false）"
+        )
+        return 0
+
     changed = 0
-    for rule_id, rule_type, action, scope in _MODERATION_SCAN_SCOPE_UPGRADES:
+    for upgrade in _MODERATION_SCAN_SCOPE_UPGRADES:
+        candidate = (
+            await conn.execute(
+                text(
+                    "SELECT pattern FROM moderation_rules "
+                    "WHERE id = :rule_id AND rule_type = :rule_type AND action = :action"
+                ),
+                {
+                    "rule_id": int(upgrade.rule_id),
+                    "rule_type": upgrade.rule_type,
+                    "action": upgrade.action,
+                },
+            )
+        ).first()
+        if candidate is None:
+            log.info(
+                "跳过审核规则扫描范围升级: rule_id=%s 没有同类型同动作的规则"
+                "（该 id 含义不同或行不存在），不改任何行",
+                upgrade.rule_id,
+            )
+            continue
+        fingerprint = moderation_rule_pattern_fingerprint(str(candidate[0] or ""))
+        if fingerprint != upgrade.pattern_fingerprint:
+            log.info(
+                "跳过审核规则扫描范围升级: rule_id=%s 的规则正文指纹与已知生产规则不同"
+                "（expected=%s actual=%s），不静默放大它的扫描范围",
+                upgrade.rule_id,
+                upgrade.pattern_fingerprint,
+                fingerprint,
+            )
+            continue
         result = await conn.execute(
             text(
                 "UPDATE moderation_rules SET scan_scope = :scope "
@@ -1848,10 +1938,10 @@ async def _sqlite_upgrade_moderation_rule_scan_scopes(conn) -> int:
                 "OR scan_scope = 'message')"
             ),
             {
-                "scope": scope,
-                "rule_id": int(rule_id),
-                "rule_type": rule_type,
-                "action": action,
+                "scope": upgrade.scope,
+                "rule_id": int(upgrade.rule_id),
+                "rule_type": upgrade.rule_type,
+                "action": upgrade.action,
             },
         )
         changed += int(result.rowcount or 0)
@@ -1865,8 +1955,15 @@ async def _sqlite_upgrade_moderation_rule_scan_scopes(conn) -> int:
 
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
+    *,
+    legacy_scan_scope_migration_enabled: bool = True,
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
-    """Create engine, ensure tables exist, return engine + session factory."""
+    """Create engine, ensure tables exist, return engine + session factory.
+
+    ``legacy_scan_scope_migration_enabled``（F-011 的显式开关）只控制
+    ``_sqlite_upgrade_moderation_rule_scan_scopes``：默认 ``True`` = 今天的行为
+    （确认是那条生产规则的行照旧升级）。
+    """
     parsed_url, sqlite_path = _normalize_database_url(url)
     is_sqlite = parsed_url.drivername.startswith("sqlite")
     if sqlite_path is not None:
@@ -2234,7 +2331,9 @@ async def init_db(
                     "WHERE scan_scope IS NULL OR TRIM(scan_scope) = ''"
                 )
             )
-            await _sqlite_upgrade_moderation_rule_scan_scopes(conn)
+            await _sqlite_upgrade_moderation_rule_scan_scopes(
+                conn, enabled=legacy_scan_scope_migration_enabled
+            )
             await _sqlite_ensure_column(
                 conn,
                 "keyword_replies",

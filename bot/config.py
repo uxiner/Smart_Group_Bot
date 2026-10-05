@@ -377,6 +377,17 @@ class ModerationConfig(BaseModel):
     # <= 该窗口（秒），第一次点击只 arm（落库 pending_action/pending_at），第二次
     # 同键点击才真正执行。窗口过期后重新按两次。默认 300 秒。
     review_confirm_seconds: int = 300
+    # F-021：成本硬上限——每个群每小时最多多少次**审核模型调用**。
+    # **默认 0 = 不限**：生产行为与今天逐字一致，不配就等于没有这道闸。
+    #
+    # 为什么需要它：整形闸只把调用摊到时间轴上，**总量一条没少**（成员发 N 条 =
+    # N 次调用），过载时整形等于失效。配了之后超限的那几条**只跑本地确定性规则
+    # 并记为"未送审"**（conclusive=False，与"模型调用失败"同口径），所以本地
+    # 关键词/正则命中照常处置，绝不会出现"既没过本地规则、又没送审"的静默放行。
+    #
+    # 作用域与整形闸一致：只作用于**成员触发**的送审；申诉复核 / 资料巡检 / 入群
+    # 筛查 / /report 这些人工与低频路径不受影响（否则一次人工复核可能被刷屏挤掉）。
+    llm_call_cap_per_hour: int = 0
 
 
 class Settings(BaseSettings):
@@ -518,6 +529,20 @@ class Settings(BaseSettings):
     bot_proactive_retry_minutes: int = 30
     skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
+
+    # F-011：启动时那次「把已知生产审核规则升级到 message+quote+vision」的一次性
+    # 迁移。默认 **True** = 与今天完全一致（核对过内容指纹的那条规则照旧升级）。
+    # 想在别的部署里彻底不做这次特殊升级就设成 false（``.env`` /
+    # ``LEGACY_SCAN_SCOPE_MIGRATION_ENABLED=false``）。
+    #
+    # 生效入口是**启动配置**：`init_db` 在 runtime_config 加载之前跑，所以这个键
+    # 不走 Mini App 热生效（`moderation.*` 段里也没有对应项）。
+    legacy_scan_scope_migration_enabled: bool = True
+
+    # F-022：TTS provider 显式选择（``doubao`` / ``edge``）。留空（默认）= 沿用
+    # 现在的隐式口径：豆包凭据齐全走豆包，否则按 ``speaker`` 的形状判断是不是
+    # Edge 音色名（``zh-TW-HsiaoChenNeural`` 之类）。
+    doubao_tts_provider: str = ""
 
     doubao_tts_enabled: bool = False
     doubao_tts_http_timeout_sec: float = 20.0
@@ -1143,6 +1168,11 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.moderation.review_confirm_seconds = max(
         1, int(settings.moderation.review_confirm_seconds)
+    )
+    # F-021：0 = 不限（默认值，生产行为不变）。负数按 0 处理，避免负上限把
+    # 审核全部变成"不送审"。
+    settings.moderation.llm_call_cap_per_hour = max(
+        0, int(settings.moderation.llm_call_cap_per_hour or 0)
     )
 
     settings.bot.token = settings.bot_token

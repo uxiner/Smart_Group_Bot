@@ -547,6 +547,10 @@ class ModerationSettingsConfig(StrictModel):
     # 「人工放行 / 确认封禁」双击确认窗口（秒）：第一次点击只 arm，第二次同键
     # 点击且间隔 <= 该窗口才真正执行。默认 300。
     review_confirm_seconds: int = Field(default=300, ge=1, le=86400)
+    # F-021：每群每小时最多多少次审核模型调用。**0 = 不限**（默认，生产行为与
+    # 今天逐字一致）。超限时只跑本地确定性规则并记为"未送审"（conclusive=False），
+    # 与"模型调用失败"同口径，绝不静默放行。作用域：仅成员触发的送审。
+    llm_call_cap_per_hour: int = Field(default=0, ge=0, le=1000000)
 
 
 class PatrolSettingsConfig(StrictModel):

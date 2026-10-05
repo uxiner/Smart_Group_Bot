@@ -606,7 +606,14 @@ async def main() -> None:
     validate_bootstrap_settings(settings)
     # F-025：用户图片会不会离开本服务，必须在启动日志里可见（默认不外发）。
 
-    engine, session_factory = await init_db(settings.database_url)
+    engine, session_factory = await init_db(
+        settings.database_url,
+        # F-011：那次「把已知生产规则升级到 message+quote+vision」的一次性迁移现在
+        # 是显式开关，默认开 = 与今天完全一致。
+        legacy_scan_scope_migration_enabled=(
+            settings.legacy_scan_scope_migration_enabled
+        ),
+    )
     # 模型窗口元数据晚到/变化时，把新窗口套到 MemoryService 的预算上（不重启也要生效）。
     # MemoryService 的预算是构造时的快照：启动预取超时转后台、周期刷新带来新窗口，
     # 都必须走这一条线才算真的生效。
