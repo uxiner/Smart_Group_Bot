@@ -762,6 +762,10 @@ class LoggingSettingsConfig(StrictModel):
     file_path: str = Field(default="data/bot.log", max_length=1000)
     file_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=10 * 1024 * 1024 * 1024)
     file_backup_count: int = Field(default=3, ge=1, le=100)
+    # A-16 / P4-1：入口日志里消息正文的预览字数。默认 100 = 改之前的硬编码行为
+    # （`LoggingMiddleware` 里 `raw_text[:100]`），**不配 = 日志逐字不变**。
+    # 调小只留更短的前缀；0 = 完全不记录正文，只记长度 + 内容哈希前缀。
+    message_preview_chars: int = Field(default=100, ge=0, le=1000)
 
 
 class PromptSettingsConfig(StrictModel):
@@ -2527,6 +2531,14 @@ def build_legacy_runtime_config(
                 _env_int(
                     "LOG_FILE_BACKUP_COUNT",
                     3,
+                    values=raw_env,
+                ),
+            ),
+            message_preview_chars=max(
+                0,
+                _env_int(
+                    "LOG_MESSAGE_PREVIEW_CHARS",
+                    100,
                     values=raw_env,
                 ),
             ),

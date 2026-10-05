@@ -91,6 +91,12 @@ class TelegramDeliveryResult:
 
 _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
 _TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
+#: A-22 / P4-3：已经打过失败日志的任务。观察点可能被走到两次（done 回调 + 关停时
+#: 的 ``flush_telegram_background_tasks``），同一个失败只该记一条。弱引用，任务
+#: 回收后条目自动消失。
+_TELEGRAM_BACKGROUND_REPORTED: "weakref.WeakSet[asyncio.Task[object]]" = (
+    weakref.WeakSet()
+)
 _TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
 _UNINITIALIZED_AUTO_DELETE_WARNED = False
 
@@ -108,15 +114,61 @@ def confirm_telegram_delivery(callback: Callable[[], None] | None) -> None:
         log.exception("Telegram delivery callback failed")
 
 
+def _background_task_label(task: asyncio.Task[object]) -> str:
+    """一个可定位的后台任务标签：名字（发起位置）+ id。
+
+    名字由发起处给出（``_schedule_telegram_background_task(name=...)`` /
+    ``asyncio.create_task(..., name=...)``，例如 ``delete-button:<chat>:<msg>``、
+    ``typing-send:<chat>``），所以排障时看到日志就能知道是哪一个投递炸了。
+    """
+
+    try:
+        name = task.get_name()
+    except Exception:  # pragma: no cover - 非 Task 对象
+        name = "?"
+    return f"{name}#{id(task):x}"
+
+
 def _observe_telegram_background_task(task: asyncio.Task[object]) -> None:
+    """回收一个后台任务，并把**失败原因**落到日志里（A-22 / P4-3）。
+
+    改前这里是 ``try: task.exception() except: pass``：后台任务炸了既没有日志、
+    也没有痕迹，只剩下「群里的操作没发生」。现在至少 ``log.exception`` 打出完整
+    traceback + 任务名。
+
+    **成败语义不变**：回收/记账照旧，异常不外抛，也不重试（重试是行为变化）。
+    """
+
     _TELEGRAM_BACKGROUND_TASKS.discard(task)
     _TELEGRAM_BACKGROUND_STARTED.pop(task, None)
     if task.cancelled():
         return
     try:
-        task.exception()
-    except (asyncio.CancelledError, Exception):
-        pass
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        # 连「取任务异常」本身都失败（自定义 Task / loop 已关）：仍然别静默。
+        log.exception(
+            "Telegram background task result unavailable | task=%s",
+            _background_task_label(task),
+        )
+        return
+    if exc is None:
+        return
+    if task in _TELEGRAM_BACKGROUND_REPORTED:
+        return
+    _TELEGRAM_BACKGROUND_REPORTED.add(task)
+    try:
+        # 在这里重新抛一次，只为拿到一个「正在处理中」的异常上下文：
+        # log.exception 依赖 sys.exc_info()，直接调用会打出一条没有 traceback 的日志。
+        raise exc
+    except BaseException:
+        log.exception(
+            "Telegram background task failed | task=%s error=%s",
+            _background_task_label(task),
+            type(exc).__name__,
+        )
 
 
 def _track_telegram_background_task(task: asyncio.Task[object]) -> None:
@@ -1074,7 +1126,31 @@ _MARKDOWN_FENCE_LINE_RE = re.compile(
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
-_MARKDOWN_TOKEN_RE = re.compile(r"\x00tgmd(\d+)\x00")
+#: A-19 / P4-7：占位符前缀的**基准**形态。真正用的是每次渲染按输入动态选出的
+#: 前缀（见 :func:`_markdown_token_prefix`），它保证输入构造不出可命中的占位符。
+_MARKDOWN_TOKEN_BASE = "\x00tgmd"
+
+
+def _markdown_token_prefix(text: str) -> str:
+    """返回一个在 ``text`` 里**不可能出现**的占位符前缀。
+
+    A-19：改前前缀写死是 ``\\x00tgmd``，于是正文里只要出现 ``\\x00tgmd9\\x00``
+    （用户自己打出来，或模型原样吐回来），反替换就会去取 ``tokens[9]`` → IndexError，
+    整条消息的渲染直接炸掉。
+
+    这里在**输入原文**上找一个不存在的变体：``\\x00tgmd`` 不在 text 里就用它，否则
+    逐个加长。所有占位符都以选中的前缀开头，而 ``source`` 里除了占位符就只有
+    text 的片段，所以输入**构造不出**一个能命中的占位符。
+    """
+
+    prefix = _MARKDOWN_TOKEN_BASE
+    while prefix in text:
+        prefix += "x"
+    return prefix
+
+
+def _markdown_token_pattern(prefix: str) -> re.Pattern[str]:
+    return re.compile(re.escape(prefix) + r"(\d+)\x00")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1324,11 +1400,15 @@ def _render_blockquotes(text: str) -> str:
 
 def _render_inline_markdown(text: str) -> str:
     tokens: list[str] = []
+    # 前缀取自输入本身：输入里不可能存在它，所以只有本函数塞进去的占位符会被
+    # 反替换命中（详见 _markdown_token_prefix）。
+    prefix = _markdown_token_prefix(text)
+    token_re = _markdown_token_pattern(prefix)
 
     def _stash(rendered: str) -> str:
         index = len(tokens)
         tokens.append(rendered)
-        return f"\x00tgmd{index}\x00"
+        return f"{prefix}{index}\x00"
 
     source = _MARKDOWN_INLINE_CODE_RE.sub(
         lambda match: _stash(f"<code>{html.escape(match.group(1))}</code>"),
@@ -1354,10 +1434,15 @@ def _render_inline_markdown(text: str) -> str:
     rendered = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", rendered)
     rendered = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", rendered)
     rendered = _render_blockquotes(rendered)
-    return _MARKDOWN_TOKEN_RE.sub(
-        lambda match: tokens[int(match.group(1))],
-        rendered,
-    )
+
+    def _restore(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        # 正常路径下 token_re 只可能匹配到本函数刚塞进去的占位符（``index`` 必然
+        # 合法）；这里的下界判断只是兜底，保证即使将来前缀选取被改坏也只会把这段
+        # 文本原样留下，而不是整条渲染抛 IndexError。
+        return tokens[index] if index < len(tokens) else match.group(0)
+
+    return token_re.sub(_restore, rendered)
 
 
 def _render_fenced_code_html(opening: str, content: str) -> str:
@@ -1740,7 +1825,17 @@ async def typing_action(
             else:
                 _track_telegram_background_task(task)
             raise
-        except Exception:
+        except Exception as exc:
+            # A-22 / P4-3：输入状态是装饰性的，失败只影响这一次心跳（返回 False，
+            # worker 随即收工），**不能**让它把整个上下文炸掉——但必须留下痕迹，
+            # 否则「群里一直没反应」在日志里完全看不出来。成败语义不变。
+            if task.done():
+                log.warning(
+                    "Telegram typing action send failed | task=%s chat=%s error=%s",
+                    _background_task_label(task),
+                    chat_id,
+                    type(exc).__name__,
+                )
             if not task.done():
                 task.cancel()
                 done, _pending = await asyncio.wait(

@@ -135,6 +135,16 @@ class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
     disable_link_preview: bool = True
+    # B-41 / P4-11：**这个开关在生产不可达，写成 true 也不会丢任何消息**。
+    # 三道保险都指向 False，所以留在这里只是为了兼容老的 payload/TOML：
+    #   * ``runtime_config.BotBehaviorConfig.drop_pending_updates`` 有
+    #     ``_preserve_pending_updates`` 前置校验，任何写入都会被归一成 False；
+    #   * ``apply_to_settings`` 因此永远把 False 落到这里的进程设置上；
+    #   * 真到起跑时 ``update_delivery.run_update_delivery`` 仍然强制
+    #     ``polling_drop_pending_updates = False``，并在看到 true 时打一条
+    #     "ignored deprecated drop_pending_updates=true" 的 debug 日志。
+    # 丢弃 Telegram 积压必须是运维的**显式**动作，不是 bot 生命周期的一部分。
+    # 代码保留（不删），但不要指望它生效。
     drop_pending_updates: bool = False
     inbound_debounce_seconds: float = 5.0
     reply_batch_timeout_seconds: float = 45.0
@@ -264,6 +274,10 @@ class BotConfig(BaseModel):
     memory_recall_limit: int = 8
     memory_event_ttl_days: int = 30
     memory_deleted_retention_days: int = 30
+    # B-39 / P4-9：每日提炼次数台账（进程内 dict）的保留天数。默认 1 = 只留当天，
+    # 与改前**额度口径完全一致**（读侧只按自然日过滤，历史条目本来就不参与判定）。
+    # 调大只是让运维在进程内多留几天分作用域计数便于排查。
+    memory_extract_ledger_retention_days: int = 1
 
     # 第②项：后台群摘要（默认关闭；与 legacy 热历史压缩完全独立，不会自动打开旧开关）。
     # 原文/归档/私聊一条都不删，摘要只是"旧内容的低信任资料"，前台只读已发布的摘要。
@@ -583,10 +597,17 @@ class Settings(BaseSettings):
     movie_info_imdb_aws_secret_access_key: str = ""
     movie_info_imdb_aws_session_token: str = ""
 
-    # Firecrawl-backed web search (websearch skill backend).
+    # Firecrawl 接入（**顶层字段**，不是 settings.bot 下的）。
+    # 技能拿到的是根 ``Settings``（``SkillService(settings=settings)``，见
+    # handlers/{group,admin,commands}.py），所以这几个字段刻意放在 Settings 上；
+    # 读侧是 getattr(settings, "firecrawl_*")。
+    #: 检索技能（websearch）与抓取技能（webfetch）**共用**的接入参数。
     firecrawl_api_key: str = ""
     firecrawl_api_base: str = "https://api.firecrawl.dev"
+    #: 抓取技能（webfetch / WebFetchSkill）的单次调用超时，秒。
     firecrawl_timeout_sec: float = 20.0
+    #: 检索技能（websearch / WebSearchSkill）的单次调用超时，秒——与上面那个
+    #: **不是同一个旋钮**，别把 20 秒当检索的超时。
     firecrawl_search_timeout_sec: float = 18.0
 
     av_enabled: bool = True
@@ -1118,6 +1139,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             "memory_recall_limit",
             "memory_event_ttl_days",
             "memory_deleted_retention_days",
+            # B-39 / P4-9：台账保留期（只在 [bot] 段可配，不进 runtime_config/UI）。
+            "memory_extract_ledger_retention_days",
         ):
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))

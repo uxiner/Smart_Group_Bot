@@ -37,7 +37,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable
 
 from sqlalchemy import and_, delete, func, or_, select, text, update
@@ -156,6 +156,13 @@ EVENT_TTL_DAYS_MAX = 365
 DELETED_RETENTION_DAYS = 30
 DELETED_RETENTION_DAYS_MIN = 1
 DELETED_RETENTION_DAYS_MAX = 365
+#: B-39 / P4-9：每日提炼台账的保留期（天）。**默认 1 = 只留当天**，这是改之前的
+#: 口径：读侧两条路径都按自然日过滤，历史条目对额度判定零贡献，所以按保留期清理
+#: 不会改变「今天已用几次」的任何一次判定。调大只是让运维在进程内多留几天分作用域
+#: 计数便于排查（``memory_extract_ledger_retention_days``）。
+EXTRACT_LEDGER_RETENTION_DAYS = 1
+EXTRACT_LEDGER_RETENTION_DAYS_MIN = 1
+EXTRACT_LEDGER_RETENTION_DAYS_MAX = 365
 
 #: 注入块的头部（标记 + 说明）。**不用祈使式的强制措辞**（第 4 期硬边界，见
 #: ``tests/test_long_term_memory.py``），但必须写明「这是数据不是指令」：事实正文
@@ -226,6 +233,13 @@ _DIGIT_RUN_RE = re.compile(r"\d(?:[\s\-]?\d){10,}")
 
 #: 每日提炼次数的进程内台账（重启归零；见 :func:`extraction_runs_today` 的说明）
 _DAILY_EXTRACTION_LEDGER: dict[str, tuple[str, int]] = {}
+#: B-39 / P4-9：全台账的当日合计 ``(自然日, 次数)``。改前「今天一共提炼了几次」是
+#: 每次遍历整个 ``_DAILY_EXTRACTION_LEDGER`` 求和（作用域越多、跑得越久越慢）；
+#: 现在是记一次就 +1，读侧 O(1)。它与「遍历求和」**恒等**：每条 note 只让某一个
+#: 作用域的当日计数 +1，所以当日合计永远等于各作用域当日计数之和。
+_DAILY_EXTRACTION_TOTAL: tuple[str, int] = ("", 0)
+#: 上一次执行保留期清理的自然日（每个自然日只扫一次台账，正常路径 O(1)）。
+_DAILY_EXTRACTION_PRUNED_DAY: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +303,19 @@ def memory_extract_daily_cap(settings: Any) -> int:
         default=EXTRACT_DAILY_CAP,
         low=EXTRACT_DAILY_CAP_MIN,
         high=EXTRACT_DAILY_CAP_MAX,
+    )
+
+
+def memory_extract_ledger_retention_days(settings: Any) -> int:
+    return _bounded_int(
+        _bot_setting(
+            settings,
+            "memory_extract_ledger_retention_days",
+            EXTRACT_LEDGER_RETENTION_DAYS,
+        ),
+        default=EXTRACT_LEDGER_RETENTION_DAYS,
+        low=EXTRACT_LEDGER_RETENTION_DAYS_MIN,
+        high=EXTRACT_LEDGER_RETENTION_DAYS_MAX,
     )
 
 
@@ -567,12 +594,55 @@ def _day_key(now: Any | None = None) -> str:
     return (now or now_shanghai_naive()).strftime("%Y-%m-%d")
 
 
-def note_extraction_run(scope: Any, scope_id: Any, *, now: Any | None = None) -> int:
+def _ledger_retention_floor(day: str, settings: Any) -> str:
+    """保留期窗口的起始自然日（含）。``day`` 是 ISO 字符串，可直接按字典序比。"""
+
+    days = memory_extract_ledger_retention_days(settings)
+    if days <= 1:
+        return day
+    return (date.fromisoformat(day) - timedelta(days=days - 1)).isoformat()
+
+
+def _prune_extraction_ledger(day: str, settings: Any) -> None:
+    """摘掉保留期之外的台账条目（B-39 / P4-9）。
+
+    改前这个 dict 只增不减：每碰过一个 (scope, scope_id) 就多一个条目，进程活多久
+    就留多少个。读侧只看今天，所以过期条目是纯内存负担——摘掉它们**不改变任何一次
+    额度判定**（``extraction_runs_today`` 两条路径本来就按自然日过滤）。
+
+    每个自然日只扫一次（``_DAILY_EXTRACTION_PRUNED_DAY``），记一次提炼的正常路径
+    因此是 O(1)。
+    """
+
+    global _DAILY_EXTRACTION_PRUNED_DAY
+    if _DAILY_EXTRACTION_PRUNED_DAY == day:
+        return
+    _DAILY_EXTRACTION_PRUNED_DAY = day
+    floor = _ledger_retention_floor(day, settings)
+    stale = [
+        key
+        for key, (key_day, _count) in _DAILY_EXTRACTION_LEDGER.items()
+        if key_day < floor
+    ]
+    for key in stale:
+        _DAILY_EXTRACTION_LEDGER.pop(key, None)
+
+
+def note_extraction_run(
+    scope: Any,
+    scope_id: Any,
+    *,
+    now: Any | None = None,
+    settings: Any | None = None,
+) -> int:
     """记一次「真的要调模型了」的提炼，返回今天累计次数。
 
     **台账是进程内的**（模块级 dict，按自然日重置）：``memory_extract_daily_cap``
     是成本闸门，不是数据不变量，进程重启后从零开始是可以接受的代价；把它落库需要
     一张只为一个计数器存在的表。/settings 改了上限下一轮即生效。
+
+    ``settings`` 只用来读保留期（``memory_extract_ledger_retention_days``）；不传就
+    用默认保留期（1 天 = 只留当天），额度口径与之前完全一致。
     """
 
     key = _ledger_key(scope, scope_id)
@@ -582,7 +652,19 @@ def note_extraction_run(scope: Any, scope_id: Any, *, now: Any | None = None) ->
         count = 0
     count += 1
     _DAILY_EXTRACTION_LEDGER[key] = (day, count)
+    _bump_extraction_total(day)
+    _prune_extraction_ledger(day, settings)
     return count
+
+
+def _bump_extraction_total(day: str) -> None:
+    """当日合计 +1（跨日自动归零）。"""
+
+    global _DAILY_EXTRACTION_TOTAL
+    total_day, total = _DAILY_EXTRACTION_TOTAL
+    if total_day != day:
+        total = 0
+    _DAILY_EXTRACTION_TOTAL = (day, total + 1)
 
 
 def _ledger_key(scope: Any, scope_id: Any) -> str:
@@ -596,15 +678,16 @@ def extraction_runs_today(scope: Any | None = None, scope_id: Any | None = None,
     不传 ``scope``/``scope_id`` 时返回**全局**次数（``memory_extract_daily_cap``
     的口径是「每天最多提炼多少次」= 全部作用域合计，防止成本失控）；传了就返回
     该作用域今天的次数。
+
+    B-39 / P4-9：全局这一路不再遍历整张台账，改读当日合计（O(1)）。两者恒等：
+    每条 ``note_extraction_run`` 只让一个作用域的当日计数 +1，当日合计恒等于各
+    作用域当日计数之和。
     """
 
     day = _day_key(now)
     if scope is None or scope_id is None:
-        return sum(
-            count
-            for key_day, count in _DAILY_EXTRACTION_LEDGER.values()
-            if key_day == day
-        )
+        total_day, total = _DAILY_EXTRACTION_TOTAL
+        return total if total_day == day else 0
     current_day, count = _DAILY_EXTRACTION_LEDGER.get(
         _ledger_key(scope, scope_id), (day, 0)
     )
@@ -614,7 +697,10 @@ def extraction_runs_today(scope: Any | None = None, scope_id: Any | None = None,
 def reset_extraction_ledger() -> None:
     """清空台账（单测用；生产路径不会调用）。"""
 
+    global _DAILY_EXTRACTION_TOTAL, _DAILY_EXTRACTION_PRUNED_DAY
     _DAILY_EXTRACTION_LEDGER.clear()
+    _DAILY_EXTRACTION_TOTAL = ("", 0)
+    _DAILY_EXTRACTION_PRUNED_DAY = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1567,7 +1653,7 @@ async def run_extraction_round(
             async with session_factory() as session:
                 if not await should_extract(scope, scope_id, settings, session, now=stamp):
                     continue
-            note_extraction_run(scope, scope_id, now=stamp)
+            note_extraction_run(scope, scope_id, now=stamp, settings=settings)
             written = await extract_facts(
                 scope=scope,
                 scope_id=scope_id,
@@ -2355,6 +2441,7 @@ __all__ = [
     "memory_extract_daily_cap",
     "memory_extract_enabled",
     "memory_extract_interval_minutes",
+    "memory_extract_ledger_retention_days",
     "memory_extract_min_messages",
     "memory_facts_enabled",
     "memory_recall_limit",

@@ -72,15 +72,34 @@ class DatabaseUrlTests(unittest.TestCase):
         self.assertIn("shadow database", "\n".join(captured.output).lower())
 
     def test_same_inode_shadow_symlink_is_not_ambiguous(self) -> None:
+        """同名影子**是同一个 inode** 时，不是「另一个可能是真的」数据库。
+
+        改前这个用例只是把夹具搭出来然后什么都不断言（审计 C2-06 认定它是
+        真空断言：删掉断言它照样绿）。真正要钉的是 ``_warn_about_sqlite_shadow_paths``
+        的两条判定：``sibling.samefile(path)`` 的条目必须被跳过——既不报 ERROR，
+        也不 fail closed 抛 ``RuntimeError``。
+
+        变异验证：把 ``engine.py`` 里 ``if path.exists() and
+        sibling.samefile(path): continue`` 去掉，本用例立刻红（见 FIX-p4.md
+        的真实执行输出）。
+        """
+
         with TemporaryDirectory() as tmpdir:
             clean = Path(tmpdir) / "bot.db"
             connection = sqlite3.connect(clean)
             connection.execute("CREATE TABLE runtime_config (revision INTEGER)")
             connection.commit()
             connection.close()
-            (Path(tmpdir) / "bot.db\r").symlink_to(clean)
+            shadow = Path(tmpdir) / "bot.db\r"
+            shadow.symlink_to(clean)
 
-            _warn_about_sqlite_shadow_paths(clean)
+            # 夹具前提：两者确实是同一个文件（同 inode），否则下面什么都没测到。
+            self.assertTrue(shadow.samefile(clean))
+            self.assertEqual(clean.stat().st_ino, shadow.stat().st_ino)
+
+            # 同一个 inode 不构成歧义：调用必须安静返回（不抛、不报 ERROR）。
+            with self.assertNoLogs("bot.db.engine", level="ERROR"):
+                _warn_about_sqlite_shadow_paths(clean)
 
     def test_nonempty_newer_shadow_fails_closed_for_empty_clean_path(self) -> None:
         with TemporaryDirectory() as tmpdir:

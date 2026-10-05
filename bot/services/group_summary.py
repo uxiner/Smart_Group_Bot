@@ -195,7 +195,18 @@ class GroupSummaryConfig:
 
 
 def group_summary_config(settings: Any) -> GroupSummaryConfig:
-    """从 ``settings.bot``（或 BotConfig）读摘要配置，宽容取值 + 夹取。"""
+    """从 ``settings.bot``（或 BotConfig）读摘要配置，宽容取值 + 夹取。
+
+    下面的 ``default`` / ``low`` / ``high`` 与 ``bot/config.py`` 的
+    ``Field(default=…, ge=…, le=…)``（以及 ``bot/services/runtime_config.py`` 的
+    BotBehaviorConfig、Mini App 的 min/max）**一一对应**：它们是最后一道夹取，
+    前面两层（pydantic 校验、UI min/max）已经挡过一次。
+
+    加新字段时四处必须同步：config.py 声明、runtime_config 的 BotBehaviorConfig、
+    app.js 的控件、以及这里的 default/low/high。
+    ``tests/test_p4_config_surface_docs.py`` 会逐字段核对 default/low/high 与
+    config.py 是否一致。
+    """
 
     bot = getattr(settings, "bot", None)
     view = bot if bot is not None else settings

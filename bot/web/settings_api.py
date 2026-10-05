@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ from functools import wraps
 from typing import Annotated, Any, Literal
 
 from aiohttp import web
+from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -208,6 +210,13 @@ _GROUP_UPDATE_LOCKS: dict[int, asyncio.Lock] = {}
 #: 免得这个模块级字典随授权群数单调增长（A-10）。
 _GROUP_UPDATE_LOCK_WAITERS: dict[int, int] = {}
 _JSON_BODY_TIMEOUT_SECONDS = 5.0
+#: D3-22 / P4-8：请求体大小上界。**默认值与今天完全一致**——``verify_web``
+#: 建 app 时用的就是 ``client_max_size=_WEB_MAX_REQUEST_BYTES = 1 MiB``，这里只是把
+#: 同一条上界在 handler 里显式再挡一次（并在超限时立刻拒绝，不去缓冲正文），
+#: 同时把 aiohttp 抛的 ``HTTPRequestEntityTooLarge``（纯文本 413）换成与其它接口
+#: 一致的 JSON 错误信封。真正的「流式」上界由 aiohttp 的 ``client_max_size`` 兜底
+#: （没有 Content-Length 的分块请求由它拦住）。
+_JSON_BODY_MAX_BYTES = 1024 * 1024
 _JSON_BODY_CANCEL_GRACE_SECONDS = 0.1
 _JSON_BODY_ORPHAN_LIMIT = 32
 _JSON_BODY_ORPHANS: set[asyncio.Task[Any]] = set()
@@ -534,13 +543,24 @@ def _track_json_body_orphan(task: asyncio.Task[Any]) -> None:
 
 
 async def _read_request_json(request: web.Request) -> Any:
-    """Read one JSON body with a hard caller-visible deadline.
+    """Read one JSON body with a hard caller-visible deadline and a size bound.
 
     ``asyncio.wait_for`` can wait indefinitely for a coroutine that suppresses
     cancellation.  The request handler must still return 408 at the configured
     deadline; a misbehaving body reader is retired separately and bounded.
+
+    ``Content-Length`` 在开读之前就被检查（D3-22）：超限直接 413，不会把正文读进
+    进程内存；没有 Content-Length 的分块请求由 aiohttp 的 ``client_max_size``
+    （同一条 1 MiB 上界）兜底。
     """
 
+    declared = getattr(request, "content_length", None)
+    if declared is not None and int(declared) > max(0, int(_JSON_BODY_MAX_BYTES)):
+        raise _APIError(
+            413,
+            "request_too_large",
+            "请求体过大，请缩小后再试。",
+        )
     if len(_JSON_BODY_TASKS) >= _JSON_BODY_ORPHAN_LIMIT:
         raise _APIError(
             503,
@@ -589,6 +609,13 @@ async def _read_request_json(request: web.Request) -> Any:
 async def _json_object(request: web.Request) -> dict[str, Any]:
     try:
         body = await _read_request_json(request)
+    except HTTPRequestEntityTooLarge as exc:
+        # D3-22：aiohttp 的流式上界命中。换成与其它接口一致的 JSON 错误信封。
+        raise _APIError(
+            413,
+            "request_too_large",
+            "请求体过大，请缩小后再试。",
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise _APIError(400, "invalid_json", "请求体必须是有效的 JSON。") from exc
     if not isinstance(body, dict):
@@ -1699,6 +1726,60 @@ def _apply_group_settings(
     return updated
 
 
+def _path_int(
+    request: web.Request,
+    key: str,
+    *,
+    code: str = "invalid_user_id",
+    message: str = "用户 ID 无效。",
+) -> int:
+    """把 ``{id}`` 这类路径参数解析成 int，非法/缺失一律 400（D3-20 / A-24）。
+
+    改前多个 handler 直接对 ``request.match_info`` 做裸 ``int()``，非数字会让
+    ``ValueError`` 冒到装饰器的兜底 ``except Exception`` → 500 "internal_error"：
+    明明是客户端把 URL 打错了，却回一个「服务器炸了」，既误导管理员，也让
+    真正的 5xx 混在这条噪声里。这里是全文件**唯一**的路径整数解析入口。
+    """
+
+    try:
+        return int(request.match_info[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _APIError(400, code, message) from exc
+
+
+def _group_id(request: web.Request) -> int:
+    return _path_int(
+        request, "id", code="invalid_group_id", message="群 ID 无效。"
+    )
+
+
+def _opaque_error_ref(exc: BaseException, *, code: str, where: str) -> str:
+    """把内部异常细节换成**通用文案 + 一个能在服务端日志里对上的编号**。
+
+    A-27 / D3-23：``str(exc)`` 直接进响应体时，管理员会看到
+    ``runtime config revision changed: expected 5, got 7`` /
+    ``CONFIG_MASTER_KEY is required before saving secret settings`` 这类内部原文
+    ——暴露了内部实现（revision 数值、配置项的 env 变量名），对排障也没有帮助。
+    现在详情只进服务端日志，客户端拿到的文案里带一个 ``ref=`` 编号，管理员把这个
+    编号报给运维就能在日志里定位到同一次失败。
+    """
+
+    ref = secrets.token_hex(4)
+    log.error(
+        "Mini App settings API internal error | ref=%s code=%s where=%s type=%s",
+        ref,
+        code,
+        where,
+        type(exc).__name__,
+        exc_info=exc,
+    )
+    return ref
+
+
+def _opaque_error_message(exc: BaseException, *, code: str, where: str, text: str) -> str:
+    return f"{text}（错误编号 {_opaque_error_ref(exc, code=code, where=where)}）"
+
+
 def register_settings_routes(
     app: web.Application,
     *,
@@ -1737,14 +1818,28 @@ def register_settings_routes(
                     details=_validation_details(exc),
                 )
             except RuntimeConfigConflictError as exc:
+                # A-27 / D3-23：原文（expected/got 的 revision 数值）只进日志。
                 return _error_response(
                     409,
                     "revision_conflict",
-                    str(exc) or "配置已被其他会话更新，请刷新后重试。",
+                    _opaque_error_message(
+                        exc,
+                        code="revision_conflict",
+                        where="authenticated.put_settings",
+                        text="配置已被其他会话更新，请刷新后重试。",
+                    ),
                 )
-            except Exception:
-                log.exception("Mini App settings API request failed")
-                return _error_response(500, "internal_error", "服务器处理请求失败。")
+            except Exception as exc:
+                return _error_response(
+                    500,
+                    "internal_error",
+                    _opaque_error_message(
+                        exc,
+                        code="internal_error",
+                        where="authenticated",
+                        text="服务器处理请求失败。",
+                    ),
+                )
 
         return wrapped
 
@@ -1769,10 +1864,28 @@ def register_settings_routes(
                     details=_validation_details(exc),
                 )
             except RuntimeConfigEncryptionError as exc:
-                return _error_response(400, "secret_storage_unavailable", str(exc))
-            except Exception:
-                log.exception("Mini App group API request failed")
-                return _error_response(500, "internal_error", "服务器处理请求失败。")
+                # A-27 / D3-23：原文会写出 CONFIG_MASTER_KEY 这个 env 变量名。
+                return _error_response(
+                    400,
+                    "secret_storage_unavailable",
+                    _opaque_error_message(
+                        exc,
+                        code="secret_storage_unavailable",
+                        where="any_admin",
+                        text="密钥服务暂时不可用，请联系最高管理员。",
+                    ),
+                )
+            except Exception as exc:
+                return _error_response(
+                    500,
+                    "internal_error",
+                    _opaque_error_message(
+                        exc,
+                        code="internal_error",
+                        where="any_admin",
+                        text="服务器处理请求失败。",
+                    ),
+                )
 
         return wrapped
 
@@ -1910,7 +2023,17 @@ def register_settings_routes(
         except RuntimeConfigConflictError:
             raise
         except RuntimeConfigEncryptionError as exc:
-            raise _APIError(400, "secret_storage_unavailable", str(exc)) from exc
+            # A-27 / D3-23：原文会写出 CONFIG_MASTER_KEY 这个 env 变量名。
+            raise _APIError(
+                400,
+                "secret_storage_unavailable",
+                _opaque_error_message(
+                    exc,
+                    code="secret_storage_unavailable",
+                    where="put_settings.encryption",
+                    text="密钥服务暂时不可用，请联系最高管理员。",
+                ),
+            ) from exc
         except ValueError as exc:
             raise _APIError(400, "invalid_settings", str(exc)) from exc
         return _success_response(manager.api_document())
@@ -1969,7 +2092,7 @@ def register_settings_routes(
 
     @authenticated
     async def delete_authorized_group_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         async with session_factory() as session:
             row = await session.get(AuthorizedGroup, group_id)
             if row is not None:
@@ -1983,7 +2106,7 @@ def register_settings_routes(
     async def list_group_admins_api(request: web.Request, user: Any) -> web.Response:
         # Group admins may read this list too: the Mini App call-admin picker
         # renders it for every group they manage. Mutations stay super-admin.
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         async with session_factory() as session:
             rows = (await session.scalars(
@@ -2017,7 +2140,7 @@ def register_settings_routes(
         Falls back to the locally authorized admin list (with roster display
         names) when the Telegram lookup is unavailable.
         """
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         admins: list[dict[str, Any]] = []
         get_admins = getattr(bot, "get_chat_administrators", None)
@@ -2068,7 +2191,7 @@ def register_settings_routes(
 
     @authenticated
     async def create_group_admin_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         body = _AdminCreate.model_validate(await _json_object(request))
         async with session_factory() as session:
             authorized = await session.get(AuthorizedGroup, group_id)
@@ -2106,8 +2229,8 @@ def register_settings_routes(
 
     @authenticated
     async def delete_group_admin_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
-        user_id = int(request.match_info["user_id"])
+        group_id = _group_id(request)
+        user_id = _path_int(request, "user_id")
         async with session_factory() as session:
             row = await session.scalar(select(Admin).where(
                 Admin.group_id == group_id,
@@ -2503,10 +2626,7 @@ def register_settings_routes(
 
     @any_admin
     async def put_group_settings(request: web.Request, user: Any) -> web.Response:
-        try:
-            group_id = int(request.match_info["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_group_id", "群 ID 无效。") from exc
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
 
         request_body = await _json_object(request)
@@ -2711,24 +2831,6 @@ def register_settings_routes(
             {"group": document, "permission_apply": permission_apply}
         )
 
-    def _group_id(request: web.Request) -> int:
-        try:
-            return int(request.match_info["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_group_id", "群 ID 无效。") from exc
-
-    def _path_int(
-        request: web.Request,
-        key: str,
-        *,
-        code: str = "invalid_user_id",
-        message: str = "用户 ID 无效。",
-    ) -> int:
-        try:
-            return int(request.match_info[key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, code, message) from exc
-
     @any_admin
     async def list_rules(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
@@ -2767,10 +2869,9 @@ def register_settings_routes(
     async def update_rule(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            rule_id = int(request.match_info["rule_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_rule_id", "群规 ID 无效。") from exc
+        rule_id = _path_int(
+            request, "rule_id", code="invalid_rule_id", message="群规 ID 无效。"
+        )
         body = _RuleUpdate.model_validate(await _json_object(request))
         if not body.model_fields_set:
             raise _APIError(400, "empty_rule_update", "至少需要修改一个字段。")
@@ -2798,10 +2899,9 @@ def register_settings_routes(
     async def delete_rule(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            rule_id = int(request.match_info["rule_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_rule_id", "群规 ID 无效。") from exc
+        rule_id = _path_int(
+            request, "rule_id", code="invalid_rule_id", message="群规 ID 无效。"
+        )
         async with session_factory() as session:
             row = await session.get(ModerationRule, rule_id)
             if row is None or int(row.group_id) != group_id:
@@ -3061,10 +3161,9 @@ def register_settings_routes(
     async def update_memory(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            memory_id = int(request.match_info["memory_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_memory_id", "记忆 ID 无效。") from exc
+        memory_id = _path_int(
+            request, "memory_id", code="invalid_memory_id", message="记忆 ID 无效。"
+        )
         body = _MemoryCreate.model_validate(await _json_object(request))
         content = clean_multiline_text(body.content, max_len=4000).strip()
         if not content:
@@ -3082,10 +3181,9 @@ def register_settings_routes(
     async def delete_memory(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            memory_id = int(request.match_info["memory_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_memory_id", "记忆 ID 无效。") from exc
+        memory_id = _path_int(
+            request, "memory_id", code="invalid_memory_id", message="记忆 ID 无效。"
+        )
         async with session_factory() as session:
             row = await session.get(GroupPermanentMemory, memory_id)
             if row is None or int(row.group_id) != group_id:

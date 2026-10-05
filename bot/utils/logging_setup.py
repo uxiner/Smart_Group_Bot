@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -62,6 +64,67 @@ _LOG_SINK_HANDLERS: tuple[logging.Handler, ...] = ()
 _LOG_SATURATED_SINCE: float | None = None
 _LOG_REAPER_THREADS: dict[threading.Thread, float] = {}
 _ATEXIT_REGISTERED = False
+
+#: A-17 / P4-1：日志里出现的**用户可控文本**（消息正文、用户名、群名）如果原样写入，
+#: ``\r`` / ``\n`` / ``\x00`` 可以把一条记录伪造成多条（把 ``\n`` 之后的伪造行伪装成
+#: 别的组件写的），ANSI 转义（ESC ``\x1b``）可以让终端把日志渲染成别的东西——排障与
+#: 审计都会因此失真。这里统一净化：**保留原文字符形态**（转义后仍能读出原文），只把
+#: 「能伪造日志结构」的字节换成可见写法。ESC 落在控制字符集合里，所以转义掉 ESC 就
+#: 等于让 ANSI 序列退化成普通字面量。
+_LOG_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: 日志格式用 ``" | "`` 分隔字段，字段里再出现分隔符就会伪造出一列。
+_LOG_COLUMN_SEPARATOR = "|"
+
+
+def _escape_log_control(match: re.Match[str]) -> str:
+    char = match.group(0)
+    if char == "\n":
+        return "\\n"
+    if char == "\r":
+        return "\\r"
+    if char == "\t":
+        return "\\t"
+    return f"\\x{ord(char):02x}"
+
+
+def sanitize_log_field(value: object) -> str:
+    """Return a log field that cannot forge extra lines or terminal escapes.
+
+    控制字符转成 ``\\n`` / ``\\x1b`` 这类**可见的等价写法**（不是占位符堆，原文仍可读），
+    字段内嵌的 ``|`` 转成 ``\\|``，这样「聊天 / 用户 / 类型 / 内容」四个字段的边界
+    只可能来自日志格式本身。空串原样返回，非字符串按 ``str()`` 处理（与 ``%s`` 一致）。
+    """
+
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return ""
+    text = _LOG_CONTROL_RE.sub(_escape_log_control, text)
+    return text.replace(_LOG_COLUMN_SEPARATOR, "\\|")
+
+
+#: A-16 / P4-2：入口日志的消息正文预览字数。**默认 100 = 改之前的硬编码值**
+#: （``LoggingMiddleware`` 里的 ``raw_text[:100]``），所以不配这一项时日志逐字不变。
+#: 0 = 不记录正文，只记长度 + 内容哈希前缀（见 ``redacted_message_preview``）。
+_DEFAULT_MESSAGE_PREVIEW_CHARS = 100
+_MESSAGE_PREVIEW_CHARS = _DEFAULT_MESSAGE_PREVIEW_CHARS
+
+
+def message_preview_chars() -> int:
+    """当前生效的入口日志正文预览字数（``logging.message_preview_chars``）。"""
+
+    return _MESSAGE_PREVIEW_CHARS
+
+
+def redacted_message_preview(text: str) -> str:
+    """``message_preview_chars == 0`` 时的占位：只有长度和内容哈希前缀。
+
+    排障仍然能回答「这条消息有多长」「是不是同一条」，但正文一个字都不落盘。
+    """
+
+    if not text:
+        return "-"
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<{len(text)}字 #{digest}>"
 
 
 def logging_resource_health_snapshot() -> dict[str, Any]:
@@ -402,12 +465,42 @@ def shutdown_logging(*, timeout: float = _LISTENER_STOP_TIMEOUT_SECONDS) -> bool
 
 
 def configure_logging(*, force: bool = False, config: Any | None = None) -> None:
-    """Configure a compact, context-aware logging pipeline."""
-    global _ATEXIT_REGISTERED, _LOG_LISTENER, _LOG_QUEUE_HANDLER, _LOG_SINK_HANDLERS
+    """Configure a compact, context-aware logging pipeline.
+
+    A-23 / P4-4：替换 root handler 的**整段**是原子的，见
+    ``_configure_logging_locked`` 的说明。
+    """
 
     root = logging.getLogger()
     if root.handlers and not force:
         return
+    with _LOGGING_STATE_LOCK:
+        _configure_logging_locked(force=force, config=config, root=root)
+
+
+def _configure_logging_locked(
+    *,
+    force: bool,
+    config: Any | None,
+    root: logging.Logger,
+) -> None:
+    """退役旧 sink、建新 pipeline、摘挂 root handler、发布全局状态（**全程持锁**）。
+
+    改前这段只有开头（reaper 检查）和结尾（发布状态）两小段持锁，中间建
+    listener、``root.handlers.clear()`` / ``addHandler``、关旧 handler 全是裸的。
+    两个线程同时 ``force=True``（例如 Mini App 热更新设置撞上关停期的重配置）
+    会各自建一套 listener，然后往同一个 stdout 交错写——旧 sink 的半行和新 sink
+    的半行会拼成一条**从未发生过**的记录，排障时日志与事实对不上；被关掉的还是
+    另一套正在用的 handler。
+
+    ``_LOGGING_STATE_LOCK`` 是 RLock，本函数内部的 ``shutdown_logging()`` 会重入
+    它，所以整段一把锁住是安全的（reaper 线程只在 finally 里短暂取锁，不会与
+    本函数互等）。函数体里原有的两处 ``with _LOGGING_STATE_LOCK:`` 保留，它们在
+    锁内是空操作。
+    """
+
+    global _ATEXIT_REGISTERED, _LOG_LISTENER, _LOG_QUEUE_HANDLER, _LOG_SINK_HANDLERS
+    global _MESSAGE_PREVIEW_CHARS
 
     if force:
         with _LOGGING_STATE_LOCK:
@@ -442,6 +535,11 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         ).strip()
         log_file_max_bytes = max(1024, int(getattr(config, "file_max_bytes", 5 * 1024 * 1024)))
         log_file_backup_count = max(1, int(getattr(config, "file_backup_count", 3)))
+        # A-16：缺字段的老 payload / 老 config 对象一律退回 100（= 今天的行为）。
+        preview_chars = max(
+            0,
+            int(getattr(config, "message_preview_chars", _DEFAULT_MESSAGE_PREVIEW_CHARS)),
+        )
     else:
         color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
         log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
@@ -458,6 +556,11 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
             os.getenv("LOG_FILE_BACKUP_COUNT"),
             default=3,
             min_value=1,
+        )
+        preview_chars = _parse_int(
+            os.getenv("LOG_MESSAGE_PREVIEW_CHARS"),
+            default=_DEFAULT_MESSAGE_PREVIEW_CHARS,
+            min_value=0,
         )
     queue_size = _parse_int(
         os.getenv("LOG_QUEUE_SIZE"),
@@ -539,6 +642,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         _LOG_QUEUE_HANDLER = queue_handler
         _LOG_LISTENER = listener
         _LOG_SINK_HANDLERS = tuple(sink_handlers)
+        _MESSAGE_PREVIEW_CHARS = preview_chars
         if not _ATEXIT_REGISTERED:
             atexit.register(shutdown_logging)
             _ATEXIT_REGISTERED = True

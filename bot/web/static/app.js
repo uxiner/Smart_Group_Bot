@@ -939,7 +939,7 @@
           <input type="checkbox" data-auto-delete-category="${value}"${enabled ? " checked" : ""}>
           <span>${escapeHtml(label)}</span>
         </label>
-        <select class="delete-category-mode" data-auto-delete-mode="${value}" aria-label="${attr(label)}清理方式" title="定时自动删除或提供删除按钮（二选一）"${enabled ? "" : " disabled"}>
+        <select class="delete-category-mode" data-auto-delete-mode="${value}" aria-label="${attr(label)}清理方式" title="二选一：自动删除 = 到点由 bot 删掉本类消息；删除按钮 = 不定时删除，每条消息下方附一个「删除消息」按钮（本行的秒数在按钮模式下不生效）"${enabled ? "" : " disabled"}>
           <option value="timer"${mode === "timer" ? " selected" : ""}>自动删除</option>
           <option value="button"${mode === "button" ? " selected" : ""}>删除按钮</option>
         </select>
@@ -1234,6 +1234,7 @@
             ${field("logging.file_path", "文件路径", { maxlength: 1000 })}
             ${field("logging.file_max_bytes", "单文件最大字节", { type: "number", min: 1024, max: 10737418240, step: 1, required: true })}
             ${field("logging.file_backup_count", "保留文件数", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${field("logging.message_preview_chars", "入口日志正文预览字数", { type: "number", min: 0, max: 1000, step: 1, required: true, hint: "默认 100，与改动前一致；0 = 不记录正文，只记长度与内容哈希前缀" })}
           </div>
         </section>
       </div>`;
