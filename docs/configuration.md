@@ -209,7 +209,7 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
 
 默认全部等于今天真实生效的值，不配就逐字等于改造前。
 
-**需要重启**（`reload_kind: "restart"`，进程级闸门）：
+**需要重启**（`reload_kind: "restart"`，共 29 项，进程级闸门与服务构造）：
 
 `llm_request_capacity` 8 · `llm_request_noncritical_capacity` 7 ·
 `llm_request_normal_capacity` 4 · `llm_request_background_capacity` 2 ·
