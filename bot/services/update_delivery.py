@@ -30,6 +30,10 @@ _RESERVED_WEBHOOK_PATHS = {
     "/verify",
 }
 _RESERVED_WEBHOOK_PREFIXES = ("/api/", "/settings-assets/")
+
+#: 下面这组是**未绑定运行时配置时的默认值**（= 改造前的数值）。真实读侧是
+#: :func:`polling_limits` → ``runtime_config.resources.webhook_*`` /
+#: ``polling_*``；这里保留常量是为了让"没配置"这件事有个可对照的基准。
 WEBHOOK_MAX_CONCURRENT_UPDATES = 8
 # Interactive administration and automatic membership enforcement have
 # separate lanes.  A join flood may consume the security lane, but it cannot

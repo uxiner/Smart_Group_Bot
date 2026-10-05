@@ -92,13 +92,16 @@ from bot.services.update_completion import (
     reset_update_completion,
 )
 from bot.services.update_delivery import (
-    WEBHOOK_AUTH_CONCURRENT_UPDATES,
-    WEBHOOK_AUTH_QUEUE_CAPACITY,
-    WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
-    WEBHOOK_CRITICAL_QUEUE_CAPACITY,
-    WEBHOOK_MAX_CONCURRENT_UPDATES,
-    WEBHOOK_SECURITY_CONCURRENT_UPDATES,
-    WEBHOOK_SECURITY_QUEUE_CAPACITY,
+    # 下面这组 ``WEBHOOK_*`` 是**未绑定运行时配置时的默认值**（= 改造前的数值），
+    # 保留为显式再导出是为了兼容既有 import；真实的读侧是
+    # :func:`webhook_budget`，它读 ``runtime_config.resources.webhook_*``。
+    WEBHOOK_AUTH_CONCURRENT_UPDATES,  # noqa: F401  (re-export)
+    WEBHOOK_AUTH_QUEUE_CAPACITY,  # noqa: F401  (re-export)
+    WEBHOOK_CRITICAL_CONCURRENT_UPDATES,  # noqa: F401  (re-export)
+    WEBHOOK_CRITICAL_QUEUE_CAPACITY,  # noqa: F401  (re-export)
+    WEBHOOK_MAX_CONCURRENT_UPDATES,  # noqa: F401  (re-export)
+    WEBHOOK_SECURITY_CONCURRENT_UPDATES,  # noqa: F401  (re-export)
+    WEBHOOK_SECURITY_QUEUE_CAPACITY,  # noqa: F401  (re-export)
     TELEGRAM_AUTH_CANDIDATE_BURST,
     mark_privileged_operator,
     privileged_operator_is_trusted,
@@ -2879,18 +2882,21 @@ class _WebhookUpdateQueue:
                 "oldest security queued update is "
                 f"{security_queue_age:.1f}s old"
             )
+        # 一次判定用一份预算快照：健康阈值与实际执行超时必须同源，
+        # 否则"配置调小了但健康检查还按旧值"会漏报。
+        budget = webhook_budget()
+        grace = _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
         oldest_queue_age = self._oldest_queue_age(
             priority=ExecutionPriority.NORMAL
         )
-        if oldest_queue_age > _WEBHOOK_UPDATE_TIMEOUT_SECONDS:
+        if oldest_queue_age > budget["update_timeout_seconds"]:
             return f"oldest queued update is {oldest_queue_age:.1f}s old"
         critical_active_age = self._oldest_active_age(
             priority=ExecutionPriority.CRITICAL
         )
         if (
             critical_active_age
-            > _WEBHOOK_CRITICAL_UPDATE_TIMEOUT_SECONDS
-            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+            > budget["critical_update_timeout_seconds"] + grace
         ):
             return (
                 "oldest critical active update is "
@@ -2901,8 +2907,7 @@ class _WebhookUpdateQueue:
         )
         if (
             security_active_age
-            > _WEBHOOK_SECURITY_UPDATE_TIMEOUT_SECONDS
-            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+            > budget["security_update_timeout_seconds"] + grace
         ):
             return (
                 "oldest security active update is "
@@ -2911,8 +2916,7 @@ class _WebhookUpdateQueue:
         auth_active_age = self._oldest_active_age(auth_candidate=True)
         if (
             auth_active_age
-            > _WEBHOOK_AUTH_UPDATE_TIMEOUT_SECONDS
-            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+            > budget["auth_update_timeout_seconds"] + grace
         ):
             return (
                 "oldest authentication-candidate active update is "
@@ -2923,7 +2927,7 @@ class _WebhookUpdateQueue:
         )
         if (
             oldest_active_age
-            > _WEBHOOK_UPDATE_TIMEOUT_SECONDS + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+            > budget["update_timeout_seconds"] + grace
         ):
             return f"oldest active update is {oldest_active_age:.1f}s old"
         return None

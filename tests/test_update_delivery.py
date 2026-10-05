@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1312,6 +1312,28 @@ class UpdateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         dispatcher.start_polling.assert_awaited_once()
 
 
+@contextmanager
+def _bind_webhook_budget(**short):
+    """端到端预算现在是 ``runtime_config.resources.webhook_*``，必须配配置才生效。"""
+
+    from bot.services import policy_runtime
+
+    previous = policy_runtime.bound_settings()
+    # 在已绑定的 settings 上叠加：嵌套使用时不丢掉外层的改动。
+    settings = (previous or Settings(_env_file=None)).model_copy(deep=True)
+    settings.resources = settings.resources.model_copy(
+        update={f"webhook_{name}": value for name, value in short.items()}
+    )
+    policy_runtime.bind(settings)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime.unbind()
+        else:
+            policy_runtime.bind(previous)
+
+
 class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_durable_inbox_ack_does_not_occupy_worker_for_full_ai_reply(self) -> None:
         from datetime import timedelta
@@ -1868,7 +1890,7 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
         server.enable_webhook_route()
         try:
             with (
-                patch("bot.services.verify_web._WEBHOOK_UPDATE_TIMEOUT_SECONDS", 0.01),
+                _bind_webhook_budget(update_timeout_seconds=0.01),
                 patch("bot.services.verify_web._WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS", 0.01),
             ):
                 response = await handler(

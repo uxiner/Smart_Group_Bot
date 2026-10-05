@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import tempfile
 import unittest
 from datetime import timedelta
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 from aiogram import Bot, Dispatcher
 from sqlalchemy import select, update
 
+from bot.config import Settings
 from bot.db.engine import init_db
 from bot.db.models import WebhookInboxUpdate
 from bot.services.request_priority import ExecutionPriority
@@ -33,6 +35,77 @@ def _request(payload: dict) -> SimpleNamespace:
     )
 
 
+from bot.services import policy_runtime  # noqa: E402
+
+policy_runtime_bound = policy_runtime.bound_settings
+policy_runtime_bind = policy_runtime.bind
+policy_runtime_unbind = policy_runtime.unbind
+
+
+@contextmanager
+def _bind_webhook(**short):
+    """``with _bind_webhook(update_timeout_seconds=0.01):``。
+
+    端到端预算现在是 ``runtime_config.resources.webhook_*``，所以必须配配置。
+    """
+
+    previous = policy_runtime_bound()
+    # **在已绑定的 settings 上叠加**，而不是从默认新建一个：嵌套使用时
+    # （``with _bind_webhook(...), _bind_inbox(...)``）后一个必须保住前一个的改动，
+    # 否则 update_timeout 会被悄悄退回默认 150s，测试就变成"等一个永远不会来的超时"。
+    settings = previous or Settings(_env_file=None)
+    settings = settings.model_copy(deep=True)
+    settings.resources = settings.resources.model_copy(
+        update={f"webhook_{name}": value for name, value in short.items()}
+    )
+    policy_runtime_bind(settings)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime_unbind()
+        else:
+            policy_runtime_bind(previous)
+
+
+@contextmanager
+def _bind_inbox(**short):
+    """``with _bind_inbox(lease_seconds=0.06):`` → ``webhook_inbox_lease_seconds``。
+
+    这些值以前是模块常量，测试用 ``patch`` 打；现在它们是
+    ``runtime_config.resources.webhook_inbox_*``，所以测试也必须配配置——
+    否则 ``patch`` 一个已经不读的常量只会让测试"看起来在调、其实没调"。
+    """
+
+    previous = policy_runtime_bound()
+    base = previous or Settings(_env_file=None)
+    base = base.model_copy(deep=True)
+    base.resources = base.resources.model_copy(
+        update={f"webhook_inbox_{name}": value for name, value in short.items()}
+    )
+    policy_runtime_bind(base)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime_unbind()
+        else:
+            policy_runtime_bind(previous)
+
+
+def _inbox_policy(**resources) -> None:
+    from bot.config import Settings
+    from bot.services import policy_runtime
+
+    settings = Settings(_env_file=None)
+    settings.resources = settings.resources.model_copy(update=resources)
+    policy_runtime.bind(settings)
+
+
+def _unbind_policy() -> None:
+    policy_runtime_unbind()
+
+
 class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -43,6 +116,9 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.bot = Bot(token="42:TEST_TOKEN")
 
     async def asyncTearDown(self) -> None:
+        # 配置是进程级的全局绑定：每个用例进来前先复位，别把上一条用例的租约
+        # 带进下一条（那会让"租约 0.06 秒"这种断言看起来通过、其实没生效）。
+        _unbind_policy()
         await self.bot.session.close()
         await self.engine.dispose()
         self.tempdir.cleanup()
@@ -325,9 +401,9 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
             side_effect=cancellation_resistant
         )
         with (
-            patch("bot.services.verify_web._WEBHOOK_UPDATE_TIMEOUT_SECONDS", 0.02),
+            _bind_webhook(update_timeout_seconds=0.02),
             patch("bot.services.verify_web._WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS", 0.01),
-            patch("bot.services.verify_web._WEBHOOK_INBOX_LEASE_SECONDS", 0.06),
+            _bind_inbox(lease_seconds=0.06),
         ):
             response = await queue.handle_verified(
                 _request({"update_id": 1104, "message": {"text": "orphan"}})
@@ -374,9 +450,9 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
             side_effect=finishes_after_cancel
         )
         with (
-            patch("bot.services.verify_web._WEBHOOK_UPDATE_TIMEOUT_SECONDS", 0.01),
+            _bind_webhook(update_timeout_seconds=0.01),
             patch("bot.services.verify_web._WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS", 0.1),
-            patch("bot.services.verify_web._WEBHOOK_INBOX_LEASE_SECONDS", 0.05),
+            _bind_inbox(lease_seconds=0.05),
         ):
             response = await queue.handle_verified(
                 _request({"update_id": 1111, "message": {"text": "grace"}})
@@ -404,7 +480,7 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("bot.services.verify_web._WEBHOOK_INBOX_MAX_ATTEMPTS", 3),
             patch("bot.services.verify_web._WEBHOOK_INBOX_RETRY_BASE_SECONDS", 0.05),
-            patch("bot.services.verify_web._WEBHOOK_INBOX_RETRY_MAX_SECONDS", 1.0),
+            _bind_inbox(retry_max_seconds=1.0, lease_seconds=60.0),
         ):
             for attempt in range(1, 4):
                 lease = await queue._claim_durable_update(1105)
@@ -492,7 +568,7 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         queue = self._queue()
         with (
             patch("bot.services.verify_web._WEBHOOK_INBOX_RETENTION_SECONDS", 0.01),
-            patch("bot.services.verify_web._WEBHOOK_INBOX_CLEANUP_INTERVAL_SECONDS", 0.01),
+            _bind_inbox(cleanup_interval_seconds=0.01),
             patch("bot.services.verify_web._WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS", 0.01),
         ):
             await queue.start_recovery()
