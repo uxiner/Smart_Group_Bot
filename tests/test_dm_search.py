@@ -58,10 +58,10 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(
             dm_search.build_search_query("亲爱的，帮我查查 5090 的价格"), "帮我查查 5090 的价格"
         )
-        # 称呼前缀来自 ``display.search_query_prefixes``；显示名也一并被剥掉，
-        # 所以部署者换品牌后不需要改代码。用合成名，不在公开树里种任何人设。
+        # 称呼前缀来自 ``display.search_query_prefixes``；默认显示名（``助手``）
+        # 也一并被剥掉，所以部署者换品牌后不需要改代码。
         self.assertEqual(
-            dm_search.build_search_query("诶--  小助手 最近显卡新闻"), "最近显卡新闻"
+            dm_search.build_search_query("诶--  助手 最近显卡新闻"), "最近显卡新闻"
         )
 
     def test_configured_wake_prefixes_and_display_name_are_stripped(self) -> None:

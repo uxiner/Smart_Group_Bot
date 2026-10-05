@@ -9,6 +9,11 @@
 
 不传 ``--week`` 就是"最近一个完整自然周"（上周一 ~ 上周日，Asia/Shanghai）。
 
+参与门槛、每天计入上限与奖励向量都来自运行时配置
+（``runtime_config.activity.*``，默认 3 天 / 10 条 / 每天 20 条 / 向量
+``[25,12,12,4,4,4,4,4,4,4]``）。本工具走真正的 ``RuntimeConfigManager`` 初始化再读，
+所以改了 Mini App 里的值之后手动补跑也会用新值。
+
 **重复执行安全**：同一个用户、同一个周只会发一次奖（奖励流水上的幂等键 + 唯一索引），
 重复跑既不会重复加分，也不会报错。周报（``bot.tools.weekly_report``）用的是同一个
 函数，所以手动补跑和定时周报不会互相打架。
@@ -24,6 +29,7 @@ from datetime import date
 
 from bot.config import Settings
 from bot.db.engine import init_db
+from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.activity import (
     render_activity_lines,
     settle_weekly_activity,
@@ -69,6 +75,13 @@ async def _settle(
 ) -> int:
     settings = Settings()
     engine, session_factory = await init_db(settings.database_url)
+    # 门槛、每天计入上限与奖励向量都是运行时配置：走真正的 RuntimeConfigManager
+    # 初始化再读，否则手动补跑会按 schema 默认值算，和 Mini App 里配的对不上。
+    runtime_config = RuntimeConfigManager(
+        session_factory=session_factory,
+        settings=settings,
+    )
+    await runtime_config.initialize()
     failed = 0
     try:
         async with session_factory() as session:

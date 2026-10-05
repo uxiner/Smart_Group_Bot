@@ -1347,8 +1347,11 @@ class MemberActivityDaily(Base):
     ``group_message_archive``（只留 7 天，覆盖不了完整自然周），要么什么都没了。
     所以每条合格消息落到这里做一次 UPSERT。
 
-    ``messages`` 在**写入时**就按 ``MAX_DAILY_MESSAGES``（20）封顶：防刷屏的要求
-    落在数据层，之后不管怎么聚合都不会把刷屏算成贡献。``activity_date`` 与
+    ``messages`` 在**写入时**就按每天的条数上限封顶：防刷屏的要求落在数据层，之后
+    不管怎么聚合都不会把刷屏算成贡献。上限是运行时配置
+    ``runtime_config.activity.max_daily_messages``（默认 20），读侧
+    ``bot.services.activity.record_message_activity``；改动它**只影响之后的写入**，
+    已经落库的历史行不会被回算。``activity_date`` 与
     ``member_checkins.checkin_date`` 同口径（本地自然日 ``YYYY-MM-DD``）。
     """
 

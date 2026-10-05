@@ -168,7 +168,10 @@ def build_search_query(text: str) -> str:
     alternatives = "|".join(
         re.escape(item) for item in search_query_prefixes()
     )
-    prefix = re.compile(rf"^(?:{alternatives}|亲爱的|宝宝|喂)[，,、\s]*")
+    # ``[-—–]*`` 让"诶--"这种拖长音的招呼语一起被剥掉（与之前的固定前缀同口径）。
+    prefix = re.compile(
+        rf"^(?:{alternatives}|亲爱的|宝宝|喂)[-—–]*[，,、\s]*"
+    )
     for _ in range(4):  # 反复剥：可能连着几个称呼/语气词
         stripped = prefix.sub("", body)
         if stripped == body:

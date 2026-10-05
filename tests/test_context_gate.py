@@ -19,6 +19,8 @@ from types import SimpleNamespace
 from bot.services.context_gate import (
     CONTEXT_MESSAGE_TOKEN_OVERHEAD,
     CONTEXT_TOKEN_BUDGET,
+    CONTEXT_TOKEN_BUDGET_MAX,
+    CONTEXT_TOKEN_BUDGET_MIN,
     CONTEXT_TRUNCATION_NOTE,
     assemble_context_within_budget,
     bounded_context_token_budget,
@@ -60,11 +62,11 @@ class BudgetClampTests(unittest.TestCase):
 
         self.assertEqual(CONTEXT_TOKEN_BUDGET_MAX, BUSINESS_CONTEXT_TOKENS_MAX)
         self.assertEqual(CONTEXT_TOKEN_BUDGET_MIN, BUSINESS_CONTEXT_TOKENS_MIN)
-        self.assertEqual(
-            BotBehaviorConfig().context_budget_tokens.field_metadata
-            and BotBehaviorConfig.model_fields["context_budget_tokens"].metadata[-1].le,
-            BUSINESS_CONTEXT_TOKENS_MAX,
-        )
+        schema_bound = [
+            getattr(meta, "le", None)
+            for meta in BotBehaviorConfig.model_fields["context_budget_tokens"].metadata
+        ]
+        self.assertIn(BUSINESS_CONTEXT_TOKENS_MAX, schema_bound)
         self.assertEqual(bounded_context_token_budget(0), BUSINESS_CONTEXT_TOKENS_MIN)
         self.assertEqual(bounded_context_token_budget(-5), BUSINESS_CONTEXT_TOKENS_MIN)
         self.assertEqual(
