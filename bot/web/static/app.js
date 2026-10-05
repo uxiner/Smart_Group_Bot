@@ -227,6 +227,7 @@
     groupApiModelQuerySecretChanges: new Map(),
     groupCardOpen: new Map(),
     groupSectionOpen: new Map(),
+    advancedOpen: new Map(),
     resourceFormDrafts: new Map(),
     resourceFormBaselines: new Map(),
     pendingResourceCreates: new Map(),
@@ -417,6 +418,32 @@
     } catch (_) {
       // Older Telegram clients do not expose every WebApp method.
     }
+    syncTelegramSafeArea();
+    if (tg.onEvent) {
+      tg.onEvent("safeAreaChanged", syncTelegramSafeArea);
+      tg.onEvent("contentSafeAreaChanged", syncTelegramSafeArea);
+      tg.onEvent("viewportChanged", syncTelegramSafeArea);
+    }
+  }
+
+  // Telegram reports its own safe-area / viewport insets in CSS pixels; env()
+  // only covers standalone webviews. Mirror both into custom properties so the
+  // topbar, drawer and sticky nav stay clear of the Telegram header/footer.
+  function syncTelegramSafeArea() {
+    const insets = {
+      "--tg-safe-top": tg?.safeAreaInset,
+      "--tg-safe-bottom": tg?.contentSafeAreaInset?.bottom ?? tg?.safeAreaInset,
+      "--tg-safe-left": tg?.safeAreaInset,
+      "--tg-safe-right": tg?.safeAreaInset,
+    };
+    const viewportHeight = tg?.viewport?.height;
+    for (const [property, value] of Object.entries(insets)) {
+      if (!value || typeof value !== "number") continue;
+      document.documentElement.style.setProperty(property, `${Math.max(0, Math.round(value))}px`);
+    }
+    if (typeof viewportHeight === "number" && viewportHeight > 0) {
+      document.documentElement.style.setProperty("--tg-viewport-height", `${Math.round(viewportHeight)}px`);
+    }
   }
 
   function authHeaders(hasBody = false) {
@@ -553,9 +580,18 @@
       || state.accessMutating
       || state.immediateMutations > 0
       || state.groupSaving.size > 0;
-    saveButton.innerHTML = state.saving
-      ? `<span class="spinner spinner-compact"></span><span>保存中</span>`
-      : `${icon("save")}<span>保存全部</span>`;
+    // Only rewrite the button's markup when the label actually changes. A
+    // blur-driven `change` event also lands here (that is how updatePathControl
+    // refreshes the header while the pointer is already down on 保存全部);
+    // replacing the button's children mid-press removes the mousedown target and
+    // the browser never delivers the click, so the save silently did nothing.
+    const savePhase = state.saving ? "saving" : "idle";
+    if (saveButton.dataset.savePhase !== savePhase) {
+      saveButton.dataset.savePhase = savePhase;
+      saveButton.innerHTML = state.saving
+        ? `<span class="spinner spinner-compact"></span><span>保存中</span>`
+        : `${icon("save")}<span>保存全部</span>`;
+    }
     saveButton.setAttribute("aria-label", dirtyCount ? `保存全部 ${dirtyCount} 项更改` : "保存全部");
     saveButton.title = dirtyCount ? `保存全部 ${dirtyCount} 项更改` : "所有更改均已保存";
     saveState.hidden = !state.session;
@@ -596,6 +632,68 @@
         <div><h3>${escapeHtml(title)}</h3>${description ? `<p>${escapeHtml(description)}</p>` : ""}</div>
         ${action}
       </div>`;
+  }
+
+  // 字段级 help/details：一句话结论留在 hint 里，其余说明折叠起来，
+  // 这样"高级项"不再靠一长段施工备注顶着。
+  function helpDisclosure(help, label = "展开说明") {
+    if (!help) return "";
+    return `
+      <details class="field-help">
+        <summary>${icon("chevron-down")}<span>${escapeHtml(label)}</span></summary>
+        <div class="field-help-body">${escapeHtml(help)}</div>
+      </details>`;
+  }
+
+  // 分组级渐进披露：把"大部分人用不到"的字段收进可展开的面板，
+  // 但任何字段都没有被删除——展开后与原先完全一致。
+  function advancedPanel(id, title, description, body, { open = false } = {}) {
+    const expanded = state.advancedOpen.has(id) ? state.advancedOpen.get(id) : open;
+    return `
+      <details class="advanced-panel" data-advanced-panel="${attr(id)}"${expanded ? " open" : ""}>
+        <summary>
+          <span class="advanced-panel-icon">${icon("sliders-horizontal")}</span>
+          <span class="advanced-panel-copy">
+            <strong>${escapeHtml(title)}</strong>
+            ${description ? `<small>${escapeHtml(description)}</small>` : ""}
+          </span>
+          ${icon("chevron-down", "advanced-panel-chevron")}
+        </summary>
+        <div class="advanced-body">${body}</div>
+      </details>`;
+  }
+
+  function captureAdvancedDisclosureStates() {
+    content.querySelectorAll("[data-advanced-panel]").forEach(panel => {
+      state.advancedOpen.set(panel.dataset.advancedPanel, panel.open);
+    });
+  }
+
+  // 校验报错必须落在"看得见"的字段上：先把折叠层逐级打开再 reportValidity。
+  function revealAdvancedDisclosure(control) {
+    let revealed = false;
+    let node = control?.parentElement || null;
+    while (node && node !== content) {
+      if (node.matches?.("details.advanced-panel") && !node.open) {
+        node.open = true;
+        if (node.dataset.advancedPanel) state.advancedOpen.set(node.dataset.advancedPanel, true);
+        revealed = true;
+      }
+      node = node.parentElement;
+    }
+    return revealed;
+  }
+
+  // 按配置路径把字段所在的折叠层全部打开并滚到它身上，
+  // 这样"这个字段需要填数字"不会指向一个用户根本没打开过的面板。
+  function revealFieldByPath(path) {
+    if (!path) return;
+    const control = content.querySelector(`[data-path="${CSS.escape(path)}"]`);
+    if (!control) return;
+    if (revealAdvancedDisclosure(control)) {
+      control.focus({ preventScroll: true });
+      control.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
   }
 
   function field(path, label, options = {}) {
@@ -641,10 +739,11 @@
         <div class="field-label-row"><label class="field-label" for="${id}">${escapeHtml(label)}</label>${labelRight}</div>
         ${control}
         ${hint ? `<span class="field-hint">${escapeHtml(hint)}</span>` : ""}
+        ${helpDisclosure(options.help, options.helpLabel)}
       </div>`;
   }
 
-  function toggle(path, label, hint = "", full = false) {
+  function toggle(path, label, hint = "", full = false, help = "") {
     const value = Boolean(getPath(state.config, path));
     const id = `field-${path.replaceAll(".", "-")}`;
     const restart = (state.document?.restart_required_paths || []).includes(path);
@@ -653,6 +752,7 @@
         <div class="toggle-copy">
           <strong>${escapeHtml(label)}${restart ? ` <span class="badge warning">需重启</span>` : ""}</strong>
           ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
+          ${helpDisclosure(help)}
         </div>
         <label class="toggle" for="${id}">
           <input id="${id}" type="checkbox" data-path="${attr(path)}" data-kind="boolean" aria-label="${attr(label)}"${value ? " checked" : ""}>
@@ -661,7 +761,7 @@
       </div>`;
   }
 
-  function secretField(path, label, hint = "") {
+  function secretField(path, label, hint = "", help = "") {
     const change = state.secretChanges[path];
     const configured = state.configuredSecrets.has(path);
     const clearing = change?.action === "clear";
@@ -686,6 +786,7 @@
           <div class="secret-status">${status}${action}</div>
         </div>
         ${hint ? `<span class="field-hint">${escapeHtml(hint)}</span>` : ""}
+        ${helpDisclosure(help)}
       </div>`;
   }
 
@@ -947,87 +1048,102 @@
       </div>`;
     };
     return `
-      ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。")}
+      ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。保存后立即生效，无需重启。")}
       <datalist id="parse-modes"><option value="HTML"></option><option value="Markdown"></option><option value="MarkdownV2"></option></datalist>
       <div class="section-stack">
         <section class="settings-section">
-          ${sectionHead("消息处理")}
+          ${sectionHead("消息处理", "控制 Bot 如何接收、生成与发送消息。")}
           <div class="field-grid three">
             ${field("bot.parse_mode", "消息解析格式", { maxlength: 32, list: "parse-modes", placeholder: "留空发送纯文本" })}
-            ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true })}
+            ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true, hint: "短时间内的连续消息会合并成一轮处理" })}
             ${field("bot.reply_batch_timeout_seconds", "单次回复总时限（秒）", { type: "number", min: 5, max: 120, step: 1, required: true, hint: "覆盖决策、工具、生成和投递的总预算" })}
-            ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除；作为各类别的默认秒数" })}
-            ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "全局控制 AI 自动回复等 Bot 生成内容的网页预览")}
+            ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除；作为下方各类别的默认秒数" })}
+            ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "同时作用于 AI 自动回复等所有 Bot 生成内容")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
-            ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
-            ${toggle("bot.enable_rich_messages", "启用富文本排版", "D3-40：控制粗体/斜体/代码块等富文本渲染。此前的开关既无 UI、又无 env、又无 DB 路径（load_settings() 从不被调用），读取侧 getattr(..., False) 恒真，等于没有关")}
-            ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}
-            ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true })}
+            ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新同一条 Telegram 消息")}
+            ${toggle("bot.enable_rich_messages", "启用富文本排版", "开启后按下方「消息解析格式」渲染粗体、斜体、代码块等样式；关闭则统一按纯文本发送。")}
+            ${advancedPanel("bot.streaming", "流式输出细调", "只在需要调整发送节奏时改动", `
+              <div class="field-grid">
+                ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true, hint: "首个片段的最小长度，太小会频繁编辑同一条消息" })}
+                ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true, hint: "两次编辑之间的最小间隔，太小可能触发 Telegram 限流" })}
+              </div>`)}
           </div>
           <div class="choice-grid full-width-control">
             ${AUTO_DELETE_CATEGORY_META.map(({ key, label }) => categoryRow(key, label)).join("")}
           </div>
-          <p class="field-hint">勾选的类别按所选方式清理：「自动删除」按右侧秒数定时删除（留空用全局秒数）；「删除按钮」在消息下方提供管理员可用的内联删除按钮，两者互斥。</p>
+          <p class="field-hint">勾选的类别按所选方式清理，两种方式互斥：「自动删除」到点由 Bot 删除该类消息，秒数留空则使用上方全局秒数；「删除按钮」不定时删除，而是在每条消息下方附一个管理员可用的内联删除按钮（此模式下本行的秒数不生效）。</p>
         </section>
         <section class="settings-section">
-          ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，不再依赖自动压缩替代原文。")}
+          ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，原始消息不会被删除。")}
           <div class="field-grid three">
-            ${toggle("bot.group_summary_enabled", "启用后台群摘要", "默认关闭。开启后：近期原文 + 旧内容后台摘要（独立于 legacy 热历史压缩；原文/归档一条都不删，前台只读已发布的摘要，绝不等待摘要生成）")}
-            ${field("bot.group_summary_recent_raw_messages", "摘要模式：近期原文条数", { type: "number", min: 20, max: 10000, step: 1, required: true, hint: "默认 200；开启摘要时只读最近 N 条原文，其余由摘要承载（仍受群历史条数上限与预算约束）" })}
-            ${field("bot.group_summary_max_tokens", "摘要长度上限 Token", { type: "number", min: 256, max: 32768, step: 256, required: true, hint: "默认 4096；超出按此裁断并标注" })}
-            ${field("bot.group_summary_batch_max_messages", "单批最大条数", { type: "number", min: 10, max: 2000, step: 10, required: true, hint: "默认 200" })}
-            ${field("bot.group_summary_batch_max_input_tokens", "单批最大输入 Token", { type: "number", min: 1024, max: 1000000, step: 1024, required: true, hint: "默认 16384；实际还受模型/业务预算约束" })}
-            ${field("bot.group_summary_global_concurrency", "摘要全局并发", { type: "number", min: 1, max: 8, step: 1, required: true, hint: "默认 2（硬上限，与普通回复共享 normal 容量，回复永远保留 ≥2）" })}
-            ${field("bot.group_summary_per_group_concurrency", "摘要每群并发", { type: "number", min: 1, max: 1, step: 1, required: true, hint: "固定 1（硬安全约束，不是每用户 1）" })}
-            ${field("bot.group_summary_deadline_seconds", "摘要执行硬超时（秒）", { type: "number", min: 1, max: 120, step: 1, required: true, hint: "默认 15；入场后整个模型调用+fallback+重试合计不超过它" })}
-            ${field("bot.group_summary_queue_wait_seconds", "摘要排队最长等待（秒）", { type: "number", min: 1, max: 600, step: 1, required: true, hint: "默认 30；过期跳过并退避，排队时间不计入模型时限" })}
-            ${field("bot.group_summary_min_refresh_seconds", "同群最小刷新间隔（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "默认 60" })}
-            ${field("bot.group_summary_failure_backoff_seconds", "失败退避起点（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 60" })}
-            ${field("bot.group_summary_failure_backoff_max_seconds", "失败退避上限（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 3600" })}
-            ${field("bot.group_summary_pending_capacity", "摘要待处理群队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 1000（容量不是可支持群数）；队满本次跳过并计数" })}
-            ${field("bot.group_summary_trigger_messages", "触发阈值：未摘要旧消息条数", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 200：近期窗口之外累积到这么多就触发" })}
-            ${field("bot.group_summary_trigger_budget_ratio", "触发阈值：输入预算占用比", { type: "number", min: 0.1, max: 1, step: 0.05, required: true, hint: "默认 0.85：装配逼近有效输入预算的 85% 且有未摘要旧消息时触发" })}
-            ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
-            ${field("bot.context_budget_tokens", "每轮业务总预算 Token", { type: "number", min: 1024, max: 16000000, step: 1024, required: true, hint: "默认 278528（272Ki，推荐值）。覆盖人设/工具定义/记忆/历史/本轮/工具结果/输出预留；显式配置不会被隐藏常量截断，与模型真实窗口取更小" })}
-            ${field("bot.context_reserve_tokens", "输出/工具预留 Token", { type: "number", min: 1024, max: 8000000, step: 1024, required: true, hint: "默认 32768（32Ki），必须小于业务总预算；实际输出需求更大时按该角色 max_tokens 进一步收紧，且只扣一次" })}
-            ${field("bot.group_history_max_messages", "群历史单次读取条数", { type: "number", min: 1, max: 20000, step: 1, required: true, hint: "默认 1000（最近 N 条安全上限）；归档按页从新到旧读取，条数或预算先到即停" })}
-            ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动发现模型窗口（默认）" }, { value: "fixed", label: "固定模型侧上限（兼容旧配置）" }], hint: "每轮业务预算固定为 272Ki（输入上限 245760，含人设/工具定义/记忆/历史/本轮/工具结果/输出预留）。auto：再自动发现模型真实窗口，只在模型更小时进一步收紧；fixed：不查元数据，用右侧固定值当模型侧上限" })}
-            ${field("bot.max_context_tokens", "固定上限 Token（仅 fixed 生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。auto 模式下它只作为“查不到任何模型元数据”时的保守降级值，不再压住已知模型" })}
-            ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
             ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
             ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
-            ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；仅在没有模型元数据时作为保守降级值（auto 模式优先用实际模型窗口）" })}
-            ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期行由后台巡检清理" })}
-            ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）；仅在没有模型元数据时作为保守降级值（auto 模式优先用实际模型窗口）" })}
-            ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768；留给系统提示词/人设/本轮消息/召回/回复预留。装配历史 + 余量必须 ≤ 生效窗口" })}
-            ${field("bot.search_record_retention_days", "检索留档保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；检索结果留档由后台巡检按此清理" })}
-            ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
-            ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
-            ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
-            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "⚠️ 不是长期记忆的总开关：它只管「按当前问题从本群原始消息档案里检索相关消息」。第 ④ 期长期记忆（user_facts）的提炼/注入/写入由下面的「长期记忆总开关」控制，关掉它第 ④ 期照样提炼照样写库")}
-            ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
+            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "只影响「按当前问题从本群原始消息档案里检索相关消息」。", false, "这不是长期记忆的总开关：它不控制稳定事实（口味、身份、关系、约定等）的提炼、注入与写入，那部分由下一页的「启用长期记忆（总开关）」负责。关掉本页开关后，长期记忆仍会照常提炼与写入。")}
+            ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩近期窗口，原始档案不会删除。", false, "这是给仍在使用旧版压缩行为的群保留的兼容开关，新部署建议保持关闭：归档与召回已经能覆盖长对话，不需要额外压缩。")}
+            ${advancedPanel("bot.summary", "群摘要（后台）", "把更早的内容压成摘要，默认关闭", `
+              <div class="field-grid three">
+                ${toggle("bot.group_summary_enabled", "启用后台群摘要", "开启后：近期原文 + 旧内容的后台摘要。原始消息与归档一条都不删，前台只读已发布的摘要，绝不等待摘要生成。")}
+                ${field("bot.group_summary_recent_raw_messages", "摘要模式：近期原文条数", { type: "number", min: 20, max: 10000, step: 1, required: true, hint: "默认 200；只读最近 N 条原文，其余由摘要承载" })}
+                ${field("bot.group_summary_max_tokens", "摘要长度上限 Token", { type: "number", min: 256, max: 32768, step: 256, required: true, hint: "默认 4096；超出按此裁断并标注" })}
+                ${field("bot.group_summary_batch_max_messages", "单批最大条数", { type: "number", min: 10, max: 2000, step: 10, required: true, hint: "默认 200" })}
+                ${field("bot.group_summary_batch_max_input_tokens", "单批最大输入 Token", { type: "number", min: 1024, max: 1000000, step: 1024, required: true, hint: "默认 16384；实际还受模型与业务预算约束" })}
+                ${field("bot.group_summary_global_concurrency", "摘要全局并发", { type: "number", min: 1, max: 8, step: 1, required: true, hint: "默认 2。与普通回复共享容量，普通回复始终保留至少 2 个名额" })}
+                ${field("bot.group_summary_per_group_concurrency", "摘要每群并发", { type: "number", min: 1, max: 1, step: 1, required: true, hint: "固定为 1，不随用户数放开" })}
+                ${field("bot.group_summary_deadline_seconds", "摘要执行硬超时（秒）", { type: "number", min: 1, max: 120, step: 1, required: true, hint: "默认 15；整轮模型调用、重试与回退合计不超过它" })}
+                ${field("bot.group_summary_queue_wait_seconds", "摘要排队最长等待（秒）", { type: "number", min: 1, max: 600, step: 1, required: true, hint: "默认 30；过期就跳过并退避，排队时间不计入模型时限" })}
+                ${field("bot.group_summary_min_refresh_seconds", "同群最小刷新间隔（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "默认 60" })}
+                ${field("bot.group_summary_failure_backoff_seconds", "失败退避起点（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 60" })}
+                ${field("bot.group_summary_failure_backoff_max_seconds", "失败退避上限（秒）", { type: "number", min: 1, max: 86400, step: 1, required: true, hint: "默认 3600" })}
+                ${field("bot.group_summary_pending_capacity", "摘要待处理群队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 1000。容量不等于可支持的群数量；队满时本次跳过并计数" })}
+                ${field("bot.group_summary_trigger_messages", "触发阈值：未摘要旧消息条数", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "默认 200：近期窗口之外累积到这么多就触发" })}
+                ${field("bot.group_summary_trigger_budget_ratio", "触发阈值：输入预算占用比", { type: "number", min: 0.1, max: 1, step: 0.05, required: true, hint: "默认 0.85：占用逼近有效输入预算的 85% 且存在未摘要旧消息时触发" })}
+              </div>`)}
+            ${advancedPanel("bot.context-budget", "上下文预算", "Token 预算与模型窗口上限，默认值即可满足绝大多数场景", `
+              <div class="field-grid three">
+                ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
+                ${field("bot.context_budget_tokens", "每轮业务总预算 Token", { type: "number", min: 1024, max: 16000000, step: 1024, required: true, hint: "默认 278528（272Ki，推荐值）。覆盖人设、工具定义、记忆、历史、本轮、工具结果与输出预留；与模型真实窗口取更小的一个" })}
+                ${field("bot.context_reserve_tokens", "输出/工具预留 Token", { type: "number", min: 1024, max: 8000000, step: 1024, required: true, hint: "默认 32768（32Ki），必须小于业务总预算；输出需求更大时按该角色 max_tokens 进一步收紧" })}
+                ${field("bot.context_window_mode", "上下文上限模式", { type: "select", kind: "string", required: true, options: [{ value: "auto", label: "自动发现模型窗口（默认）" }, { value: "fixed", label: "固定模型侧上限（兼容旧配置）" }], hint: "每轮业务预算固定为 272Ki（输入上限 245760，含人设、工具定义、记忆、历史、本轮、工具结果与输出预留）。自动模式会再查询模型真实窗口，只在模型更小时进一步收紧；固定模式不查元数据，直接用右侧数值。" })}
+                ${field("bot.max_context_tokens", "固定上限 Token（仅固定模式生效）", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。自动模式下它只在查不到任何模型元数据时作为保守降级值" })}
+                ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
+              </div>`)}
+            ${advancedPanel("bot.history-budget", "历史与检索留档", "历史读取量与检索结果的新鲜窗口", `
+              <div class="field-grid three">
+                ${field("bot.group_history_max_messages", "群历史单次读取条数", { type: "number", min: 1, max: 20000, step: 1, required: true, hint: "默认 1000。归档按页从新到旧读取，条数或预算先到即停" })}
+                ${field("bot.group_history_token_budget", "群聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。仅在没有模型元数据时作为保守降级值" })}
+                ${field("bot.group_history_reserve_tokens", "群聊固定部分余量", { type: "number", min: 1024, max: 1000000, step: 1, required: true, hint: "默认 32768。留给系统提示词、人设、本轮消息、召回与回复预留；装配历史 + 余量必须 ≤ 生效窗口" })}
+                ${field("bot.private_chat_history_token_budget", "私聊历史 Token 预算", { type: "number", min: 1024, max: 2000000, step: 1, required: true, hint: "默认 278528（272K）。仅在没有模型元数据时作为保守降级值" })}
+                ${field("bot.private_chat_history_retention_days", "私聊历史保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；过期内容由后台巡检清理" })}
+                ${field("bot.search_record_retention_days", "检索留档保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30 天；检索结果留档由后台巡检按此清理" })}
+                ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
+                ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
+                ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号、参数这类事实变化很慢" })}
+              </div>`)}
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("长期记忆（第 ④ 期）", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定…）。D3-39：这一整块 11 个开关此前可 PUT、可落库、有 revision 保护，但 Mini App 完全无入口——其中 memory_facts_enabled / memory_tool_enabled 是真·总开关，关不掉。下方开关热生效：保存后立即影响提炼、注入与写入，无需重启。")}
+          ${sectionHead("长期记忆", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定等）。这一页的开关保存后立即生效，无需重启。")}
           <div class="field-grid three">
-            ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "**总开关**，关掉 = 不提炼、不注入、不写入（群聊注入 / 私聊召回 / /memory 命令都先判它）。关闭后已写入的事实不再注入，库里的行保留，需要时去群组页「永久记忆」手工清理")}
+            ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "关掉 = 不提炼、不注入、不写入（群聊注入、私聊召回与 /memory 命令都会先检查它）。", false, "关闭后已写入的事实不再注入，但库里的记录仍然保留，需要时可在群组页的「永久记忆」中手工清理。")}
             ${toggle("bot.memory_extract_enabled", "启用后台提炼", "从群聊/私聊原文里被动提炼事实；关掉后不再有新的提炼，已有事实仍会被召回注入")}
-            ${field("bot.memory_extract_interval_minutes", "提炼巡检间隔（分钟）", { type: "number", min: 5, max: 1440, step: 1, required: true, hint: "默认 30" })}
-            ${field("bot.memory_extract_min_messages", "触发提炼所需最少新消息", { type: "number", min: 5, max: 500, step: 1, required: true, hint: "默认 20；未达到就跳过这一轮（游标不前移）" })}
-            ${field("bot.memory_extract_daily_cap", "每天最多提炼次数", { type: "number", min: 0, max: 500, step: 1, required: true, hint: "默认 48；0 = 不限。防成本失控" })}
-            ${field("bot.memory_extract_batch_max", "单批最大条数", { type: "number", min: 20, max: 1000, step: 10, required: true, hint: "默认 200；超 token 预算时从最旧一端整条丢弃（会留日志）" })}
-            ${toggle("bot.memory_tool_enabled", "启用模型主动记忆（remember 工具）", "模型可以主动写一条关于**当前说话人本人**的稳定事实；总开关关闭时本项无效。关掉后模型只能读、不能写（仍可被调用，只是不落库）")}
-            ${field("bot.memory_tool_daily_cap", "remember 工具每日上限", { type: "number", min: 0, max: 200, step: 1, required: true, hint: "默认 30（每作用域每天，0 = 不限）。群作用域另有一道「每个成员每天」的闸，普通成员不能独占全群额度（B-34）" })}
-            ${field("bot.memory_recall_limit", "注入条数上限", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "默认 8；每轮注入的事实条数与字符数都不超它" })}
-            ${field("bot.memory_event_ttl_days", "有期限事实的保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；category=event 的事实到期后不再注入并标删除" })}
-            ${field("bot.memory_deleted_retention_days", "已删除事实保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；被 /memory off 或被新事实替代的行，保留这么多天后才物理清理" })}
+            ${toggle("bot.memory_tool_enabled", "启用模型主动记忆（remember 工具）", "模型可以主动写一条关于当前说话人本人的稳定事实；总开关关闭时本项无效。", false, "关掉后模型只能读、不能写：工具仍可被调用，但不会落库。")}
+            ${advancedPanel("bot.memory-tuning", "长期记忆细调", "提炼节奏与额度限制，默认值即可满足绝大多数场景", `
+              <div class="field-grid three">
+                ${field("bot.memory_extract_interval_minutes", "提炼巡检间隔（分钟）", { type: "number", min: 5, max: 1440, step: 1, required: true, hint: "默认 30" })}
+                ${field("bot.memory_extract_min_messages", "触发提炼所需最少新消息", { type: "number", min: 5, max: 500, step: 1, required: true, hint: "默认 20；未达到就跳过这一轮，等待位置保持不变" })}
+                ${field("bot.memory_extract_daily_cap", "每天最多提炼次数", { type: "number", min: 0, max: 500, step: 1, required: true, hint: "默认 48；0 表示不限。用于控制成本" })}
+                ${field("bot.memory_extract_batch_max", "单批最大条数", { type: "number", min: 20, max: 1000, step: 10, required: true, hint: "默认 200；超出 Token 预算时从最旧一端整条丢弃" })}
+                ${field("bot.memory_tool_daily_cap", "remember 工具每日上限", { type: "number", min: 0, max: 200, step: 1, required: true, hint: "默认 30（每个作用域每天，0 表示不限）", help: "群作用域另有一道「每个成员每天」的限制，普通成员不能独占全群额度。调高上限前请先确认成本可接受。" })}
+                ${field("bot.memory_recall_limit", "注入条数上限", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "默认 8；每轮注入的事实条数与字符数都不超过它" })}
+                ${field("bot.memory_event_ttl_days", "有期限事实的保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；到期的事实不再注入并标记删除" })}
+                ${field("bot.memory_deleted_retention_days", "已删除事实保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；被 /memory off 或被新事实替代的记录，保留这么多天后才物理清理" })}
+              </div>`)}
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("主动发言", "群组页可逐群开关并设置任务简述。")}
+          ${sectionHead("主动发言", "群组页可逐群开关并设置任务简述；这里配置全局节奏。")}
           <div class="field-grid three">
             ${toggle("bot.proactive_default_enabled", "新群默认启用", "作为群级设置的默认策略")}
             ${field("bot.proactive_idle_minutes", "空闲触发（分钟）", { type: "number", min: 180, max: 43200, step: 1, required: true })}
@@ -1053,13 +1169,13 @@
             ${field("moderation.warn_threshold", "ban 规则累计阈值", { type: "number", min: 1, max: 100, step: 1, required: true, hint: "仅 action=ban 的规则会累计并在达标后封禁" })}
             ${field("moderation.high_confidence_threshold", "高置信度阈值", { type: "number", min: 0, max: 1, step: 0.01, required: true, hint: "低于阈值时，warn/delete 保持原动作；只有 ban 规则进入真人质询" })}
             ${field("moderation.challenge_timeout_seconds", "ban 质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
-            ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
+            ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "访客模式等 bot 消息先审核，累计干净消息达标后加入白名单。", false, "白名单由 Bot 自行累积，不影响人工添加的豁免名单。")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
-            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "默认关闭（opt-in），需在此显式打开。复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
-            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "默认关闭（opt-in），需在此显式打开。引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
+            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "默认关闭，需要在此显式打开。", false, "复用图片描述时的视觉判定：命中后删图 + 群内 @警告（2 分钟后自动删除）+ 发起质询。只处理图片（贴纸不受影响），带 /av 的图片由识图流程负责。")}
+            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "默认关闭，需要在此显式打开。", false, "引用/转发内容命中封禁规则且置信度足够高时，连同被引用消息的原作者一起处置（删除其消息 + 记违规 + 发起质询）。原作者是管理员、群主、豁免用户，或属于警示式引用时会跳过。关闭后只处理转发者。")}
             ${field("moderation.quoted_author_max_age_seconds", "引用追溯上限（秒）", { type: "number", min: 0, max: 31536000, step: 1, required: true, hint: "被引用消息超过该时长不再追溯原作者（只记日志），默认 604800 秒 = 7 天" })}
-            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "默认关闭（opt-in），需在此显式打开。除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
-            ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据（对象/时间/规则/置信度/理由/送审原文/已执行动作，带图附图片，best-effort 不刷屏）；普通成员违规不发")}
+            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "默认关闭，需要在此显式打开。", false, "开启后，除最高管理员外的管理员与群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询、不封禁、不禁言、不累计警告。最高管理员与手动豁免名单始终完全跳过。关闭后恢复为只审核普通成员。")}
+            ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据。", false, "证据包含对象、时间、命中规则、置信度、判定理由、送审原文与已执行动作，带图时附上图片。尽力发送，不会刷屏；普通成员违规不发送私聊。")}
           </div>
         </section>
         <section class="settings-section">
@@ -1144,13 +1260,16 @@
             ${field("tts.model", "模型", { maxlength: 255, placeholder: "使用服务默认模型" })}
             ${field("tts.speaker", "音色", { maxlength: 255, placeholder: "使用服务默认音色" })}
             ${field("tts.audio_format", "音频格式", { maxlength: 64 })}
-            ${field("tts.sample_rate", "采样率", { type: "number", min: 8000, max: 192000, step: 1, required: true })}
-            ${field("tts.bit_rate", "比特率", { type: "number", min: 8000, max: 512000, step: 1, required: true })}
-            ${field("tts.emotion", "情感", { maxlength: 64, placeholder: "不指定" })}
-            ${field("tts.emotion_scale", "情感强度", { type: "number", min: 1, max: 5, step: 1, required: true })}
-            ${field("tts.speech_rate", "语速调整", { type: "number", min: -100, max: 100, step: 1, required: true })}
-            ${field("tts.loudness_rate", "音量调整", { type: "number", min: -100, max: 100, step: 1, required: true })}
-            ${field("tts.silence_duration_ms", "尾部静音（毫秒）", { type: "number", min: 0, max: 10000, step: 1, required: true })}
+            ${advancedPanel("tts.audio", "音频参数", "音质与语调节，保留默认即可", `
+              <div class="field-grid three">
+                ${field("tts.sample_rate", "采样率", { type: "number", min: 8000, max: 192000, step: 1, required: true })}
+                ${field("tts.bit_rate", "比特率", { type: "number", min: 8000, max: 512000, step: 1, required: true })}
+                ${field("tts.emotion", "情感", { maxlength: 64, placeholder: "不指定" })}
+                ${field("tts.emotion_scale", "情感强度", { type: "number", min: 1, max: 5, step: 1, required: true })}
+                ${field("tts.speech_rate", "语速调整", { type: "number", min: -100, max: 100, step: 1, required: true })}
+                ${field("tts.loudness_rate", "音量调整", { type: "number", min: -100, max: 100, step: 1, required: true })}
+                ${field("tts.silence_duration_ms", "尾部静音（毫秒）", { type: "number", min: 0, max: 10000, step: 1, required: true })}
+              </div>`)}
           </div>
         </section>
         <section class="settings-section">
@@ -1172,10 +1291,13 @@
             ${field("av.dm_sample_count", "私聊样例图张数（0=关闭）", { type: "number", min: 0, max: 5, step: 1, required: true })}
             ${field("av.inline_seed_count", "私聊内联下载地址条数（0=关闭该块）", { type: "number", min: 0, max: 5, step: 1, required: true, hint: "硬上限 5 条；群内文案不受影响" })}
             ${toggle("av.ai_synopsis_enabled", "私聊 AI 题材概述（默认关）", "开启后每次私聊查询多一次模型调用，输出会标注「AI 概述，非官方剧情」")}
-            ${field("av.javbus_base_url", "JavBus 地址", { type: "url", maxlength: 1000 })}
-            ${field("av.madouqu_base_url", "Madouqu 地址", { type: "url", maxlength: 1000 })}
-            ${field("av.dmm_base_url", "DMM 地址", { type: "url", maxlength: 1000 })}
-            ${field("av.fc2_base_url", "FC2 地址", { type: "url", maxlength: 1000 })}
+            ${advancedPanel("av.sources", "数据源地址", "使用内置地址即可，只有自建镜像才需要改", `
+              <div class="field-grid three">
+                ${field("av.javbus_base_url", "JavBus 地址", { type: "url", maxlength: 1000 })}
+                ${field("av.madouqu_base_url", "Madouqu 地址", { type: "url", maxlength: 1000 })}
+                ${field("av.dmm_base_url", "DMM 地址", { type: "url", maxlength: 1000 })}
+                ${field("av.fc2_base_url", "FC2 地址", { type: "url", maxlength: 1000 })}
+              </div>`)}
           </div>
         </section>
         <section class="settings-section">
@@ -1200,13 +1322,16 @@
             ${field("movie_info.default_language", "默认语言", { maxlength: 6, placeholder: "zh-CN", required: true })}
             ${field("movie_info.default_region", "默认地区", { maxlength: 2, placeholder: "CN", required: true })}
             ${secretField("movie_info.tmdb_read_access_token", "TMDB Read Access Token", "使用请求头鉴权；空白不会覆盖已保存的密钥")}
-            ${field("movie_info.imdb_data_set_id", "IMDb Data Set ID", { maxlength: 255 })}
-            ${field("movie_info.imdb_revision_id", "IMDb Revision ID", { maxlength: 255 })}
-            ${field("movie_info.imdb_asset_id", "IMDb Asset ID", { maxlength: 255 })}
-            ${secretField("movie_info.imdb_api_key", "IMDb API Key", "空白不会覆盖已保存的密钥")}
-            ${secretField("movie_info.imdb_aws_access_key_id", "IMDb AWS Access Key ID", "空白不会覆盖已保存的密钥")}
-            ${secretField("movie_info.imdb_aws_secret_access_key", "IMDb AWS Secret Access Key", "空白不会覆盖已保存的密钥")}
-            ${secretField("movie_info.imdb_aws_session_token", "IMDb AWS Session Token", "临时凭据可留空；空白不会覆盖已保存的密钥")}
+            ${advancedPanel("movie_info.imdb", "IMDb 接入", "需要 AWS Data Exchange 商业订阅；只查 TMDB 时可全部留空", `
+              <div class="field-grid three">
+                ${field("movie_info.imdb_data_set_id", "IMDb Data Set ID", { maxlength: 255 })}
+                ${field("movie_info.imdb_revision_id", "IMDb Revision ID", { maxlength: 255 })}
+                ${field("movie_info.imdb_asset_id", "IMDb Asset ID", { maxlength: 255 })}
+                ${secretField("movie_info.imdb_api_key", "IMDb API Key", "空白不会覆盖已保存的密钥")}
+                ${secretField("movie_info.imdb_aws_access_key_id", "IMDb AWS Access Key ID", "空白不会覆盖已保存的密钥")}
+                ${secretField("movie_info.imdb_aws_secret_access_key", "IMDb AWS Secret Access Key", "空白不会覆盖已保存的密钥")}
+                ${secretField("movie_info.imdb_aws_session_token", "IMDb AWS Session Token", "临时凭据可留空；空白不会覆盖已保存的密钥")}
+              </div>`)}
           </div>
         </section>
       </div>`;
@@ -1234,7 +1359,7 @@
             ${field("logging.file_path", "文件路径", { maxlength: 1000 })}
             ${field("logging.file_max_bytes", "单文件最大字节", { type: "number", min: 1024, max: 10737418240, step: 1, required: true })}
             ${field("logging.file_backup_count", "保留文件数", { type: "number", min: 1, max: 100, step: 1, required: true })}
-            ${field("logging.message_preview_chars", "入口日志正文预览字数", { type: "number", min: 0, max: 1000, step: 1, required: true, hint: "默认 100，与改动前一致；0 = 不记录正文，只记长度与内容哈希前缀" })}
+            ${field("logging.message_preview_chars", "入口日志正文预览字数", { type: "number", min: 0, max: 1000, step: 1, required: true, hint: "默认 100；设为 0 表示不记录正文，只记录长度与内容哈希前缀" })}
           </div>
         </section>
       </div>`;
@@ -2737,7 +2862,7 @@
       mobileNav.offsetParent ? mobileNav.getBoundingClientRect().bottom : 0,
     );
     const candidates = [...content.querySelectorAll(
-      "[data-group-settings-section], [data-resource-category], [data-group-card]",
+      "[data-group-settings-section], [data-resource-category], [data-group-card], [data-advanced-panel]",
     )].map(element => ({ element, rect: element.getBoundingClientRect() }))
       .filter(item => item.rect.bottom > stickyBottom + 8)
       .sort((left, right) => Math.abs(left.rect.top - stickyBottom) - Math.abs(right.rect.top - stickyBottom));
@@ -2751,6 +2876,8 @@
       selector = `[data-group-resource-panel="${CSS.escape(element.dataset.groupResourcePanel)}"][data-resource-category="${CSS.escape(element.dataset.resourceCategory)}"]`;
     } else if (element.matches("[data-group-card]")) {
       selector = `[data-group-card][data-group-id="${CSS.escape(element.dataset.groupId)}"]`;
+    } else if (element.matches("[data-advanced-panel]")) {
+      selector = `[data-advanced-panel="${CSS.escape(element.dataset.advancedPanel)}"]`;
     }
     return selector ? { selector, top: target.rect.top } : null;
   }
@@ -2758,6 +2885,7 @@
   function renderContent({ resetScroll = false } = {}) {
     if (!state.config) return;
     captureGroupDisclosureStates();
+    captureAdvancedDisclosureStates();
     captureResourceFormDrafts();
     const renderers = {
       overview: renderOverview,
@@ -2868,6 +2996,7 @@
 
   async function loadAll({ keepTab = true } = {}) {
     captureGroupDisclosureStates();
+    captureAdvancedDisclosureStates();
     captureResourceFormDrafts();
     state.groupResources.clear();
     state.groupResourceLoads.clear();
@@ -2972,7 +3101,7 @@
       currentGroup.settings.default_permissions = normalizeDefaultPermissions(result.default_permissions);
       showToast(
         result.repaired
-          ? "旧权限配置已兼容修复，请检查后保存"
+          ? "已把旧版权限配置补全为当前字段，请检查后保存"
           : result.configured
             ? "已加载保存的群权限"
             : "已读取 Telegram 当前群权限，请检查后保存",
@@ -3159,12 +3288,16 @@
       return "hCaptcha Secret Key 不能与 Site Key 相同";
     }
     const nullPath = findNullNumber(state.config);
-    if (nullPath) return `${nullPath} 需要填写有效数字`;
+    if (nullPath) {
+      revealFieldByPath(nullPath);
+      return `${nullPath} 需要填写有效数字`;
+    }
     const invalid = [...content.querySelectorAll(
       "[data-path], [data-secret-input], [data-prompt-input]",
     )]
       .find(control => !control.checkValidity());
     if (invalid) {
+      revealAdvancedDisclosure(invalid);
       invalid.reportValidity();
       return "请修正标记的字段";
     }
@@ -3935,6 +4068,14 @@
       renameProvider(Number(target.dataset.providerIndex), target.dataset.providerOldName, target.value);
     }
   });
+
+  // <details> 的 toggle 事件不保证冒泡，用捕获阶段统一记录展开状态，
+  // 这样重渲染（切 tab、保存、刷新资源）之后高级项仍然保持原来的开合。
+  content.addEventListener("toggle", event => {
+    const panel = event.target;
+    if (!panel?.matches?.("[data-advanced-panel]")) return;
+    state.advancedOpen.set(panel.dataset.advancedPanel, panel.open);
+  }, true);
 
   content.addEventListener("click", async event => {
     const button = event.target.closest("[data-action]");

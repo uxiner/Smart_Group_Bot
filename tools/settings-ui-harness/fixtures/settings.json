@@ -1,0 +1,703 @@
+{
+ "session": {
+  "user_id": 42,
+  "can_manage_global": true,
+  "display_name": "Fixture Admin"
+ },
+ "group_admin_session": {
+  "user_id": 4242,
+  "can_manage_global": false,
+  "display_name": "Fixture Group Admin"
+ },
+ "settings": {
+  "revision": 12,
+  "config": {
+   "schema_version": 2,
+   "models": {
+    "providers": [
+     {
+      "name": "night-crystal",
+      "provider": "openai_compatible",
+      "api_key": "",
+      "api_base": "https://api.example.invalid/v1",
+      "stream": true,
+      "chat_endpoint": "auto"
+     },
+     {
+      "name": "icefall",
+      "provider": "anthropic",
+      "api_key": "",
+      "api_base": "",
+      "stream": false,
+      "chat_endpoint": "auto"
+     }
+    ],
+    "main": {
+     "provider": "night-crystal",
+     "model": "fixture-large-1",
+     "fallbacks": [
+      {
+       "provider": "icefall",
+       "model": "fixture-large-2",
+       "request_params": {}
+      }
+     ],
+     "temperature": 0.7,
+     "max_tokens": 2048,
+     "timeout_sec": 12.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "vision": {
+     "provider": "icefall",
+     "model": "fixture-vision-1",
+     "fallbacks": [],
+     "temperature": 0.2,
+     "max_tokens": 1024,
+     "timeout_sec": 12.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "decision": {
+     "provider": "",
+     "model": "",
+     "fallbacks": [],
+     "temperature": 0.1,
+     "max_tokens": 512,
+     "timeout_sec": 6.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "moderation": {
+     "provider": "",
+     "model": "",
+     "fallbacks": [],
+     "temperature": 0.1,
+     "max_tokens": 1024,
+     "timeout_sec": 8.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "compress": {
+     "provider": "",
+     "model": "",
+     "fallbacks": [],
+     "temperature": 0.3,
+     "max_tokens": 1024,
+     "timeout_sec": 12.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "skill": null,
+    "embed": {
+     "provider": "",
+     "model": "text-embedding-004",
+     "fallbacks": [],
+     "timeout_sec": 10.0,
+     "total_deadline_sec": 0.0,
+     "request_params": {}
+    },
+    "retry_attempts": 2,
+    "retry_backoff_sec": 0.8,
+    "retry_timeout_multiplier": 1.35
+   },
+   "bot": {
+    "parse_mode": "HTML",
+    "disable_link_preview": true,
+    "drop_pending_updates": false,
+    "inbound_debounce_seconds": 5.0,
+    "reply_batch_timeout_seconds": 45.0,
+    "enable_typing": true,
+    "enable_rich_messages": true,
+    "enable_streaming": true,
+    "stream_chunk_size": 36,
+    "stream_edit_interval_sec": 1.0,
+    "auto_delete_seconds": 0,
+    "auto_delete_categories": [
+     "management",
+     "moderation"
+    ],
+    "auto_delete_category_seconds": {},
+    "auto_delete_category_mode": {},
+    "decision_context_items": 5,
+    "context_window_mode": "auto",
+    "max_context_tokens": 278528,
+    "context_budget_tokens": 278528,
+    "context_reserve_tokens": 32768,
+    "group_history_max_messages": 1000,
+    "max_output_tokens": 2048,
+    "memory_recent_messages": 500,
+    "memory_retention_days": 7,
+    "memory_archive_max_messages_per_group": 50000,
+    "memory_recall_enabled": true,
+    "memory_recall_max_results": 8,
+    "memory_automatic_compaction": false,
+    "group_summary_enabled": false,
+    "group_summary_recent_raw_messages": 200,
+    "group_summary_max_tokens": 4096,
+    "group_summary_batch_max_messages": 200,
+    "group_summary_batch_max_input_tokens": 16384,
+    "group_summary_global_concurrency": 2,
+    "group_summary_per_group_concurrency": 1,
+    "group_summary_deadline_seconds": 15.0,
+    "group_summary_queue_wait_seconds": 30.0,
+    "group_summary_min_refresh_seconds": 60.0,
+    "group_summary_failure_backoff_seconds": 60.0,
+    "group_summary_failure_backoff_max_seconds": 3600.0,
+    "group_summary_pending_capacity": 1000,
+    "group_summary_trigger_messages": 200,
+    "group_summary_trigger_budget_ratio": 0.85,
+    "private_chat_history_token_budget": 278528,
+    "private_chat_history_retention_days": 30,
+    "group_history_token_budget": 278528,
+    "group_history_reserve_tokens": 32768,
+    "search_record_retention_days": 30,
+    "search_freshness_price_hours": 24,
+    "search_freshness_news_hours": 48,
+    "search_freshness_fact_hours": 168,
+    "memory_facts_enabled": true,
+    "memory_extract_enabled": true,
+    "memory_extract_interval_minutes": 30,
+    "memory_extract_min_messages": 20,
+    "memory_extract_daily_cap": 48,
+    "memory_extract_batch_max": 200,
+    "memory_tool_enabled": true,
+    "memory_tool_daily_cap": 30,
+    "memory_recall_limit": 8,
+    "memory_event_ttl_days": 30,
+    "memory_deleted_retention_days": 30,
+    "proactive_default_enabled": false,
+    "proactive_idle_minutes": 180,
+    "proactive_jitter_minutes": 60,
+    "proactive_check_interval_seconds": 60.0,
+    "proactive_quiet_hours_start": 0,
+    "proactive_quiet_hours_end": 9,
+    "proactive_retry_minutes": 30,
+    "proactive_task_brief": "结合群里的最新话题自然地开口，避免刷屏。"
+   },
+   "moderation": {
+    "enabled": true,
+    "warn_threshold": 3,
+    "high_confidence_threshold": 0.9,
+    "challenge_timeout_seconds": 600,
+    "bot_screening_enabled": true,
+    "bot_screening_message_count": 5,
+    "nsfw_image_guard_enabled": false,
+    "punish_quoted_author_enabled": false,
+    "quoted_author_max_age_seconds": 604800,
+    "admin_moderation_enabled": false,
+    "admin_alert_super_admin_enabled": true,
+    "log_channel_enabled": true,
+    "log_channel_id": -1004337744233,
+    "review_confirm_seconds": 300,
+    "llm_call_cap_per_hour": 0
+   },
+   "patrol": {
+    "enabled": false,
+    "schedule_time": "04:30",
+    "batch_size": 500,
+    "batch_pause_seconds": 5.0,
+    "fetch_bio": true,
+    "challenge_timeout_seconds": 600,
+    "check_interval_seconds": 60.0
+   },
+   "raid_guard": {
+    "enabled": false,
+    "pin_message": true,
+    "join_threshold": 8,
+    "window_seconds": 60,
+    "lockdown_seconds": 600,
+    "lookback_seconds": 300,
+    "challenge_timeout_seconds": 600
+   },
+   "call_admin": {
+    "enabled": true,
+    "pin_message": false,
+    "cooldown_seconds": 60
+   },
+   "vote_ban": {
+    "enabled": false,
+    "pin_message": true,
+    "vote_threshold": 5,
+    "duration_seconds": 1800,
+    "trigger_limit": 3,
+    "trigger_window_seconds": 3600
+   },
+   "verification": {
+    "enabled": false,
+    "timeout_seconds": 600,
+    "check_interval_seconds": 30.0,
+    "provider": "turnstile",
+    "turnstile_site_key": "",
+    "turnstile_secret_key": "",
+    "hcaptcha_site_key": "",
+    "hcaptcha_secret_key": ""
+   },
+   "tts": {
+    "enabled": false,
+    "provider": "",
+    "http_timeout_sec": 20.0,
+    "max_text_length": 500,
+    "api_base": "https://openspeech.bytedance.com",
+    "app_id": "",
+    "app_key": "",
+    "access_key": "",
+    "resource_id": "seed-tts-2.0",
+    "model": "",
+    "speaker": "",
+    "audio_format": "ogg_opus",
+    "sample_rate": 48000,
+    "bit_rate": 96000,
+    "emotion": "",
+    "emotion_scale": 4,
+    "speech_rate": 0,
+    "loudness_rate": 0,
+    "silence_duration_ms": 0
+   },
+   "music": {
+    "enabled": true,
+    "http_timeout_sec": 15.0,
+    "base_url": "https://music-api.gdstudio.xyz/api.php",
+    "default_source": "kuwo",
+    "stable_sources": [
+     "kuwo",
+     "netease",
+     "joox",
+     "bilibili"
+    ]
+   },
+   "movie_info": {
+    "enabled": false,
+    "http_timeout_sec": 6.0,
+    "max_results": 6,
+    "default_language": "zh-CN",
+    "default_region": "CN",
+    "tmdb_read_access_token": "",
+    "imdb_data_set_id": "",
+    "imdb_revision_id": "",
+    "imdb_asset_id": "",
+    "imdb_api_key": "",
+    "imdb_aws_access_key_id": "",
+    "imdb_aws_secret_access_key": "",
+    "imdb_aws_session_token": ""
+   },
+   "av": {
+    "enabled": true,
+    "http_timeout_sec": 15.0,
+    "max_results": 18,
+    "dm_sample_count": 4,
+    "inline_seed_count": 3,
+    "ai_synopsis_enabled": false,
+    "javbus_base_url": "https://www.javbus.com",
+    "madouqu_base_url": "https://madouqu.com",
+    "dmm_base_url": "https://www.dmm.co.jp",
+    "fc2_base_url": "https://adult.contents.fc2.com"
+   },
+   "stickers": {
+    "fallback_file_ids": []
+   },
+   "logging": {
+    "level": "INFO",
+    "third_party_level": "WARNING",
+    "color": "on",
+    "to_file": false,
+    "file_path": "data/bot.log",
+    "file_max_bytes": 5242880,
+    "file_backup_count": 3,
+    "message_preview_chars": 100
+   },
+   "prompts": {
+    "decision": "你是一个群聊助手。先判断这条消息是否需要回复，再生成回复。",
+    "moderation": "你是群规审核器。逐条比对规则，输出判定与置信度。",
+    "casual": "你是群里的日常聊天搭子，语气自然、简短。",
+    "manage_intent": "判断消息里是否包含管理意图，并抽取目标动作与对象。",
+    "compress": "把给定的历史对话压缩成不超过指定长度的摘要。",
+    "skill_tools": "根据用户问题选择合适的技能工具，必要时并行调用。",
+    "sticker_decision": "判断当前话题是否适合用贴纸回应。",
+    "reply_mode": "决定本轮应该文字回复、调用工具还是保持沉默。",
+    "persona": "你使用的固定人设与语气设定。",
+    "proactive_topic": "结合群近期话题，给出一个自然的主动发言切入点。",
+    "style_distill": "从样本中提炼该用户的表达风格特征。",
+    "av_synopsis": "用中性、不剧透的语言概括条目主题。"
+   }
+  },
+  "configured_secrets": [
+   "verification.turnstile_secret_key",
+   "providers.night-crystal.api_key",
+   "movie_info.tmdb_read_access_token"
+  ],
+  "bootstrap": {
+   "public_base_url": "https://miniapp.example.invalid",
+   "listen_host": "127.0.0.1",
+   "listen_port": 8788,
+   "database_url": "sqlite+aiosqlite:////app/data/fixture.db",
+   "master_key_configured": true
+  },
+  "restart_required_paths": [
+   "bot.parse_mode"
+  ]
+ },
+ "groups": {
+  "groups": [
+   {
+    "id": -1001234567890,
+    "title": "夜蓝综合交流群 · 这是一个刻意很长的群名用来验证标题截断",
+    "revision": "7",
+    "settings": {
+     "av_enabled": false,
+     "mute_all_replies": false,
+     "at_reply_mode": false,
+     "tts_mode": "off",
+     "join_verification_enabled": true,
+     "join_verification_provider": "turnstile",
+     "welcome_message": "欢迎来到本群！请先阅读群公告并在入群 5 分钟内完成昵称标注，否则可能会被提醒或临时禁言。这里是用于布局验证的一段较长的欢迎语，用来确认多行文本不会撑破移动端卡片。",
+     "welcome_buttons": [
+      {
+       "label": "阅读群规",
+       "payload": "/rules"
+      },
+      {
+       "label": "申请发言",
+       "payload": "/apply"
+      }
+     ],
+     "welcome_disable_link_preview": true,
+     "default_permissions": null,
+     "patrol_enabled": true,
+     "raid_guard_enabled": true,
+     "raid_guard_pin_message": null,
+     "raid_guard_join_threshold": null,
+     "raid_guard_window_seconds": null,
+     "raid_guard_lockdown_seconds": null,
+     "raid_guard_lookback_seconds": null,
+     "raid_guard_challenge_timeout_seconds": null,
+     "call_admin_enabled": true,
+     "call_admin_pin_message": null,
+     "call_admin_targets": [
+      111111111,
+      222222222
+     ],
+     "vote_ban_enabled": true,
+     "vote_ban_pin_message": null,
+     "vote_ban_threshold": null,
+     "vote_ban_duration_seconds": null,
+     "vote_ban_trigger_limit": null,
+     "vote_ban_trigger_window_seconds": null,
+     "proactive_enabled": true,
+     "proactive_task_brief": "关注群里的技术讨论，必要时补充一句背景。",
+     "mimic_target_user_id": 987654321,
+     "mimic_target_user_name": "fixture_user",
+     "mimic_profile_text": "",
+     "mimic_sample_count": 0,
+     "mimic_distilled_at_count": 0,
+     "api_model_query_enabled": false,
+     "api_model_query_base_url": "",
+     "api_model_query_http_timeout_sec": 15.0,
+     "api_model_query_check_timeout_sec": 45.0,
+     "api_model_query_api_key_configured": false
+    }
+   },
+   {
+    "id": -1009876543210,
+    "title": "极简测试群",
+    "revision": "2",
+    "settings": {
+     "av_enabled": false,
+     "mute_all_replies": true,
+     "at_reply_mode": false,
+     "tts_mode": "reply",
+     "join_verification_enabled": null,
+     "join_verification_provider": null,
+     "welcome_message": "",
+     "welcome_buttons": [],
+     "welcome_disable_link_preview": true,
+     "default_permissions": null,
+     "patrol_enabled": null,
+     "raid_guard_enabled": null,
+     "raid_guard_pin_message": null,
+     "raid_guard_join_threshold": null,
+     "raid_guard_window_seconds": null,
+     "raid_guard_lockdown_seconds": null,
+     "raid_guard_lookback_seconds": null,
+     "raid_guard_challenge_timeout_seconds": null,
+     "call_admin_enabled": null,
+     "call_admin_pin_message": null,
+     "call_admin_targets": [],
+     "vote_ban_enabled": null,
+     "vote_ban_pin_message": null,
+     "vote_ban_threshold": null,
+     "vote_ban_duration_seconds": null,
+     "vote_ban_trigger_limit": null,
+     "vote_ban_trigger_window_seconds": null,
+     "proactive_enabled": null,
+     "proactive_task_brief": "群里已经安静了一阵，请结合群记忆，自然抛出一个大家可能感兴趣、容易接话的话题。",
+     "mimic_target_user_id": 0,
+     "mimic_target_user_name": "",
+     "mimic_profile_text": "",
+     "mimic_sample_count": 0,
+     "mimic_distilled_at_count": 0,
+     "api_model_query_enabled": false,
+     "api_model_query_base_url": "",
+     "api_model_query_http_timeout_sec": 15.0,
+     "api_model_query_check_timeout_sec": 45.0,
+     "api_model_query_api_key_configured": false
+    }
+   },
+   {
+    "id": -1005550001111,
+    "title": "空数据群",
+    "revision": "1",
+    "settings": {
+     "av_enabled": false,
+     "mute_all_replies": false,
+     "at_reply_mode": false,
+     "tts_mode": "off",
+     "join_verification_enabled": null,
+     "join_verification_provider": null,
+     "welcome_message": "",
+     "welcome_buttons": [],
+     "welcome_disable_link_preview": true,
+     "default_permissions": null,
+     "patrol_enabled": null,
+     "raid_guard_enabled": null,
+     "raid_guard_pin_message": null,
+     "raid_guard_join_threshold": null,
+     "raid_guard_window_seconds": null,
+     "raid_guard_lockdown_seconds": null,
+     "raid_guard_lookback_seconds": null,
+     "raid_guard_challenge_timeout_seconds": null,
+     "call_admin_enabled": null,
+     "call_admin_pin_message": null,
+     "call_admin_targets": [],
+     "vote_ban_enabled": null,
+     "vote_ban_pin_message": null,
+     "vote_ban_threshold": null,
+     "vote_ban_duration_seconds": null,
+     "vote_ban_trigger_limit": null,
+     "vote_ban_trigger_window_seconds": null,
+     "proactive_enabled": null,
+     "proactive_task_brief": "群里已经安静了一阵，请结合群记忆，自然抛出一个大家可能感兴趣、容易接话的话题。",
+     "mimic_target_user_id": 0,
+     "mimic_target_user_name": "",
+     "mimic_profile_text": "",
+     "mimic_sample_count": 0,
+     "mimic_distilled_at_count": 0,
+     "api_model_query_enabled": false,
+     "api_model_query_base_url": "",
+     "api_model_query_http_timeout_sec": 15.0,
+     "api_model_query_check_timeout_sec": 45.0,
+     "api_model_query_api_key_configured": false
+    }
+   }
+  ]
+ },
+ "authorized_groups": {
+  "authorized_groups": [
+   {
+    "group_id": -1001234567890,
+    "title": "夜蓝综合交流群 · 这是一个刻意很长的群名用来验证标题截断"
+   },
+   {
+    "group_id": -1009876543210,
+    "title": "极简测试群"
+   },
+   {
+    "group_id": -1005550001111,
+    "title": "空数据群"
+   }
+  ]
+ },
+ "admins": {
+  "admins": [
+   {
+    "user_id": 111111111,
+    "display_name": "Fixture Admin One",
+    "username": "fixture_one"
+   },
+   {
+    "user_id": 222222222,
+    "display_name": "Fixture Admin Two",
+    "username": ""
+   }
+  ]
+ },
+ "global_bans": {
+  "global_bans": [
+   {
+    "user_id": 700000001,
+    "reason": "fixture reason / 合成数据 / 仅用于布局验证",
+    "source": "manual",
+    "created_at": "2026-01-02T03:04:05+00:00"
+   },
+   {
+    "user_id": 700000002,
+    "reason": "",
+    "source": "manual",
+    "created_at": "2026-01-03T00:00:00+00:00"
+   }
+  ]
+ },
+ "global_exemptions": {
+  "global_exemptions": [
+   {
+    "user_id": 700000003,
+    "created_at": "2026-01-04T00:00:00+00:00"
+   }
+  ]
+ },
+ "resources": {
+  "1001234567890": {
+   "rules": [
+    {
+     "id": 1,
+     "rule_type": "keyword",
+     "pattern": "加群送饮料",
+     "action": "warn",
+     "enabled": true,
+     "scan_scope": "message"
+    },
+    {
+     "id": 2,
+     "rule_type": "regex",
+     "pattern": "https?://\\S+",
+     "action": "delete",
+     "enabled": true,
+     "scan_scope": "message+quote"
+    },
+    {
+     "id": 3,
+     "rule_type": "image",
+     "pattern": "nsfw",
+     "action": "ban",
+     "enabled": false,
+     "scan_scope": "message+vision"
+    }
+   ],
+   "memories": [
+    {
+     "id": 10,
+     "content": "群规：每周三晚 8 点开语音房。",
+     "created_by": 42,
+     "created_at": "2026-01-05T10:00:00+00:00",
+     "updated_at": "2026-01-05T10:00:00+00:00"
+    },
+    {
+     "id": 11,
+     "content": "管理员 @fixture_one 负责新人接待。",
+     "created_by": 111111111,
+     "created_at": "2026-01-06T10:00:00+00:00",
+     "updated_at": "2026-01-06T10:00:00+00:00"
+    }
+   ],
+   "warnings": [
+    {
+     "user_id": 800000001,
+     "count": 3,
+     "is_banned": false,
+     "display_name": "Fixture Warned User",
+     "username": "warned"
+    },
+    {
+     "user_id": 800000002,
+     "count": 7,
+     "is_banned": true,
+     "display_name": "",
+     "username": ""
+    }
+   ],
+   "bans": [
+    {
+     "user_id": 800000002,
+     "is_banned": true,
+     "display_name": "",
+     "username": ""
+    }
+   ],
+   "exemptions": [
+    {
+     "user_id": 800000003,
+     "created_at": "2026-01-07T10:00:00+00:00",
+     "display_name": "Fixture Exempt",
+     "username": "exempt"
+    }
+   ],
+   "reply_mutes": [
+    {
+     "user_id": 800000004,
+     "created_at": "2026-01-08T10:00:00+00:00",
+     "display_name": "Fixture Mute",
+     "username": "mute"
+    }
+   ],
+   "keyword_replies": [
+    {
+     "id": 20,
+     "keyword": "菜单",
+     "match_type": "exact",
+     "reply_text": "这里是我们群的功能菜单。",
+     "buttons": [
+      {
+       "label": "群规",
+       "payload": "/rules"
+      }
+     ],
+     "pin_message": false,
+     "auto_delete": false,
+     "disable_link_preview": true,
+     "enabled": true
+    }
+   ],
+   "scheduled_messages": [
+    {
+     "id": 30,
+     "text": "早上好，今天是本周群公告日。",
+     "buttons": [],
+     "schedule_type": "daily",
+     "schedule_time": "09:00",
+     "interval_minutes": 60,
+     "pin_message": false,
+     "unpin_previous": false,
+     "auto_delete": false,
+     "disable_link_preview": true,
+     "enabled": true
+    }
+   ]
+  },
+  "9876543210": {
+   "rules": [],
+   "memories": [],
+   "warnings": [],
+   "bans": [],
+   "exemptions": [],
+   "reply_mutes": [],
+   "keyword_replies": [],
+   "scheduled_messages": []
+  },
+  "5550001111": {
+   "rules": [],
+   "memories": [],
+   "warnings": [],
+   "bans": [],
+   "exemptions": [],
+   "reply_mutes": [],
+   "keyword_replies": [],
+   "scheduled_messages": []
+  }
+ },
+ "telegram_admins": {
+  "admins": [
+   {
+    "user_id": 111111111,
+    "display_name": "Fixture Admin One",
+    "username": "fixture_one",
+    "is_super_admin": false
+   },
+   {
+    "user_id": 42,
+    "display_name": "Fixture Super Admin",
+    "username": "fixture_super",
+    "is_super_admin": true
+   }
+  ]
+ }
+}

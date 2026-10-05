@@ -135,18 +135,24 @@ class D3_39MemorySwitchUiTests(unittest.TestCase):
         )
 
     def test_memory_recall_enabled_is_not_presented_as_the_master_switch(self) -> None:
+        # 语义要求：UI 必须让用户看出 memory_recall_enabled **不是**长期记忆总开关。
+        # 重设计后这句解释从 hint 移到了可访问的 help/details（`.field-help`），
+        # 因此这里同时接受 hint 与 help，并要求「不是…总开关」这句话仍然说出口，
+        # 而不是断言它必须出现在第 3 个参数里。
         match = re.search(
-            r'toggle\("bot\.memory_recall_enabled",\s*"([^"]+)"\s*,\s*"([^"]*)"',
+            r'toggle\(\s*"bot\.memory_recall_enabled",\s*"([^"]+)"\s*,\s*"([^"]*)"\s*'
+            r'(?:,\s*(?:true|false)\s*,\s*"([^"]*)")?\s*\)',
             APP_JS,
         )
         self.assertIsNotNone(match, "找不到 memory_recall_enabled 的开关文案")
-        label, hint = match.group(1), match.group(2)
+        label, hint, help_text = match.group(1), match.group(2), match.group(3) or ""
         self.assertNotIn("总开关", label)
         self.assertIn(
             "不是",
-            hint,
-            "必须在 hint 里点明它**不是**第 ④ 期总开关（关掉它照样写库提炼）",
+            hint + help_text,
+            "必须在 hint 或 help 里点明它**不是**长期记忆总开关（关掉它照样写库提炼）",
         )
+        self.assertIn("总开关", hint + help_text)
 
     def test_the_schema_still_backs_every_rendered_switch(self) -> None:
         fields = RuntimeConfig.model_fields["bot"].annotation.model_fields
