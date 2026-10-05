@@ -19,6 +19,7 @@ from sqlalchemy.pool import StaticPool
 
 from bot.config import ModerationConfig
 from bot.db.engine import (
+    _PRODUCTION_RULE_6_PATTERN,
     _sqlite_ensure_column,
     _sqlite_upgrade_moderation_rule_scan_scopes,
 )
@@ -354,7 +355,9 @@ _LEGACY_RULES = (
     (3, -100, "regex", "包邮", "delete", 1),
     (4, -100, "keyword", "加V", "delete", 1),
     (5, -100, "regex", "秒杀|优惠券", "delete", 1),
-    (6, -100, "regex", "探花|招募", "ban", 1),
+    # 规则正文**必须**与 `bot/db/engine.py` 里那条生产规则的真值一致：F-011 之后升级要
+    # 核对内容指纹，fixture 自己编一个正文就会让这两条用例变成"测一个不存在的部署"。
+    (6, -100, "regex", _PRODUCTION_RULE_6_PATTERN, "ban", 1),
     (7, -100, "regex", "探花", "warn", 1),
 )
 
