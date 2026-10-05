@@ -8188,7 +8188,12 @@ def _log_channel_enabled(settings: Settings) -> bool:
 
 
 def _admin_log_channel_id(settings: Settings) -> int:
-    """证据频道 id；未配置（0）时频道投递不可用，回退私聊老路径。"""
+    """证据频道 id。
+
+    配置里**默认就有**一个具体频道（见 ``bot/config.py`` 的 ``log_channel_id``），
+    所以"取不到 id"只在两种情况下发生：显式配成 0，或老 payload 里没有这个键。
+    这两种都按"未配置"处理 → 频道投递不可用，回退私聊老路径。
+    """
 
     moderation = getattr(settings, "moderation", None)
     try:

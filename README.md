@@ -96,6 +96,27 @@
 - **管理员违规证据私聊**：管理员违规时把完整证据（对象/身份/时间/规则/置信度/理由/送审原文/已执行/回链，带图附图片）私聊最高管理员；best-effort 不影响群内处置，同一人 10 分钟内 ≥5 次合并成一条；`moderation.admin_alert_super_admin_enabled` 默认开启；**频道投递开启时（默认）这条私聊路径被取代**。
 - **审核证据 → 频道 + 人工放行**：群里**所有**被处置的命中都往「审核日志」频道发一条完整证据卡，**每条单独发**，每张卡带「人工放行 / 放行收回」按钮，只有最高管理员可点。**放行**：`review_state=released` + 立即解除该成员限制（作废质询超时封禁，不添加永久豁免）+ 频道新发 `🟢 人工放行 · 待调整规则` 交接消息（@Ming_GPT_bot mention）。**收回**：按该 case 的**原始处置**重新施加限制（challenge → 重新禁言 + 重新质询；ban → 重新封禁；delete/warn → 无限制可恢复），结果写进频道状态行与 `🔴 放行收回 · 无需调整` 交接消息；最高管理员与手动豁免名单跳过。开关 `moderation.log_channel_enabled`（默认开）/ `log_channel_id`；关掉回到私聊老路径；**不新增 LLM 调用**。
 
+#### ⚠️ 审核日志频道：默认 ID 与怎么改（C4-02）
+
+**默认的审核日志频道 id 是 `-1004337744233`，且 `log_channel_enabled` 默认就是开的。**
+也就是说：**不改任何配置的全新部署，会把命中审核的消息证据（群 id、用户 id、昵称、送审原文全文、判定理由，命中带图时还会在频道里追发图片）投递到这个频道。** fork 本项目之前请先确认那是不是你自己的频道，不是的话必须改。
+
+| 项 | 默认值 | 含义 |
+| --- | --- | --- |
+| `moderation.log_channel_enabled` | `true` | 关掉后回到「私聊最高管理员」老路径 |
+| `moderation.log_channel_id` | `-1004337744233` | 证据频道 id；**配成 `0` 才表示"未配置"**，此时频道投递整体不可用、自动回退私聊老路径 |
+
+怎么改（覆盖入口）：
+
+1. **运行时配置（推荐，存库热生效）** — `PUT /api/v1/settings`，body 形如
+   `{"config": {"moderation": {"log_channel_id": -100XXXXXXXXXX}}, "revision": <当前 revision>}`。
+   取当前 `revision` 用 `GET /api/v1/settings`（需要最高管理员身份）。
+   > Mini App 界面**目前没有**这个控件，只能走 API 或直接改 `runtime_config` 表。
+2. **`config.toml` 的 `[moderation]` 段** — **仅**在数据库里还没有 `runtime_config` 行时
+   做一次性导入；一旦导入完成该文件即被忽略，之后只认数据库里的值。
+3. **环境变量** — **无效**。`ModerationConfig` 不是 `BaseSettings`，`Settings` 也没有
+   `env_nested_delimiter`，写 `MODERATION__LOG_CHANNEL_ID` 不会被读取。
+
 </details>
 
 ### 5️⃣ 运营看板与周报（全新）

@@ -357,7 +357,21 @@ class ModerationConfig(BaseModel):
     # 的命中都单独发一条完整证据卡（带「人工放行 / 放行收回」按钮）。默认开启；
     # 关掉后回到私聊最高管理员的老路径（含 10 分钟聚合抑制）。
     log_channel_enabled: bool = True
-    # 证据频道 id；0 表示未配置（此时频道投递不可用，回退私聊老路径）。
+    # 证据频道 id。**默认值就是下面那个频道**（有意为之，不是占位符）；把「未配置」
+    # 的语义留给 0：``_admin_log_channel_id`` 把 0 视为"不可用"，此时频道投递整体
+    # 关闭、回退私聊最高管理员的老路径（含 10 分钟聚合抑制）。
+    #
+    # 覆盖入口（按代码实际能力，与 README 的披露一致）：
+    #   * 运行时配置（**主要入口**）：Mini App 后端 ``PUT /api/v1/settings``，
+    #     body ``{"config": {"moderation": {"log_channel_id": <id>}}, "revision": <n>}``，
+    #     落库到 ``runtime_config`` 表并热生效（``apply_to_settings``）。
+    #     注意 Mini App 界面**目前没有**这个控件，需要用 API 或直接改库。
+    #   * ``config.toml`` 的 ``[moderation]`` 段：**仅**在 ``runtime_config`` 行还不
+    #     存在时做一次性导入（之后该文件被忽略）。
+    #   * 环境变量：**无效**。``ModerationConfig`` 是普通 ``BaseModel``，``Settings``
+    #     没有 ``env_nested_delimiter``，也没有扁平的 ``moderation_log_channel_id``
+    #     字段，所以 ``MODERATION__LOG_CHANNEL_ID`` 读不到（tests/
+    #     test_moderation_log_channel_docs.py 把这条钉住）。
     log_channel_id: int = -1004337744233
     # 证据卡上的「人工放行 / 确认封禁」必须**按两次**才生效：两次点击的间隔必须
     # <= 该窗口（秒），第一次点击只 arm（落库 pending_action/pending_at），第二次
