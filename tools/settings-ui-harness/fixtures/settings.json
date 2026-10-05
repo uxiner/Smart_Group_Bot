@@ -188,7 +188,8 @@
     "admin_moderation_enabled": false,
     "admin_alert_super_admin_enabled": true,
     "log_channel_enabled": true,
-    "log_channel_id": -1000000000001,
+    "log_channel_id": 0,
+    "review_handover_mention": "",
     "review_confirm_seconds": 300,
     "llm_call_cap_per_hour": 0
    },
@@ -319,6 +320,189 @@
     "proactive_topic": "结合群近期话题，给出一个自然的主动发言切入点。",
     "style_distill": "从样本中提炼该用户的表达风格特征。",
     "av_synopsis": "用中性、不剧透的语言概括条目主题。"
+   },
+   "private_chat": {
+    "per_user_daily_limit": 100,
+    "admin_per_user_daily_limit": 500,
+    "global_daily_limit": 20000,
+    "admin_global_daily_limit": 100000,
+    "input_max_chars": 1000,
+    "reply_max_chars": 3800,
+    "vision_budget_seconds": 30.0,
+    "memory_turns": 12,
+    "access_ttl_seconds": 60.0,
+    "search_daily_limit": 2000,
+    "voice_max_segments": 6
+   },
+   "economy": {
+    "checkin_daily_point_cap": 10,
+    "checkin_rank_limit": 10,
+    "checkin_violation_window_days": 30,
+    "challenge_skip_cost": 2,
+    "tag_price_7d": 30,
+    "tag_days_7d": 7,
+    "tag_price_30d": 80,
+    "tag_days_30d": 30,
+    "pin_price": 20,
+    "pin_hours": 6,
+    "lottery_price": 5,
+    "lottery_daily_limit": 10,
+    "lottery_prizes": [
+     {
+      "payout": 0,
+      "weight": 3900,
+      "label": "谢谢参与"
+     },
+     {
+      "payout": 3,
+      "weight": 2000,
+      "label": "3 分"
+     },
+     {
+      "payout": 5,
+      "weight": 1600,
+      "label": "5 分"
+     },
+     {
+      "payout": 8,
+      "weight": 1000,
+      "label": "8 分"
+     },
+     {
+      "payout": 12,
+      "weight": 1000,
+      "label": "12 分"
+     },
+     {
+      "payout": 40,
+      "weight": 400,
+      "label": "40 分"
+     },
+     {
+      "payout": 100,
+      "weight": 100,
+      "label": "100 分"
+     }
+    ],
+    "tag_max_length": 16,
+    "expiry_check_seconds": 300.0,
+    "expiry_pass_deadline_seconds": 120.0,
+    "expiry_batch_limit": 200,
+    "expiry_retry_seconds": 900.0
+   },
+   "activity": {
+    "min_message_text_length": 2,
+    "max_daily_messages": 20,
+    "min_active_days": 3,
+    "min_weekly_messages": 10,
+    "weekly_reward_points": [
+     25,
+     12,
+     12,
+     4,
+     4,
+     4,
+     4,
+     4,
+     4,
+     4
+    ]
+   },
+   "checkin_reminder": {
+    "slots": [
+     9,
+     12,
+     15,
+     18
+    ],
+    "slot_greetings": {
+     "9": "早上好",
+     "12": "中午好",
+     "15": "下午好",
+     "18": "晚上好"
+    },
+    "auto_delete_seconds": 600,
+    "roster_max_names": 20,
+    "stale_grace_seconds": 900
+   },
+   "display": {
+    "bot_display_name": "助手",
+    "private_voice_title": "语音回复",
+    "checkin_button_text": "✅ 一键签到",
+    "shop_button_text": "🛒 积分商店",
+    "search_query_prefixes": [
+     "诶",
+     "嗯哼",
+     "呀",
+     "欸"
+    ],
+    "private_not_member_notice": "抱歉，私聊只对已授权的群里成员开放。\n如果你是群成员，请先在群里发一条消息，再回来私聊我试试。",
+    "private_limit_notice": "今天聊得有点多啦，先休息一下——明天再继续吧。",
+    "private_global_limit_notice": "今天找我聊天的人有点多，我有点跟不上了，明天再聊吧。",
+    "private_media_unsupported_notice": "私聊里我目前只能看文字和图片，视频/文件/语音还看不了。"
+   },
+   "resources": {
+    "llm_request_capacity": 8,
+    "llm_request_noncritical_capacity": 7,
+    "llm_request_normal_capacity": 4,
+    "llm_request_background_capacity": 2,
+    "llm_tokenizer_concurrency": 2,
+    "telegram_total_capacity": 64,
+    "telegram_noncritical_capacity": 60,
+    "telegram_normal_capacity": 44,
+    "pending_reply_execution_capacity": 4,
+    "tts_synthesis_concurrency": 3,
+    "tts_transcode_concurrency": 2,
+    "tts_private_concurrency": 2,
+    "av_query_concurrency": 3,
+    "llm_stage_deadlines": {
+     "decision": 35.0,
+     "moderation": 35.0,
+     "embed": 60.0,
+     "compress": 90.0,
+     "vision": 90.0,
+     "main": 120.0,
+     "skill": 120.0,
+     "synopsis": 20.0,
+     "group_summary": 15.0
+    },
+    "telegram_critical_admission_timeout_seconds": 1.5,
+    "telegram_high_admission_timeout_seconds": 4.0,
+    "telegram_normal_admission_timeout_seconds": 15.0,
+    "telegram_privileged_timeout_seconds": 8.0,
+    "pending_reply_timeout_seconds": 45.0,
+    "admin_alert_window_seconds": 600.0,
+    "admin_alert_aggregate_after": 5,
+    "admin_alert_state_limit": 512,
+    "admin_alert_text_limit": 900,
+    "moderation_throttle_burst": 3,
+    "moderation_throttle_spacing_seconds": 4.0,
+    "moderation_throttle_max_wait_seconds": 6.0,
+    "moderation_throttle_max_waiters": 3,
+    "tts_max_segments_per_message": 6,
+    "tts_transcode_timeout_seconds": 30.0,
+    "tts_max_http_timeout_seconds": 60.0,
+    "av_query_deadline_seconds": 45.0,
+    "av_query_admission_timeout_seconds": 2.0,
+    "av_star_name_cache_max": 512,
+    "decision_history_token_budget": 8192,
+    "decision_history_max_messages": 80,
+    "memory_max_facts_per_extraction": 6,
+    "memory_extract_input_token_limit": 12000,
+    "memory_extract_scope_limit": 20,
+    "memory_candidate_row_limit": 200,
+    "memory_private_group_fanout": 3,
+    "memory_tool_subject_daily_cap": 5,
+    "memory_maintenance_interval_seconds": 21600,
+    "search_prune_interval_seconds": 21600,
+    "search_record_recall_limit": 5,
+    "archive_batch_size": 8,
+    "archive_backfill_per_pass": 64,
+    "archive_scan_limit": 4096,
+    "archive_candidate_limit": 64,
+    "archive_query_timeout_seconds": 8.0,
+    "archive_maintenance_interval_seconds": 5.0,
+    "archive_indexing_lease_seconds": 120.0
    }
   },
   "configured_secrets": [
@@ -334,7 +518,23 @@
    "master_key_configured": true
   },
   "restart_required_paths": [
-   "bot.parse_mode"
+   "bot.parse_mode",
+   "resources.av_query_concurrency",
+   "resources.llm_request_background_capacity",
+   "resources.llm_request_capacity",
+   "resources.llm_request_noncritical_capacity",
+   "resources.llm_request_normal_capacity",
+   "resources.llm_tokenizer_concurrency",
+   "resources.pending_reply_execution_capacity",
+   "resources.telegram_noncritical_capacity",
+   "resources.telegram_normal_capacity",
+   "resources.telegram_total_capacity",
+   "resources.tts_private_concurrency",
+   "resources.tts_synthesis_concurrency",
+   "resources.tts_transcode_concurrency"
+  ],
+  "restart_pending": [
+   "resources.pending_reply_execution_capacity"
   ]
  },
  "groups": {

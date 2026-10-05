@@ -81,6 +81,11 @@ node $CHECKS/pixels.mjs /tmp/dsh-ui-shots/*.png
 
 # 7) 保存按钮点击回归（改字段 → 真鼠标点击保存）
 node $CHECKS/save-click-probe.mjs 8781
+
+# 8) 运营参数页（移动端不横溢 / 44px 触达 / 键盘焦点 / 重启标记 / 奖池结构化编辑器 /
+#    同一次点击 blur 不吞保存 / 群管理员看不到这一页）
+node $CHECKS/operations.mjs
+GROUP_HARNESS=http://127.0.0.1:8793 node $CHECKS/operations.mjs
 ```
 
 `safe-area.mjs` 用桩上的 `__setInsets(safe, content)` / `__setViewport(height, stable)`

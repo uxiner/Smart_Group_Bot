@@ -19,7 +19,10 @@ from pathlib import Path
 
 os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
 
-from bot.services.runtime_config import RuntimeConfig  # noqa: E402
+from bot.services.runtime_config import (  # noqa: E402
+    RESTART_REQUIRED_PATHS,
+    RuntimeConfig,
+)
 from bot.web.settings_api import _public_group_settings  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -173,7 +176,9 @@ def build() -> dict:
                 "database_url": "sqlite+aiosqlite:////app/data/fixture.db",
                 "master_key_configured": True,
             },
-            "restart_required_paths": ["bot.parse_mode"],
+            # 与真实 API 契约一致：全部需要重启的字段 + 本次保存里真的改了的那几个。
+            "restart_required_paths": list(RESTART_REQUIRED_PATHS),
+            "restart_pending": ["resources.pending_reply_execution_capacity"],
         },
         "groups": {"groups": groups},
         "authorized_groups": {
