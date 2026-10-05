@@ -114,7 +114,9 @@ class CasualService:
         messages.append({"role": "system", "content": REPLY_OUTPUT_AWARENESS})
         messages.append({"role": "system", "content": REPLY_RICH_FORMATTING})
         if reply_targets_context.strip():
-            messages.append({"role": "system", "content": reply_targets_context.strip()})
+            # B-42：块内是成员可控的显示名与正文/caption 预览，只能以 user 角色
+            # + 不可信围栏进入提示词。
+            messages.append({"role": "user", "content": reply_targets_context.strip()})
         messages.append(
             {
                 "role": "system",

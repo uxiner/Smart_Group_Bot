@@ -12,6 +12,8 @@
   都没有——不是靠提示词求它别这么干。
 * 「一次调用写一条」，每条独立提交；受 ``memory_tool_daily_cap``（每作用域每天）
   限制，超限就跳过并只记日志。
+* 群作用域额外受 :data:`bot.services.long_term_memory.TOOL_SUBJECT_DAILY_CAP`
+  （每个成员每天）限制（B-34）：整群额度不能被单个普通成员吃光。
 * 返回给模型的只有一句**简短确认**（「已记住」），绝不回显整条事实——回显等于把
   用户隐私再塞回上下文，还可能被当成「机器人复述过」的证据。
 """
@@ -158,6 +160,26 @@ class RememberSkill:
                 if self.settings is not None
                 else ltm.TOOL_DAILY_CAP
             )
+            # B-34：群作用域额外加一道 per-subject 闸门。``cap`` 是**整群**额度，
+            # 没有这一道时任何普通成员都能独自吃光它。私聊作用域「一个人一个额度」，
+            # 口径保持原样（不叠加第二道闸门）。
+            if scope == SCOPE_GROUP:
+                used_by_subject = await count_tool_facts_today(
+                    session,
+                    scope=scope,
+                    scope_id=scope_id,
+                    subject_user_id=subject_user_id,
+                )
+                if used_by_subject >= ltm.TOOL_SUBJECT_DAILY_CAP:
+                    log.info(
+                        "long-term memory: remember 工具已达**本人**每日上限 | scope=%s | "
+                        "scope_id=%s | subject=%s | cap=%d",
+                        scope,
+                        scope_id,
+                        subject_user_id,
+                        ltm.TOOL_SUBJECT_DAILY_CAP,
+                    )
+                    return -1
             if cap > 0:
                 used = await count_tool_facts_today(
                     session, scope=scope, scope_id=scope_id

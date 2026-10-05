@@ -288,6 +288,12 @@ class BotBehaviorConfig(StrictModel):
     inbound_debounce_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
     reply_batch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=120.0)
     enable_typing: bool = True
+    # D3-40：富文本（粗体/斜体/代码块等）渲染总开关。此前它只存在于
+    # ``bot/config.py`` 的 ``load_settings()`` 里，而那个函数**全仓无生产调用点**，
+    # 于是它既无 env 生效路径、又不在 schema 里，``getattr(..., False)`` 恒真——
+    # 唯一一个「既无 UI、又无 env、又无 DB」的行为开关。这里补齐三方接线
+    # （schema + apply + Mini App），**不**去把 ``load_settings()`` 改成被调用。
+    enable_rich_messages: bool = True
     enable_streaming: bool = True
     stream_chunk_size: int = Field(default=36, ge=8, le=4096)
     stream_edit_interval_sec: float = Field(default=1.0, ge=0.3, le=30.0)
@@ -451,7 +457,6 @@ class BotBehaviorConfig(StrictModel):
     # 第 3 期方向规则：群 → 私聊允许；私聊 → 群**默认禁止**。默认 False 时群聊装配
     # 上下文的任何路径都不读 ``private_chat_messages``；本期不实现打开后的读取逻辑
     # （开启需要用户显式授权，届时再补读取器、授权校验与审计）。
-    group_can_read_private_history: bool = False
     # 第 4 期：长期记忆（``user_facts``）——从对话里提炼的稳定事实。
     # 全部可运行时覆盖；语义见 ``bot.services.long_term_memory`` 与 ``bot/config.py``。
     memory_facts_enabled: bool = True
@@ -1080,6 +1085,7 @@ class RuntimeConfig(StrictModel):
         settings.bot.inbound_debounce_seconds = bot.inbound_debounce_seconds
         settings.bot.reply_batch_timeout_seconds = bot.reply_batch_timeout_seconds
         settings.bot.enable_typing = bot.enable_typing
+        settings.bot.enable_rich_messages = bot.enable_rich_messages
         settings.bot.enable_streaming = bot.enable_streaming
         settings.bot.stream_chunk_size = bot.stream_chunk_size
         settings.bot.stream_edit_interval_sec = bot.stream_edit_interval_sec
@@ -1123,9 +1129,6 @@ class RuntimeConfig(StrictModel):
         settings.bot.search_freshness_price_hours = bot.search_freshness_price_hours
         settings.bot.search_freshness_news_hours = bot.search_freshness_news_hours
         settings.bot.search_freshness_fact_hours = bot.search_freshness_fact_hours
-        settings.bot.group_can_read_private_history = (
-            bot.group_can_read_private_history
-        )
         # 第 4 期：长期记忆（user_facts）
         settings.bot.memory_facts_enabled = bot.memory_facts_enabled
         settings.bot.memory_extract_enabled = bot.memory_extract_enabled
@@ -1413,6 +1416,20 @@ def _normalize_deprecated_runtime_payload(
     if "sub2api" in normalized:
         normalized.pop("sub2api", None)
         changed = True
+
+    # D3-35：``bot.group_can_read_private_history`` 是一个「可配置、无消费者」的旋钮
+    # ——getter 写好了、UI 上是个可点的 toggle，但 ``bot/`` 里零调用方（打开后读取
+    # 逻辑从未实现）。与其留一个假开关，不如从严格 schema 里移除；老库里已落库的
+    # 那一行在这里**一次性**剥离（``extra="forbid"`` 否则会让 initialize() 抛错）。
+    strip_bot = dict(normalized.get("bot") or {})
+    if "group_can_read_private_history" in strip_bot:
+        strip_bot.pop("group_can_read_private_history", None)
+        normalized["bot"] = strip_bot
+        changed = True
+        log.warning(
+            "Retired setting removed: bot.group_can_read_private_history "
+            "(the group->private-history read path was never implemented)"
+        )
 
     models_payload = normalized.get("models")
     if isinstance(models_payload, dict):
@@ -1978,9 +1995,9 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             if key in bot_data:
                 setattr(settings.bot, key, int(bot_data[key]))
         for key in (
+            "enable_rich_messages",
             "memory_recall_enabled",
             "memory_automatic_compaction",
-            "group_can_read_private_history",
             # 第 4 期：长期记忆的两个开关
             "memory_facts_enabled",
             "memory_extract_enabled",
@@ -2161,6 +2178,11 @@ def build_legacy_runtime_config(
                 else settings.bot.reply_batch_timeout_seconds
             ),
             enable_typing=settings.bot_enable_typing,
+            enable_rich_messages=(
+                settings.bot_enable_rich_messages
+                if "bot_enable_rich_messages" in getattr(settings, "model_fields_set", set())
+                else settings.bot.enable_rich_messages
+            ),
             enable_streaming=settings.bot_enable_streaming,
             stream_chunk_size=settings.bot_stream_chunk_size,
             stream_edit_interval_sec=settings.bot_stream_edit_interval_sec,
@@ -2269,12 +2291,6 @@ def build_legacy_runtime_config(
                 if "bot_search_freshness_fact_hours"
                 in getattr(settings, "model_fields_set", set())
                 else settings.bot.search_freshness_fact_hours
-            ),
-            group_can_read_private_history=(
-                settings.bot_group_can_read_private_history
-                if "bot_group_can_read_private_history"
-                in getattr(settings, "model_fields_set", set())
-                else settings.bot.group_can_read_private_history
             ),
             # 第 4 期：长期记忆（user_facts）
             memory_facts_enabled=(

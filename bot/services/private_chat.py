@@ -186,6 +186,11 @@ BUSY_NOTICE = "刚走神了一下，这条没接住，再发一次好吗？"
 # 准入判定
 # ---------------------------------------------------------------------------
 
+#: 准入缓存 TTL（秒，B-35）。缓存里除了档位还带着「已确认可访问的授权群集合」，
+#: 被踢出群之后这个集合就过期了，所以窗口必须短。原来是 600s（最长 10 分钟的越权
+#: 窗口：被踢之后那一群的内容继续注入他的私聊），现降到 60s。
+MEMBER_ACCESS_TTL_SECONDS = 60.0
+
 
 class MemberAccessCache:
     """``user_id -> 准入档位`` 的 TTL 缓存（纯内存，进程重启即空）。
@@ -196,12 +201,16 @@ class MemberAccessCache:
     第 3 期起还顺带缓存**已确认他在里面的授权群 id**：B 项（群 → 私聊参考公开记录）
     需要「该用户可访问的群」，而准入判定本来就已经对每个授权群打过一次
     ``getChatMember``——那次查询的命中结果就是可访问群，不缓存就得为每条私聊再打一轮。
+
+    TTL（B-35）必须**短**：缓存里除了档位还带着「可访问群集合」，被踢出群之后这个
+    集合就过期了。原来 600s 意味着最长 10 分钟里，那一个群的内容仍然继续注入他的私聊。
+    60s 是「省一次 ``getChatMember``」与「越权窗口」之间的折中。
     """
 
     def __init__(
         self,
         *,
-        ttl_seconds: float = 600.0,
+        ttl_seconds: float = MEMBER_ACCESS_TTL_SECONDS,
         max_users: int = 4096,
         clock: Callable[[], float] | None = None,
     ) -> None:
@@ -391,18 +400,21 @@ async def resolve_access(
         if tier in (TIER_ADMIN, TIER_MEMBER):
             confirmed.append(group_id)
         if tier == TIER_ADMIN:
-            store.put(uid, TIER_ADMIN, confirmed)
-            return AccessVerdict(
-                True, TIER_ADMIN, group_ids=tuple(confirmed)
-            )
-        if tier == TIER_MEMBER:
+            # B-35：**不要**在这里提前 return。档位取「最高」是对的，但
+            # ``confirmed`` 必须遍历完整个授权群列表才完整——``list_authorized_groups``
+            # 按 ``created_at.desc()`` 排序，提前返回等于只拿到「前缀」，
+            # 后面的群永远不查、也永远不进 ``AccessVerdict.group_ids``，
+            # 私聊侧的可访问群集合因此不完整。
+            best = TIER_ADMIN
+        elif tier == TIER_MEMBER and best != TIER_ADMIN:
             best = TIER_MEMBER
 
-    if best == TIER_MEMBER:
-        # 还有群没查成时先不缓存：下次重查有可能升档（普通成员 → 管理员）
+    if best in (TIER_ADMIN, TIER_MEMBER):
+        # 还有群没查成时先不缓存：下次重查有可能升档（普通成员 → 管理员），
+        # 缓存里的「可访问群集合」也就不再是全集。
         if not unknown:
-            store.put(uid, TIER_MEMBER, confirmed)
-        return AccessVerdict(True, TIER_MEMBER, group_ids=tuple(confirmed))
+            store.put(uid, best, confirmed)
+        return AccessVerdict(True, best, group_ids=tuple(confirmed))
 
     if unknown:
         # 有群没查成 → 不下结论，也不缓存（下一次重试）

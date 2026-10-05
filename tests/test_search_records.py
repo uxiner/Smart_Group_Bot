@@ -170,10 +170,13 @@ class KindAndAgeTests(unittest.TestCase):
                 SimpleNamespace(bot=SimpleNamespace(group_can_read_private_history=False))
             )
         )
-        self.assertTrue(
+        # D3-35：即使某个 settings 对象上残留了这个属性，也**不得**被当成放行开关
+        # ——它是「可配置、无消费者」的假旋钮，已从 RuntimeConfig 移除。
+        self.assertFalse(
             sm.group_can_read_private_history(
                 SimpleNamespace(bot=SimpleNamespace(group_can_read_private_history=True))
-            )
+            ),
+            "群→私聊方向是单向红线：不存在任何能打开它的配置",
         )
 
 

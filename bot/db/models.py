@@ -135,6 +135,73 @@ class GroupSummary(Base):
     )
 
 
+class WeeklyReportPost(Base):
+    """周报的**发送台账**：一行 = 一个目标在某个 ISO 周收到过一次周报。
+
+    ``bot.tools.weekly_report`` 以前对群消息**完全没有幂等**：cron 与上一次运行重叠、
+    运维手工补跑、手动重跑，都会让**每个授权群收到重复周报**，而 exit code 仍是 0、
+    数据上无法察觉。积分结算那半边是幂等的（``(用户, ISO 周)`` 唯一键），只有发消息
+    这一半不是。
+
+    ``(target_id, week_key)`` 上的唯一索引就是幂等键，写入走
+    ``INSERT ... ON CONFLICT DO NOTHING + RETURNING``（与 ``checkin_reminder_posts``
+    同一套模式）。``target_id`` 为 0 表示"私发超管的成本摘要"——它同样需要幂等。
+    ``message_id`` 在发送成功后才回填。
+    """
+
+    __tablename__ = "weekly_report_posts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 群 id；``0`` = 私发超管的成本摘要（不是群，所以不与群 id 冲突）
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: ISO 周，形如 ``2026-W41``（发送时刻的 ISO 周，不依赖 ``days`` 参数）
+    week_key: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 发送成功前为 0；发送成功后回填 Telegram message_id
+    message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ux_weekly_report_posts_target_week",
+            "target_id",
+            "week_key",
+            unique=True,
+        ),
+    )
+
+
+class GroupSummaryFailureState(Base):
+    """摘要调度器的**失败退避台账**（B-25）。
+
+    退避阶梯（``failure_backoff_seconds * 2**(k-1)``，封顶
+    ``failure_backoff_max_seconds``）与「退避到什么时候」以前只活在
+    ``GroupSummaryScheduler`` 的两个进程内 dict 里，于是**每次重启都从
+    ``failure_backoff_seconds`` 重新爬阶梯**——容器滚动重启等于给所有持续失败的群
+    发一次「立即重试」，永远到不了上限。
+
+    ``backoff_until`` 存的是**墙钟**时间（不是 ``time.monotonic``）：进程重启之后
+    仍然可以和 ``now_shanghai_naive()`` 比较。成功发布后对应行被删除。
+    """
+
+    __tablename__ = "group_summary_failure_states"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    backoff_until: Mapped[datetime] = mapped_column(
+        DateTime, default=now_shanghai_naive
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GroupPermanentMemory(Base):
     __tablename__ = "group_permanent_memories"
 
@@ -1564,6 +1631,12 @@ class CheckinReminderPost(Base):
     ``bot.services.checkin_reminder.release_reminder_slot``），这样"没发出去"
     不会被记成"已发过"。``message_id`` 在发送成功后才回填，供审计与按钮回调
     反查"这条提醒是哪个时段发的"。
+
+    ``delivered_at``（B-27）是「占位真的变成了消息」的证据。进程在 claim 与 send
+    之间被 SIGKILL / OOM / 容器驱逐时只会留下 ``message_id=0`` 的空占位，而唯一
+    索引会让该时段永远不再发、且没有补发路径；``reap_stale_reminder_slots`` 靠
+    「``message_id=0`` 且 ``delivered_at IS NULL`` 且 ``created_at`` 早于宽限期」
+    把这类空占位清掉并补发。
     """
 
     __tablename__ = "checkin_reminder_posts"
@@ -1574,6 +1647,8 @@ class CheckinReminderPost(Base):
     slot_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # 发送成功前为 0；发送成功后回填 Telegram message_id
     message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    #: 发送成功并回填 message_id 的时刻；空占位为 NULL（B-27 的判定依据）
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=now_shanghai_naive,

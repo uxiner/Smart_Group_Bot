@@ -19,7 +19,13 @@ RUN apt-get update \
 COPY requirements.lock ./requirements.lock
 RUN pip install --no-cache-dir --requirement requirements.lock
 
+# Application code lives in the image. docker-compose.yml deliberately does NOT
+# bind-mount ./bot over it (B-08): that shadowed this copy, so the image was a
+# dependency-only artifact and host-side git operations silently swapped the
+# running code with no diff review and no version pin.
 COPY --chown=app:app bot ./bot
+# Prompt templates are also mounted read-only by compose (runtime-seeded), but
+# they are copied here so the image is runnable on its own.
 COPY --chown=app:app prompt ./prompt
 RUN mkdir -p /app/data && chown app:app /app/data
 

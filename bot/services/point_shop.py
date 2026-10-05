@@ -1147,7 +1147,16 @@ async def _buy_pin_locked(
     existing = await active_entitlement(
         session, group_id=gid, user_id=uid, kind=KIND_PIN
     )
-    if existing is not None and existing.expires_at is not None:
+    # D2-05：只认**还没到期**的置顶。``active_entitlement`` 只看「行存在」，而到期
+    # 清理每 300s 才跑一轮——刚过期的置顶行会在库里滞留最长约 5 分钟。旧判定只看
+    # ``expires_at is not None``，于是这 5 分钟里用户被无谓挡下一个购买窗口，还收到
+    # 一句自相矛盾的「还有 0 分钟到期」。口径与 ``next_expiry`` 一致：
+    # ``expires_at > moment`` 才算生效中；过期行放行，交给 ``upsert_entitlement`` 覆盖。
+    if (
+        existing is not None
+        and existing.expires_at is not None
+        and existing.expires_at > moment
+    ):
         left = minutes_left(existing.expires_at, moment)
         return ShopReply(
             "already_pinned",

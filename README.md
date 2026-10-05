@@ -166,6 +166,8 @@ APP_UID="$(id -u)" APP_GID="$(id -g)" docker compose up -d --build
 ```
 
 - 数据库是 SQLite（**WAL 模式**）：备份用 SQLite 在线备份 API（`VACUUM INTO` / `sqlite3.backup()`），**不要直接 `cp` 数据文件**
+- **代码不在容器里挂载**：`bot/` 由 `Dockerfile` 的 `COPY bot ./bot` 打进镜像，`docker-compose.yml` 刻意**不**再挂 `./bot`（B-08）。早先那行 bind mount 把镜像里的代码整个盖住，于是 `docker compose build` 变成空操作、宿主机上 `git pull` 一重启就换掉生产代码，中间没有 diff 确认也没有版本 pin。改代码一律走重新构建镜像；确需热改请另建一个**不提交**的 `docker-compose.override.yml`
+- 仍然挂载的只有三样：`./data`（SQLite）、`./prompt`（运行时加载并 seed 进 `runtime_config`）、`./config.toml`（一次性导入）
 - 生产机代码更新走「备份 → 拷已测产物 → 逐文件哈希核对 → 重启 → 验活」，不是 `git pull`
 - 定时任务由宿主 cron 触发：周报与活跃榜发奖（`python -m bot.tools.weekly_report`）、商店到期清理（`python -m bot.tools.shop_expire`，建议每 5–10 分钟）、签到提醒（`python -m bot.tools.checkin_reminder --slot <时段>`，工具本身不判断「现在几点」，要不要发由 cron 决定）
 

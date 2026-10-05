@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram.types import Message
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -7,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import Settings
 from bot.db.models import Admin, AuthorizedGroup
 from bot.services.update_delivery import mark_privileged_operator
+
+log = logging.getLogger(__name__)
 
 
 async def _schedule_auto_delete(sent: Message | None, settings: Settings) -> None:
@@ -29,7 +33,13 @@ async def _send_access_notice(
     title: str,
     action: str,
 ) -> None:
-    """Send an action-first access notice without creating an import cycle."""
+    """Send an action-first access notice without creating an import cycle.
+
+    The notice is the **only** feedback a user gets for「权限不足 / 当前群未授权 /
+    群内才可用」, so a send failure must be loud and traceable rather than a
+    one-line f-string warning (B-10): module-level ``log`` + ``%s`` lazy formatting
+    + ``exc_info=True``.
+    """
     # message_templates imports bot.utils.telegram, which imports this module.
     # Keeping this import inside the send path preserves that dependency order.
     from bot.services.message_templates import render_action_notice
@@ -40,9 +50,10 @@ async def _send_access_notice(
             parse_mode="HTML",
         )
         await _schedule_auto_delete(sent, settings)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Suppressed notice failure: {e}")
+    except Exception:
+        log.warning(
+            "access notice send failed | title=%s action=%s", title, action, exc_info=True
+        )
 
 
 def is_super_admin_user_id(user_id: int, settings: Settings) -> bool:

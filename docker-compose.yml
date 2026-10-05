@@ -8,11 +8,22 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-      - ./bot:/app/bot:ro
-      # Prompt templates are loaded from this directory at runtime and seeded
-      # into runtime_config on first boot.  Without the mount the container
-      # keeps the copy baked into the image, so prompt edits silently had no
-      # effect and the owner-policy migration kept re-applying the old text.
+      # Application code is NOT bind-mounted (B-08). It is baked into the image
+      # by `COPY bot ./bot`, so `docker compose build && up` is the only thing
+      # that decides what runs, and the running code always matches the image
+      # tag. A host-side `./bot` mount used to shadow the image copy entirely,
+      # which turned every build into a no-op and let `git pull` on the host
+      # change production with no diff review and no version pin.
+      #
+      # Need hot code edits while developing? Use a separate, explicit override
+      # file (docker-compose.override.yml, not committed) rather than changing
+      # this default.
+      #
+      # Prompt templates stay mounted: they are loaded from this directory at
+      # runtime and seeded into runtime_config on first boot. Without the mount
+      # the container keeps the copy baked into the image, so prompt edits
+      # silently had no effect and the owner-policy migration kept re-applying
+      # the old text.
       - ./prompt:/app/prompt:ro
       # Legacy one-time import only; ignored after runtime_config is created.
       - ./config.toml:/app/config.toml:ro

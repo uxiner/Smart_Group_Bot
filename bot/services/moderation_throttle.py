@@ -134,11 +134,30 @@ class ModerationAdmissionGate:
 
     # -- 状态 ------------------------------------------------------------- #
 
-    def _state_for(self, key: tuple[int, int], now: float) -> _KeyState:
+    def _state_for(self, key: tuple[int, int], now: float) -> _KeyState | None:
+        """取（必要时新建）桶；**字典已达硬上限且腾不出位置时返回 ``None``**。
+
+        B-05：原来这里是「满了先清一次，然后无论清没清出位置都插入新 key」，
+        ``max_keys`` 只是「触发一次清理的机会」，不是内存上界。返回 ``None`` 时
+        调用方按「放弃整形」处理（bypass），与模块顶部「绝不丢消息 / 绝不拒绝」的
+        承诺一致——上限守住的是内存，不是准入。
+        """
+
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= self.max_keys:
                 self._prune(now)
+                if len(self._states) >= self.max_keys:
+                    self.bypassed_total += 1
+                    log.warning(
+                        "审核整形：状态桶已达上限且无法回收，本次跳过整形（判定不变）| "
+                        "keys=%d/%d group=%s user=%s",
+                        len(self._states),
+                        self.max_keys,
+                        key[0],
+                        key[1],
+                    )
+                    return None
             # 新 key 的桶是**满的**：tat 落后 now 一个容忍度 = 前 burst 条零延迟。
             state = _KeyState(tat=now - self._tolerance, last_seen=now)
             self._states[key] = state
@@ -203,14 +222,17 @@ class ModerationAdmissionGate:
             return AdmissionOutcome()
 
         now = self._clock()
-        delay = self._plan(self._state_for(key, now), now)
+        state = self._state_for(key, now)
+        if state is None:
+            # B-05：桶已满且回收不了 → 放弃整形（不等待、不拒绝），判定内容不变。
+            return AdmissionOutcome(bypassed=True)
+        delay = self._plan(state, now)
         if delay <= 0:
             return AdmissionOutcome()
 
         self.shaped_total += 1
         if delay > self.max_observed_wait:
             self.max_observed_wait = delay
-        state = self._states.get(key)
         if self.max_waiters <= 0 or self._waiters >= self.max_waiters:
             self.bypassed_total += 1
             if state is not None:

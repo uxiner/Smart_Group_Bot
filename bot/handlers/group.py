@@ -170,7 +170,7 @@ from bot.services.update_completion import (
     request_current_update_retry,
 )
 from bot.utils.prompts import build_content_boundaries_context
-from bot.utils.security import format_history_message_line
+from bot.utils.security import format_history_message_line, wrap_untrusted_multiline
 from bot.utils.timezone import (
     format_shanghai_timestamp,
     now_shanghai,
@@ -2309,6 +2309,99 @@ async def _moderation_undo_false_positive(
     return "undo"
 
 
+@dataclass(frozen=True)
+class _UnbanRecoveryOutcome:
+    """``lease -> commit -> activate -> release`` 这条**共用**解禁序列的结果。"""
+
+    #: 是否真的拿到了恢复工单（False = 没有待处理的旧限制，无需解禁）
+    needs_work: bool
+    #: Telegram 侧的解禁调用是否成功
+    released: bool
+    #: 是否已经请求了持久化重投递（Telegram 没解干净时的补偿）
+    retry_requested: bool
+
+
+async def _lease_and_release_restriction(
+    *,
+    bot: Any,
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+    prefix: str,
+    raise_on_integrity: bool = False,
+) -> _UnbanRecoveryOutcome:
+    """「解禁」的**唯一实现**（B-06）。
+
+    永久豁免（:func:`_moderation_add_permanent_exemption`）与人工放行
+    （:func:`_release_member_restriction_for_review`）走的是同一条恢复流程。以前后者
+    是前者的「照抄」，两份实现已经开始漂移：人工放行在 Telegram 解禁调用失败时
+    **不**请求持久化重投递，两条路径的失败补偿行为不一致，以后再各自演进只会越差越大。
+
+    顺序固定（顺序本身就是恢复协议的一部分）：
+
+    1. ``lease`` —— 先把恢复工单拿到手（没有待处理限制时返回 ``None``，视为无需解禁）；
+    2. ``commit`` —— 工单**先落库**，之后进程崩了也不会丢；
+    3. ``activate`` —— 交给后台继续校准；
+    4. ``release`` —— 真正调 Telegram 解禁；没解干净时在这里**统一**请求重投递。
+
+    lease / commit / release 抛错统一往上抛，由各自的调用方按自己的口径处理；
+    ``raise_on_integrity`` 只给豁免路径用——它要把「已被并发插了
+    ``ModerationExemption``」这个 ``IntegrityError`` 翻译成一句用户提示。
+    """
+
+    try:
+        recovery = await lease_join_verification_for_unban(
+            session, int(group_id), int(user_id), manual_unban=False
+        )
+    except Exception as exc:
+        log.exception("%s: lease failed | group=%s user=%s", prefix, group_id, user_id)
+        raise RuntimeError(f"{prefix}: lease failed") from exc
+    if recovery is None:
+        return _UnbanRecoveryOutcome(
+            needs_work=False, released=True, retry_requested=False
+        )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        if raise_on_integrity:
+            raise
+        log.exception(
+            "%s: recovery commit conflicted | group=%s user=%s", prefix, group_id, user_id
+        )
+        raise RuntimeError(f"{prefix}: recovery commit conflicted")
+    except Exception as exc:
+        log.exception(
+            "%s: recovery commit failed | group=%s user=%s", prefix, group_id, user_id
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise RuntimeError(f"{prefix}: recovery commit failed") from exc
+    activate_manual_unban_recovery(recovery)
+    try:
+        released = bool(
+            await release_moderation_restriction_after_exemption(
+                bot, session, recovery
+            )
+        )
+    except Exception as exc:
+        log.exception("%s: unban failed | group=%s user=%s", prefix, group_id, user_id)
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise RuntimeError(f"{prefix}: unban failed") from exc
+    if not released:
+        # 持久化重投递补偿提到**共用层**：Telegram 侧没解干净时让当前 update 再走一遍。
+        request_current_update_retry()
+        return _UnbanRecoveryOutcome(
+            needs_work=True, released=False, retry_requested=True
+        )
+    return _UnbanRecoveryOutcome(needs_work=True, released=True, retry_requested=False)
+
+
 async def _moderation_add_permanent_exemption(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -2330,35 +2423,29 @@ async def _moderation_add_permanent_exemption(
                 created_by=operator_id,
             )
         )
-    recovery = await lease_join_verification_for_unban(
-        session,
-        int(violation.group_id),
-        int(violation.user_id),
-        manual_unban=False,
-    )
-    if recovery is None:
-        await session.rollback()
-        await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
-        return "retry"
     try:
-        await session.commit()
+        outcome = await _lease_and_release_restriction(
+            bot=callback.bot,
+            session=session,
+            group_id=int(violation.group_id),
+            user_id=int(violation.user_id),
+            prefix="moderation exemption",
+            raise_on_integrity=True,
+        )
     except IntegrityError:
         await session.rollback()
         await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
         return None
-    activate_manual_unban_recovery(recovery)
-    released = await release_moderation_restriction_after_exemption(
-        callback.bot,
-        session,
-        recovery,
-    )
+    if not outcome.needs_work:
+        await session.rollback()
+        await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
+        return "retry"
     if existing is not None:
         text = "该用户已在当前群永久豁免 AI 审核"
     else:
         text = "已永久豁免该用户的当前群 AI 审核"
-    if not released:
+    if not outcome.released:
         text += "；旧限制正在由恢复任务继续校准"
-        request_current_update_retry()
     await callback.answer(text, show_alert=True)
     return "exempt" if existing is None else None
 
@@ -2393,10 +2480,11 @@ def _review_card_link(html_text: str) -> str:
 async def _release_member_restriction_for_review(*, bot, session, violation) -> bool:
     """人工放行时「只做解禁那一半」。
 
-    照抄 ``_moderation_add_permanent_exemption`` 的恢复流程，但**不**添加
-    ``ModerationExemption`` 行——人工放行不是永久豁免。这样质询超时封禁会被作废、
-    成员恢复发言权限。``recovery is None``（没有待处理质询/本来就没事）视为无需解禁，
-    不算错误。
+    解禁序列本身**不在这里**：B-06 之后它与永久豁免共用
+    :func:`_lease_and_release_restriction`（lease → commit → activate → release，
+    含统一的重投递补偿）。本函数只负责「不添加 ``ModerationExemption`` 行」这一条
+    差异——人工放行不是永久豁免。这样质询超时封禁会被作废、成员恢复发言权限。
+    没有待处理质询/本来就没事（``needs_work=False``）视为无需解禁，不算错误。
     """
 
     violation_id = int(getattr(violation, "id", 0) or 0)
@@ -2408,38 +2496,19 @@ async def _release_member_restriction_for_review(*, bot, session, violation) -> 
     if group_id == 0 or user_id == 0:
         return True
     try:
-        recovery = await lease_join_verification_for_unban(
-            session, group_id, user_id, manual_unban=False
+        outcome = await _lease_and_release_restriction(
+            bot=bot,
+            session=session,
+            group_id=group_id,
+            user_id=user_id,
+            prefix="review release",
         )
     except Exception:
-        log.exception("review release: lease failed | violation=%s", violation_id)
+        log.exception("review release failed | violation=%s", violation_id)
         return False
-    if recovery is None:
+    if not outcome.needs_work:
         return True
-    try:
-        await session.commit()
-    except Exception:
-        log.exception(
-            "review release: recovery commit failed | violation=%s", violation_id
-        )
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        return False
-    activate_manual_unban_recovery(recovery)
-    try:
-        released = await release_moderation_restriction_after_exemption(
-            bot, session, recovery
-        )
-    except Exception:
-        log.exception("review release: unban failed | violation=%s", violation_id)
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        return False
-    return bool(released)
+    return bool(outcome.released)
 
 
 async def _reapply_restriction_for_review(
@@ -4607,6 +4676,41 @@ _NSFW_IMAGE_WARNING_REASON = "检测到裸露/色情图片或视频，已删除�
 _NSFW_IMAGE_CHALLENGE_REASON = "检测到在群内公开发布裸露/色情图片或视频（内容已删除）"
 
 
+#: 视觉描述的**代码级**长度上限（B-12）。提示词里「30 字以内」只是软约束：一张
+#: 文字密集的截图可以让 OCR 描述膨胀到几万个字符，而这段文本会直接进入审核文本、
+#: 决策上下文与 ``group_message_archive`` 归档（``record_violation`` 侧另有 [:500]
+#: 截断，归档侧没有）。日志之外的**所有**下游只喂截断版。
+VISION_TEXT_MAX_CHARS = 800
+
+
+def _cap_vision_text(value: Any) -> str:
+    """把视觉描述硬截断到 :data:`VISION_TEXT_MAX_CHARS`（保留末尾判定行）。
+
+    NSFW 守卫那一路要求判定 JSON 在**最后一行**，所以不能一刀切在末尾截断——
+    那会把 ``NSFW_DECISION {"nsfw": "yes"}`` 砍成半行，判定直接失效（宁可漏判）。
+    这里保留最后一行不动，只截断它前面的正文。
+    """
+
+    text = str(value or "").strip()
+    if len(text) <= VISION_TEXT_MAX_CHARS:
+        return text
+    lines = text.splitlines()
+    if len(lines) > 1 and _NSFW_DECISION_LINE_RE.match(lines[-1]):
+        tail = lines[-1]
+        head = "\n".join(lines[:-1])
+        head_budget = max(0, VISION_TEXT_MAX_CHARS - len(tail) - 1)
+        if head_budget < len(head):
+            log.warning(
+                "【视觉】描述超长，已截断正文（保留末尾判定行）| chars=%d",
+                len(text),
+            )
+            return "\n".join([head[:head_budget].rstrip(), tail])
+    log.warning(
+        "【视觉】描述超长，已截断 | chars=%d -> %d", len(text), VISION_TEXT_MAX_CHARS
+    )
+    return text[:VISION_TEXT_MAX_CHARS].rstrip() + " ..."
+
+
 def _nsfw_decision_payload(vision_text: str) -> dict[str, Any] | None:
     """取末尾那行结构化判定并严格解析；形状不对返回 ``None``。
 
@@ -4752,7 +4856,8 @@ async def _nsfw_video_thumbnail_vision_text(message: Message, llm: LLMService) -
 
     if vision_text == "NO_VALID_IMAGE_CONTENT":
         return ""
-    return vision_text
+    # B-12：代码级长度上限。日志之外的所有下游（审核 / 决策 / 归档）只喂截断版。
+    return _cap_vision_text(vision_text)
 
 
 async def _guard_nsfw_video_only_message(
@@ -5161,6 +5266,11 @@ async def _append_image_context(
         log.info("【视觉】识别为空")
         return text, ""
 
+    # B-12：提示词里的「30 字以内」只是软约束，这里做代码级硬截断。此后
+    # ``input_text``（关键词/正则扫描、决策上下文）、``group_message_archive``
+    # 归档、NSFW 判定拿到的都只有截断版；日志仍打完整前 80 字。
+    vision_text = _cap_vision_text(vision_text)
+
     log.info("【视觉】识别结果 | %s", vision_text[:80])
     if not nsfw_guard:
         return f"{text}\n[image-vision]\n{vision_text}", vision_text
@@ -5476,6 +5586,13 @@ def _message_sender_label(message: Message | None) -> str:
     return "unknown"
 
 
+#: ``[REPLY_TARGET_CANDIDATES]`` 块的围栏标签（B-42）：块内含成员可控的显示名与
+#: 正文 / caption 预览，只能当**数据**读。
+REPLY_TARGETS_UNTRUSTED_LABEL = "reply_target_candidates"
+#: 整块的注入上限（字符）。候选条目数 = 批内消息数 × 3 左右，80 字预览 × 数十条。
+REPLY_TARGETS_MAX_CHARS = 4000
+
+
 def _append_reply_target_candidate(
     lines: list[str],
     alias_map: dict[str, int],
@@ -5575,7 +5692,18 @@ def _build_reply_targets_context(items: list[_PendingReplyItem]) -> tuple[str, d
             relation="message that the latest input replies to",
         )
 
-    return "\n".join(lines), alias_map
+    # B-42：整块套不可信围栏。块里的 ``sender``（Telegram 显示名）与 ``preview``
+    # （消息正文 / 图片 caption）都是**成员可控**的，system 身份会把它们抬到指令
+    # 优先级；围栏同时中和成员文本里伪造的闭合标签。调用方以 ``role="user"`` 注入
+    # （``skills/service.py`` / ``casual.py``）。
+    return (
+        wrap_untrusted_multiline(
+            REPLY_TARGETS_UNTRUSTED_LABEL,
+            "\n".join(lines),
+            max_len=REPLY_TARGETS_MAX_CHARS,
+        ),
+        alias_map,
+    )
 
 
 def _resolve_reply_target_message_id(
@@ -6341,6 +6469,11 @@ async def _inject_group_long_term_memory(
     fact_messages = render_facts_block(records)
     if not fact_messages:
         return history
+    # B-33：长期记忆行必须带来源标记。否则最终请求闸门（``payload_fit``）按 role 分层时
+    # 会把它们当成普通历史（``role='user'``），**优先于检索留档**丢掉——与
+    # 「历史 → 检索留档 → 记忆召回」的口径正好相反。
+    for fact_item in fact_messages:
+        fact_item["memory_source"] = "long_term_fact"
 
     search_layer: list[dict] = []
     header_layer: list[dict] = []

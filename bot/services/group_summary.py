@@ -42,14 +42,20 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
-from sqlalchemy import case, func, insert, literal, select, update
+from sqlalchemy import case, delete as sql_delete, func, insert, literal, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from bot.db.models import GroupArchiveState, GroupMessageArchive, GroupSummary
+from bot.db.models import (
+    GroupArchiveState,
+    GroupMessageArchive,
+    GroupSummary,
+    GroupSummaryFailureState,
+)
 from bot.services.request_priority import ExecutionPriority
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.model_limits import (
@@ -73,6 +79,10 @@ GROUP_SUMMARY_PROMPT_VERSION = "gs1"
 GROUP_SUMMARY_BLOCK_MARKER = "[GROUP_SUMMARY]"
 
 #: 摘要**绝不允许**出现在输出里的保留标记/口吻：命中即判无效，保留旧摘要。
+#: D3-01：这里**只收真正的块标记**。原来的裸子串 ``system:`` / ``System:`` /
+#: ``SYSTEM:`` 会命中完全正常、忠实、不含任何指令的群聊摘要
+#: （「配置文件里会带 ``system:`` 这一行」「迁移到 system: docker 部署」），
+#: 而真正的块标记伪造已经被 ``[SYSTEM]`` / ``[system]`` 覆盖。
 _FORBIDDEN_OUTPUT_MARKERS: tuple[str, ...] = (
     "[SAFETY_RULES]",
     "[CURRENT_TURN_FOCUS]",
@@ -84,17 +94,17 @@ _FORBIDDEN_OUTPUT_MARKERS: tuple[str, ...] = (
     "[permanent-memory]",
     "[SEARCH_RECORDS]",
     GROUP_SUMMARY_BLOCK_MARKER,
-    "system:",
-    "System:",
-    "SYSTEM:",
 )
 #: 明显的"以管理员/系统身份下令"的口吻（低信任资料不许冒充证据或指令）。
+#: D3-01：中文分支只拦**主语是模型自己**或**动作指向读者**的句子；「已封禁该用户」
+#: 这类第三人称转述是群聊摘要的正常内容（运维群天天在讨论封禁/解封），不能拦。
 _FORBIDDEN_OUTPUT_RE = re.compile(
     r"(?:"
     r"ignore (?:all |the )?(?:previous|above) instructions"
     r"|you are (?:now )?(?:an? )?(?:admin|administrator|system)"
     r"|(?:我是|作为)(?:管理员|系统|机器人管理员)"
-    r"|已(?:经)?(?:封禁|踢出|解封|警告)(?:了)?(?:该|此)?(?:用户|成员)"
+    r"|(?:我|本人)(?:已|已经)?(?:经)?(?:把)?你(?:给)?(?:封禁|踢出|禁言|移出|拉黑)"
+    r"|你(?:已|已经)?(?:经)?(?:被)?(?:封禁|踢出|禁言|移出|拉黑)"
     r")",
     re.IGNORECASE,
 )
@@ -422,6 +432,83 @@ class SqlGroupSummaryStore:
                 )
             ).scalar_one_or_none()
         return int(value or 0)
+
+    async def load_failure_states(self) -> list[tuple[int, int, datetime]]:
+        """读回持久化的退避台账（``[(group_id, failure_count, backoff_until)]``）。
+
+        供调度器在启动时恢复：以前退避只活在进程内存里，重启即清零，容器滚动重启
+        等于给所有持续失败的群一次「立即重试」（B-25）。读失败按空列表处理。
+        """
+
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            GroupSummaryFailureState.group_id,
+                            GroupSummaryFailureState.failure_count,
+                            GroupSummaryFailureState.backoff_until,
+                        )
+                    )
+                ).all()
+        except Exception as exc:
+            log.warning("group summary: 退避台账读取失败（按无退避处理） | error=%s", exc)
+            return []
+        return [
+            (int(row[0]), max(0, int(row[1] or 0)), row[2])
+            for row in rows
+            if row[2] is not None
+        ]
+
+    async def save_failure_state(
+        self, group_id: int, *, failure_count: int, backoff_until: datetime
+    ) -> None:
+        """落一条退避台账（UPSERT）。写失败只记日志——退避丢失只是退回旧行为。"""
+
+        gid = int(group_id)
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    sqlite_insert(GroupSummaryFailureState)
+                    .values(
+                        group_id=gid,
+                        failure_count=max(0, int(failure_count)),
+                        backoff_until=backoff_until,
+                        updated_at=now_shanghai_naive(),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[
+                            GroupSummaryFailureState.group_id,
+                        ],
+                        set_={
+                            "failure_count": max(0, int(failure_count)),
+                            "backoff_until": backoff_until,
+                            "updated_at": now_shanghai_naive(),
+                        },
+                    )
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(
+                "group summary: 退避台账写入失败 | group=%s | error=%s", gid, exc
+            )
+
+    async def clear_failure_state(self, group_id: int) -> None:
+        """发布成功：删掉退避台账（否则重启后又从旧阶梯继续）。"""
+
+        gid = int(group_id)
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    sql_delete(GroupSummaryFailureState).where(
+                        GroupSummaryFailureState.group_id == gid
+                    )
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(
+                "group summary: 退避台账清理失败 | group=%s | error=%s", gid, exc
+            )
 
     async def pending_count(
         self,
@@ -982,6 +1069,8 @@ class GroupSummaryMetrics:
     deadline_exceeded_total: int = 0
     source_changed_total: int = 0
     admission_timeout_total: int = 0
+    #: 输出被校验拒绝的次数（与「是不是真的伪造」无关，见 D3-01）。
+    output_rejected_total: int = 0
     success_total: int = 0
     failure_total: int = 0
     skipped_not_ready_total: int = 0
@@ -1003,6 +1092,7 @@ class GroupSummaryMetrics:
             "deadline_exceeded_total": self.deadline_exceeded_total,
             "source_changed_total": self.source_changed_total,
             "admission_timeout_total": self.admission_timeout_total,
+            "output_rejected_total": self.output_rejected_total,
             "success_total": self.success_total,
             "failure_total": self.failure_total,
             "skipped_not_ready_total": self.skipped_not_ready_total,
@@ -1023,7 +1113,8 @@ class GroupSummaryScheduler:
     * **每群合并**：同一个群多次 ``notify`` 只保留一份 pending 状态（``merged`` 计数）；
     * **有界队列**：超过 ``pending_capacity`` 时本次跳过并计数，绝不留下无界 dict/task；
     * **排队过期**：等待超过 ``queue_wait_seconds`` 的任务直接丢弃并计数（不调用模型）；
-    * **执行硬超时**：入场后（含 fallback 与重试）整体 ``deadline_seconds``；
+    * **执行硬超时**：``run_group`` 入口起、入场准备 + 模型调用（含 fallback 与重试）
+      + 发布在内，整体不超过 ``deadline_seconds``（B-24：原先它只包住模型调用）；
     * **回复优先**：主门禁有 NORMAL 在排队时不再claim新摘要；
     * **迟到不发布**：发布走版本 CAS；取消/超时后不再触碰 DB。
     """
@@ -1081,6 +1172,10 @@ class GroupSummaryScheduler:
         self._active_models = 0
         self.metrics = GroupSummaryMetrics()
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: fire-and-forget 的辅助任务（退避台账落库/清理）。**刻意与 ``_tasks``
+        #: 分开**：``_pump`` 的并发判定是 ``len(self._tasks) < limit``，把辅助
+        #: 任务混进去会凭空吃掉摘要的执行槽（limit 默认 2）。
+        self._aux_tasks: set[asyncio.Task[Any]] = set()
 
     # -- 前台唯一入口（绝不阻塞、绝不 await 生成） -------------------------
     def notify(
@@ -1128,6 +1223,7 @@ class GroupSummaryScheduler:
     async def run(self) -> None:
         """常驻后台循环：有活干活，没活等通知（失败只记日志，不退出）。"""
 
+        await self._restore_failure_states()
         try:
             while not self._closed:
                 try:
@@ -1391,9 +1487,31 @@ class GroupSummaryScheduler:
         outcome = "skipped"
         try:
             try:
-                outcome = await self._run_group_inner(gid, cfg)
+                # B-24：硬超时上移到**任务入口**，覆盖整条链路——原先它只包住
+                # ``background_summary_completion`` 一个调用，前置的
+                # content_revision / load / coverage_intact / pending_count /
+                # read_snapshot 与后置的 publish 全部在 timeout 之外。DB 一卡，
+                # 任务可以远超 deadline_seconds 仍占着执行槽（``_pump`` 的并发判定
+                # 看的就是 ``_running``），整条摘要流水线随之停摆。
+                #
+                # 口径不变：``deadline_seconds`` 仍是「入场准备 + 模型调用 + 发布」
+                # 的**总**预算（docstring 早就这么写的），只是现在名副其实了。
+                # 模型调用内部仍保留它自己的 ``asyncio.timeout``（那一次会先命中，
+                # 走既有的 ``deadline_exceeded`` 分支）。
+                async with asyncio.timeout(cfg.deadline_seconds):
+                    outcome = await self._run_group_inner(gid, cfg)
             except asyncio.CancelledError:
                 raise
+            except (TimeoutError, asyncio.TimeoutError):
+                self.metrics.deadline_exceeded_total += 1
+                self.metrics.failure_total += 1
+                self._register_failure(gid, cfg)
+                log.warning(
+                    "group summary deadline exceeded | group=%s | deadline=%.2fs",
+                    gid,
+                    float(cfg.deadline_seconds),
+                )
+                outcome = "deadline_exceeded"
             except Exception:
                 self.metrics.failure_total += 1
                 self._register_failure(gid, cfg)
@@ -1535,7 +1653,15 @@ class GroupSummaryScheduler:
         permit = None
         gate = self._gate
         if gate is not None:
-            admission_budget = max(0.05, float(cfg.queue_wait_seconds))
+            # B-23：``queue_wait_seconds`` 是**整个入场等待**的预算，而 ``dirty_since``
+            # 在 ``_claim_next`` 里已经计过一次入场时间（并做过一次过期判定）。这里
+            # 再给满额就等于把同一份预算花两遍：中间还夹着 read_snapshot /
+            # fit_summary_prompt。方向是「剩余预算」，且不短于 50ms。
+            waited = 0.0
+            pending_now = self._pending.get(gid)
+            if pending_now is not None and pending_now.dirty_since is not None:
+                waited = max(0.0, self._clock() - pending_now.dirty_since)
+            admission_budget = max(0.05, float(cfg.queue_wait_seconds) - waited)
             try:
                 permit = await gate.acquire_permit(
                     priority=ExecutionPriority.BACKGROUND,
@@ -1598,9 +1724,18 @@ class GroupSummaryScheduler:
         valid, reason = is_valid_summary_output(body, group_id=gid)
         if not valid:
             self.metrics.failure_total += 1
-            self._register_failure(gid, cfg)
+            self.metrics.output_rejected_total += 1
+            # D3-01：只有「真的是伪造/注入」才配得上指数退避。``reserved_marker``
+            # 这类闭集拒绝会误伤忠实摘要（群聊里讨论 ``system:`` 配置、复述封禁
+            # 记录都很正常），拿它去把退避从 60s 翻到 3600s 等于让该群的后台摘要
+            # **永久**停摆，而且每来一条新消息就白烧一次模型调用。
+            if not reason.startswith("reserved_marker:"):
+                self._register_failure(gid, cfg)
             log.warning(
-                "group summary output rejected | group=%s | reason=%s", gid, reason
+                "group summary output rejected | group=%s | reason=%s | backoff=%s",
+                gid,
+                reason,
+                "no" if reason.startswith("reserved_marker:") else "yes",
             )
             return "invalid_output"
 
@@ -1671,6 +1806,10 @@ class GroupSummaryScheduler:
         self._last_success_at[gid] = self._clock()
         self._backoff_until.pop(gid, None)
         self._failures.pop(gid, None)
+        # B-25：发布成功要**清掉落库的台账**，否则下次重启又把旧阶梯恢复回来。
+        clear_fn = getattr(self._store, "clear_failure_state", None)
+        if callable(clear_fn):
+            self._spawn(clear_fn(gid), label="clear_failure_state")
         log.info(
             "group summary published | group=%s | version=%s | covered=%s..%s "
             "(%d messages) | truncated=%s | rebuilt=%s",
@@ -1700,13 +1839,84 @@ class GroupSummaryScheduler:
         return "published"
 
     def _register_failure(self, group_id: int, cfg: GroupSummaryConfig) -> None:
+        """记一次失败并推进退避阶梯（**同步**：调用点包括 ``_claim_next``）。
+
+        B-25：阶梯与「退避到什么时候」同时落库（墙钟），否则容器每次滚动重启都
+        相当于给所有持续失败的群发一次「立即重试」，永远爬不到上限。落库是
+        fire-and-forget：退避台账写失败只退回旧行为，绝不阻塞调度。
+        """
+
         attempts = self._failures.get(int(group_id), 0) + 1
         self._failures[int(group_id)] = attempts
         delay = min(
             cfg.failure_backoff_max_seconds,
             cfg.failure_backoff_seconds * (2 ** max(0, attempts - 1)),
         )
-        self._backoff_until[int(group_id)] = self._clock() + delay
+        deadline = self._clock() + delay
+        self._backoff_until[int(group_id)] = deadline
+        # 退避台账是**可选**能力：测试替身 / 旧实现没有这几个方法时照旧走内存口径。
+        save_fn = getattr(self._store, "save_failure_state", None)
+        if callable(save_fn):
+            self._spawn(
+                save_fn(
+                    int(group_id),
+                    failure_count=attempts,
+                    backoff_until=now_shanghai_naive() + timedelta(seconds=delay),
+                ),
+                label="save_failure_state",
+            )
+
+    async def _restore_failure_states(self) -> None:
+        """启动时把落库的退避台账读回内存（B-25）。读不到就当没有退避。"""
+
+        loader = getattr(self._store, "load_failure_states", None)
+        if not callable(loader):
+            return
+        try:
+            states = await loader()
+        except Exception as exc:
+            log.warning("group summary: 退避台账恢复失败（按无退避处理） | error=%s", exc)
+            return
+        now_wall = now_shanghai_naive()
+        for group_id, failure_count, backoff_until in states or []:
+            remaining = (backoff_until - now_wall).total_seconds()
+            if remaining <= 0:
+                # 退避早就到期了：保留失败计数（阶梯继续往上爬），但立刻可重试。
+                self._failures[int(group_id)] = max(0, int(failure_count))
+                continue
+            self._failures[int(group_id)] = max(0, int(failure_count))
+            self._backoff_until[int(group_id)] = self._clock() + remaining
+        if states:
+            log.info(
+                "group summary: 已恢复 %d 个群的失败退避台账 | still_backing_off=%d",
+                len(states),
+                len(self._backoff_until),
+            )
+
+    def _spawn(self, coro: Awaitable[Any], *, label: str) -> None:
+        """跑一个**不阻塞调度**的后台协程（失败只记日志，绝不影响主流程）。
+
+        放在 ``_aux_tasks`` 而不是 ``_tasks``：后者是 ``_pump`` 的执行槽预算
+        （``len(self._tasks) < limit``），辅助任务混进去会挤掉真正的摘要。
+        """
+
+        try:
+            task = asyncio.ensure_future(coro)
+        except RuntimeError:  # pragma: no cover - 没有运行中的事件循环
+            log.debug("group summary: no loop; dropped %s", label)
+            coro.close()
+            return
+        self._aux_tasks.add(task)
+        task.add_done_callback(self._aux_tasks.discard)
+
+        def _done(finished: asyncio.Future[Any]) -> None:
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                log.warning("group summary background task failed | task=%s | %s", label, exc)
+
+        task.add_done_callback(_done)
 
     def _note_model_concurrency(self, delta: int, cfg: GroupSummaryConfig) -> None:
         del cfg
@@ -1721,6 +1931,12 @@ class GroupSummaryScheduler:
         await self._cancel_tasks(timeout_seconds=timeout_seconds)
 
     async def _cancel_tasks(self, *, timeout_seconds: float = 5.0) -> None:
+        aux = [task for task in self._aux_tasks if not task.done()]
+        self._aux_tasks = {task for task in self._aux_tasks if not task.done()}
+        for task in aux:
+            task.cancel()
+        if aux:
+            await asyncio.wait(aux, timeout=max(0.1, float(timeout_seconds)))
         tasks = [task for task in self._tasks if not task.done()]
         self._tasks = {task for task in self._tasks if not task.done()}
         for task in tasks:
@@ -1813,6 +2029,7 @@ class GroupSummaryScheduler:
             "pending_capacity": cfg.pending_capacity,
             "running": len(self._running),
             "tasks": len([task for task in self._tasks if not task.done()]),
+            "aux_tasks": len([task for task in self._aux_tasks if not task.done()]),
             "global_concurrency": cfg.global_concurrency,
             "effective_concurrency": self._effective_concurrency(cfg),
             "gate_background_capacity": self._gate_background_capacity(),

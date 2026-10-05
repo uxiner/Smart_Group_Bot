@@ -858,6 +858,48 @@ class PinPurchaseTests(_DbTestCase):
         self.assertEqual(await self._balance(8), 80)
         self.assertEqual(len(await self._entitlements()), 2)
 
+    async def test_expired_but_unswept_pin_no_longer_blocks_a_new_purchase(self) -> None:
+        """D2-05：已过期但尚未清扫的置顶行不得挡住购买，也不得回「还有 0 分钟」。
+
+        到期清理每 300s 才跑一轮，所以刚过期的置顶行会在库里滞留最长约 5 分钟。
+        旧判定只看「行存在且 ``expires_at is not None``」，于是用户被无谓挡下一个
+        购买窗口，并收到一句自相矛盾的回执。
+        """
+
+        await self._grant_points(7, 100)
+        bot = FakeBot()
+        await self._buy_pin(bot, user_id=7, now=_day())
+        self.assertEqual(await self._balance(7), 80)
+
+        # 到期后 1 分钟、清理还没跑（清扫 300s 一轮）
+        expired = await self._buy_pin(
+            bot, user_id=7, now=_day() + timedelta(hours=PIN_HOURS, minutes=1)
+        )
+        self.assertEqual(
+            expired.status,
+            "ok",
+            f"过期的置顶必须放行，实际={expired.status} / {expired.text}",
+        )
+        self.assertNotIn("还有 0 分钟", expired.text)
+        self.assertEqual(await self._balance(7), 60, "过期后可以再买一次（扣 20 分）")
+        self.assertEqual(len(await self._entitlements()), 1, "覆盖同一行而不是新增")
+        self.assertEqual(len(bot.pin_calls), 2)
+
+    async def test_a_live_pin_still_blocks(self) -> None:
+        """回归：到期时间**未到**的置顶仍必须挡住购买。"""
+
+        await self._grant_points(7, 100)
+        bot = FakeBot()
+        await self._buy_pin(bot, user_id=7, now=_day())
+        just_before = await self._buy_pin(
+            bot,
+            user_id=7,
+            now=_day() + timedelta(hours=PIN_HOURS, seconds=-1),
+        )
+        self.assertEqual(just_before.status, "already_pinned")
+        self.assertIn("还有 1 分钟到期", just_before.text)
+        self.assertEqual(await self._balance(7), 80)
+
     async def test_insufficient_points_does_not_charge(self) -> None:
         await self._grant_points(7, 10)
         bot = FakeBot()

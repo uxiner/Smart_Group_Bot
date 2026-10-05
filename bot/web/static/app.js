@@ -92,6 +92,10 @@
     moderation: { label: "审核模型", icon: "shield-alert", parent: "继承决策模型", embed: false, deadlineDefault: 35 },
     compress: { label: "压缩模型", icon: "minimize-2", parent: "继承主模型", embed: false, deadlineDefault: 90 },
     embed: { label: "向量模型", icon: "binary", parent: "继承主模型", embed: true, deadlineDefault: 60 },
+    // D3-42：skill 角色后端完整支持（rc 用 `models.skill or main` 建 settings.bot.skill_model，
+    // __main__ 传给 llm.reconfigure(skill=...)），但 ROLE_META 里缺席 → 模型页、供应商校验、
+    // 回退重命名里全都看不到它，运维只能手改 DB payload。deadlineDefault 对齐 llm.py 的 120 秒。
+    skill: { label: "技能模型", icon: "sparkles", parent: "继承主模型", embed: false, deadlineDefault: 120 },
   };
 
   const PROMPT_META = {
@@ -685,6 +689,37 @@
       </div>`;
   }
 
+  // D3-42：`models.skill` 允许是 `null`（后端 `models.skill or main` = 继承主模型）。
+  // 渲染循环与供应商校验都直接读 `state.config.models[role].provider`，所以先把
+  // 缺失/null 的角色补成一个"留空 = 继承"的空壳，UI 才不会炸、校验也不会误报。
+  function normalizeModelRoles() {
+    const models = state.config?.models;
+    if (!models) return;
+    const template = models.main || {};
+    for (const roleName of Object.keys(ROLE_META)) {
+      const role = models[roleName];
+      if (!role || typeof role !== "object") {
+        // 从**主模型**整份克隆再把 provider/model 留空：`null` 在后端等价于
+        // `models.skill or main`，即继承主模型的 temperature / max_tokens /
+        // timeout / 回退链。若这里造一个"空壳"（fallbacks: []、各自的
+        // total_deadline），保存回去就会**悄悄丢掉主模型的回退链**。
+        models[roleName] = {
+          ...JSON.parse(JSON.stringify(template)),
+          provider: "",
+          model: "",
+        };
+        if (models[roleName].total_deadline_sec == null) {
+          models[roleName].total_deadline_sec = ROLE_META[roleName].deadlineDefault;
+        }
+      } else {
+        if (role.provider == null) role.provider = "";
+        if (role.model == null) role.model = "";
+        if (role.request_params == null) role.request_params = {};
+        if (role.fallbacks == null) role.fallbacks = [];
+      }
+    }
+  }
+
   function providerOptions(selected, allowInherit = true, inheritLabel = "继承主模型") {
     const providers = state.config.models.providers || [];
     const options = [];
@@ -925,6 +960,7 @@
             ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "全局控制 AI 自动回复等 Bot 生成内容的网页预览")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
+            ${toggle("bot.enable_rich_messages", "启用富文本排版", "D3-40：控制粗体/斜体/代码块等富文本渲染。此前的开关既无 UI、又无 env、又无 DB 路径（load_settings() 从不被调用），读取侧 getattr(..., False) 恒真，等于没有关")}
             ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}
             ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true })}
           </div>
@@ -970,9 +1006,24 @@
             ${field("bot.search_freshness_price_hours", "价格类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 24；超出窗口的价格留档注入时会标注可能已过期" })}
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
             ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
-            ${toggle("bot.group_can_read_private_history", "允许群聊读取私聊历史", "默认关闭（隐私红线：群→私聊允许，私聊→群默认禁止）。本期只保证关闭时绝不读取，打开后的读取逻辑尚未实现")}
-            ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
+            ${toggle("bot.memory_recall_enabled", "启用记忆召回（第 3 期）", "按当前问题从本群**原始档案**里检索相关消息。⚠️ 它**不是**长期记忆（第 4 期）的总开关——关掉它，第 4 期照样写库提炼，见下一节「长期记忆（第 4 期）」")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
+          </div>
+        </section>
+        <section class="settings-section">
+          ${sectionHead("长期记忆（第 ④ 期）", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定…）。D3-39：这一整块 11 个开关此前可 PUT、可落库、有 revision 保护，但 Mini App 完全无入口——其中 memory_facts_enabled / memory_tool_enabled 是真·总开关，关不掉。")}
+          <div class="field-grid three">
+            ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "D3-39：**总开关**。关掉 = 不提炼、不注入、不写入（群聊注入 / 私聊召回 / /memory 命令都先判它）。关闭后已写入的事实不再注入，库里的行保留")}
+            ${toggle("bot.memory_extract_enabled", "启用后台提炼", "从群聊/私聊原文里被动提炼事实；关掉后不再有新的提炼，已有事实仍会被召回注入")}
+            ${field("bot.memory_extract_interval_minutes", "提炼巡检间隔（分钟）", { type: "number", min: 5, max: 1440, step: 1, required: true, hint: "默认 30" })}
+            ${field("bot.memory_extract_min_messages", "触发提炼所需最少新消息", { type: "number", min: 5, max: 500, step: 1, required: true, hint: "默认 20；未达到就跳过这一轮（游标不前移）" })}
+            ${field("bot.memory_extract_daily_cap", "每天最多提炼次数", { type: "number", min: 0, max: 500, step: 1, required: true, hint: "默认 48；0 = 不限。防成本失控" })}
+            ${field("bot.memory_extract_batch_max", "单批最大条数", { type: "number", min: 20, max: 1000, step: 10, required: true, hint: "默认 200；超 token 预算时从最旧一端整条丢弃（会留日志）" })}
+            ${toggle("bot.memory_tool_enabled", "启用模型主动记忆（remember 工具）", "D3-39：模型可以主动写一条关于**当前说话人本人**的稳定事实。关掉后 remember 工具不写库（仍可被调用，只是不落库）")}
+            ${field("bot.memory_tool_daily_cap", "remember 工具每日上限", { type: "number", min: 0, max: 200, step: 1, required: true, hint: "默认 30（每作用域每天，0 = 不限）。群作用域另有一道「每个成员每天」的闸，普通成员不能独占全群额度（B-34）" })}
+            ${field("bot.memory_recall_limit", "注入条数上限", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "默认 8；每轮注入的事实条数与字符数都不超它" })}
+            ${field("bot.memory_event_ttl_days", "有期限事实的保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；category=event 的事实到期后不再注入并标删除" })}
+            ${field("bot.memory_deleted_retention_days", "已删除事实保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 30；被 /memory off 或被新事实替代的行，保留这么多天后才物理清理" })}
           </div>
         </section>
         <section class="settings-section">
@@ -2771,6 +2822,7 @@
   function applySettingsDocument(document) {
     state.document = document;
     state.config = clone(document.config);
+    normalizeModelRoles();
     if (state.config?.bot?.auto_delete_seconds == null && state.config?.bot?.auto_delete_minutes != null) {
       state.config.bot.auto_delete_seconds = Number(state.config.bot.auto_delete_minutes || 0) * 60;
     }

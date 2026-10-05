@@ -31,6 +31,7 @@ import re
 from typing import Any, Iterable
 
 from bot.services import memory_holder
+from bot.utils.security import wrap_untrusted_multiline
 
 log = logging.getLogger(__name__)
 
@@ -128,13 +129,23 @@ def _record_lines(
     if not content:
         return []
     stamp = f"{sent_at} " if sent_at else ""
-    return [f"{header} {stamp}{sender}：{content}"]
+    return [
+        wrap_untrusted_multiline(
+            GROUP_PUBLIC_UNTRUSTED_LABEL, f"{header} {stamp}{sender}：{content}"
+        )
+    ]
 
 
 GROUP_PUBLIC_HEADER = (
-    "下面这些是该用户在已授权群里**公开**说过 / 公开讨论过的内容（只读参考）。"
-    "每一条都标了来源群与时间；这是群聊里的公开记录，不等于他在私聊里说过的话。"
+    "下面这些是该用户**所在群**里**公开**的讨论片段（只读参考）——"
+    "**可能来自群里的其他成员**，不代表都是他本人说的。"
+    "每一条都标了来源群、实际发送者与时间；这是群聊里的公开记录，"
+    "不等于他在私聊里说过的话。"
 )
+
+#: 注入块的围栏标签。正文是**群成员可控**的原话（B-32）：围栏 + user 角色是它
+#: 唯一的信任边界，与长期记忆（``long_term_memory``）用同一套 ``<untrusted:*>``。
+GROUP_PUBLIC_UNTRUSTED_LABEL = "group_public_record"
 
 #: 注入块的头部消息（标记 + 说明）。由调用方放进**永不裁剪**的固定层：来源声明不该
 #: 因为在预算里排在最前面就被先裁掉——被裁的永远是最旧的一条公开记录。
@@ -150,8 +161,9 @@ def render_group_public_block(
 ) -> str:
     """把公开记录渲染成注入块；没有记录时返回空串。
 
-    **每条都带来源标注**（``[群聊公开记录 · 群名/群id]``）与发送者、时间；只给中性
-    说明，不加任何强制指令块——是否用、怎么用由模型自己判断（用户口径）。
+    **每条都带来源标注**（``[群聊公开记录 · 群名/群id]``）与**实际发送者**、时间；
+    只给中性说明，不加任何强制指令块——是否用、怎么用由模型自己判断（用户口径）。
+    正文套 ``<untrusted:group_public_record>`` 围栏（B-32）：群成员的原话只是**数据**。
     """
 
     body: list[str] = []
@@ -180,6 +192,9 @@ def render_group_public_messages(
 
     理由与检索留档一致：统一闸门按「条」裁剪，拆开才能在超预算时从最旧的一条开始丢。
     头部说明用 :data:`GROUP_PUBLIC_HEADER_BLOCK`，由调用方放进永不裁剪的固定层。
+
+    **每条都是 ``role="user"`` 且套了 ``<untrusted:group_public_record>`` 围栏**（B-32）：
+    内容是群成员的原话，进 system 等于把群里的文字提到 system 优先级。
     """
 
     items = [item for item in (records or []) if isinstance(item, dict)][
@@ -193,7 +208,7 @@ def render_group_public_messages(
         for line in _record_lines(
             item, label_map=label_map, content_max_chars=content_max_chars
         ):
-            messages.append({"role": "system", "content": line})
+            messages.append({"role": "user", "content": line})
     return messages
 
 

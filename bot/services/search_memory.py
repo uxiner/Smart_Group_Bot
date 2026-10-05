@@ -193,19 +193,23 @@ def freshness_windows(settings: Any) -> dict[str, int]:
 
 
 def group_can_read_private_history(settings: Any) -> bool:
-    """群聊是否允许读取私聊正文。**默认 False**，且本期不实现打开后的读取逻辑。
+    """群聊是否允许读取私聊正文：**恒为 False**（D3-35）。
 
     用户口径（2026-10-03）：方向规则是单向的——群→私聊允许（群里公开说的话可以
-    进私聊），**私聊→群默认禁止**。这个开关是给「以后用户显式授权」留的位置：
+    进私聊），**私聊→群永远禁止**。
 
-    * 默认 False 时，群聊装配上下文的**任何**路径都不读 ``private_chat_messages``；
-    * 打开它需要用户**显式授权**（并在实现时补上授权校验、审计日志与用例），
-      本期**不实现**打开后的读取逻辑——读取器不存在，开关打开也不会有任何私聊
-      正文进入群聊 prompt。
+    这个 getter 以前读的是一个「可配置、无消费者」的旋钮：UI 上是可点的 toggle、
+    DB 里可 PUT、有 revision 保护，而 ``bot/`` 里**零调用方**——拨 true 不改变任何
+    行为。那种假开关比没有更糟（运维会以为自己放开了某个方向）。对应配置项已从
+    :class:`bot.services.runtime_config.RuntimeConfig` 移除（老库里的那一行由
+    ``_normalize_deprecated_runtime_payload`` 一次性剥离）。
+
+    保留这个函数是因为它是这条隐私红线的**可执行断言**：任何把群→私聊方向接通的
+    改动都必须先改这里，而这里现在会直接被测试挡住。
     """
 
-    value = _bot_setting(settings, "group_can_read_private_history", False)
-    return bool(value)
+    del settings  # 恒为 False：没有可配置项，也不读环境变量
+    return False
 
 
 def normalize_scope(value: Any) -> str:

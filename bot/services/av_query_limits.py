@@ -39,10 +39,20 @@ class AVPrivateRateLimiter:
         self._clock = clock or time.monotonic
         self._hits: dict[int, deque[float]] = {}
 
-    def _prune(self, user_id: int, now: float) -> deque[float]:
+    def _prune(self, user_id: int, now: float) -> deque[float] | None:
+        """返回该用户的滑窗；字典已达**硬上限**且无法腾出位置时返回 ``None``。
+
+        B-05：原来这里「满了先清一次，然后无论清没清出位置都插入新 key」，
+        于是 ``max_users`` 只是「触发一次清理的机会」，不是内存上界。现在：
+        清理后仍达上限就**不建新桶**，调用方按「不计数」处理（放行、不限流），
+        既守住内存上界，又不因限流器自身而拒绝用户请求。
+        """
+
         hits = self._hits.get(user_id)
         if hits is None:
             self._drop_idle_users()
+            if len(self._hits) >= self.max_users:
+                return None
             hits = deque()
             self._hits[user_id] = hits
         cutoff = now - self.window_seconds
@@ -51,7 +61,11 @@ class AVPrivateRateLimiter:
         return hits
 
     def _drop_idle_users(self) -> None:
-        """字典只增不减会随用户数慢慢涨；满了先清掉已经过期的空队列。"""
+        """字典只增不减会随用户数慢慢涨；满了先清掉已经过期的空队列。
+
+        注意这只在「腾得动」时有效：全是活跃用户时一个也删不掉，所以
+        :meth:`_prune` 之后仍要复查 ``len(self._hits) >= self.max_users``。
+        """
 
         if len(self._hits) < self.max_users:
             return
@@ -76,6 +90,9 @@ class AVPrivateRateLimiter:
             return False, 0
         now = self._clock()
         hits = self._prune(uid, now)
+        if hits is None:
+            # 容量已满且腾不出位置：无法判断这个用户的额度 → 不限流。
+            return False, 0
         if len(hits) < self.limit:
             return False, 0
         return True, self._retry_after(hits, now)
@@ -88,6 +105,8 @@ class AVPrivateRateLimiter:
             return True, 0
         now = self._clock()
         hits = self._prune(uid, now)
+        if hits is None:
+            return True, 0
         if len(hits) >= self.limit:
             return False, self._retry_after(hits, now)
         hits.append(now)
