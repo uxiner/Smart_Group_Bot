@@ -971,9 +971,17 @@
             ${field("bot.search_freshness_news_hours", "新闻类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 48；超出窗口的新闻留档会标注可能已过期" })}
             ${field("bot.search_freshness_fact_hours", "事实类新鲜窗口（小时）", { type: "number", min: 1, max: 8760, step: 1, required: true, hint: "默认 168（7 天）；型号/参数这类事实变化很慢" })}
             ${toggle("bot.group_can_read_private_history", "允许群聊读取私聊历史", "默认关闭（隐私红线：群→私聊允许，私聊→群默认禁止）。本期只保证关闭时绝不读取，打开后的读取逻辑尚未实现")}
-            ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
+            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "⚠️ 不是长期记忆的总开关：它只管「按当前问题从本群原始消息档案里检索相关消息」。第 ④ 期长期记忆（user_facts）的提炼/注入/写入由下面的「长期记忆总开关」控制，关掉它第 ④ 期照样提炼照样写库")}
             ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>
+        </section>
+        <section class="settings-section">
+          ${sectionHead("长期记忆（第 ④ 期 user_facts）", "机器人从群聊/私聊里提炼稳定事实（身份/偏好/关系/禁忌/技能/事件），去重合并后按需注入。下方两个开关热生效：保存后立即影响提炼、注入与写入，不需要重启。")}
+          <div class="field-grid three">
+            ${toggle("bot.memory_facts_enabled", "长期记忆总开关", "总开关，关掉 = 不提炼、不注入、不写（历史已提炼的事实不再注入，也不会再新增/更新；已存在的数据不会被删除）。关掉后请自行在群组页「永久记忆」里清理残留")}
+            ${toggle("bot.memory_tool_enabled", "允许模型主动写入", "允许模型自己调用 remember 工具写事实；总开关关闭时本项无效。关掉后模型只能读、不能写")}
+          </div>
+          <p class="field-hint">其余第 ④ 期参数（提炼节奏 / 每日次数上限 / 每作用域写入条数上限 / 注入条数 / 事件过期天数等）目前仍只能在 API（PUT /api/v1/settings）里，界面上暂未提供控件。</p>
         </section>
         <section class="settings-section">
           ${sectionHead("主动发言", "群组页可逐群开关并设置任务简述。")}
