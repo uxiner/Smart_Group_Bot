@@ -1126,7 +1126,31 @@ _MARKDOWN_FENCE_LINE_RE = re.compile(
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
-_MARKDOWN_TOKEN_RE = re.compile(r"\x00tgmd(\d+)\x00")
+#: A-19 / P4-7：占位符前缀的**基准**形态。真正用的是每次渲染按输入动态选出的
+#: 前缀（见 :func:`_markdown_token_prefix`），它保证输入构造不出可命中的占位符。
+_MARKDOWN_TOKEN_BASE = "\x00tgmd"
+
+
+def _markdown_token_prefix(text: str) -> str:
+    """返回一个在 ``text`` 里**不可能出现**的占位符前缀。
+
+    A-19：改前前缀写死是 ``\\x00tgmd``，于是正文里只要出现 ``\\x00tgmd9\\x00``
+    （用户自己打出来，或模型原样吐回来），反替换就会去取 ``tokens[9]`` → IndexError，
+    整条消息的渲染直接炸掉。
+
+    这里在**输入原文**上找一个不存在的变体：``\\x00tgmd`` 不在 text 里就用它，否则
+    逐个加长。所有占位符都以选中的前缀开头，而 ``source`` 里除了占位符就只有
+    text 的片段，所以输入**构造不出**一个能命中的占位符。
+    """
+
+    prefix = _MARKDOWN_TOKEN_BASE
+    while prefix in text:
+        prefix += "x"
+    return prefix
+
+
+def _markdown_token_pattern(prefix: str) -> re.Pattern[str]:
+    return re.compile(re.escape(prefix) + r"(\d+)\x00")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1376,11 +1400,15 @@ def _render_blockquotes(text: str) -> str:
 
 def _render_inline_markdown(text: str) -> str:
     tokens: list[str] = []
+    # 前缀取自输入本身：输入里不可能存在它，所以只有本函数塞进去的占位符会被
+    # 反替换命中（详见 _markdown_token_prefix）。
+    prefix = _markdown_token_prefix(text)
+    token_re = _markdown_token_pattern(prefix)
 
     def _stash(rendered: str) -> str:
         index = len(tokens)
         tokens.append(rendered)
-        return f"\x00tgmd{index}\x00"
+        return f"{prefix}{index}\x00"
 
     source = _MARKDOWN_INLINE_CODE_RE.sub(
         lambda match: _stash(f"<code>{html.escape(match.group(1))}</code>"),
@@ -1406,10 +1434,15 @@ def _render_inline_markdown(text: str) -> str:
     rendered = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", rendered)
     rendered = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", rendered)
     rendered = _render_blockquotes(rendered)
-    return _MARKDOWN_TOKEN_RE.sub(
-        lambda match: tokens[int(match.group(1))],
-        rendered,
-    )
+
+    def _restore(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        # 正常路径下 token_re 只可能匹配到本函数刚塞进去的占位符（``index`` 必然
+        # 合法）；这里的下界判断只是兜底，保证即使将来前缀选取被改坏也只会把这段
+        # 文本原样留下，而不是整条渲染抛 IndexError。
+        return tokens[index] if index < len(tokens) else match.group(0)
+
+    return token_re.sub(_restore, rendered)
 
 
 def _render_fenced_code_html(opening: str, content: str) -> str:
