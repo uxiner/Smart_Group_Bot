@@ -55,7 +55,7 @@ def _ad_rule(rule_type: str = "regex", scope: str = "message+quote+vision") -> M
     pattern = (
         r"(?i)(招募|招收|收|买|收购|出售)[^\n。]{0,12}(资源|视频|账号|设备|脚本|代练)"
         if rule_type == "regex"
-        else "兼职招募"
+        else "招募兼职"
     )
     return ModerationRule(
         id=6,

@@ -37,6 +37,7 @@ import unittest
 
 from bot.db.models import AuthorizedGroup
 from bot.handlers import group
+from bot.services import policy_runtime
 from bot.services.moderation import ModerationVerdict
 from bot.utils.timezone import now_shanghai_naive
 
@@ -496,6 +497,18 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         group._ADMIN_ALERT_STATE.clear()
+        policy_runtime.unbind()
+
+    def _with_handover_mention(self, mention: str = "@your_bot"):
+        """把交接对象显式配好：默认是空（不 @ 任何人）。"""
+
+        from bot.config import Settings
+
+        settings = Settings(_env_file=None)
+        settings.moderation.review_handover_mention = mention
+        settings.moderation.log_channel_id = CHANNEL_ID
+        policy_runtime.bind(settings)
+        return settings
 
     # ---- 权限：只有频道管理员或最高管理员可点 ---------------------------
     async def test_deauthorized_group_blocks_review_action(self) -> None:
@@ -588,7 +601,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         ):
             # 第一次点击：只 arm，不执行任何处置、不改 review_state
             first = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(first, _settings(), session=session)
+            await group.on_review_action(first, self._with_handover_mention(), session=session)
             self.assertEqual(first.answered[-1][0], "再按一次确认")
             self.assertFalse(first.answered[-1][1])
             self.assertEqual(violation.review_state, "none")
@@ -602,7 +615,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
 
             # 第二次点击同一个按钮（窗口内）：执行
             second = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(second, _settings(), session=session)
+            await group.on_review_action(second, self._with_handover_mention(), session=session)
 
         self.assertEqual(violation.review_state, "released")
         self.assertEqual(violation.reviewed_by, SUPER_ADMIN_ID)
@@ -654,7 +667,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
                 session=session,
             )
             second = _callback(data="mrev:rel:100", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(second, _settings(), session=session)
+            await group.on_review_action(second, self._with_handover_mention(), session=session)
 
         self.assertEqual(violation.review_state, "released")
         release.assert_not_awaited()
@@ -682,13 +695,13 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         ):
             # 窗口已过期：这一下只当「第一次」，重新 arm、不执行
             first = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(first, _settings(), session=session)
+            await group.on_review_action(first, self._with_handover_mention(), session=session)
             self.assertEqual(first.answered[-1][0], "再按一次确认")
             self.assertEqual(violation.review_state, "none")
             lease.assert_not_awaited()
             # 紧接着同键第二次 → 执行
             second = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(second, _settings(), session=session)
+            await group.on_review_action(second, self._with_handover_mention(), session=session)
 
         self.assertEqual(violation.review_state, "released")
         lease.assert_awaited_once()
@@ -719,7 +732,7 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
             ban.assert_not_awaited()
             # 再点「确认封禁」第二次 → 执行
             second = _callback(data="mrev:ban:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(second, _settings(), session=session)
+            await group.on_review_action(second, self._with_handover_mention(), session=session)
 
         self.assertEqual(violation.review_state, "banned")
         ban.assert_awaited_once()
@@ -751,7 +764,9 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.admin._perform_group_ban", new=ban),
         ):
             callback = _callback(data="mrev:ban:99", operator_id=SUPER_ADMIN_ID)
-            await group.on_review_action(callback, _settings(), session=session)
+            await group.on_review_action(
+                callback, self._with_handover_mention(), session=session
+            )
 
         self.assertEqual(violation.review_state, "banned")
         self.assertEqual(violation.reviewed_by, SUPER_ADMIN_ID)

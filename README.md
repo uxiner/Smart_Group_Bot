@@ -177,6 +177,17 @@
 - 拉上游更新：`git fetch upstream && git merge upstream/main`，冲突在本分支解决
 - **不向上游开 PR**；密钥永不入库（凭据只在未跟踪的 `.env` 里，`config.toml` 不含凭据）
 
+## 配置
+
+配置分三层：部署引导（`.env`，改完需重启）、热配置（Mini App 保存即生效，少数
+进程级闸门需重启）、群级覆盖（群组页）。每一项的默认值、上下界、可编辑角色、真实
+消费者与迁移说明见 **[docs/configuration.md](docs/configuration.md)**；机器可读目录
+见 [`docs/configuration-fields.json`](docs/configuration-fields.json)。
+
+公开部署的默认状态是**中性**的：审核证据频道 `log_channel_id = 0`（未配置，命中
+证据按既有路径私聊最高管理员）、审核交接对象为空（不 @ 任何人）、对外显示名为中性
+词。请在 Mini App 里显式写入你自己的部署值。
+
 ## 部署
 
 沿用上游的 Docker 方式（细节见 [`docs/README.upstream.md`](docs/README.upstream.md)）：
