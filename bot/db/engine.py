@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 _SQLITE_TIMEOUT_SECONDS = 5
 _SQLITE_BUSY_TIMEOUT_MS = _SQLITE_TIMEOUT_SECONDS * 1000
+#: C3-05：``/healthz`` 的 DB 存活性探测超时。它只跑一条 ``SELECT 1``，短到不会
+#: 在高频轮询里放大负载；超时即视为不健康，让 /healthz 返回 503。
+_DB_LIVENESS_PROBE_TIMEOUT_SECONDS = 1.0
 #: 当前 schema 版本（`PRAGMA user_version`）。每个一次性迁移用自己的历史版本号
 #: 作为闸门，**不要**直接拿这个常量去判断"是否需要跑"——否则下次抬版本会把老迁移
 #: 再跑一遍（时间戳迁移重跑就是再 +8 小时，属于真实数据损坏）。
@@ -2211,6 +2214,11 @@ async def init_db(
                 # 在这里用幂等语句建，老库启动即生效。
                 "CREATE INDEX IF NOT EXISTS ix_member_checkins_group_day "
                 "ON member_checkins (group_id, checkin_date)",
+                # F-032：violations 原来只有 (group_id, user_id, ban_enforced) 与
+                # (group_id, source_message_id) 两个索引，审核质量报表按时间窗口统计
+                # 时每次都全表扫。和 F-030 同理，create_all 不会给已存在的表补索引。
+                "CREATE INDEX IF NOT EXISTS ix_violations_group_created_at "
+                "ON violations (group_id, created_at)",
             ):
                 await conn.execute(text(index_sql))
             # 审核规则的扫描范围：列存在性 + 老数据默认值 + 生产规则的一次性升级。
@@ -2345,6 +2353,39 @@ async def init_db(
         autoflush=False,
     )
 
+    def _database_liveness_probe() -> tuple[bool, str]:
+        """C3-05：真的打一条查询，而不是只读连接池计数器。
+
+        过去 ``database_pool_health_snapshot`` 只统计 checkedout/overflow 这些
+        **计数器**，所以 DB 文件损坏、磁盘满、锁死、WAL 异常时 ``/healthz`` 照样
+        200——对最需要它的故障是瞎的，compose 的 healthcheck 同样发现不了。
+
+        ``resource_health_snapshot()`` 是同步的、而引擎是 async 的（``sync_engine``
+        离开协程会抛 ``MissingGreenlet``），所以这里用 stdlib ``sqlite3`` 开一条
+        **只读**短连接跑 ``SELECT 1``：它是独立连接，因此文件级故障同样会暴露。
+        内存库（``sqlite_path is None``）没有独立文件可探，跳过并保持原口径。
+        """
+
+        if sqlite_path is None:
+            return True, ""
+        probe: sqlite3.Connection | None = None
+        try:
+            probe = sqlite3.connect(
+                f"file:{sqlite_path}?mode=ro",
+                uri=True,
+                timeout=_DB_LIVENESS_PROBE_TIMEOUT_SECONDS,
+            )
+            probe.execute("SELECT 1").fetchone()
+        except Exception as exc:  # noqa: BLE001 - 任何失败都等于"不健康"
+            return False, f"{type(exc).__name__}: {exc}"[:200]
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:  # noqa: BLE001 - 关闭失败不影响判定
+                    pass
+        return True, ""
+
     def database_pool_health_snapshot() -> dict[str, Any]:
         pool = engine.sync_engine.pool
         checked_out_fn = getattr(pool, "checkedout", None)
@@ -2356,15 +2397,18 @@ async def init_db(
         max_overflow = max(0, int(getattr(pool, "_max_overflow", 0) or 0))
         capacity = max(1, base_size + max_overflow)
         ratio = checked_out / capacity
+        probe_ok, probe_error = _database_liveness_probe()
         return {
-            "ok": ratio < 0.80,
-            "fatal": ratio >= 0.95,
+            "ok": probe_ok and ratio < 0.80,
+            "fatal": probe_ok and ratio >= 0.95,
+            "probe_ok": probe_ok,
             "checked_out": checked_out,
             "pool_size": base_size,
             "overflow": overflow,
             "max_overflow": max_overflow,
             "capacity": capacity,
             "utilization": round(ratio, 4),
+            "error": probe_error,
         }
 
     register_resource_health_provider("database_pool", database_pool_health_snapshot)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram.types import Message
@@ -8,10 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import Admin, AuthorizedGroup
+from bot.services.request_priority import privileged_request_scope
 from bot.services.update_delivery import mark_privileged_operator
 
 log = logging.getLogger(__name__)
 
+#: D3-48：与 admin._ensure_ban_command_admin 的 4s 对齐。一次 Bot API 调用不应
+#: 在命令链路上挂太久，问不到就按本地表离线降级。
+_TELEGRAM_ADMIN_REVALIDATION_TIMEOUT_SECONDS = 4.0
 
 async def _schedule_auto_delete(sent: Message | None, settings: Settings) -> None:
     # Deferred import: bot.utils.telegram imports is_super_admin_user_id from
@@ -303,6 +308,7 @@ async def ensure_group_admin_permission(
     settings: Settings,
     *,
     allow_super_admin: bool = True,
+    revalidate_telegram: bool = False,
 ) -> bool:
     if not message.chat or message.chat.type not in ("group", "supergroup"):
         await _send_access_notice(
@@ -331,6 +337,22 @@ async def ensure_group_admin_permission(
     await _end_read_transaction(session)
     if ok:
         mark_privileged_operator(int(user.id), group_id=int(message.chat.id))
+        if revalidate_telegram:
+            # D3-48：本地 `admins` 表没有任何自动回收路径（全仓 deauthorize_group_admin
+            # 只有 /unauthadmin 一个调用点），而 D3-18 的 Web 侧已经改成向 Telegram
+            # 交叉校验。这里对副作用较大的命令补上同一道复验。
+            #
+            # 三态而非二值（与 settings_api._telegram_admin_revalidated 同一口径）：
+            # False = Telegram 权威名单里确实没有他 → 拒绝；None = 没问成（超时/限流/
+            # 异常）→ 沿用本地表离线降级。混成二值会在两个方向上都出错。
+            if await _telegram_admin_revalidated(message, user.id) is False:
+                await _send_access_notice(
+                    message,
+                    settings,
+                    title="权限不足",
+                    action="你在该群的管理权限已被撤销。",
+                )
+                return False
         return True
 
     await _send_access_notice(
@@ -339,4 +361,45 @@ async def ensure_group_admin_permission(
         title="权限不足",
         action="你没有群管理权限，请联系最高管理员授权。",
     )
+    return False
+
+
+async def _telegram_admin_revalidated(message: Message, user_id: int) -> bool | None:
+    """Ask Telegram whether this user is still a group admin (D3-48).
+
+    ``True`` = still an administrator, ``False`` = the authoritative
+    ``getChatAdministrators`` list does not contain them, ``None`` = the lookup
+    itself failed (no capability / timeout / rate limit) and the caller must
+    fall back to the local table.
+    """
+
+    bot = getattr(message, "bot", None)
+    get_admins = getattr(bot, "get_chat_administrators", None)
+    if not callable(get_admins):
+        return None
+    try:
+        with privileged_request_scope():
+            async with asyncio.timeout(_TELEGRAM_ADMIN_REVALIDATION_TIMEOUT_SECONDS):
+                members = await get_admins(int(message.chat.id))
+    except Exception:
+        log.warning(
+            "bot command admin revalidation unavailable | group=%s user=%s",
+            int(message.chat.id),
+            int(user_id),
+            exc_info=True,
+        )
+        return None
+    for member in members or []:
+        member_user = getattr(member, "user", None)
+        if member_user is None:
+            continue
+        try:
+            if int(getattr(member_user, "id", 0) or 0) != int(user_id):
+                continue
+        except (TypeError, ValueError):
+            continue
+        return str(getattr(member, "status", "") or "").strip().lower() in {
+            "creator",
+            "administrator",
+        }
     return False

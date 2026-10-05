@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 
 from bot.config import Settings
@@ -26,6 +27,30 @@ from bot.services.update_delivery import (
 from bot.services.verify_web import VerifyWebServer, _WebhookUpdateQueue
 
 WEBHOOK_SECRET = "s" * 32
+BOT_TOKEN = "42:TEST_TOKEN"
+
+
+def _signed_init_data(user_id: int) -> str:
+    """initData signed the way Telegram signs Mini App payloads."""
+    import hashlib
+    import hmac
+    from urllib.parse import urlencode
+
+    pairs = {
+        "auth_date": str(int(time.time())),
+        "query_id": "AAF-test",
+        "user": json.dumps(
+            {"id": user_id, "first_name": "admin"}, separators=(",", ":")
+        ),
+    }
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(
+        b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256
+    ).digest()
+    pairs["hash"] = hmac.new(
+        secret, check_string.encode(), hashlib.sha256
+    ).hexdigest()
+    return urlencode(pairs)
 
 
 def _settings(**values: object) -> Settings:
@@ -1510,17 +1535,26 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
 
         session.close.assert_not_awaited()
 
-    async def test_health_is_unavailable_while_switching_then_recovers_for_polling(self) -> None:
+    async def test_health_is_unavailable_while_switching_then_recovers_for_polling(
+        self,
+    ) -> None:
         server = VerifyWebServer(
             bot=SimpleNamespace(token="42:TEST_TOKEN"),
             settings=_settings(),
             session_factory=SimpleNamespace(),
         )
 
-        await server.disable_webhook_route()
-        switching = await server.handle_health(SimpleNamespace())
-        server.mark_polling_active()
-        polling = await server.handle_health(SimpleNamespace())
+        # 这两条只测 **webhook** 健康；资源快照是进程级全局 provider，前面的用例
+        # 留下的临时库文件可能已被删除（C3-05 之后这会被正确判成不健康），与本用例
+        # 无关，所以在这里固定成健康。
+        healthy = {"ok": True, "fatal": False, "system": {"ok": True}, "resources": {}}
+        with patch.object(
+            verify_web_module, "resource_health_snapshot", return_value=healthy
+        ):
+            await server.disable_webhook_route()
+            switching = await server.handle_health(SimpleNamespace())
+            server.mark_polling_active()
+            polling = await server.handle_health(SimpleNamespace())
 
         self.assertEqual(switching.status, 503)
         self.assertEqual(polling.status, 200)
@@ -1536,11 +1570,15 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             webhook_secret=WEBHOOK_SECRET,
         )
         server.build_app()
+        healthy = {"ok": True, "fatal": False, "system": {"ok": True}, "resources": {}}
         try:
-            server.enable_webhook_route()
-            registering = await server.handle_health(SimpleNamespace())
-            server.mark_webhook_active()
-            active = await server.handle_health(SimpleNamespace())
+            with patch.object(
+                verify_web_module, "resource_health_snapshot", return_value=healthy
+            ):
+                server.enable_webhook_route()
+                registering = await server.handle_health(SimpleNamespace())
+                server.mark_webhook_active()
+                active = await server.handle_health(SimpleNamespace())
 
             self.assertEqual(registering.status, 503)
             self.assertEqual(active.status, 200)
@@ -1659,7 +1697,7 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             await bot.session.close()
 
     async def test_healthz_does_not_expose_internal_error_text(self) -> None:
-        """F-009：/healthz 免鉴权，异常原文（表名/库路径）不能进响应体。"""
+        """F-009 + D3-17：异常原文（表名/库路径）既不进 /healthz，也不进详情端点。"""
 
         bot = Bot(token="42:TEST_TOKEN")
         dispatcher = Dispatcher()
@@ -1680,7 +1718,18 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             "OperationalError: no such table: webhook_inbox_updates",
         )
         try:
-            response = await server.handle_health(SimpleNamespace())
+            # D3-17：/healthz 免鉴权，现在只回 {"ok": bool}。
+            public = await server.handle_health(SimpleNamespace())
+            self.assertEqual(list(json.loads(public.text)), ["ok"])
+            self.assertNotIn("OperationalError", public.text)
+            self.assertNotIn("webhook_inbox_updates", public.text)
+
+            # 详情搬到需超管鉴权的端点，自由文本仍被 F-009 的 redactor 换成布尔。
+            response = await server.handle_health_detail(
+                SimpleNamespace(
+                    headers={"Authorization": f"tma {_signed_init_data(1)}"},
+                )
+            )
             payload = json.loads(response.text)
 
             self.assertNotIn("OperationalError", response.text)
@@ -1693,6 +1742,27 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await server.disable_webhook_route()
+            await bot.session.close()
+
+    async def test_health_detail_requires_super_admin(self) -> None:
+        """D3-17：新端点不能变成一个新的未鉴权面。"""
+
+        bot = Bot(token="42:TEST_TOKEN")
+        server = VerifyWebServer(
+            bot=bot,
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+        )
+        try:
+            with self.assertRaises(web.HTTPUnauthorized):
+                await server.handle_health_detail(SimpleNamespace(headers={}))
+            with self.assertRaises(web.HTTPForbidden):
+                await server.handle_health_detail(
+                    SimpleNamespace(
+                        headers={"Authorization": f"tma {_signed_init_data(2)}"},
+                    )
+                )
+        finally:
             await bot.session.close()
 
     async def test_non_ascii_webhook_secret_header_gets_401_not_500(self) -> None:

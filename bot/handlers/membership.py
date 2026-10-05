@@ -1018,6 +1018,16 @@ async def _enforce_pending_moderation_challenge(
             return
         if is_patrol:
             async def preserve_ban() -> bool:
+                # D3-52：四个同类闭包里就这一个漏了 rollback，而
+                # join_verification.preserve_ban 的 docstring 明确写了这个要求
+                # （"A cancellation/DB error may leave an aborted transaction, so
+                # normalize it before every authoritative policy read"）。这个闭包被
+                # _ensure_kick_unbanned_result 在一次 kick 里最多调用 4 次，若上一次
+                # commit 因取消/DB 错误留下 aborted 事务，第 2 次策略读直接抛
+                # PendingRollbackError，被 :3106-3113 吞成 ok=False → 一次本可完成的
+                # timeout kick 被判失败并回队。rollback 只清未提交改动，此处本就没有
+                # 待写内容。
+                await session.rollback()
                 blocked = await verification_release_blocked_by_ban(
                     session,
                     group_id=int(record.group_id),

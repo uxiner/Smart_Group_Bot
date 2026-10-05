@@ -3353,8 +3353,22 @@ async def cmd_raidguard(
         )
     except Exception as exc:
         log.exception("manual raid enable failed | group=%s", group_id)
-        detail = str(exc) if isinstance(exc, RuntimeError) else "手动爆破防护状态保存失败，请稍后重试"
-        await _answer(message, settings, html.escape(detail))
+        # D3-47：``enable_manual_lockdown`` 是**先落库 + 武装、后发 Telegram**
+        # （raid_guard.py:2103-2122）。RuntimeError 只在"状态没能落库"时抛，那是真的
+        # 没生效；而 flood-wait / 网络错（TelegramRetryAfter / TelegramNetworkError）
+        # 来自后面的 ``_publish_lockdown_status``——此时锁定**已经生效**（内存 + DB
+        # 都写了），只是带"关闭"按钮的状态消息没发出去。两种情况混成同一句
+        # "保存失败"会让管理员以为没生效、实际进群全被拒，重试 /raidguard on 还会把
+        # 截止时间推后。这里按异常类型区分，不回滚已生效的锁定。
+        if isinstance(exc, RuntimeError):
+            await _answer(message, settings, html.escape(str(exc)))
+            return
+        await _answer(
+            message,
+            settings,
+            "爆破防护**已开启**（状态已保存），但状态消息发布失败，群里看不到那条"
+            "带「关闭」按钮的提示。如需立即解除，请发送 /raidguard off。",
+        )
         return
     # The service has already posted the persistent state-change notice. The
     # command acknowledgement follows the normal management retention policy.
@@ -4087,7 +4101,14 @@ async def cmd_cost(
 async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_group_admin_permission(message, session, settings):
+    # D3-48：/mute 能对**任何人**下手，必须向 Telegram 交叉校验「你现在还是不是
+    # 管理员」——本地 admins 表没有任何自动回收路径（与 D3-18 的 Web 侧同一根因）。
+    if not await ensure_group_admin_permission(
+        message,
+        session,
+        settings,
+        revalidate_telegram=True,
+    ):
         return
 
     args = (message.text or "").partition(" ")[2].strip().lower()
@@ -4163,7 +4184,30 @@ async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) 
             created_by=(message.from_user.id if message.from_user else 0),
         )
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # D3-45：``reply_mutes`` 上有 ix_reply_mute_group_user 唯一索引，而上面
+        # 的 SELECT 不进 SQLiteSafeAsyncSession 的写锁（锁在 flush/commit 才拿）。
+        # 两个管理员（或同一管理员双击）同时对同一用户 /mute 时，两条协程的 SELECT
+        # 都会在对方 INSERT 之前完成，后提交者在这里抛 IntegrityError——异常直接
+        # 逃出 handler，:4078 的 _answer 永不执行，管理员**完全无反馈**，只剩一条
+        # 未处理异常栈；用户其实已被先提交者静默。
+        # 语义与 :4059 的「已在静默名单」分支一致：回滚后按已存在处理。
+        await session.rollback()
+        log.info(
+            "reply mute already recorded by a concurrent /mute | group=%s user=%s",
+            group_id,
+            target.id,
+        )
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 已在静默名单",
+        )
+        return
     await _answer(
         message,
         settings,
@@ -4261,7 +4305,13 @@ async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings
 async def cmd_proactive(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_group_admin_permission(message, session, settings):
+    # D3-48：/proactive 能改主动话题排期，同样要向 Telegram 交叉校验管理员身份。
+    if not await ensure_group_admin_permission(
+        message,
+        session,
+        settings,
+        revalidate_telegram=True,
+    ):
         return
 
     args = (message.text or "").partition(" ")[2].strip().lower()

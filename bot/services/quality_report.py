@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import (
@@ -192,26 +192,73 @@ async def collect_quality(
         )
     ).scalar() or 0
 
-    confidence_rows = await session.execute(
-        select(Violation.confidence).where(
-            Violation.group_id == gid, Violation.created_at >= utc_since
+    # F-032：过去这里把窗口内**每一行**的 confidence 整列拉进 Python 再统计。报表是
+    # 每群 8 次窗口查询里最贵的一次（命中数大时是 O(窗口内命中数) 的行传输 + Python
+    # 循环）。改成 SQL 侧一次聚合出全部 7 个计数，返回值逐个等价。
+    confidence_row = (
+        await session.execute(
+            select(
+                func.count(),
+                func.sum(case((Violation.confidence.is_(None), 1), else_=0)),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Violation.confidence.isnot(None),
+                                Violation.confidence >= confidence_threshold,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Violation.confidence.isnot(None),
+                                Violation.confidence < MARGINAL_CONFIDENCE,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Violation.confidence.isnot(None),
+                                Violation.confidence >= MARGINAL_CONFIDENCE,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            ).where(
+                Violation.group_id == gid, Violation.created_at >= utc_since
+            )
         )
-    )
-    marginal = confident = no_confidence = 0
+    ).one()
+    total_confidence = int(confidence_row[0] or 0)
+    no_confidence = int(confidence_row[1] or 0)
+    high_hits = int(confidence_row[2] or 0)
+    marginal = int(confidence_row[3] or 0)
+    confident = int(confidence_row[4] or 0)
     bands = {key: 0 for key, _label in CONFIDENCE_BANDS}
-    high_hits = 0
-    for (value,) in confidence_rows.all():
-        if value is None:
-            no_confidence += 1
-            continue
-        numeric = float(value)
-        bands[confidence_band(numeric)] += 1
-        if numeric >= confidence_threshold:
-            high_hits += 1
-        if numeric < MARGINAL_CONFIDENCE:
-            marginal += 1
-        else:
-            confident += 1
+    if total_confidence:
+        # 区间分布仍要在 Python 里算：confidence_band 的边界是按相邻 band 的中点
+        # 动态算出来的（CONFIDENCE_BANDS 可被配置改写），SQL 里复刻不了。
+        band_rows = await session.execute(
+            select(Violation.confidence).where(
+                Violation.group_id == gid,
+                Violation.created_at >= utc_since,
+                Violation.confidence.isnot(None),
+            )
+        )
+        for (value,) in band_rows.all():
+            bands[confidence_band(float(value))] += 1
 
     labels = await _rule_labels(session, gid)
     rule_rows = await session.execute(
@@ -228,12 +275,26 @@ async def collect_quality(
 
     repeat_members = 0
     if members:
-        repeat_rows = await session.execute(
-            select(Violation.user_id, func.count())
-            .where(Violation.group_id == gid, Violation.created_at >= utc_since)
-            .group_by(Violation.user_id)
+        # F-032：同一条 GROUP BY 的结果过去整列拉进 Python 只为数"出现 >1 次的人"。
+        # 改成 SQL 侧对子查询计数，行数不再随窗口内命中数增长。
+        repeat_members = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(
+                        select(Violation.user_id)
+                        .where(
+                            Violation.group_id == gid,
+                            Violation.created_at >= utc_since,
+                        )
+                        .group_by(Violation.user_id)
+                        .having(func.count() > 1)
+                        .subquery()
+                    )
+                )
+            ).scalar()
+            or 0
         )
-        repeat_members = sum(1 for _uid, count in repeat_rows.all() if int(count) > 1)
 
     reason_rows = await session.execute(
         select(Violation.verdict_reason, func.count())

@@ -115,6 +115,7 @@ from bot.web.auth import (
     MAX_INIT_DATA_AGE_SECONDS,
     MAX_INIT_DATA_FUTURE_SECONDS,
     _auth_timestamp,
+    require_super_admin,
 )
 from bot.web.settings_api import flush_member_identity_tasks, register_settings_routes
 
@@ -3459,6 +3460,8 @@ class VerifyWebServer:
         app.router.add_post("/verify", self.handle_challenge_submit)
         app.router.add_post("/verify/status", self.handle_challenge_status)
         app.router.add_get("/healthz", self.handle_health)
+        # D3-17：需要排障细节的调用方走这个需鉴权端点；/healthz 只回 {"ok": bool}。
+        app.router.add_get("/api/v1/health", self.handle_health_detail)
         if self.runtime_config is not None:
             app.router.add_get("/settings", self.handle_settings_page)
             app.router.add_static(
@@ -3726,7 +3729,7 @@ class VerifyWebServer:
             await asyncio.wait({self._stop_task}, timeout=1.0)
             raise
 
-    async def handle_health(self, _request: web.Request) -> web.Response:
+    async def _collect_health(self) -> tuple[bool, Any, dict[str, Any]]:
         processor = self._webhook_processor
         webhook_health = processor.health_snapshot() if processor is not None else None
         resources = resource_health_snapshot()
@@ -3751,10 +3754,27 @@ class VerifyWebServer:
             and self._delivery_mode in {"webhook", "polling"}
             and bool(resources.get("ok", False))
         )
-        # /healthz 没有任何鉴权守卫，而服务可能监听所有网卡（F-017）：计数器留着
-        # 便于排障，但里面的自由文本（"<异常类型>: <异常>"——SQLAlchemy/SQLite 的
-        # 表名、数据库路径，worker 内部诊断）一律换成"有没有"的布尔值，原文只进
-        # 日志（F-009）。docker healthcheck 只看状态码，不需要这些字符串。
+        return ok, webhook_health, resources
+
+    async def handle_health(self, _request: web.Request) -> web.Response:
+        # /healthz 没有任何鉴权守卫，而服务可能监听所有网卡（F-017）。这里只回
+        # 一个布尔：docker healthcheck 与编排也只需要这个（D3-17）。任何排障细节
+        # （worker/队列存活数、队列年龄、cgroup/磁盘水位、config_revision …）都去
+        # 需鉴权的 /api/v1/health 取。
+        ok, _webhook_health, _resources = await self._collect_health()
+        return web.json_response({"ok": ok}, status=200 if ok else 503)
+
+    async def handle_health_detail(self, request: web.Request) -> web.Response:
+        """The full health picture, super-admin only (D3-17)."""
+
+        await require_super_admin(
+            request,
+            bot_token=self.bot.token,
+            super_admin_id=self.settings.super_admin_id,
+        )
+        ok, webhook_health, resources = await self._collect_health()
+        # F-009：即使是超管端点，自由文本（"<异常类型>: <异常>"——表名、数据库
+        # 路径、worker 内部诊断）也先换成"有没有"，原文只进日志。
         return web.json_response(
             {
                 "ok": ok,

@@ -12,7 +12,7 @@ import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
@@ -40,6 +40,32 @@ _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
 
 
+#: D3-15：``tg://`` 的显式白名单。其余 Deep Link 形态都能被「最低权限档（群管理员）」
+#: 借机器人之口使用：``tg://user?id=@channel`` 渲染成「订阅 @channel」强提示、
+#: ``tg://openmessage?…&text=…`` 以**机器人自身身份**代发钓鱼消息、``tg://join`` 拉人
+#: 入群。而这些消息是机器人以管理员身份发出的，普通成员难以区分来源。
+#: 只保留「打开 bot/用户主页」与「打开私聊」这两种无副作用的跳转。
+_TG_ALLOWED_ACTIONS = frozenset({"resolve", "openmessage"})
+
+
+def _safe_tg_link(parsed: ParseResult) -> bool:
+    """True only for the two side-effect-free ``tg://`` shapes we allow."""
+
+    action = (parsed.netloc or parsed.path.lstrip("/")).strip().lower()
+    if action not in _TG_ALLOWED_ACTIONS:
+        return False
+    try:
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    if action == "resolve":
+        # ``tg://resolve?domain=<username>`` 只打开主页；多带任何参数一律拒。
+        return bool((query.get("domain") or [""])[0].strip()) and set(query) == {"domain"}
+    # ``tg://openmessage?user_id=<id>``：不带 ``text`` 时只是「打开与该用户的私聊」；
+    # 带上 ``text`` 就变成以机器人身份代发内容，正是 D3-15 要排除的形态。
+    return (query.get("user_id") or [""])[0].strip().isdigit() and set(query) == {"user_id"}
+
+
 def _safe_link(value: object) -> str:
     raw = str(value or "").strip()
     if not raw or len(raw) > MAX_TEMPLATE_BUTTON_VALUE:
@@ -48,7 +74,7 @@ def _safe_link(value: object) -> str:
     if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
         return raw
     if parsed.scheme.lower() == "tg" and (parsed.netloc or parsed.path):
-        return raw
+        return raw if _safe_tg_link(parsed) else ""
     return ""
 
 

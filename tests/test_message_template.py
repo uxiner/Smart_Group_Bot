@@ -242,6 +242,47 @@ class TemplateKeyboardTests(unittest.TestCase):
                 [{"text": "bad", "action": "arbitrary", "value": "owned"}]
             )
 
+    def test_rejects_tg_links_outside_the_explicit_allowlist(self) -> None:
+        """D3-15：``tg://`` 收紧成显式白名单，其余形态一律拒收。
+
+        修前 ``_safe_link`` 只要求 ``tg://`` 的 netloc/path 非空，于是最低权限档
+        （群管理员）就能通过 ``welcome_buttons`` / ``keyword-replies`` /
+        ``scheduled-messages`` 投放借机器人之口的钓鱼与强推订阅链接。
+        """
+
+        for value in (
+            "tg://user?id=@channel",
+            "tg://join?invite=AAAA",
+            "tg://openmessage?user_id=1&text=%E9%92%93%E9%B1%BC",
+            "tg://resolve?domain=bot&text=1",
+            "tg://proxy?server=evil",
+            "tg://",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_template_buttons(
+                        [{"text": "点我", "action": "url", "value": value}]
+                    )
+
+    def test_keeps_the_side_effect_free_tg_links(self) -> None:
+        """D3-15：``tg://resolve?domain=`` 与不带 text 的 ``tg://openmessage?user_id=`` 仍可用。"""
+
+        for value in ("tg://resolve?domain=my_bot", "tg://openmessage?user_id=12345"):
+            with self.subTest(value=value):
+                buttons = normalize_template_buttons(
+                    [{"text": "打开", "action": "url", "value": value}]
+                )
+                self.assertEqual(buttons[0]["value"], value)
+
+    def test_markdown_link_reuses_the_same_tg_allowlist(self) -> None:
+        """D3-15：正文 Markdown 链接与按钮共用 ``_safe_link``，同时收紧。"""
+
+        rendered = render_markdown_html(
+            "[订阅](tg://user?id=@channel) 和 [主页](tg://resolve?domain=my_bot)"
+        )
+        self.assertNotIn('<a href="tg://user', rendered)
+        self.assertIn('<a href="tg://resolve?domain=my_bot">主页</a>', rendered)
+
     def test_rejects_unknown_button_style(self) -> None:
         with self.assertRaisesRegex(ValueError, "按钮颜色无效"):
             normalize_template_buttons(

@@ -10,14 +10,19 @@ ROOT = Path(__file__).resolve().parent.parent
 class DeploymentConfigTests(unittest.TestCase):
     def test_compose_has_safe_network_identity_and_shutdown_defaults(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-        self.assertIn('user: "${APP_UID:-1000}:${APP_GID:-1000}"', compose)
+        # C3-01: 容器身份必须显式给出；空值/未设置时 compose 直接报错，而不是静默
+        # 回落 0 或 1000（后者会覆盖 Dockerfile 的 USER app:app）。
+        self.assertIn('user: "${APP_UID:?', compose)
+        self.assertIn('${APP_GID:?', compose)
+        self.assertNotIn('user: "${APP_UID:-', compose)
         self.assertIn("init: true", compose)
         self.assertIn(
             "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:"
             "${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}",
             compose,
         )
-        self.assertIn("os.environ.get('MINIAPP_LISTEN_PORT', '8480')", compose)
+        self.assertIn("load_bootstrap_settings as s", compose)
+        self.assertNotIn("os.environ.get('MINIAPP_LISTEN_PORT', '8480')", compose)
         self.assertRegex(compose, r"(?m)^\s*stop_grace_period:\s*125s\s*$")
 
     def test_compose_bounds_swap_fds_pids_and_logs(self) -> None:
