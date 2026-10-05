@@ -1825,7 +1825,14 @@ async def _sqlite_migrate_telegram_delete_jobs(conn) -> None:
 
 # 生产规则 #6 的规则正文。**只用于算指纹**（见 ``_ScanScopeUpgrade``）：升级前必须
 # 核对"这一行确实是这条规则"，而不是只看自增 id。
-_PRODUCTION_RULE_6_PATTERN = "探花|招募"
+#
+# 正文按生产库实测抄录（`moderation_rules` 里 id=6 那一行，63 字符，sha256 前 16 位
+# ``e9d32f1e00b0e9e2``）。**不要凭记忆改写**：早先的版本写成 ``"探花|招募"``（审计报告里的
+# 截断转述），指纹与生产实际不符 → 守卫会把真·生产规则也跳过，迁移在本部署里变成永不生效
+# 的死代码；注释与事实不符。改这里必须用生产库里的原值重新算指纹并同步改用例。
+_PRODUCTION_RULE_6_PATTERN = (
+    r"(?i)(招募?探花|收探花|探花(视频|资源)|提供设备[^\n。]{0,12}(收|买|收购|结算)|(收|买)探花视频)"
+)
 
 
 def moderation_rule_pattern_fingerprint(pattern: str) -> str:

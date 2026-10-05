@@ -43,7 +43,10 @@ from bot.db.engine import (
 )
 
 #: 生产部署里 id=6 那条硬规则（regex + ban，「探花招募族」）的正文。
-PRODUCTION_RULE_6_PATTERN = "探花|招募"
+#: 按生产库实测抄录（63 字符，指纹 ``e9d32f1e00b0e9e2``）——**不是审计报告里那句截断转述**。
+PRODUCTION_RULE_6_PATTERN = (
+    r"(?i)(招募?探花|收探花|探花(视频|资源)|提供设备[^\n。]{0,12}(收|买|收购|结算)|(收|买)探花视频)"
+)
 
 _LEGACY_RULES_DDL = (
     "CREATE TABLE moderation_rules ("
@@ -228,7 +231,8 @@ class ForeignRuleSixIsNotTouchedTests(_LegacyRuleCase):
             await self._ensure_column(conn)
             await conn.execute(
                 text("UPDATE moderation_rules SET pattern = :pattern WHERE id = 6"),
-                {"pattern": " 探花|招募 "},
+                # 生产真值的大小写 + 首尾空白变体（`(?i)` → `(?I)`，其余为中文/符号，casefold 后同一）
+                {"pattern": f"  {PRODUCTION_RULE_6_PATTERN.upper()}  "},
             )
             self.assertEqual(
                 await _sqlite_upgrade_moderation_rule_scan_scopes(conn), 1
