@@ -78,6 +78,25 @@ class _StubBoard:
     has_data = False
 
 
+def _reset_state() -> None:
+    """清掉两个模块级状态字典（未修复的代码里它们还不存在）。"""
+
+    for name in ("_rank_cooldown", "_rank_cache"):
+        state = getattr(commands, name, None)
+        if isinstance(state, dict):
+            state.clear()
+
+
+def _cooldown_seconds() -> float:
+    """冷却窗口；未修复的代码里没有这个常量，取一个足够大的值让红检落在行为上。"""
+
+    return float(getattr(commands, "_RANK_COOLDOWN_SECONDS", 10))
+
+
+def _cache_ttl_seconds() -> float:
+    return float(getattr(commands, "_RANK_CACHE_TTL_SECONDS", 60))
+
+
 class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         fd, self._db_path = tempfile.mkstemp(suffix=".db")
@@ -99,16 +118,16 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await session.commit()
 
-        # 模块级状态是进程级的，每个用例都要从干净状态起步。
-        commands._rank_cooldown.clear()
-        commands._rank_cache.clear()
+        # 模块级状态是进程级的，每个用例都要从干净状态起步。未修复的代码里这两个
+        # 字典还不存在（``getattr`` 兜住），这样红检会落在**行为断言**上
+        # （"第二次调用又聚合了一遍"），而不是在 setUp 里就 AttributeError。
+        _reset_state()
         self.clock = _FakeClock()
         self.aggregations = 0
         self._real_board = commands.build_rank_board
 
     async def asyncTearDown(self) -> None:
-        commands._rank_cooldown.clear()
-        commands._rank_cache.clear()
+        _reset_state()
         await self.engine.dispose()
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -173,7 +192,7 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
         """② 冷却期过后正常。"""
 
         await self._run("/rank")
-        self.clock.advance(commands._RANK_COOLDOWN_SECONDS + 1.0)
+        self.clock.advance(_cooldown_seconds() + 1.0)
         again = await self._run("/rank")
 
         self.assertIn("<b>本群积分榜</b>", again[-1])
@@ -182,7 +201,7 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
         """③ 缓存命中不改变输出内容（冷却之后、缓存窗口之内）。"""
 
         first = await self._run("/rank")
-        self.clock.advance(commands._RANK_COOLDOWN_SECONDS + 1.0)
+        self.clock.advance(_cooldown_seconds() + 1.0)
         second = await self._run("/rank")
 
         self.assertEqual(self.aggregations, 1, "缓存窗口内不得再聚合")
@@ -192,7 +211,7 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
         """``/rank`` 与 ``/rank week`` 是两个口径，不能互相复用。"""
 
         await self._run("/rank")
-        self.clock.advance(commands._RANK_COOLDOWN_SECONDS + 1.0)
+        self.clock.advance(_cooldown_seconds() + 1.0)
         week = await self._run("/rank week")
 
         self.assertEqual(self.aggregations, 2)
@@ -202,14 +221,14 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
         """名次是调用者自己的，缓存不能跨成员复用。"""
 
         await self._run("/rank", user_id=1)
-        self.clock.advance(commands._RANK_COOLDOWN_SECONDS + 1.0)
+        self.clock.advance(_cooldown_seconds() + 1.0)
         other = await self._run("/rank", user_id=3)
 
         self.assertIn("你：第 3 名", other[-1])
 
     async def test_cache_expires(self) -> None:
         await self._run("/rank")
-        self.clock.advance(commands._RANK_CACHE_TTL_SECONDS + 1.0)
+        self.clock.advance(_cache_ttl_seconds() + 1.0)
         await self._run("/rank")
 
         self.assertEqual(self.aggregations, 2, "缓存过期后必须重新聚合")
@@ -217,24 +236,28 @@ class RankCooldownCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_cache_and_cooldown_dictionaries_stay_bounded(self) -> None:
         """长期运行不能把两个字典撑爆。"""
 
-        for index in range(commands._RANK_CACHE_MAX_ENTRIES + 50):
-            commands._rank_store_board(
+        max_entries = int(getattr(commands, "_RANK_CACHE_MAX_ENTRIES", 512))
+        store = getattr(commands, "_rank_store_board", None)
+        if store is None:
+            self.fail("bot.handlers.commands 里还没有 _rank_store_board（短缓存不存在）")
+        for index in range(max_entries + 50):
+            store(
                 -1000 - index,
                 week=False,
                 user_id=index,
                 board=_StubBoard(),
                 now=self.clock.now,
             )
-        self.assertLessEqual(
-            len(commands._rank_cache), commands._RANK_CACHE_MAX_ENTRIES
-        )
+        self.assertLessEqual(len(commands._rank_cache), max_entries)
 
-        for index in range(commands._RANK_COOLDOWN_MAX_ENTRIES + 50):
+        cooldown_max = int(getattr(commands, "_RANK_COOLDOWN_MAX_ENTRIES", 512))
+        prune = getattr(commands, "_rank_prune", None)
+        if prune is None:
+            self.fail("bot.handlers.commands 里还没有 _rank_prune")
+        for index in range(cooldown_max + 50):
             commands._rank_cooldown[(-2000 - index, index)] = self.clock.now
-        commands._rank_prune(self.clock.now)
-        self.assertLessEqual(
-            len(commands._rank_cooldown), commands._RANK_COOLDOWN_MAX_ENTRIES
-        )
+        prune(self.clock.now)
+        self.assertLessEqual(len(commands._rank_cooldown), cooldown_max)
 
 
 if __name__ == "__main__":  # pragma: no cover
