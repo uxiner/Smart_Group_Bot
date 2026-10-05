@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -1726,6 +1727,33 @@ def _group_id(request: web.Request) -> int:
     )
 
 
+def _opaque_error_ref(exc: BaseException, *, code: str, where: str) -> str:
+    """把内部异常细节换成**通用文案 + 一个能在服务端日志里对上的编号**。
+
+    A-27 / D3-23：``str(exc)`` 直接进响应体时，管理员会看到
+    ``runtime config revision changed: expected 5, got 7`` /
+    ``CONFIG_MASTER_KEY is required before saving secret settings`` 这类内部原文
+    ——暴露了内部实现（revision 数值、配置项的 env 变量名），对排障也没有帮助。
+    现在详情只进服务端日志，客户端拿到的文案里带一个 ``ref=`` 编号，管理员把这个
+    编号报给运维就能在日志里定位到同一次失败。
+    """
+
+    ref = secrets.token_hex(4)
+    log.error(
+        "Mini App settings API internal error | ref=%s code=%s where=%s type=%s",
+        ref,
+        code,
+        where,
+        type(exc).__name__,
+        exc_info=exc,
+    )
+    return ref
+
+
+def _opaque_error_message(exc: BaseException, *, code: str, where: str, text: str) -> str:
+    return f"{text}（错误编号 {_opaque_error_ref(exc, code=code, where=where)}）"
+
+
 def register_settings_routes(
     app: web.Application,
     *,
@@ -1764,14 +1792,28 @@ def register_settings_routes(
                     details=_validation_details(exc),
                 )
             except RuntimeConfigConflictError as exc:
+                # A-27 / D3-23：原文（expected/got 的 revision 数值）只进日志。
                 return _error_response(
                     409,
                     "revision_conflict",
-                    str(exc) or "配置已被其他会话更新，请刷新后重试。",
+                    _opaque_error_message(
+                        exc,
+                        code="revision_conflict",
+                        where="authenticated.put_settings",
+                        text="配置已被其他会话更新，请刷新后重试。",
+                    ),
                 )
-            except Exception:
-                log.exception("Mini App settings API request failed")
-                return _error_response(500, "internal_error", "服务器处理请求失败。")
+            except Exception as exc:
+                return _error_response(
+                    500,
+                    "internal_error",
+                    _opaque_error_message(
+                        exc,
+                        code="internal_error",
+                        where="authenticated",
+                        text="服务器处理请求失败。",
+                    ),
+                )
 
         return wrapped
 
@@ -1796,10 +1838,28 @@ def register_settings_routes(
                     details=_validation_details(exc),
                 )
             except RuntimeConfigEncryptionError as exc:
-                return _error_response(400, "secret_storage_unavailable", str(exc))
-            except Exception:
-                log.exception("Mini App group API request failed")
-                return _error_response(500, "internal_error", "服务器处理请求失败。")
+                # A-27 / D3-23：原文会写出 CONFIG_MASTER_KEY 这个 env 变量名。
+                return _error_response(
+                    400,
+                    "secret_storage_unavailable",
+                    _opaque_error_message(
+                        exc,
+                        code="secret_storage_unavailable",
+                        where="any_admin",
+                        text="密钥服务暂时不可用，请联系最高管理员。",
+                    ),
+                )
+            except Exception as exc:
+                return _error_response(
+                    500,
+                    "internal_error",
+                    _opaque_error_message(
+                        exc,
+                        code="internal_error",
+                        where="any_admin",
+                        text="服务器处理请求失败。",
+                    ),
+                )
 
         return wrapped
 
@@ -1937,7 +1997,17 @@ def register_settings_routes(
         except RuntimeConfigConflictError:
             raise
         except RuntimeConfigEncryptionError as exc:
-            raise _APIError(400, "secret_storage_unavailable", str(exc)) from exc
+            # A-27 / D3-23：原文会写出 CONFIG_MASTER_KEY 这个 env 变量名。
+            raise _APIError(
+                400,
+                "secret_storage_unavailable",
+                _opaque_error_message(
+                    exc,
+                    code="secret_storage_unavailable",
+                    where="put_settings.encryption",
+                    text="密钥服务暂时不可用，请联系最高管理员。",
+                ),
+            ) from exc
         except ValueError as exc:
             raise _APIError(400, "invalid_settings", str(exc)) from exc
         return _success_response(manager.api_document())
