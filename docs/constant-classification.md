@@ -98,8 +98,8 @@ total`）在 schema 里强校验，`tests/test_startup_resources.py` 另有一�
 | `bot/handlers/commands.py` / `membership.py` | 抽走质询免除价的读侧 | 分页大小、冷却、缓存 TTL 等未抽离 |
 | `bot/utils/telegram.py` | — | 11 项运营常量（按会话并发、typing 超时、流式增量上限等）未抽离 |
 | `bot/web/settings_api.py` | 权限模型已确认（`@authenticated` = 最高管理员 / `@any_admin` = 群管理员） | 成员身份查询的缓存与限流（约 15 项）未抽离 |
-| `bot/services/update_delivery.py` | — | 27 项（webhook 队列容量、轮询超时、退避、看门狗间隔）未抽离 |
-| `bot/services/verify_web.py` | — | 约 43 项（限流窗口、durable inbox 租约与批量、清理间隔）未抽离 |
+| `bot/services/update_delivery.py` | 抽走轮询三项超时 + webhook 连接池上限（`resources.polling_*` / `webhook_max_concurrent_updates`） | 删除 webhook 的退避表、看门狗间隔、探测重试等运维常量未抽离 |
+| `bot/services/verify_web.py` | 抽走 webhook 三车道并发与队列容量、四级端到端预算、HTTP 响应超时、durable inbox 租约/恢复批量/重试退避/清理间隔与批量 | 限流窗口与令牌桶（`_VERIFICATION_USER_RATE_LIMIT` 等）、durable inbox 保留期与 DLQ 保留期、dedup 上限等未抽离——其中保留期属数据生命周期，限流属安全策略 |
 | `bot/services/memory.py` / `model_limits.py` / `context_gate.py` | 确认既有字段已贯通、确认无硬写死覆盖 | 压缩/归档相关的约 35 项运营常量未抽离 |
 | `bot/services/join_verification.py` | 确认既有策略已可配；确认 nonce / 租约 / 终态是常量 | 7 项 Telegram 调用容量与重试常量未抽离 |
 | `bot/services/scheduled_messages.py` / `telegram_cleanup.py` | — | 构造器默认参数约 17 项未抽离 |
@@ -119,8 +119,10 @@ total`）在 schema 里强校验，`tests/test_startup_resources.py` 另有一�
 
 1. **没有在真实 Telegram 上跑过。** 全部验证是本机单元/集成测试与静态检查。没有
    连过生产、没有读过生产 `.env`、没有连过生产数据库。
-2. **`update_delivery.py` / `verify_web.py` 的资源预算仍是硬编码。** 本轮判定为"不做
-   一次性大改"，但它们的常量清单是真实的（见上表），不是"没看见"。
+2. **webhook 侧只抽了"资源预算"，没抽限流与生命周期。** `_VERIFICATION_USER_RATE_LIMIT` /
+   `_VERIFICATION_IP_RATE_LIMIT` 属安全策略（公开验证页的滥用防护），durable inbox 的
+   保留期/DLQ 保留期属数据生命周期，两者都刻意留在源码常量里。删除 webhook 的退避表
+   与探测重试也仍是硬编码——它们是"失败时怎么办"，不是容量旋钮。
 3. **跨模块的端到端行为**（例如"改了私聊配额之后，一整轮 DM 的扣费-退款-回执在真实
    Telegram 上的表现"）只覆盖到函数级，未做端到端。
 4. **UI 的移动端与键盘可达性**只做了 CSS 约束（44px 触达、`:focus-visible`、窄屏两

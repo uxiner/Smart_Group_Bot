@@ -1218,6 +1218,79 @@ class ResourceSettingsConfig(StrictModel):
         default=120.0, ge=5.0, le=3600.0, allow_inf_nan=False
     )
 
+    # --- webhook / 轮询 / 出站发送 --------------------------------------------
+    # 这些是 **webhook 服务的资源预算**。VerifyWebServer 与 aiohttp session 在启动
+    # 时构造一次（worker 数、队列容量、连接池上限都固化在对象里），所以除少数
+    # "每轮现取"的 durable-inbox 维护旋钮外一律 restart。默认逐字等于改造前。
+    webhook_max_concurrent_updates: int = Field(
+        default=8, ge=1, le=256, json_schema_extra=_RESTART
+    )
+    #: 三条独立车道：管理员交互 / 入群风控 / 鉴权。**互不挤占**——入群洪峰不能
+    #: 把管理员的 /ban、/unban 堵在队列里。改一个必须仍然 ≤ 总容量。
+    webhook_critical_concurrent_updates: int = Field(
+        default=4, ge=1, le=256, json_schema_extra=_RESTART
+    )
+    webhook_security_concurrent_updates: int = Field(
+        default=4, ge=1, le=256, json_schema_extra=_RESTART
+    )
+    webhook_auth_concurrent_updates: int = Field(
+        default=2, ge=1, le=256, json_schema_extra=_RESTART
+    )
+    webhook_critical_queue_capacity: int = Field(
+        default=64, ge=1, le=100_000, json_schema_extra=_RESTART
+    )
+    webhook_security_queue_capacity: int = Field(
+        default=128, ge=1, le=100_000, json_schema_extra=_RESTART
+    )
+    webhook_auth_queue_capacity: int = Field(
+        default=64, ge=1, le=100_000, json_schema_extra=_RESTART
+    )
+    #: 端到端预算。普通更新 150s 必须盖住"防抖 + 同步审核/索引 + 群回复 worker
+    #: 的整段预算"（后者群级可配、上界 120s），否则请求会在 handler 跑完之前被掐断。
+    webhook_update_timeout_seconds: float = Field(
+        default=150.0, ge=5.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    webhook_critical_update_timeout_seconds: float = Field(
+        default=60.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    webhook_security_update_timeout_seconds: float = Field(
+        default=120.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    webhook_auth_update_timeout_seconds: float = Field(
+        default=45.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    #: HTTP 响应超时必须 ≥ 最大的端到端预算，否则响应先于 handler 结束就断。
+    webhook_http_response_timeout_seconds: float = Field(
+        default=155.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    #: durable inbox 的租约。**必须不小于最大的端到端预算**：租约先到期的话，
+    #: 恢复循环会把一个仍在执行的 update 交给第二个 worker，造成重复处理。
+    webhook_inbox_lease_seconds: float = Field(
+        default=300.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    #: durable inbox 的维护旋钮：每轮现取，热生效。
+    webhook_inbox_recovery_batch: int = Field(default=64, ge=1, le=5000)
+    webhook_inbox_retry_max_seconds: float = Field(
+        default=300.0, ge=1.0, le=3600.0, allow_inf_nan=False
+    )
+    webhook_inbox_cleanup_interval_seconds: float = Field(
+        default=60.0, ge=5.0, le=3600.0, allow_inf_nan=False
+    )
+    webhook_inbox_cleanup_batch: int = Field(default=256, ge=1, le=10_000)
+    #: 轮询（未启用 webhook 时的兜底传输）的三个超时。session 启动时建一次。
+    polling_timeout_seconds: int = Field(
+        default=15, ge=1, le=300, json_schema_extra=_RESTART
+    )
+    polling_http_timeout_seconds: int = Field(
+        default=30, ge=1, le=600, json_schema_extra=_RESTART
+    )
+    polling_request_timeout_seconds: float = Field(
+        default=35.0, ge=1.0, le=600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+    )
+    #: 同一会话的并发发送上限。**每次发送现建信号量**（不是模块级长寿命闸门），
+    #: 所以热生效是安全的：没有 slot 会被漏掉或泄漏。
+    telegram_send_chat_parallel: int = Field(default=3, ge=1, le=32, json_schema_extra=_HOT)
+
     @field_validator("llm_stage_deadlines", mode="before")
     @classmethod
     def _validate_stage_deadlines(cls, value: object) -> dict[str, float]:
@@ -1259,7 +1332,65 @@ class ResourceSettingsConfig(StrictModel):
             raise ValueError("Telegram 非关键容量必须小于总容量（至少留 1 个关键名额）")
         if self.archive_indexing_lease_seconds < self.archive_query_timeout_seconds:
             raise ValueError("归档索引租约不能短于查询 deadline，否则会重复写")
+        self._validate_webhook_budget()
         return self
+
+    def _validate_webhook_budget(self) -> None:
+        """webhook 预算的关联约束。
+
+        这些不是"风格偏好"，每一条都对应一个真实的故障模式：
+
+        * **租约 ≥ 最大的端到端预算**：否则 durable inbox 的恢复循环会在一个
+          update 还在执行时把租约判为过期，交给第二个 worker → 同一条 update
+          被处理两次（管理员回调会重复执行动作）。
+        * **租约 ≥ 最大重试退避**：否则一次合法重试会被恢复循环判成僵尸。
+        * **HTTP 响应超时 ≥ 最大的端到端预算**：否则 handler 还在跑，HTTP 层已经
+          断开并让 Telegram 重投。
+        * **每条车道的并发 ≤ 总并发、队列容量 ≥ 车道并发**：否则要么配置自相矛盾
+          （队列比 worker 还小，等于立刻丢更新），要么车道比总池还大，"独立车道"
+          的隔离承诺不成立。
+        """
+
+        lanes = (
+            ("critical", self.webhook_critical_concurrent_updates),
+            ("security", self.webhook_security_concurrent_updates),
+            ("auth", self.webhook_auth_concurrent_updates),
+        )
+        queues = (
+            ("critical", self.webhook_critical_queue_capacity),
+            ("security", self.webhook_security_queue_capacity),
+            ("auth", self.webhook_auth_queue_capacity),
+        )
+        for name, workers in lanes:
+            if workers > self.webhook_max_concurrent_updates:
+                raise ValueError(
+                    f"webhook {name} 车道的并发不能超过总并发 "
+                    f"{self.webhook_max_concurrent_updates}"
+                )
+        for (name, workers), (_qname, capacity) in zip(lanes, queues):
+            if capacity < workers:
+                raise ValueError(
+                    f"webhook {name} 车道的队列容量 {capacity} 不能小于它的并发 {workers}"
+                )
+        longest = max(
+            self.webhook_update_timeout_seconds,
+            self.webhook_critical_update_timeout_seconds,
+            self.webhook_security_update_timeout_seconds,
+            self.webhook_auth_update_timeout_seconds,
+        )
+        if self.webhook_inbox_lease_seconds < longest:
+            raise ValueError(
+                f"durable inbox 租约 {self.webhook_inbox_lease_seconds}s 不能短于最大的"
+                f"端到端预算 {longest}s，否则仍在执行的 update 会被第二个 worker 抢走"
+            )
+        if self.webhook_inbox_lease_seconds < self.webhook_inbox_retry_max_seconds:
+            raise ValueError(
+                "durable inbox 租约不能短于最大重试退避，否则一次合法重试会被判成僵尸"
+            )
+        if self.webhook_http_response_timeout_seconds < longest:
+            raise ValueError(
+                "webhook HTTP 响应超时应不小于最大的端到端预算"
+            )
 
 
 class LoggingSettingsConfig(StrictModel):

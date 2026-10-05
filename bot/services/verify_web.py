@@ -41,6 +41,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
+from bot.services import policy_runtime
 from bot.db.models import JoinVerification, UserWarning, WebhookInboxUpdate
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
@@ -212,6 +213,31 @@ _WEBHOOK_UNTRUSTED_AUTH_BURST = TELEGRAM_AUTH_CANDIDATE_BURST
 _WEBHOOK_ORPHAN_FATAL_AGE_SECONDS = 120.0
 _WEBHOOK_LATE_FINALIZER_FATAL_AGE_SECONDS = 300.0
 _WEBHOOK_HTTP_RESPONSE_TIMEOUT_SECONDS = 155.0
+
+
+def webhook_budget() -> dict[str, float]:
+    """webhook 服务的资源预算（启动时装配：worker 数、队列容量、连接池上限
+    都在 ``VerifyWebServer`` 构造时固化，所以这些字段是 restart）。
+
+    超时部分每次判定现取，所以读起来是热的——但**它们和 worker 数一样只在启动时
+    被固定进对象**，因此统一标成 restart，见 ``RESTART_REQUIRED_PATHS``。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "max_concurrent_updates": resources.webhook_max_concurrent_updates,
+        "critical_concurrent_updates": resources.webhook_critical_concurrent_updates,
+        "security_concurrent_updates": resources.webhook_security_concurrent_updates,
+        "auth_concurrent_updates": resources.webhook_auth_concurrent_updates,
+        "critical_queue_capacity": resources.webhook_critical_queue_capacity,
+        "security_queue_capacity": resources.webhook_security_queue_capacity,
+        "auth_queue_capacity": resources.webhook_auth_queue_capacity,
+        "update_timeout_seconds": resources.webhook_update_timeout_seconds,
+        "critical_update_timeout_seconds": resources.webhook_critical_update_timeout_seconds,
+        "security_update_timeout_seconds": resources.webhook_security_update_timeout_seconds,
+        "auth_update_timeout_seconds": resources.webhook_auth_update_timeout_seconds,
+        "http_response_timeout_seconds": resources.webhook_http_response_timeout_seconds,
+    }
 _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS = 2.0
 _WEBHOOK_DRAIN_TIMEOUT_SECONDS = 15.0
 _WEBHOOK_REQUEST_DRAIN_TIMEOUT_SECONDS = 3.0
@@ -220,6 +246,24 @@ _WEBHOOK_FAILURE_THRESHOLD = 3
 _WEBHOOK_DEDUP_TTL_SECONDS = 60.0 * 60.0
 _WEBHOOK_DEDUP_MAX_UPDATES = 4096
 _WEBHOOK_INBOX_LEASE_SECONDS = 5 * 60
+
+
+def inbox_limits() -> dict[str, float | int]:
+    """durable inbox 的租约与维护旋钮（现取配置，默认与常量逐字相同）。
+
+    租约与 webhook 的端到端预算有关联：schema 校验保证
+    ``webhook_inbox_lease_seconds >= max(各 update timeout)``，否则一个仍在执行
+    的 update 会被恢复循环交给第二个 worker 重复处理。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "lease_seconds": resources.webhook_inbox_lease_seconds,
+        "recovery_batch": resources.webhook_inbox_recovery_batch,
+        "retry_max_seconds": resources.webhook_inbox_retry_max_seconds,
+        "cleanup_interval_seconds": resources.webhook_inbox_cleanup_interval_seconds,
+        "cleanup_batch": resources.webhook_inbox_cleanup_batch,
+    }
 _WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS = 2.0
 _WEBHOOK_INBOX_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _WEBHOOK_INBOX_DLQ_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -982,35 +1026,73 @@ class _WebhookUpdateQueue:
         bot: Bot,
         session_factory: async_sessionmaker[AsyncSession] | None,
         secret_token: str,
-        worker_count: int,
-        critical_worker_count: int = WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
-        security_worker_count: int = WEBHOOK_SECURITY_CONCURRENT_UPDATES,
-        auth_worker_count: int = WEBHOOK_AUTH_CONCURRENT_UPDATES,
-        critical_queue_capacity: int = WEBHOOK_CRITICAL_QUEUE_CAPACITY,
-        security_queue_capacity: int = WEBHOOK_SECURITY_QUEUE_CAPACITY,
-        auth_queue_capacity: int = WEBHOOK_AUTH_QUEUE_CAPACITY,
+        worker_count: int | None = None,
+        critical_worker_count: int | None = None,
+        security_worker_count: int | None = None,
+        auth_worker_count: int | None = None,
+        critical_queue_capacity: int | None = None,
+        security_queue_capacity: int | None = None,
+        auth_queue_capacity: int | None = None,
     ) -> None:
         self.dispatcher = dispatcher
         self.bot = bot
         self.session_factory = session_factory
         self.secret_token = secret_token
-        self.worker_count = max(1, int(worker_count))
-        self.critical_worker_count = max(1, int(critical_worker_count))
-        self.security_worker_count = max(1, int(security_worker_count))
-        self.auth_worker_count = max(1, int(auth_worker_count))
+        # 没显式传就现取运行时配置（``resources.webhook_*``）。worker 数与队列容量
+        # 在这里就固化了，所以这些是 restart 字段——装配点只有这一处。
+        budget = webhook_budget()
+        self.worker_count = max(
+            1, int(worker_count if worker_count is not None else budget["max_concurrent_updates"])
+        )
+        self.critical_worker_count = max(
+            1,
+            int(
+                critical_worker_count
+                if critical_worker_count is not None
+                else budget["critical_concurrent_updates"]
+            ),
+        )
+        self.security_worker_count = max(
+            1,
+            int(
+                security_worker_count
+                if security_worker_count is not None
+                else budget["security_concurrent_updates"]
+            ),
+        )
+        self.auth_worker_count = max(
+            1,
+            int(
+                auth_worker_count
+                if auth_worker_count is not None
+                else budget["auth_concurrent_updates"]
+            ),
+        )
         self.queue = _BoundedPriorityUpdateQueue(
             ordinary_capacity=self.worker_count * 4,
             auth_capacity=max(
                 self.auth_worker_count,
-                int(auth_queue_capacity),
+                int(
+                    auth_queue_capacity
+                    if auth_queue_capacity is not None
+                    else budget["auth_queue_capacity"]
+                ),
             ),
             critical_capacity=max(
                 self.critical_worker_count,
-                int(critical_queue_capacity),
+                int(
+                    critical_queue_capacity
+                    if critical_queue_capacity is not None
+                    else budget["critical_queue_capacity"]
+                ),
             ),
             security_capacity=max(
                 self.security_worker_count,
-                int(security_queue_capacity),
+                int(
+                    security_queue_capacity
+                    if security_queue_capacity is not None
+                    else budget["security_queue_capacity"]
+                ),
             ),
         )
         self._workers: list[asyncio.Task[None]] = []
@@ -1333,7 +1415,9 @@ class _WebhookUpdateQueue:
             return None
         assert self.session_factory is not None
         now = now_shanghai_naive()
-        lease_until = now + timedelta(seconds=_WEBHOOK_INBOX_LEASE_SECONDS)
+        lease_until = now + timedelta(
+            seconds=float(inbox_limits()["lease_seconds"])
+        )
         async with self.session_factory() as session:
             result = await session.execute(
                 update(WebhookInboxUpdate)
@@ -1381,7 +1465,9 @@ class _WebhookUpdateQueue:
             return True
         assert self.session_factory is not None
         now = now_shanghai_naive()
-        lease_until = now + timedelta(seconds=_WEBHOOK_INBOX_LEASE_SECONDS)
+        lease_until = now + timedelta(
+            seconds=float(inbox_limits()["lease_seconds"])
+        )
         async with self.session_factory() as session:
             result = await session.execute(
                 update(WebhookInboxUpdate)
@@ -1432,13 +1518,15 @@ class _WebhookUpdateQueue:
     def _retry_delay_seconds(attempts: int, *, update_id: int = 0) -> float:
         exponent = max(0, int(attempts) - 1)
         base_delay = min(
-            _WEBHOOK_INBOX_RETRY_MAX_SECONDS,
+            float(inbox_limits()["retry_max_seconds"]),
             _WEBHOOK_INBOX_RETRY_BASE_SECONDS * (2**exponent),
         )
         # Stable per-update jitter avoids a wave of poison/transient rows all
         # becoming claimable on the same recovery tick after an outage.
         jitter = 0.90 + ((abs(int(update_id)) * 17) % 21) / 100.0
-        return min(_WEBHOOK_INBOX_RETRY_MAX_SECONDS, base_delay * jitter)
+        return min(
+            float(inbox_limits()["retry_max_seconds"]), base_delay * jitter
+        )
 
     async def _release_durable_update(
         self,
@@ -1557,16 +1645,17 @@ class _WebhookUpdateQueue:
         # Drain several batches per pass while yielding between commits.  A
         # single 256-row batch/minute had a hard growth threshold of only
         # 4.27 updates/s, below realistic traffic for multiple active groups.
-        while cleaned_total < _WEBHOOK_INBOX_CLEANUP_BATCH * 16:
+        cleanup_batch = int(inbox_limits()["cleanup_batch"])
+        while cleaned_total < cleanup_batch * 16:
             cleaned_round = 0
             for terminal_column, cutoff in (
                 (WebhookInboxUpdate.completed_at, completed_cutoff),
                 (WebhookInboxUpdate.dead_lettered_at, dead_cutoff),
             ):
-                remaining = _WEBHOOK_INBOX_CLEANUP_BATCH * 16 - cleaned_total
+                remaining = cleanup_batch * 16 - cleaned_total
                 if remaining <= 0:
                     break
-                batch_limit = min(_WEBHOOK_INBOX_CLEANUP_BATCH, remaining)
+                batch_limit = min(cleanup_batch, remaining)
                 async with self.session_factory() as session:
                     stale_ids = (
                         select(WebhookInboxUpdate.update_id)
@@ -1696,7 +1785,7 @@ class _WebhookUpdateQueue:
                         )
                         .where(*eligibility, *lane_range)
                         .order_by(WebhookInboxUpdate.created_at)
-                        .limit(_WEBHOOK_INBOX_RECOVERY_BATCH)
+                        .limit(int(inbox_limits()["recovery_batch"]))
                     )
                 ).all()
                 rows.extend(lane_rows)
@@ -1866,7 +1955,7 @@ class _WebhookUpdateQueue:
                 now = time.monotonic()
                 if (
                     now - self._last_cleanup_at
-                    >= _WEBHOOK_INBOX_CLEANUP_INTERVAL_SECONDS
+                    >= float(inbox_limits()["cleanup_interval_seconds"])
                 ):
                     await self._cleanup_durable_inbox()
                     self._last_cleanup_at = now
@@ -1980,7 +2069,7 @@ class _WebhookUpdateQueue:
         try:
             succeeded = await asyncio.wait_for(
                 asyncio.shield(result),
-                timeout=_WEBHOOK_HTTP_RESPONSE_TIMEOUT_SECONDS,
+                timeout=float(webhook_budget()["http_response_timeout_seconds"]),
             )
         except TimeoutError:
             return web.Response(text="Update processing timeout", status=503)
@@ -2202,7 +2291,7 @@ class _WebhookUpdateQueue:
     ) -> Any:
         """Wait for a terminal task while keeping its durable lease exclusive."""
 
-        renew_interval = max(0.05, _WEBHOOK_INBOX_LEASE_SECONDS / 3.0)
+        renew_interval = max(0.05, float(inbox_limits()["lease_seconds"]) / 3.0)
         lease_warning_reported = False
         try:
             while True:
@@ -2431,12 +2520,12 @@ class _WebhookUpdateQueue:
     @staticmethod
     def _update_timeout_seconds(queued: _QueuedWebhookUpdate) -> float:
         if queued.auth_candidate:
-            return _WEBHOOK_AUTH_UPDATE_TIMEOUT_SECONDS
+            return float(webhook_budget()["auth_update_timeout_seconds"])
         if queued.priority <= ExecutionPriority.CRITICAL:
-            return _WEBHOOK_CRITICAL_UPDATE_TIMEOUT_SECONDS
+            return float(webhook_budget()["critical_update_timeout_seconds"])
         if queued.priority <= ExecutionPriority.HIGH:
-            return _WEBHOOK_SECURITY_UPDATE_TIMEOUT_SECONDS
-        return _WEBHOOK_UPDATE_TIMEOUT_SECONDS
+            return float(webhook_budget()["security_update_timeout_seconds"])
+        return float(webhook_budget()["update_timeout_seconds"])
 
     async def _process_update(self, queued: _QueuedWebhookUpdate) -> bool:
         loop = asyncio.get_running_loop()
@@ -2448,7 +2537,9 @@ class _WebhookUpdateQueue:
         else:
             # Ordinary work retains the original end-to-end budget so queue
             # pressure cannot add another full execution window.
-            deadline = queued.enqueued_at + _WEBHOOK_UPDATE_TIMEOUT_SECONDS
+            deadline = queued.enqueued_at + float(
+                webhook_budget()["update_timeout_seconds"]
+            )
         key = id(queued)
         self._active_started_at[key] = loop.time()
         if queued.auth_candidate:
@@ -3479,6 +3570,8 @@ class VerifyWebServer:
             )
         self.webhook_route_error = None
         if self.webhook_dispatcher is not None:
+            # 不传车道尺寸：``_WebhookUpdateQueue`` 自己从运行时配置读
+            # （``resources.webhook_*``），所以每一个构造点都拿到同一份。
             processor = _WebhookUpdateQueue(
                 dispatcher=self.webhook_dispatcher,
                 bot=self.bot,
@@ -3486,13 +3579,6 @@ class VerifyWebServer:
                     self.session_factory if callable(self.session_factory) else None
                 ),
                 secret_token=self.webhook_secret,
-                worker_count=WEBHOOK_MAX_CONCURRENT_UPDATES,
-                auth_worker_count=WEBHOOK_AUTH_CONCURRENT_UPDATES,
-                critical_worker_count=WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
-                security_worker_count=WEBHOOK_SECURITY_CONCURRENT_UPDATES,
-                critical_queue_capacity=WEBHOOK_CRITICAL_QUEUE_CAPACITY,
-                security_queue_capacity=WEBHOOK_SECURITY_QUEUE_CAPACITY,
-                auth_queue_capacity=WEBHOOK_AUTH_QUEUE_CAPACITY,
             )
             self._webhook_processor = processor
             register_resource_health_provider(

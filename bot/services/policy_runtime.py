@@ -632,6 +632,71 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     "resources.archive_indexing_lease_seconds": (
         "bot/services/archive_vector.py:archive_limits",
     ),
+    # --- webhook / 轮询 / 出站发送 -------------------------------------------
+    "resources.webhook_max_concurrent_updates": (
+        "bot/services/update_delivery.py:polling_limits",
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_critical_concurrent_updates": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_security_concurrent_updates": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_auth_concurrent_updates": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_critical_queue_capacity": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_security_queue_capacity": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_auth_queue_capacity": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_update_timeout_seconds": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_critical_update_timeout_seconds": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_security_update_timeout_seconds": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_auth_update_timeout_seconds": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_http_response_timeout_seconds": (
+        "bot/services/verify_web.py:webhook_budget",
+    ),
+    "resources.webhook_inbox_lease_seconds": (
+        "bot/services/verify_web.py:inbox_limits",
+    ),
+    "resources.webhook_inbox_recovery_batch": (
+        "bot/services/verify_web.py:inbox_limits",
+    ),
+    "resources.webhook_inbox_retry_max_seconds": (
+        "bot/services/verify_web.py:inbox_limits",
+    ),
+    "resources.webhook_inbox_cleanup_interval_seconds": (
+        "bot/services/verify_web.py:inbox_limits",
+    ),
+    "resources.webhook_inbox_cleanup_batch": (
+        "bot/services/verify_web.py:inbox_limits",
+    ),
+    "resources.polling_timeout_seconds": (
+        "bot/services/update_delivery.py:polling_limits",
+    ),
+    "resources.polling_http_timeout_seconds": (
+        "bot/services/update_delivery.py:polling_limits",
+    ),
+    "resources.polling_request_timeout_seconds": (
+        "bot/services/update_delivery.py:polling_limits",
+    ),
+    "resources.telegram_send_chat_parallel": (
+        "bot/utils/telegram.py:chat_send_parallel",
+    ),
 }
 
 

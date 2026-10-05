@@ -1471,7 +1471,34 @@
               ${field("resources.archive_query_timeout_seconds", "向量查询超时（秒）", { type: "number", min: 0.5, max: 120, step: 0.5, required: true })}
               ${field("resources.archive_maintenance_interval_seconds", "向量维护间隔（秒）", { type: "number", min: 0.5, max: 600, step: 0.5, required: true })}
               ${field("resources.archive_indexing_lease_seconds", "索引租约（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "必须不短于查询超时，否则会重复写" })}
+              ${field("resources.telegram_send_chat_parallel", "同会话并发发送", { type: "number", min: 1, max: 32, step: 1, required: true, hint: "每次发送现建信号量，热生效" })}
             </div>`)}
+        </section>
+
+        <section class="settings-section">
+          ${sectionHead("webhook 与轮询", "webhook 服务的 worker 数、队列容量、连接池上限都在服务启动时构造，因此这一段全部需要重启。租约与端到端预算有关联约束：租约必须不短于最大的端到端预算，否则仍在执行的 update 会被恢复循环交给第二个 worker 重复处理。", "")}
+          <div class="field-grid three">
+            ${field("resources.webhook_max_concurrent_updates", "webhook 总并发", { type: "number", min: 1, max: 256, step: 1, required: true })}
+            ${field("resources.webhook_critical_concurrent_updates", "管理员交互车道并发", { type: "number", min: 1, max: 256, step: 1, required: true, hint: "独立车道：入群洪峰不会堵住 /ban、/unban" })}
+            ${field("resources.webhook_security_concurrent_updates", "入群风控车道并发", { type: "number", min: 1, max: 256, step: 1, required: true })}
+            ${field("resources.webhook_auth_concurrent_updates", "鉴权车道并发", { type: "number", min: 1, max: 256, step: 1, required: true })}
+            ${field("resources.webhook_critical_queue_capacity", "管理员交互队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "不能小于该车道并发" })}
+            ${field("resources.webhook_security_queue_capacity", "入群风控队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "不能小于该车道并发" })}
+            ${field("resources.webhook_auth_queue_capacity", "鉴权队列容量", { type: "number", min: 1, max: 100000, step: 1, required: true, hint: "不能小于该车道并发" })}
+            ${field("resources.webhook_update_timeout_seconds", "普通 update 端到端（秒）", { type: "number", min: 5, max: 1800, step: 1, required: true, hint: "必须盖住防抖 + 同步审核/索引 + 群回复 worker（群级可配，上界 120s）" })}
+            ${field("resources.webhook_critical_update_timeout_seconds", "管理员交互端到端（秒）", { type: "number", min: 1, max: 1800, step: 1, required: true })}
+            ${field("resources.webhook_security_update_timeout_seconds", "入群风控端到端（秒）", { type: "number", min: 1, max: 1800, step: 1, required: true })}
+            ${field("resources.webhook_auth_update_timeout_seconds", "鉴权端到端（秒）", { type: "number", min: 1, max: 1800, step: 1, required: true })}
+            ${field("resources.webhook_http_response_timeout_seconds", "HTTP 响应超时（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "必须不小于最大的端到端预算" })}
+            ${field("resources.webhook_inbox_lease_seconds", "durable inbox 租约（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "必须不短于最大的端到端预算与最大重试退避，否则会重复处理", help: "租约到期后 durable inbox 的恢复循环会认为这条 update 没人管，于是交给第二个 worker。如果租约比一次处理实际花的时间短，管理员的 /ban、/unban 回调可能被执行两次。保存时后端会强校验这条关联。", helpLabel: "为什么租约不能配小" })}
+            ${field("resources.webhook_inbox_recovery_batch", "恢复每轮批量", { type: "number", min: 1, max: 5000, step: 1, required: true, hint: "热生效" })}
+            ${field("resources.webhook_inbox_retry_max_seconds", "最大重试退避（秒）", { type: "number", min: 1, max: 3600, step: 1, required: true, hint: "热生效；不能超过租约" })}
+            ${field("resources.webhook_inbox_cleanup_interval_seconds", "留档清理间隔（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "热生效" })}
+            ${field("resources.webhook_inbox_cleanup_batch", "留档清理批量", { type: "number", min: 1, max: 10000, step: 1, required: true, hint: "热生效" })}
+            ${field("resources.polling_timeout_seconds", "轮询长轮询超时（秒）", { type: "number", min: 1, max: 300, step: 1, required: true, hint: "仅在未启用 webhook 时使用" })}
+            ${field("resources.polling_http_timeout_seconds", "轮询 HTTP 超时（秒）", { type: "number", min: 1, max: 600, step: 1, required: true })}
+            ${field("resources.polling_request_timeout_seconds", "轮询请求超时（秒）", { type: "number", min: 1, max: 600, step: 0.5, required: true })}
+          </div>
         </section>
       </div>`;
   }

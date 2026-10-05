@@ -20,6 +20,7 @@ from aiogram.enums import ChatAction, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import InputRichMessage, Message, ReplyParameters
 
+from bot.services import policy_runtime
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
 from bot.services.request_priority import (
@@ -378,6 +379,17 @@ def _needs_rich_markdown(text: str) -> bool:
                 return True
     return False
 CHAT_SEND_PARALLEL = 3
+
+
+def chat_send_parallel() -> int:
+    """同一会话的并发发送上限（现取配置，默认 3）。
+
+    这个信号量是**每次发送现建**的（不是模块级长寿命闸门），所以热读是安全的：
+    没有 slot 会被漏掉或泄漏，也不存在"旧容量 + 新容量并存"的中间态。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return resources.telegram_send_chat_parallel
 TG_TLS_RECORD_RETRY_DELAY = 0.35
 _TYPING_SEND_TIMEOUT_SECONDS = 3.0
 _TELEGRAM_CANCEL_GRACE_SECONDS = 0.25
@@ -2507,7 +2519,7 @@ async def send_reply(
 
     semaphore = _SEND_SEMAPHORES.setdefault(
         message.chat.id,
-        asyncio.Semaphore(CHAT_SEND_PARALLEL),
+        asyncio.Semaphore(chat_send_parallel()),
     )
 
     async def _deliver_payload() -> bool:
@@ -2749,7 +2761,7 @@ async def send_chat_message(
 
     semaphore = _SEND_SEMAPHORES.setdefault(
         chat_id,
-        asyncio.Semaphore(CHAT_SEND_PARALLEL),
+        asyncio.Semaphore(chat_send_parallel()),
     )
     try:
         async with asyncio.timeout(_send_total_deadline_seconds()):

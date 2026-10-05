@@ -241,6 +241,24 @@ group_summary 15）、Telegram 各级准入超时、群待回复预算、管理�
 （schema 校验），否则一个慢查询会在租约过期后被第二个 worker 抢走同一批消息，
 造成重复写。
 
+**webhook / 轮询 / 出站发送**（`resources.webhook_*` / `polling_*` /
+`telegram_send_chat_parallel`）：webhook 服务的 worker 数、队列容量、连接池上限都在
+`VerifyWebServer` / aiohttp session 构造时固化，所以这一段是 **restart**；durable
+inbox 的维护旋钮（恢复批量、重试退避上限、清理间隔与批量）每轮现取，**热生效**。
+
+关联约束在 schema 里强校验，每一条都对应一个真实故障模式：
+
+| 约束 | 不满足会怎样 |
+| --- | --- |
+| `webhook_inbox_lease_seconds` ≥ 最大的 update 端到端预算 | 租约先到期 → 恢复循环把**仍在执行**的 update 交给第二个 worker → 管理员的 /ban、/unban 回调**被执行两次** |
+| `webhook_inbox_lease_seconds` ≥ `webhook_inbox_retry_max_seconds` | 一次合法重试被恢复循环判成僵尸 |
+| `webhook_http_response_timeout_seconds` ≥ 最大的端到端预算 | handler 还在跑，HTTP 层已断开 → Telegram 重投 |
+| 每条车道并发 ≤ `webhook_max_concurrent_updates` | "独立车道"的隔离承诺不成立（车道比总池还大） |
+| 每条车道队列容量 ≥ 该车道并发 | 队列比 worker 还小 = 立刻丢更新 |
+
+`webhook_max_concurrent_updates` 同时是 webhook 连接池的上限；`polling_*` 只在
+**未启用 webhook** 的兜底轮询下生效。
+
 ---
 
 ## 保持固定的参数（不提供开关）

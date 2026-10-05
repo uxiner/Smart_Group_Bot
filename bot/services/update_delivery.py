@@ -14,6 +14,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.utils.backoff import Backoff, BackoffConfig
 
+from bot.services import policy_runtime
 from bot.config import Settings
 from bot.services.request_priority import ExecutionPriority
 
@@ -56,6 +57,21 @@ _POLLING_STOP_TIMEOUT_SECONDS = 15.0
 _POLLING_TIMEOUT_SECONDS = 15
 _POLLING_HTTP_TIMEOUT_SECONDS = 30
 _POLLING_REQUEST_TIMEOUT_SECONDS = 35.0
+
+
+def polling_limits() -> dict[str, float | int]:
+    """轮询兜底传输的超时（现取配置）。
+
+    aiohttp session 在启动时建一次，所以这三个值是 **restart** 字段——改完要重启。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "timeout_seconds": resources.polling_timeout_seconds,
+        "http_timeout_seconds": resources.polling_http_timeout_seconds,
+        "request_timeout_seconds": resources.polling_request_timeout_seconds,
+        "webhook_max_connections": resources.webhook_max_concurrent_updates,
+    }
 _POLLING_BACKOFF_CONFIG = BackoffConfig(
     min_delay=1.0,
     max_delay=10.0,
@@ -1019,11 +1035,13 @@ async def _run_durable_polling(
                 _await_with_hard_timeout(
                     bot.get_updates(
                         offset=offset,
-                        timeout=_POLLING_TIMEOUT_SECONDS,
+                        timeout=int(polling_limits()["timeout_seconds"]),
                         allowed_updates=allowed_updates,
-                        request_timeout=_POLLING_HTTP_TIMEOUT_SECONDS,
+                        request_timeout=int(
+                            polling_limits()["http_timeout_seconds"]
+                        ),
                     ),
-                    timeout=_POLLING_REQUEST_TIMEOUT_SECONDS,
+                    timeout=float(polling_limits()["request_timeout_seconds"]),
                     operation="getUpdates",
                 ),
                 name="telegram-durable-get-updates",
@@ -1290,7 +1308,9 @@ async def _run_webhook_session(
                     allowed_updates=allowed_updates,
                     drop_pending_updates=False,
                     secret_token=webhook.secret,
-                    max_connections=WEBHOOK_MAX_CONCURRENT_UPDATES,
+                    max_connections=int(
+                        polling_limits()["webhook_max_connections"]
+                    ),
                 ),
                 timeout=_TELEGRAM_CONTROL_TIMEOUT_SECONDS,
                 operation="setWebhook",

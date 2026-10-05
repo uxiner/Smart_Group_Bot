@@ -11,12 +11,28 @@
     "resources.llm_request_normal_capacity",
     "resources.llm_tokenizer_concurrency",
     "resources.pending_reply_execution_capacity",
+    "resources.polling_http_timeout_seconds",
+    "resources.polling_request_timeout_seconds",
+    "resources.polling_timeout_seconds",
     "resources.telegram_noncritical_capacity",
     "resources.telegram_normal_capacity",
     "resources.telegram_total_capacity",
     "resources.tts_private_concurrency",
     "resources.tts_synthesis_concurrency",
-    "resources.tts_transcode_concurrency"
+    "resources.tts_transcode_concurrency",
+    "resources.webhook_auth_concurrent_updates",
+    "resources.webhook_auth_queue_capacity",
+    "resources.webhook_auth_update_timeout_seconds",
+    "resources.webhook_critical_concurrent_updates",
+    "resources.webhook_critical_queue_capacity",
+    "resources.webhook_critical_update_timeout_seconds",
+    "resources.webhook_http_response_timeout_seconds",
+    "resources.webhook_inbox_lease_seconds",
+    "resources.webhook_max_concurrent_updates",
+    "resources.webhook_security_concurrent_updates",
+    "resources.webhook_security_queue_capacity",
+    "resources.webhook_security_update_timeout_seconds",
+    "resources.webhook_update_timeout_seconds"
   ],
   "fields": [
     {
@@ -1437,6 +1453,54 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.polling_http_timeout_seconds",
+      "type": "integer",
+      "default": 30,
+      "bounds": {
+        "ge": 1,
+        "le": 600
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:polling_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.polling_request_timeout_seconds",
+      "type": "number",
+      "default": 35.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 600.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:polling_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.polling_timeout_seconds",
+      "type": "integer",
+      "default": 15,
+      "bounds": {
+        "ge": 1,
+        "le": 300
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:polling_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.search_prune_interval_seconds",
       "type": "integer",
       "default": 21600,
@@ -1565,6 +1629,22 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.telegram_send_chat_parallel",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 32
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/utils/telegram.py:chat_send_parallel"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.telegram_total_capacity",
       "type": "integer",
       "default": 64,
@@ -1672,6 +1752,279 @@
       "unit": "",
       "read_consumers": [
         "bot/services/doubao_tts.py:tts_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_auth_concurrent_updates",
+      "type": "integer",
+      "default": 2,
+      "bounds": {
+        "ge": 1,
+        "le": 256
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_auth_queue_capacity",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_auth_update_timeout_seconds",
+      "type": "number",
+      "default": 45.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 1800.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_critical_concurrent_updates",
+      "type": "integer",
+      "default": 4,
+      "bounds": {
+        "ge": 1,
+        "le": 256
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_critical_queue_capacity",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_critical_update_timeout_seconds",
+      "type": "number",
+      "default": 60.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 1800.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_http_response_timeout_seconds",
+      "type": "number",
+      "default": 155.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 3600.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_cleanup_batch",
+      "type": "integer",
+      "default": 256,
+      "bounds": {
+        "ge": 1,
+        "le": 10000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_cleanup_interval_seconds",
+      "type": "number",
+      "default": 60.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 3600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_lease_seconds",
+      "type": "number",
+      "default": 300.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 3600.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_recovery_batch",
+      "type": "integer",
+      "default": 64,
+      "bounds": {
+        "ge": 1,
+        "le": 5000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_retry_max_seconds",
+      "type": "number",
+      "default": 300.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 3600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_max_concurrent_updates",
+      "type": "integer",
+      "default": 8,
+      "bounds": {
+        "ge": 1,
+        "le": 256
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:polling_limits",
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_security_concurrent_updates",
+      "type": "integer",
+      "default": 4,
+      "bounds": {
+        "ge": 1,
+        "le": 256
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_security_queue_capacity",
+      "type": "integer",
+      "default": 128,
+      "bounds": {
+        "ge": 1,
+        "le": 100000
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_security_update_timeout_seconds",
+      "type": "number",
+      "default": 120.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 1800.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_update_timeout_seconds",
+      "type": "number",
+      "default": 150.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 1800.0
+      },
+      "reload_kind": "restart",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:webhook_budget"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
