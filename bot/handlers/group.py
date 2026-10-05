@@ -2734,8 +2734,9 @@ async def _send_review_handover(
 ) -> int | None:
     """在频道里新发一条交接消息（第一行逐字为 ``header``），@ 上规则调整用的 bot。
 
-    正文以 **mention 实体**（不是纯文本）指向 ``@Ming_GPT_bot``，让 Telegram 认成
-    对该用户的 mention。``mention_tail`` 可覆盖结尾那句（封禁场景要写「无需调整规则」）。
+    正文以 **mention 实体**（不是纯文本）指向 ``moderation.review_handover_mention``
+    配置的那个账号，让 Telegram 认成对该用户的 mention。**没配置（默认空）时完全不发
+    mention 实体**，只发交接文案。``mention_tail`` 可覆盖结尾那句（封禁场景要写「无需调整规则」）。
     best-effort：失败只记日志、返回 None。
     """
 

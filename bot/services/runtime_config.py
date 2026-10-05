@@ -488,6 +488,13 @@ class BotBehaviorConfig(StrictModel):
     memory_event_ttl_days: int = Field(default=30, ge=1, le=365)
     #: 被删除/被替代的事实保留多少天后物理清理
     memory_deleted_retention_days: int = Field(default=30, ge=1, le=365)
+    #: B-39 / P4-9：每日提炼台账的保留期（天）。默认 **1 = 只留当天**。
+    #:
+    #: MEM-001 补的缺口：``BotConfig`` 早有同名字段、``long_term_memory`` 也早有读侧
+    #: ``memory_extract_ledger_retention_days(settings)``，但这一段 schema 里**没有**它，
+    #: 于是 Mini App 存不了、``apply_to_settings`` 也写不下去，读侧永远拿到默认值。
+    #: 这里只补齐闭环，不重做已有实现。
+    memory_extract_ledger_retention_days: int = Field(default=1, ge=1, le=365)
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -1694,6 +1701,11 @@ class RuntimeConfig(StrictModel):
         settings.bot.memory_recall_limit = bot.memory_recall_limit
         settings.bot.memory_event_ttl_days = bot.memory_event_ttl_days
         settings.bot.memory_deleted_retention_days = bot.memory_deleted_retention_days
+        # MEM-001：读侧 ``memory_extract_ledger_retention_days()`` 一直在读这个字段，
+        # 但这里之前从没写过，所以它在运行期恒为默认值。
+        settings.bot.memory_extract_ledger_retention_days = (
+            bot.memory_extract_ledger_retention_days
+        )
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
         settings.bot.proactive_jitter_minutes = bot.proactive_jitter_minutes

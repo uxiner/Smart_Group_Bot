@@ -359,11 +359,18 @@ class CheckinReminderToolTests(_DbTestCase):
     """CLI 工具的端到端行为：真库 + 假 Bot + 假持久调度器。"""
 
     def _settings(self) -> SimpleNamespace:
-        return SimpleNamespace(
+        # 工具现在会走真正的 RuntimeConfigManager 初始化，所以这里给一个真的
+        # Settings（临时库 + 合成主密钥），不能再用缺字段的 SimpleNamespace。
+        from bot.config import Settings
+
+        settings = Settings(
+            _env_file=None,
             database_url=f"sqlite+aiosqlite:///{self._db_path}",
-            bot=SimpleNamespace(token="123456:TEST-TOKEN"),
             bot_token="123456:TEST-TOKEN",
+            config_master_key="checkin-reminder-tool-test-key",
         )
+        settings.bot.token = "123456:TEST-TOKEN"
+        return settings
 
     async def _run_tool(
         self,

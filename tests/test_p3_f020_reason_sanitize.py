@@ -110,6 +110,17 @@ class SanitizeModelReasonTests(unittest.TestCase):
 class HandoverCardReasonTests(unittest.IsolatedAsyncioTestCase):
     """端到端：交接卡上的「判定理由」那一行是净化过的，别的字段一字不动。"""
 
+    async def asyncSetUp(self) -> None:
+        from bot.config import Settings
+        from bot.services import policy_runtime
+
+        # 交接对象默认是空的（公开树不 @ 任何人）；这个文件专门验 mention 实体的
+        # UTF-16 偏移，所以显式配一个合成账号再跑。
+        settings = Settings(_env_file=None)
+        settings.moderation.review_handover_mention = "@your_bot"
+        policy_runtime.bind(settings)
+        self.addCleanup(policy_runtime.unbind)
+
     async def _send(self, reason: str, card: str = ""):
         callback = _callback(card)
         await group._send_review_handover(
@@ -151,7 +162,8 @@ class HandoverCardReasonTests(unittest.IsolatedAsyncioTestCase):
         # mention 实体偏移仍然指向 @your_bot 本身（净化换行不能把它带偏）。
         entities = kwargs["entities"]
         self.assertEqual(len(entities), 1)
-        mention = group._REVIEW_HANDOVER_MENTION
+        mention = group._review_handover_mention()
+        self.assertTrue(mention, "本用例需要显式配置交接对象")
         self.assertEqual(entities[0].type, "mention")
         self.assertEqual(entities[0].length, len(mention))
         utf16 = text.encode("utf-16-le")

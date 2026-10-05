@@ -30,15 +30,26 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from bot.services.model_limits import effective_context_window, loose_budget_tokens
+from bot.utils.budget import (
+    BUSINESS_CONTEXT_TOKENS_MAX,
+    BUSINESS_CONTEXT_TOKENS_MIN,
+)
 from bot.utils.tokens import estimate_text_tokens
 
 #: 统一闸门的默认预算：272K = 278528（全项目统一用这个精确数字）。
 #: **2026-10-04 之后**：``auto`` 模式下这是"查不到模型元数据"时的保守降级值；
 #: 拿到真实窗口时闸门按真实窗口给（见 :func:`context_token_budget`）。
 CONTEXT_TOKEN_BUDGET = 278_528
-#: 夹取范围（与 ``runtime_config`` 里 max_context_tokens 的 ge/le 一致）
-CONTEXT_TOKEN_BUDGET_MIN = 1024
-CONTEXT_TOKEN_BUDGET_MAX = 2_000_000
+#: 夹取范围。**上界取自 :mod:`bot.utils.budget` 这一个来源**（CTX-001）。
+#:
+#: 之前这里写着 2_000_000，而 ``runtime_config`` 的
+#: ``context_budget_tokens`` 上界是 ``BUSINESS_CONTEXT_TOKENS_MAX`` = 16_000_000，
+#: 两处对不上：注释说"与 runtime_config 一致"，实际不一致，于是同一个"上界"在
+#: 文档、UI 与校验三处给出三个答案。现在只留一个来源——``bot.utils.budget``。
+#: 这**不改变**当前可配的 auto/fixed 行为：``context_token_budget()`` 本来就只保
+#: 下限、不按上界截断，所以上界取多少都不影响今天跑出来的结果。
+CONTEXT_TOKEN_BUDGET_MIN = BUSINESS_CONTEXT_TOKENS_MIN
+CONTEXT_TOKEN_BUDGET_MAX = BUSINESS_CONTEXT_TOKENS_MAX
 
 #: 每条消息在预算里额外占的固定开销（角色、时间、发送者、分隔等），与历史装配同口径。
 CONTEXT_MESSAGE_TOKEN_OVERHEAD = 12
@@ -75,8 +86,10 @@ def bounded_context_token_budget(value: Any) -> int:
 def context_token_budget(settings: Any) -> int:
     """当前生效的统一闸门**业务总窗口**（含 272Ki 上限）。
 
-    用户最终口径：每一轮的业务预算是 **272Ki = 278528**，它覆盖 system/人设 + 工具定义
-    + 记忆召回 + 检索留档 + 历史 + 本轮消息 + 工具结果 + 输出预留——**不是只限制历史**。
+    这一轮的业务预算覆盖 system/人设 + 工具定义 + 记忆召回 + 检索留档 + 历史 + 本轮消息
+    + 工具结果 + 输出预留——**不是只限制历史**。默认建议值是 272Ki = 278528
+    （``bot.utils.budget.BUSINESS_CONTEXT_WINDOW_TOKENS``），但**显式配置不被隐藏常量
+    截断**：上界以 :mod:`bot.utils.budget` 为唯一来源。
     模型侧解析出来的真实窗口（1M/4M 都原样记录、原样出现在日志里）只用于"模型更小就
     跟着更小"：
 

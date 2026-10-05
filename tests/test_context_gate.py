@@ -44,12 +44,37 @@ def _contents(messages: list[dict]) -> list[str]:
 
 class BudgetClampTests(unittest.TestCase):
     def test_budget_is_clamped_to_the_same_range_as_runtime_config(self) -> None:
-        self.assertEqual(bounded_context_token_budget(0), 1024)
-        self.assertEqual(bounded_context_token_budget(-5), 1024)
-        self.assertEqual(bounded_context_token_budget(10**9), 2_000_000)
+        """CTX-001：上界的**唯一来源**是 :mod:`bot.utils.budget`。
+
+        之前这里写死 2_000_000，而 ``runtime_config`` 的 ``context_budget_tokens``
+        上界是 ``BUSINESS_CONTEXT_TOKENS_MAX`` = 16_000_000，注释还声称"与
+        runtime_config 一致"——实际不一致，于是同一个上界在文档、UI、校验三处给出三个
+        答案。现在两边必须相等；这条断言就是防止它再分叉。
+        """
+
+        from bot.utils.budget import (
+            BUSINESS_CONTEXT_TOKENS_MAX,
+            BUSINESS_CONTEXT_TOKENS_MIN,
+        )
+        from bot.services.runtime_config import BotBehaviorConfig
+
+        self.assertEqual(CONTEXT_TOKEN_BUDGET_MAX, BUSINESS_CONTEXT_TOKENS_MAX)
+        self.assertEqual(CONTEXT_TOKEN_BUDGET_MIN, BUSINESS_CONTEXT_TOKENS_MIN)
+        self.assertEqual(
+            BotBehaviorConfig().context_budget_tokens.field_metadata
+            and BotBehaviorConfig.model_fields["context_budget_tokens"].metadata[-1].le,
+            BUSINESS_CONTEXT_TOKENS_MAX,
+        )
+        self.assertEqual(bounded_context_token_budget(0), BUSINESS_CONTEXT_TOKENS_MIN)
+        self.assertEqual(bounded_context_token_budget(-5), BUSINESS_CONTEXT_TOKENS_MIN)
+        self.assertEqual(
+            bounded_context_token_budget(10**9), BUSINESS_CONTEXT_TOKENS_MAX
+        )
         self.assertEqual(bounded_context_token_budget("nonsense"), CONTEXT_TOKEN_BUDGET)
         self.assertEqual(bounded_context_token_budget(None), CONTEXT_TOKEN_BUDGET)
         self.assertEqual(bounded_context_token_budget(4096), 4096)
+        # 显式配大是合法的（运维的选择），只是不推荐——这里钉住"不按上界截断"。
+        self.assertEqual(bounded_context_token_budget(4_000_000), 4_000_000)
 
     def test_one_entry_reads_the_live_setting(self) -> None:
         """三条链路必须读同一个数字：这里读 ``bot.max_context_tokens``。"""

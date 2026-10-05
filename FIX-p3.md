@@ -76,7 +76,7 @@ UPDATE moderation_rules SET scan_scope = :scope
 1. **升级表从元组换成带指纹的记录**（`:1844-1876`）
    `_ScanScopeUpgrade` 多了一个 `pattern_fingerprint` 字段，值由
    `moderation_rule_pattern_fingerprint()`（`:1831`）在导入时从
-   `_PRODUCTION_RULE_6_PATTERN`（那条泛化的招募/收买资源类广告正则）算出来。指纹口径 =
+   `_PRODUCTION_RULE_6_PATTERN`（`"探花|招募"`）算出来。指纹口径 =
    `sha256(pattern.strip().casefold())[:16]`：只做 strip + casefold（本地匹配一律带
    `IGNORECASE`，大小写差异本来就不是另一条规则），**不折叠中间空白**（`"a  b"` 与
    `"a b"` 在正则里不等价，宁可对不上也不要误升级别人）。
@@ -104,7 +104,7 @@ UPDATE moderation_rules SET scan_scope = :scope
   `runtime_config.py:1171` 被整对象替换，读起来像是"Mini App 能改"，实际改不动——
   与其留一个假开关，不如放在真正生效的那一层（启动配置，可用
   `LEGACY_SCAN_SCOPE_MIGRATION_ENABLED=false` 覆盖），并在注释里写明这一点。
-- 生产规则正文（那条泛化的招募/收买资源类广告正则）以可读常量留在源码里，指纹由它算出来而不是写死哈希：
+- 生产规则正文（`"探花|招募"`）以可读常量留在源码里，指纹由它算出来而不是写死哈希：
   改内容时哈希自动跟着变，不会出现"改了 pattern 忘了改指纹"这种静默失配。
 
 ### 新增用例
@@ -757,7 +757,7 @@ $ python -m pytest tests/test_tts.py tests/test_runtime_config.py \
 - **卡片其它字段一行没动**：`case` / `群组` / `发送者` / `身份` / `命中规则` / `动作` /
   `置信度` / `送审原文` / `消息回链` / @机器人 提示；
 - **mention 实体的偏移算法没动**，并且新增一条用例专门核对净化换行后 mention 仍然精确
-  落在 `@your_bot` 上（utf-16 偏移反解验证）；
+  落在 `@Ming_GPT_bot` 上（utf-16 偏移反解验证）；
 - **干净的短理由原样保留**，只做空白规范化（`"命中正则规则"` 进卡片还是
   `"命中正则规则"`）；
 - `bot/handlers/group.py:2544` 那个**另一处**读"判定理由"的地方（`_review_card_field`）
@@ -799,7 +799,7 @@ tests/test_p3_f020_reason_sanitize.py:129: AssertionError
 __________ HandoverCardReasonTests.test_reason_taken_from_the_card_is_sanitized_too __________
 
 >       self.assertNotIn("https://t.me/spam", text)
-E       AssertionError: 'https://t.me/spam' unexpectedly found in '🟢 人工放行 · 待调整规则\n\ncase：99\n群组：-100\n发送者：id:12345\n身份：成员\n命中规则：未定位具体规则（AI 语义判定）\n动作：ban\n置信度：0.97\n判定理由：详见 https://t.me/spam\n送审原文：加微信 abc123\n\n请 @your_bot 处理规则调整。'
+E       AssertionError: 'https://t.me/spam' unexpectedly found in '🟢 人工放行 · 待调整规则\n\ncase：99\n群组：-100\n发送者：id:12345\n身份：成员\n命中规则：未定位具体规则（AI 语义判定）\n动作：ban\n置信度：0.97\n判定理由：详见 https://t.me/spam\n送审原文：加微信 abc123\n\n请 @Ming_GPT_bot 处理规则调整。'
 
 tests/test_p3_f020_reason_sanitize.py:172: AssertionError
 ...
@@ -873,13 +873,13 @@ $ python -m pytest tests -q
 ## 独立验证时的修正（由验收方 Hermes 追加，2026-10-05）
 
 **P3-1（F-011）的指纹常量原本取自审计报告的截断转述，与生产库实际不符。**
-本机回读生产 `moderation_rules` 里 id=6 那一行的正文（公开 fork 里已泛化）是 52 字符：
+本机回读生产 `moderation_rules` 里 id=6 那一行的正文是 63 字符：
 
 ```
-(?i)(招募|招收|收|买|收购|出售)[^\n。]{0,12}(资源|视频|账号|设备|脚本|代练)
+(?i)(招募?探花|收探花|探花(视频|资源)|提供设备[^\n。]{0,12}(收|买|收购|结算)|(收|买)探花视频)
 ```
 
-指纹 `2330dcb38ee014e3`；而交付里那条更短的截断转述指纹不同 → 守卫会把**真·生产规则也跳过**，
+指纹 `e9d32f1e00b0e9e2`；而交付里写的 `"探花|招募"` 指纹不同 → 守卫会把**真·生产规则也跳过**，
 迁移在本部署里退化成一跑就跳过的死代码（注释里"生产规则 #6 的规则正文"这句也不成立）。
 
 已修正：`bot/db/engine.py` 与 `tests/test_p3_f011_scan_scope_migration.py` 里同一常量替换为生产真值

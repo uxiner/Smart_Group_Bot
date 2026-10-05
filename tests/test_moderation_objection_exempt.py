@@ -51,11 +51,11 @@ def _service() -> ModerationService:
     return ModerationService(ModerationConfig(high_confidence_threshold=0.9), llm)
 
 
-def _ad_rule(rule_type: str = "regex", scope: str = "message+quote+vision") -> ModerationRule:
+def _tanhua_rule(rule_type: str = "regex", scope: str = "message+quote+vision") -> ModerationRule:
     pattern = (
-        r"(?i)(招募|招收|收|买|收购|出售)[^\n。]{0,12}(资源|视频|账号|设备|脚本|代练)"
+        r"(?i)(招募?探花|收探花|探花(视频|资源)|提供设备[^\n。]{0,12}(收|买|收购|结算)|(收|买)探花视频)"
         if rule_type == "regex"
-        else "招募兼职"
+        else "招募探花"
     )
     return ModerationRule(
         id=6,
@@ -70,9 +70,9 @@ def _ad_rule(rule_type: str = "regex", scope: str = "message+quote+vision") -> M
 
 QUOTED_AD = (
     "v\n[external_reply_chat] id:-1000000000003 username:@demo_channel title:Demo Channel\n"
-    "[reply_quote] 招募兼职 提供设备 收账号脚本9000一单"
+    "[reply_quote] 招募探花 提供设备 收探花视频9000一单"
 )
-VISION_AD = "[image]\n[image-vision]\n图中海报写着：招募兼职 提供设备 收账号脚本9000一单"
+VISION_AD = "[image]\n[image-vision]\n图中海报写着：招募探花 提供设备 收探花视频9000一单"
 
 
 class ObjectionExemptionTests(unittest.IsolatedAsyncioTestCase):
@@ -83,18 +83,18 @@ class ObjectionExemptionTests(unittest.IsolatedAsyncioTestCase):
         """引用广告 + 本人在警示骗子 → 不追究（回归：曾经会被封）。"""
 
         for own in ("这是骗子别信", "别信这个 是诈骗", "举报他 别上当", "假的吧 避雷"):
-            verdict = await self._evaluate(f"{own}\n{QUOTED_AD}", _ad_rule())
+            verdict = await self._evaluate(f"{own}\n{QUOTED_AD}", _tanhua_rule())
             self.assertFalse(verdict.violated, msg=f"「{own}」+ 引用广告不该被判违规")
 
     async def test_warning_about_vision_ad_is_exempt(self) -> None:
-        verdict = await self._evaluate(f"别信这个\n{VISION_AD}", _ad_rule())
+        verdict = await self._evaluate(f"别信这个\n{VISION_AD}", _tanhua_rule())
         self.assertFalse(verdict.violated)
 
     async def test_plain_repost_of_quoted_ad_is_still_caught(self) -> None:
         """只回 v 搬运引用里的广告 → 照抓（豁免不能变成漏洞）。"""
 
         for own in ("v", "+1", "？", "看看"):
-            verdict = await self._evaluate(f"{own}\n{QUOTED_AD}", _ad_rule())
+            verdict = await self._evaluate(f"{own}\n{QUOTED_AD}", _tanhua_rule())
             self.assertTrue(verdict.violated, msg=f"「{own}」+ 引用广告必须被抓")
             self.assertEqual(verdict.match_source, MATCH_SOURCE_QUOTE)
 
@@ -102,27 +102,27 @@ class ObjectionExemptionTests(unittest.IsolatedAsyncioTestCase):
         """广告出现在他自己的正文里 → 就算写着"别信"也不豁免。"""
 
         verdict = await self._evaluate(
-            "招募兼职 提供设备 收账号脚本9000一单（别信这个啊）", _ad_rule()
+            "招募探花 提供设备 收探花视频9000一单（别信这个啊）", _tanhua_rule()
         )
         self.assertTrue(verdict.violated)
         self.assertEqual(verdict.match_source, "own")
 
     async def test_keyword_rule_also_exempts(self) -> None:
-        verdict = await self._evaluate(f"骗子 别信\n{QUOTED_AD}", _ad_rule("keyword"))
+        verdict = await self._evaluate(f"骗子 别信\n{QUOTED_AD}", _tanhua_rule("keyword"))
         self.assertFalse(verdict.violated)
-        verdict2 = await self._evaluate(f"v\n{QUOTED_AD}", _ad_rule("keyword"))
+        verdict2 = await self._evaluate(f"v\n{QUOTED_AD}", _tanhua_rule("keyword"))
         self.assertTrue(verdict2.violated)
 
     async def test_message_scope_rule_never_sees_quote(self) -> None:
         """范围还是 message 的规则，不受这次豁免影响（本来就不看引文）。"""
 
-        verdict = await self._evaluate(QUOTED_AD, _ad_rule(scope="message"))
+        verdict = await self._evaluate(QUOTED_AD, _tanhua_rule(scope="message"))
         self.assertFalse(verdict.violated)
 
     async def test_normal_quote_still_passes(self) -> None:
         verdict = await self._evaluate(
             "笑死\n[reply_to_user] id:1 name:某人\n[reply_to:text] 今天群里引流的太多了",
-            _ad_rule(),
+            _tanhua_rule(),
         )
         self.assertFalse(verdict.violated)
 

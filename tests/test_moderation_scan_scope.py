@@ -127,7 +127,7 @@ class SplitModerationTextTests(unittest.TestCase):
             "图为88VIP音乐会员页面，含专属秒杀\n"
             "以及精选活动信息。\n"
             "[reply_to_user] id:100000001 username:@owner_demo\n"
-            "[reply_to:text] 兼职招募 加V\n"
+            "[reply_to:text] 探花招募族 加V\n"
             "[reply_quote] 秒杀 优惠券"
         )
         segments = split_moderation_text(raw)
@@ -136,7 +136,7 @@ class SplitModerationTextTests(unittest.TestCase):
             segments.vision, "图为88VIP音乐会员页面，含专属秒杀\n以及精选活动信息。"
         )
         # 身份标记（用户名/ID）整行丢弃，正文标记只剥标记本身。
-        self.assertEqual(segments.quote, "兼职招募 加V\n秒杀 优惠券")
+        self.assertEqual(segments.quote, "探花招募族 加V\n秒杀 优惠券")
         self.assertNotIn("100000001", segments.own + segments.quote + segments.vision)
 
     def test_external_reply_markers_are_quote_content(self) -> None:
@@ -358,7 +358,7 @@ _LEGACY_RULES = (
     # 规则正文**必须**与 `bot/db/engine.py` 里那条生产规则的真值一致：F-011 之后升级要
     # 核对内容指纹，fixture 自己编一个正文就会让这两条用例变成"测一个不存在的部署"。
     (6, -100, "regex", _PRODUCTION_RULE_6_PATTERN, "ban", 1),
-    (7, -100, "regex", "兼职接单", "warn", 1),
+    (7, -100, "regex", "探花", "warn", 1),
 )
 
 

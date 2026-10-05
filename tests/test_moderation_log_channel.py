@@ -440,7 +440,7 @@ class LogChannelEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 message=_message(user_id=MEMBER_ID),
                 settings=_settings(),
-                verdict=_verdict(action="ban", rule_id=6, pattern="兼职招募"),
+                verdict=_verdict(action="ban", rule_id=6, pattern="招募探花"),
             )
 
         begin.assert_awaited_once()

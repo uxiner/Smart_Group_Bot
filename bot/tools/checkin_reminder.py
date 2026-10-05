@@ -8,8 +8,8 @@
 
 用法（容器内）：
 
-    docker exec smart_group_bot-bot-1 python -m bot.tools.checkin_reminder --slot 9
-    docker exec smart_group_bot-bot-1 python -m bot.tools.checkin_reminder --slot 9 --dry-run
+    docker compose exec bot python -m bot.tools.checkin_reminder --slot 9
+    docker compose exec bot python -m bot.tools.checkin_reminder --slot 9 --dry-run
 
 ``--slot`` 按**本地（Asia/Shanghai）时段**取值 9/12/15/18。本工具**不判断现在几点**：
 要不要发完全由 cron 决定，它只按 ``--slot`` 发。``--dry-run`` 只打印文案与目标群，
@@ -52,6 +52,7 @@ from aiogram import Bot
 
 from bot.config import Settings
 from bot.db.engine import init_db
+from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.checkin import local_today
 from bot.services.checkin_reminder import (
     reminder_auto_delete_seconds,
@@ -109,6 +110,14 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
 
     settings = Settings()
     engine, session_factory = await init_db(settings.database_url)
+    # 提醒时段、自动删除秒数、按钮文案都是运行时配置，**必须**走现有的
+    # RuntimeConfigManager 初始化再读——不能直接吃 schema 默认值，否则改了
+    # Mini App 里的 checkin_reminder.* 之后 CLI 仍按旧值发。
+    runtime_config = RuntimeConfigManager(
+        session_factory=session_factory,
+        settings=settings,
+    )
+    await runtime_config.initialize()
     sent = 0
     failed = 0
     try:
@@ -117,6 +126,13 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
             if not group_ids:
                 print("没有授权群，跳过")
                 return 0
+            if slot not in reminder_slots():
+                # 运行时配置可能在进程启动之后被改过：这里再按生效值确认一次。
+                print(
+                    f"--slot {slot} 不在当前生效的提醒时段里："
+                    f"{'/'.join(str(s) for s in reminder_slots())}"
+                )
+                return 1
             key = slot_key(local_today(), slot)
             if dry_run:
                 # 只渲染不发送、不占位：验证文案/目标群时用它，别拿真群当试验场
