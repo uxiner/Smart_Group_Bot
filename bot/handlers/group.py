@@ -4512,8 +4512,8 @@ async def _build_vision_data_uri(
 # 里的 vision_describe），只在提示词末尾追加一条结构化要求，不新增任何模型调用。
 # 视频（video / video_caption / video_note）本体不进文本流水线，改为拿 Telegram
 # 提供的缩略图单独判定一次；拿不到缩略图就什么都不做，只记日志。**不设群限制**：
-# 跟随 moderation.nsfw_image_guard_enabled，与群内 av_enabled 无关（机器人自己也
-# 永远不在任何群里发这类媒体）。
+# 跟随 moderation.nsfw_image_guard_enabled（**默认关闭 / opt-in**，需运维显式打开），
+# 与群内 av_enabled 无关（机器人自己也永远不在任何群里发这类媒体）。
 # 宁可漏判，不可误伤：只有模型明确回 NSFW_YES 才处置，其余（NSFW_NO /
 # NSFW_UNKNOWN / 解析不到 / 拒答 / 视觉失败）一律什么都不做，只记日志。
 # ---------------------------------------------------------------------------
@@ -4565,7 +4565,8 @@ _NSFW_GUARD_IMAGE_TYPES = frozenset(
 )
 #: 视频类消息：本体不进文本流水线，只拿 Telegram 提供的缩略图做 NSFW 判定
 #: （``message.video.thumbnail`` / ``message.video_note.thumbnail``）。**不设群限制**，
-#: 跟随图片守卫的 ``moderation.nsfw_image_guard_enabled``，与群内 ``av_enabled`` 无关。
+#: 跟随图片守卫的 ``moderation.nsfw_image_guard_enabled``（同样默认关闭 / opt-in），
+#: 与群内 ``av_enabled`` 无关。
 _NSFW_GUARD_VIDEO_TYPES = frozenset({"video", "video_caption", "video_note"})
 #: 群里「/av + 图片」由 commands.py 的「先删图再识图」流程负责，这里跳过，别打架。
 
@@ -4658,14 +4659,16 @@ def _has_guardable_image(message: Message) -> bool:
 
 
 def _nsfw_image_guard_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.nsfw_image_guard_enabled``（默认开启）。
+    """运行时可开关：``moderation.nsfw_image_guard_enabled``（默认关闭 / opt-in）。
+
+    缺字段（老 payload / 老 Settings）一律按**关闭**处理——宁可漏判，不可误伤。
 
     审核总开关关闭时本功能同样不生效——质询本身就依赖审核与真人验证配置。
     """
     moderation = getattr(settings, "moderation", None)
     if moderation is None or not bool(getattr(moderation, "enabled", False)):
         return False
-    return bool(getattr(moderation, "nsfw_image_guard_enabled", True))
+    return bool(getattr(moderation, "nsfw_image_guard_enabled", False))
 
 
 def _nsfw_image_guard_applies(
@@ -7715,10 +7718,13 @@ _QUOTE_WARNING_MARKERS = (
 
 
 def _punish_quoted_author_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.punish_quoted_author_enabled``（默认开启）。"""
+    """运行时可开关：``moderation.punish_quoted_author_enabled``（默认关闭 / opt-in）。
+
+    缺字段（老 payload / 老 Settings）按**关闭**处理，即旧版行为。
+    """
 
     moderation = getattr(settings, "moderation", None)
-    return bool(getattr(moderation, "punish_quoted_author_enabled", True))
+    return bool(getattr(moderation, "punish_quoted_author_enabled", False))
 
 
 def _quoted_author_max_age_seconds(settings: Settings) -> int:
@@ -8071,7 +8077,8 @@ async def _punish_quoted_author(
 # 其余管理员（sender_is_tg_admin and not sender_is_owner）照常判定；命中违规时
 # 只做「删消息 + 群内 @警示 + 记违规」，不质询、不封禁、不禁言、不扣分，也不会
 # 被累计次数升级成 ban。手动豁免名单（/aiexempt）仍然整段跳过；关闭
-# admin_moderation_enabled 即回到旧行为（整段跳过）。
+# admin_moderation_enabled 即回到旧行为（整段跳过）——该开关**默认关闭 /
+# opt-in**，需运维显式打开。
 #
 # D2：命中后 best-effort 私聊最高管理员一份完整证据（含原文/规则/置信度/动作，
 # 带图附图片）；同一人 10 分钟内 ≥5 次后合并成一条汇总，避免刷屏。
@@ -8115,10 +8122,13 @@ class _AdminViolationEvidence:
 
 
 def _admin_moderation_enabled(settings: Settings) -> bool:
-    """运行时可开关：``moderation.admin_moderation_enabled``（默认开启）。"""
+    """运行时可开关：``moderation.admin_moderation_enabled``（默认关闭 / opt-in）。
+
+    缺字段（老 payload / 老 Settings）按**关闭**处理，即"整段跳过"的旧行为。
+    """
 
     moderation = getattr(settings, "moderation", None)
-    return bool(getattr(moderation, "admin_moderation_enabled", True))
+    return bool(getattr(moderation, "admin_moderation_enabled", False))
 
 
 def _admin_alert_enabled(settings: Settings) -> bool:

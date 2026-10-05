@@ -329,25 +329,28 @@ class ModerationConfig(BaseModel):
     bot_screening_message_count: int = 5
     # 群内公开发布露骨色情图片（色情/裸露）→ 删图 + 群内 @警告 + 质询。
     # 判定复用审核链路本来就有的那次视觉调用（不新增模型调用）。
-    # F-024：默认**关闭**（opt-in）。这是对用户可见的执法行为，必须由运维显式
-    # 开启；开启状态会在启动日志里列出。关闭后不做判定（提示词里也不加 NSFW
+    # F-024 / 用户裁定（2026-10）：默认**关闭**（opt-in）。这是对用户可见的执法
+    # 行为，必须由运维显式开启；开启状态会在启动日志里逐条列出（见
+    # ``log_enforcement_switch_state``）。关闭后不做判定（提示词里也不加 NSFW
     # 要求）也不做任何处置——即旧版本行为。
-    # 默认开启：NSFW 图片/视频是任何群的底线，不允许因"默认值"被关掉。
-    nsfw_image_guard_enabled: bool = True
+    # 生产环境必须显式打开，否则 NSFW 图片处置不再发生（详见 README 与
+    # FIX-p2-product.md 的"生产侧需要显式做哪些配置"）。
+    nsfw_image_guard_enabled: bool = False
     # 广告经「引用/转发」再次传播时，被引用那条消息的原作者同样按规则处置
     # （删除其消息 + 记违规 + 既有质询/禁言流程）。
-    # F-024：默认**关闭**（opt-in）。默认开启等于升级后静默扩大执法范围（最长
-    # 7 天禁言），所以改为由运维显式选择；关闭后行为与旧版完全一致。
-    # 默认开启：引用/转发广告连坐原作者，是防绕过的必需项（F-001）。
-    punish_quoted_author_enabled: bool = True
+    # F-024 / 用户裁定（2026-10）：默认**关闭**（opt-in）。默认开启等于升级后静默
+    # 扩大执法范围（最长 7 天禁言），所以由运维显式选择；关闭后行为与旧版完全
+    # 一致。
+    # 生产环境必须显式打开（运行时配置项 ``moderation.punish_quoted_author_enabled``）。
+    punish_quoted_author_enabled: bool = False
     # 被引用消息超过该时长（秒）就不再追溯原作者，只记日志。默认 7 天。
     quoted_author_max_age_seconds: int = 7 * 24 * 60 * 60
     # 管理员/群主不再豁免日常审核：照常判定，命中后只删消息 + 群内 @警示 + 记违规，
     # 不质询/不封禁/不禁言/不累计警告。
-    # F-024：默认**关闭**（opt-in，即回到"整段跳过"的旧行为）——对管理员/群主
-    # 开始执法属于可见的策略变更，应由运维显式决定。
-    # 默认开启：管理员命中犯规同样走审核 + 证据卡人工放行。
-    admin_moderation_enabled: bool = True
+    # F-024 / 用户裁定（2026-10）：默认**关闭**（opt-in，即回到"整段跳过"的旧
+    # 行为）——对管理员/群主开始执法属于可见的策略变更，应由运维显式决定。
+    # 生产环境必须显式打开（运行时配置项 ``moderation.admin_moderation_enabled``）。
+    admin_moderation_enabled: bool = False
     # 管理员命中违规时，私聊最高管理员一份完整证据（best-effort，不刷屏）。默认开启。
     admin_alert_super_admin_enabled: bool = True
     # 审核命中证据投递到「审核日志」频道（取代私聊最高管理员）：群里所有被处置
@@ -1492,6 +1495,9 @@ def log_enforcement_switch_state(settings: Settings) -> None:
     这三个开关都是 opt-in（默认关闭）。只要有一个是开启的，就用 WARNING 明确
     列出来，因为每一个都会直接改变群成员看到的行为；全部关闭时记一条 INFO，
     说明当前是旧版行为，运维想开启去哪里开。
+
+    代码默认值（``ModerationConfig`` / ``ModerationSettingsConfig``）与这里的文案
+    必须一致：默认关闭，"生产要开"是部署侧的动作，不是代码默认值。
     """
 
     moderation = getattr(settings, "moderation", None)

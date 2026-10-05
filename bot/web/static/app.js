@@ -1004,10 +1004,10 @@
             ${field("moderation.challenge_timeout_seconds", "ban 质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
-            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
-            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
+            ${toggle("moderation.nsfw_image_guard_enabled", "群内色情图片处置", "默认关闭（opt-in），需在此显式打开。复用图片描述那次视觉调用判定露骨色情图：删图 + 群内 @警告（2 分钟后自动删）+ 质询；只处理图片（贴纸不碰），带 /av 的图片由识图流程负责")}
+            ${toggle("moderation.punish_quoted_author_enabled", "处罚被引用的原作者", "默认关闭（opt-in），需在此显式打开。引用/转发内容命中 ban 规则且高置信度时，连同被引用消息的原作者一起处置（删其消息 + 记违规 + 质询）；原作者是管理员/群主/豁免用户或属于警示式引用时跳过。关闭后只处理转发者")}
             ${field("moderation.quoted_author_max_age_seconds", "引用追溯上限（秒）", { type: "number", min: 0, max: 31536000, step: 1, required: true, hint: "被引用消息超过该时长不再追溯原作者（只记日志），默认 604800 秒 = 7 天" })}
-            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
+            ${toggle("moderation.admin_moderation_enabled", "管理员也走审核", "默认关闭（opt-in），需在此显式打开。除最高管理员外的管理员/群主不再整段跳过：照常判定，命中后只删消息 + 群内 @警示 + 记违规，不质询/不封禁/不禁言/不累计警告；最高管理员与手动豁免名单仍然完全跳过。关闭即回到旧行为")}
             ${toggle("moderation.admin_alert_super_admin_enabled", "管理员违规私聊证据", "管理员命中违规时私聊最高管理员完整证据（对象/时间/规则/置信度/理由/送审原文/已执行动作，带图附图片，best-effort 不刷屏）；普通成员违规不发")}
           </div>
         </section>
