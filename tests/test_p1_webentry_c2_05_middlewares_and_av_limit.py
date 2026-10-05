@@ -288,21 +288,28 @@ class AVPrivateRateLimiterTests(unittest.TestCase):
         self.assertEqual(limiter.blocked(0), (False, 0))
 
     def test_the_idle_user_ceiling_does_not_grow_without_bound(self) -> None:
-        """``_drop_idle_users`` 只清**已过期**的队列；活跃用户不受影响。"""
+        """``max_users`` 是**硬上限**（B-05）：活跃用户也挤不进去，且不因此被拒。
+
+        合并（P1-2 的 B-05 + P1-3 的 C2-05）前的写法断言「字典按人数增长」是预期行为，
+        那正是 B-05 判定的缺陷；现在字典满且腾不出位置时**不建新桶**，
+        调用方按「不计数」处理，所以既要守住上界，也要保证限流器自身绝不挡人。
+        """
 
         now = [1000.0]
         limiter = AVPrivateRateLimiter(
             limit=5, window_seconds=60.0, max_users=16, clock=lambda: now[0]
         )
         for user_id in range(1, 201):  # 0 是匿名发送者，不占槽
-            limiter.allow(user_id)
-        # 同一时刻进来的都是活跃用户，字典按人数增长是预期行为。
-        self.assertEqual(len(limiter._hits), 200)
+            allowed, retry_after = limiter.allow(user_id)
+            self.assertTrue(allowed, "限流器自身不得拒绝请求")
+            self.assertEqual(retry_after, 0)
+        # 同一时刻进来的都是活跃用户：腾不出位置 → 不建桶，字典停在上界。
+        self.assertLessEqual(len(limiter._hits), 16)
 
-        # 窗口过去之后，它们变成 idle，下一轮新建用户时才会被回收。
+        # 窗口过去之后，它们变成 idle，下一轮新建用户时会被全部回收。
         now[0] += 120.0
         limiter.allow(9999)
-        self.assertLessEqual(len(limiter._hits), 16)
+        self.assertEqual(len(limiter._hits), 1, "过期用户应被回收，只留新桶")
 
     def test_rate_limit_minutes_rounds_up_and_never_returns_zero(self) -> None:
         self.assertEqual(rate_limit_minutes(0), 1)

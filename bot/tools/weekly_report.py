@@ -249,7 +249,12 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
             await bot.session.close()
     finally:
         await engine.dispose()
-    return 1 if failed else 0
+    #: 退出码语义（B-26 与 F-026 合并后的口径）：
+    #: - 只因为「本周已发过」而跳过的目标**不算**失败（cron 重叠 / 手工重跑不该告警）；
+    #: - 真发失败（failed）算失败；
+    #: - 有群连报表都渲染不出来（failed_groups）且这次**一份都没发出去**才算失败；
+    #:   部分群投递成功时返回 0，避免把「个别群炸了」变成每周一次的告警噪音。
+    return 1 if failed or (failed_groups and sent == 0) else 0
 
 
 def main(argv: list[str] | None = None) -> int:

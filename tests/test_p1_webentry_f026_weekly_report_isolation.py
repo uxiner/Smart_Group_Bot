@@ -59,9 +59,23 @@ class WeeklyReportPerGroupIsolationTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("boom: 这个群的报表炸了")
             return f"群 {group_id} 的周报"
 
+        class _Session:
+            """够用的假会话：B-26 的周报占位要走 ``session.execute(...)``。
+
+            合并（P1-2 + P1-3）前这个替身只有 commit/rollback，因为当时发送路径
+            不碰数据库；占位逻辑进来之后必须让它能回答「这个 (目标, 周) 还没占过」。
+            """
+
+            def __init__(self) -> None:
+                self.commit = AsyncMock()
+                self.rollback = AsyncMock()
+
+            async def execute(self, *_args, **_kwargs):
+                return SimpleNamespace(scalar_one_or_none=lambda: (1,))
+
         class _Ctx:
             async def __aenter__(self):
-                return SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+                return _Session()
 
             async def __aexit__(self, *exc):
                 return None
