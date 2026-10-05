@@ -14,6 +14,7 @@ from functools import wraps
 from typing import Annotated, Any, Literal
 
 from aiohttp import web
+from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -209,6 +210,13 @@ _GROUP_UPDATE_LOCKS: dict[int, asyncio.Lock] = {}
 #: 免得这个模块级字典随授权群数单调增长（A-10）。
 _GROUP_UPDATE_LOCK_WAITERS: dict[int, int] = {}
 _JSON_BODY_TIMEOUT_SECONDS = 5.0
+#: D3-22 / P4-8：请求体大小上界。**默认值与今天完全一致**——``verify_web``
+#: 建 app 时用的就是 ``client_max_size=_WEB_MAX_REQUEST_BYTES = 1 MiB``，这里只是把
+#: 同一条上界在 handler 里显式再挡一次（并在超限时立刻拒绝，不去缓冲正文），
+#: 同时把 aiohttp 抛的 ``HTTPRequestEntityTooLarge``（纯文本 413）换成与其它接口
+#: 一致的 JSON 错误信封。真正的「流式」上界由 aiohttp 的 ``client_max_size`` 兜底
+#: （没有 Content-Length 的分块请求由它拦住）。
+_JSON_BODY_MAX_BYTES = 1024 * 1024
 _JSON_BODY_CANCEL_GRACE_SECONDS = 0.1
 _JSON_BODY_ORPHAN_LIMIT = 32
 _JSON_BODY_ORPHANS: set[asyncio.Task[Any]] = set()
@@ -535,13 +543,24 @@ def _track_json_body_orphan(task: asyncio.Task[Any]) -> None:
 
 
 async def _read_request_json(request: web.Request) -> Any:
-    """Read one JSON body with a hard caller-visible deadline.
+    """Read one JSON body with a hard caller-visible deadline and a size bound.
 
     ``asyncio.wait_for`` can wait indefinitely for a coroutine that suppresses
     cancellation.  The request handler must still return 408 at the configured
     deadline; a misbehaving body reader is retired separately and bounded.
+
+    ``Content-Length`` 在开读之前就被检查（D3-22）：超限直接 413，不会把正文读进
+    进程内存；没有 Content-Length 的分块请求由 aiohttp 的 ``client_max_size``
+    （同一条 1 MiB 上界）兜底。
     """
 
+    declared = getattr(request, "content_length", None)
+    if declared is not None and int(declared) > max(0, int(_JSON_BODY_MAX_BYTES)):
+        raise _APIError(
+            413,
+            "request_too_large",
+            "请求体过大，请缩小后再试。",
+        )
     if len(_JSON_BODY_TASKS) >= _JSON_BODY_ORPHAN_LIMIT:
         raise _APIError(
             503,
@@ -590,6 +609,13 @@ async def _read_request_json(request: web.Request) -> Any:
 async def _json_object(request: web.Request) -> dict[str, Any]:
     try:
         body = await _read_request_json(request)
+    except HTTPRequestEntityTooLarge as exc:
+        # D3-22：aiohttp 的流式上界命中。换成与其它接口一致的 JSON 错误信封。
+        raise _APIError(
+            413,
+            "request_too_large",
+            "请求体过大，请缩小后再试。",
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise _APIError(400, "invalid_json", "请求体必须是有效的 JSON。") from exc
     if not isinstance(body, dict):
