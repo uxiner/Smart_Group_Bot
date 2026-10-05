@@ -465,13 +465,42 @@ def shutdown_logging(*, timeout: float = _LISTENER_STOP_TIMEOUT_SECONDS) -> bool
 
 
 def configure_logging(*, force: bool = False, config: Any | None = None) -> None:
-    """Configure a compact, context-aware logging pipeline."""
-    global _ATEXIT_REGISTERED, _LOG_LISTENER, _LOG_QUEUE_HANDLER, _LOG_SINK_HANDLERS
-    global _MESSAGE_PREVIEW_CHARS
+    """Configure a compact, context-aware logging pipeline.
+
+    A-23 / P4-4：替换 root handler 的**整段**是原子的，见
+    ``_configure_logging_locked`` 的说明。
+    """
 
     root = logging.getLogger()
     if root.handlers and not force:
         return
+    with _LOGGING_STATE_LOCK:
+        _configure_logging_locked(force=force, config=config, root=root)
+
+
+def _configure_logging_locked(
+    *,
+    force: bool,
+    config: Any | None,
+    root: logging.Logger,
+) -> None:
+    """退役旧 sink、建新 pipeline、摘挂 root handler、发布全局状态（**全程持锁**）。
+
+    改前这段只有开头（reaper 检查）和结尾（发布状态）两小段持锁，中间建
+    listener、``root.handlers.clear()`` / ``addHandler``、关旧 handler 全是裸的。
+    两个线程同时 ``force=True``（例如 Mini App 热更新设置撞上关停期的重配置）
+    会各自建一套 listener，然后往同一个 stdout 交错写——旧 sink 的半行和新 sink
+    的半行会拼成一条**从未发生过**的记录，排障时日志与事实对不上；被关掉的还是
+    另一套正在用的 handler。
+
+    ``_LOGGING_STATE_LOCK`` 是 RLock，本函数内部的 ``shutdown_logging()`` 会重入
+    它，所以整段一把锁住是安全的（reaper 线程只在 finally 里短暂取锁，不会与
+    本函数互等）。函数体里原有的两处 ``with _LOGGING_STATE_LOCK:`` 保留，它们在
+    锁内是空操作。
+    """
+
+    global _ATEXIT_REGISTERED, _LOG_LISTENER, _LOG_QUEUE_HANDLER, _LOG_SINK_HANDLERS
+    global _MESSAGE_PREVIEW_CHARS
 
     if force:
         with _LOGGING_STATE_LOCK:
