@@ -656,6 +656,9 @@ def hcaptcha_key_configuration_issue(
 
 class TTSSettingsConfig(StrictModel):
     enabled: bool = False
+    # F-022: 显式 provider 选择（``doubao`` / ``edge``）。留空（默认）= 沿用隐式
+    # 兼容口径：豆包凭据齐全走豆包，否则按 ``speaker`` 的形状判断是不是 Edge 音色。
+    provider: Literal["", "doubao", "edge"] = ""
     http_timeout_sec: float = Field(default=20.0, ge=1.0, le=300.0)
     max_text_length: int = Field(default=500, ge=1, le=10000)
     api_base: str = Field(default="https://openspeech.bytedance.com", max_length=1000)
@@ -1205,6 +1208,7 @@ class RuntimeConfig(StrictModel):
 
         tts = self.tts
         settings.doubao_tts_enabled = tts.enabled
+        settings.doubao_tts_provider = tts.provider
         settings.doubao_tts_http_timeout_sec = tts.http_timeout_sec
         settings.doubao_tts_max_text_length = tts.max_text_length
         settings.doubao_tts_api_base = tts.api_base
@@ -2420,6 +2424,7 @@ def build_legacy_runtime_config(
         ),
         tts=TTSSettingsConfig(
             enabled=settings.doubao_tts_enabled,
+            provider=str(getattr(settings, "doubao_tts_provider", "") or "").strip().lower(),
             http_timeout_sec=settings.doubao_tts_http_timeout_sec,
             max_text_length=settings.doubao_tts_max_text_length,
             api_base=settings.doubao_tts_api_base,

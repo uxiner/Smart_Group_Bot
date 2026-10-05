@@ -18,7 +18,8 @@ colorama==0.4.6 ; sys_platform == 'win32'
 cryptography==50.0.0
 ddgs==9.14.4
 distro==1.9.0
-# Local (non-uv) additions kept in step with production; see README「本地调整」.
+# F-022: edge-tts is declared in pyproject.toml and pinned in uv.lock too, so the
+# two lock files no longer diverge (it used to be a local-only addition).
 edge-tts==7.2.8
 fake-useragent==2.2.0
 fastapi==0.139.2

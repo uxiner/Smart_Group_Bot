@@ -3121,13 +3121,96 @@ def _render_member_profile(profile: MemberProfile) -> str:
     return "\n".join(lines)
 
 
+# F-031：``/rank`` 会做一次**全历史聚合**（签到流水 + 奖励流水 + 消费流水，
+# ``/rank week`` 还要再按本周窗口过滤一遍）。原来既无冷却也无缓存：任何成员都能
+# 反复触发，数据库负载与处理耗时随触发次数线性放大（对比同文件 ``cmd_report``
+# 早就有的 ``_REPORT_COOLDOWN_SECONDS = 90``）。
+#
+# 两道闸，作用域不同、互不替代：
+#   * **冷却**按 ``(群, 成员)``：10 秒内再发只回一句友好提示，**不聚合**也不消耗
+#     任何查询（掐掉"连发刷榜"这种最脏的触发方式）。
+#   * **短缓存**按 ``(群, 模式, 成员)``，60 秒：冷却过去之后同一个人再发仍然**不
+#     聚合**，直接复用上一次的结果。
+#
+# 缓存为什么带 ``user_id``：``RankBoard`` 里的 ``caller_rank`` / ``caller_points`` /
+# ``caller_available`` 是**调用者自己**的（他可能根本不在 Top10 里），跨成员共用一份
+# 榜会把 A 的名次报给 B。所以只复用"同一个人 + 同一个口径"的结果；不为了多复用一点
+# 而去改 ``build_rank_board`` 的口径（那是拿正确性换性能）。
+_RANK_COOLDOWN_SECONDS = 10
+_RANK_CACHE_TTL_SECONDS = 60
+#: 两个字典的硬上限（超过先清过期条目；清不空就继续丢最旧的，内存优先）。
+_RANK_COOLDOWN_MAX_ENTRIES = 512
+_RANK_CACHE_MAX_ENTRIES = 512
+_rank_cooldown: dict[tuple[int, int], float] = {}
+_rank_cache: dict[tuple[int, bool, int], tuple[float, RankBoard]] = {}
+
+
+def _rank_prune(now: float) -> None:
+    """把两个字典收回各自的硬上限：先清过期条目，再丢最早的（内存优先）。
+
+    和 ``bot/services/moderation_throttle.py`` 的 B-05 一样，上限是**真的**上界，
+    不是"触发一次清理的机会"——清不空就继续丢最旧的。
+    """
+
+    cutoff = now - _RANK_CACHE_TTL_SECONDS
+    for stale in [
+        key
+        for key, (cached_at, _board) in _rank_cache.items()
+        if cached_at < cutoff
+    ]:
+        _rank_cache.pop(stale, None)
+    cooldown_cutoff = now - _RANK_COOLDOWN_SECONDS
+    for stale in [
+        key for key, seen_at in _rank_cooldown.items() if seen_at < cooldown_cutoff
+    ]:
+        _rank_cooldown.pop(stale, None)
+    while len(_rank_cache) > _RANK_CACHE_MAX_ENTRIES:
+        _rank_cache.pop(min(_rank_cache, key=lambda key: _rank_cache[key][0]), None)
+    while len(_rank_cooldown) > _RANK_COOLDOWN_MAX_ENTRIES:
+        _rank_cooldown.pop(
+            min(_rank_cooldown, key=lambda key: _rank_cooldown[key]), None
+        )
+
+
+def _rank_cooldown_remaining(group_id: int, user_id: int) -> int:
+    """Seconds this member must wait before /rank works again (0 = allowed)."""
+
+    key = (int(group_id), int(user_id))
+    remaining = _RANK_COOLDOWN_SECONDS - (time.monotonic() - _rank_cooldown.get(key, 0.0))
+    return int(remaining) + 1 if remaining > 0 else 0
+
+
+def _rank_cached_board(
+    group_id: int, *, week: bool, user_id: int, now: float
+) -> RankBoard | None:
+    entry = _rank_cache.get((int(group_id), bool(week), int(user_id)))
+    if entry is None:
+        return None
+    cached_at, board = entry
+    if now - cached_at > _RANK_CACHE_TTL_SECONDS:
+        _rank_cache.pop((int(group_id), bool(week), int(user_id)), None)
+        return None
+    return board
+
+
+def _rank_store_board(
+    group_id: int, *, week: bool, user_id: int, board: RankBoard, now: float
+) -> None:
+    _rank_cache[(int(group_id), bool(week), int(user_id))] = (now, board)
+    if len(_rank_cache) > _RANK_CACHE_MAX_ENTRIES:
+        _rank_prune(now)
+
+
 @router.message(Command("rank"))
 async def cmd_rank(
     message: Message,
     session: AsyncSession,
     settings: Settings,
 ) -> None:
-    """本群积分榜 Top10（只读）：默认按可用积分，``/rank week`` 按本周获得积分。"""
+    """本群积分榜 Top10（只读）：默认按可用积分，``/rank week`` 按本周获得积分。
+
+    F-031：带 (群, 成员) 冷却与短缓存，避免任何成员反复触发全历史聚合。
+    """
 
     if not is_group(message):
         await _answer(message, settings, "该命令仅可在群内使用。")
@@ -3138,14 +3221,38 @@ async def cmd_rank(
     if user is None:
         return
 
-    board = await build_rank_board(
-        session,
-        group_id=int(message.chat.id),
-        user_id=int(user.id),
-        week=_rank_wants_week(message),
-    )
+    group_id = int(message.chat.id)
+    user_id = int(user.id)
+    week = _rank_wants_week(message)
+    now = time.monotonic()
+
+    wait = _rank_cooldown_remaining(group_id, user_id)
+    if wait:
+        await _answer(message, settings, f"刚查过积分榜，请等 {wait} 秒后再发 /rank。")
+        return
+
+    board = _rank_cached_board(group_id, week=week, user_id=user_id, now=now)
+    cached = board is not None
+    if board is None:
+        board = await build_rank_board(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            week=week,
+        )
+        _rank_store_board(group_id, week=week, user_id=user_id, board=board, now=now)
+    _rank_cooldown[(group_id, user_id)] = now
+    if len(_rank_cooldown) > _RANK_COOLDOWN_MAX_ENTRIES:
+        _rank_prune(now)
     await session.commit()
     await _answer(message, settings, _render_rank_board(board))
+    log.info(
+        "member rank served | group=%s user=%s week=%s cache=%s",
+        group_id,
+        user_id,
+        week,
+        "hit" if cached else "miss",
+    )
 
 
 @router.message(Command("me"))

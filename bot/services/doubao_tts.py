@@ -43,9 +43,18 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SEMICOLON_RE = re.compile(r"[；;]+")
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", flags=re.IGNORECASE)
 
-# Edge TTS voice names look like `zh-TW-HsiaoChenNeural`.  They are used as the
-# voice selector when no Doubao credentials are configured, so the same
-# `tts.speaker` field switches provider without new config keys.
+# F-022: TTS provider 选择的两种口径。
+# 显式键（``tts.provider`` / ``Settings.doubao_tts_provider``）优先；留空则沿用
+# **今天**的隐式口径：豆包凭据齐全走豆包，否则看 ``tts.speaker`` 的**形状**像不像
+# Edge 音色名（``zh-TW-HsiaoChenNeural`` 之类）。隐式判断保留为兼容回退，老配置
+# 一行不用改。
+TTS_PROVIDER_DOUBAO = "doubao"
+TTS_PROVIDER_EDGE = "edge"
+_TTS_PROVIDERS = {TTS_PROVIDER_DOUBAO, TTS_PROVIDER_EDGE}
+
+# Edge TTS voice names look like `zh-TW-HsiaoChenNeural`.  When no Doubao
+# credentials are configured and no explicit provider is set, this shape is what
+# switches the provider.
 _EDGE_VOICE_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]+)+Neural$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
@@ -298,14 +307,29 @@ class DoubaoTTSService:
         self.silence_duration_ms = int(getattr(settings, "doubao_tts_silence_duration_ms", 0) or 0)
         self.http_timeout_sec = float(getattr(settings, "doubao_tts_http_timeout_sec", 20.0) or 20.0)
         self.max_text_length = int(getattr(settings, "doubao_tts_max_text_length", 500) or 500)
+        # F-022: 显式 provider 键（留空 = 走下面的隐式兼容口径）。
+        raw_provider = str(
+            getattr(settings, "doubao_tts_provider", "") or ""
+        ).strip().lower()
+        self.provider = raw_provider if raw_provider in _TTS_PROVIDERS else ""
         self.edge_voice = self._resolve_edge_voice()
 
     def _resolve_edge_voice(self) -> str:
         """Return the Edge TTS voice to use, or "" when Doubao should be used.
 
-        Doubao credentials always win; Edge is the fallback provider and is
-        selected purely by putting an Edge voice name in `tts.speaker`.
+        F-022 的口径（**默认行为与今天一致**）：
+
+        * ``tts.provider = "edge"``：显式选 Edge，直接用 ``tts.speaker`` 当音色名。
+        * ``tts.provider = "doubao"``：显式选豆包，永远不走 Edge。
+        * ``tts.provider`` 留空（默认）：**兼容回退**——豆包凭据齐全走豆包，否则按
+          ``tts.speaker`` 的形状（``_EDGE_VOICE_RE``）判断是不是 Edge 音色名。
         """
+
+        if self.provider == TTS_PROVIDER_DOUBAO:
+            return ""
+        if self.provider == TTS_PROVIDER_EDGE:
+            return (self.speaker or "").strip()
+        # 隐式回退：豆包凭据齐全时它优先（保持原行为）。
         if self.app_id and self.access_key:
             return ""
         speaker = (self.speaker or "").strip()
