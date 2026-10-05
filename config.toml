@@ -6,6 +6,9 @@
 [bot]
 parse_mode = "HTML"
 disable_link_preview = true
+# 生产不可达：runtime_config 侧的前置校验与 update_delivery 的强制 False 都会把
+# true 归一掉（见 bot/config.py BotConfig.drop_pending_updates 的注释）。保留仅为
+# 兼容老的 TOML 导入，丢弃 Telegram 积压请走运维的显式动作。
 drop_pending_updates = false
 reply_batch_timeout_seconds = 45
 memory_recent_messages = 500

@@ -35,9 +35,14 @@ class WebFetchSkill:
     def __init__(self, settings: object | None = None) -> None:
         # Firecrawl 的接入参数一律从配置系统读（与 ``WebSearchSkill`` 同口径）。
         # 修前这里是 ``os.environ["FIRECRAWL_API_KEY"]``：``service.py`` 注册的是
-        # ``WebFetchSkill()``（不传 settings），所以 ``config.py:545-548`` 里那套
-        # ``firecrawl_*`` 字段对 webfetch 完全不生效——运维只有手写一个文档里没有
-        # 的环境变量才能启用它（B-03）。
+        # ``WebFetchSkill()``（不传 settings），所以 ``bot/config.py`` 的
+        # ``Settings`` 上那套 ``firecrawl_api_key`` / ``firecrawl_api_base`` /
+        # ``firecrawl_timeout_sec`` 对 webfetch 完全不生效——运维只有手写一个文档里
+        # 没有的环境变量才能启用它（B-03）。这里按**字段名**指路，不写行号：行号会
+        # 随任何一次编辑漂移，指过去就会指错地方（D3-43）。
+        # 读侧口径：``SkillService`` 传进来的是**根 Settings**（不是 ``settings.bot``），
+        # 所以这几个字段在 config.py 里是顶层字段；检索技能的超时是另一个旋钮
+        # ``firecrawl_search_timeout_sec``（18s），别和这里这个 20s 混。
         self._api_key = ""
         self._base = "https://api.firecrawl.dev"
         self._timeout = 20.0

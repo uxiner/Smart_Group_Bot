@@ -939,7 +939,7 @@
           <input type="checkbox" data-auto-delete-category="${value}"${enabled ? " checked" : ""}>
           <span>${escapeHtml(label)}</span>
         </label>
-        <select class="delete-category-mode" data-auto-delete-mode="${value}" aria-label="${attr(label)}清理方式" title="定时自动删除或提供删除按钮（二选一）"${enabled ? "" : " disabled"}>
+        <select class="delete-category-mode" data-auto-delete-mode="${value}" aria-label="${attr(label)}清理方式" title="二选一：自动删除 = 到点由 bot 删掉本类消息；删除按钮 = 不定时删除，每条消息下方附一个「删除消息」按钮（本行的秒数在按钮模式下不生效）"${enabled ? "" : " disabled"}>
           <option value="timer"${mode === "timer" ? " selected" : ""}>自动删除</option>
           <option value="button"${mode === "button" ? " selected" : ""}>删除按钮</option>
         </select>
