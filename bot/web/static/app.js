@@ -1234,6 +1234,7 @@
             ${field("logging.file_path", "文件路径", { maxlength: 1000 })}
             ${field("logging.file_max_bytes", "单文件最大字节", { type: "number", min: 1024, max: 10737418240, step: 1, required: true })}
             ${field("logging.file_backup_count", "保留文件数", { type: "number", min: 1, max: 100, step: 1, required: true })}
+            ${field("logging.message_preview_chars", "入口日志正文预览字数", { type: "number", min: 0, max: 1000, step: 1, required: true, hint: "默认 100，与改动前一致；0 = 不记录正文，只记长度与内容哈希前缀" })}
           </div>
         </section>
       </div>`;

@@ -9,6 +9,8 @@ from aiogram import BaseMiddleware
 from aiogram.types import Message
 
 from bot.utils.logging_setup import (
+    message_preview_chars,
+    redacted_message_preview,
     reset_log_context,
     sanitize_log_field,
     set_log_context,
@@ -56,7 +58,13 @@ class LoggingMiddleware(BaseMiddleware):
         )
         msg_type = getattr(event, "content_type", "unknown")
         raw_text = (event.text or event.caption or "").replace("\n", "\\n").replace("|", "/").strip()
-        preview = sanitize_log_field(raw_text[:100]) if raw_text else "-"
+        # A-16 / P4-2：默认 100 字 = 改之前的硬编码行为（不配 = 日志逐字不变）；
+        # 调小只留更短的前缀，0 = 不落盘正文，只留长度 + 内容哈希前缀。
+        preview_chars = message_preview_chars()
+        if preview_chars > 0:
+            preview = sanitize_log_field(raw_text[:preview_chars]) if raw_text else "-"
+        else:
+            preview = redacted_message_preview(raw_text)
 
         started = time.perf_counter()
         try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import queue
@@ -99,6 +100,31 @@ def sanitize_log_field(value: object) -> str:
         return ""
     text = _LOG_CONTROL_RE.sub(_escape_log_control, text)
     return text.replace(_LOG_COLUMN_SEPARATOR, "\\|")
+
+
+#: A-16 / P4-2：入口日志的消息正文预览字数。**默认 100 = 改之前的硬编码值**
+#: （``LoggingMiddleware`` 里的 ``raw_text[:100]``），所以不配这一项时日志逐字不变。
+#: 0 = 不记录正文，只记长度 + 内容哈希前缀（见 ``redacted_message_preview``）。
+_DEFAULT_MESSAGE_PREVIEW_CHARS = 100
+_MESSAGE_PREVIEW_CHARS = _DEFAULT_MESSAGE_PREVIEW_CHARS
+
+
+def message_preview_chars() -> int:
+    """当前生效的入口日志正文预览字数（``logging.message_preview_chars``）。"""
+
+    return _MESSAGE_PREVIEW_CHARS
+
+
+def redacted_message_preview(text: str) -> str:
+    """``message_preview_chars == 0`` 时的占位：只有长度和内容哈希前缀。
+
+    排障仍然能回答「这条消息有多长」「是不是同一条」，但正文一个字都不落盘。
+    """
+
+    if not text:
+        return "-"
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<{len(text)}字 #{digest}>"
 
 
 def logging_resource_health_snapshot() -> dict[str, Any]:
@@ -441,6 +467,7 @@ def shutdown_logging(*, timeout: float = _LISTENER_STOP_TIMEOUT_SECONDS) -> bool
 def configure_logging(*, force: bool = False, config: Any | None = None) -> None:
     """Configure a compact, context-aware logging pipeline."""
     global _ATEXIT_REGISTERED, _LOG_LISTENER, _LOG_QUEUE_HANDLER, _LOG_SINK_HANDLERS
+    global _MESSAGE_PREVIEW_CHARS
 
     root = logging.getLogger()
     if root.handlers and not force:
@@ -479,6 +506,11 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         ).strip()
         log_file_max_bytes = max(1024, int(getattr(config, "file_max_bytes", 5 * 1024 * 1024)))
         log_file_backup_count = max(1, int(getattr(config, "file_backup_count", 3)))
+        # A-16：缺字段的老 payload / 老 config 对象一律退回 100（= 今天的行为）。
+        preview_chars = max(
+            0,
+            int(getattr(config, "message_preview_chars", _DEFAULT_MESSAGE_PREVIEW_CHARS)),
+        )
     else:
         color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
         log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
@@ -495,6 +527,11 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
             os.getenv("LOG_FILE_BACKUP_COUNT"),
             default=3,
             min_value=1,
+        )
+        preview_chars = _parse_int(
+            os.getenv("LOG_MESSAGE_PREVIEW_CHARS"),
+            default=_DEFAULT_MESSAGE_PREVIEW_CHARS,
+            min_value=0,
         )
     queue_size = _parse_int(
         os.getenv("LOG_QUEUE_SIZE"),
@@ -576,6 +613,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
         _LOG_QUEUE_HANDLER = queue_handler
         _LOG_LISTENER = listener
         _LOG_SINK_HANDLERS = tuple(sink_handlers)
+        _MESSAGE_PREVIEW_CHARS = preview_chars
         if not _ATEXIT_REGISTERED:
             atexit.register(shutdown_logging)
             _ATEXIT_REGISTERED = True
