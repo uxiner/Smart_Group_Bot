@@ -8,7 +8,11 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware
 from aiogram.types import Message
 
-from bot.utils.logging_setup import reset_log_context, set_log_context
+from bot.utils.logging_setup import (
+    reset_log_context,
+    sanitize_log_field,
+    set_log_context,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,11 +44,19 @@ class LoggingMiddleware(BaseMiddleware):
             user_id=user_id or "-",
         )
 
-        name = user.username or user.full_name if user else "unknown"
-        chat = event.chat.title or event.chat.id if event.chat else "?"
+        # A-17 / P4-1：三个字段都是**用户可控**的（群名、用户名/昵称、消息正文）。
+        # 原样写进日志时，\r / \n / \x00 能把一条记录伪造成多条，ESC 能让终端把
+        # 日志渲染成别的东西，字段里的 | 能伪造出额外一列。净化只改写「会伪造结构」
+        # 的字节，保留原文字符形态。
+        name = sanitize_log_field(
+            (user.username or user.full_name) if user else "unknown"
+        )
+        chat = sanitize_log_field(
+            (event.chat.title or event.chat.id) if event.chat else "?"
+        )
         msg_type = getattr(event, "content_type", "unknown")
         raw_text = (event.text or event.caption or "").replace("\n", "\\n").replace("|", "/").strip()
-        preview = raw_text[:100] if raw_text else "-"
+        preview = sanitize_log_field(raw_text[:100]) if raw_text else "-"
 
         started = time.perf_counter()
         try:

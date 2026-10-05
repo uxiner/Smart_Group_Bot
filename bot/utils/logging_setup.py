@@ -4,6 +4,7 @@ import atexit
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -62,6 +63,42 @@ _LOG_SINK_HANDLERS: tuple[logging.Handler, ...] = ()
 _LOG_SATURATED_SINCE: float | None = None
 _LOG_REAPER_THREADS: dict[threading.Thread, float] = {}
 _ATEXIT_REGISTERED = False
+
+#: A-17 / P4-1：日志里出现的**用户可控文本**（消息正文、用户名、群名）如果原样写入，
+#: ``\r`` / ``\n`` / ``\x00`` 可以把一条记录伪造成多条（把 ``\n`` 之后的伪造行伪装成
+#: 别的组件写的），ANSI 转义（ESC ``\x1b``）可以让终端把日志渲染成别的东西——排障与
+#: 审计都会因此失真。这里统一净化：**保留原文字符形态**（转义后仍能读出原文），只把
+#: 「能伪造日志结构」的字节换成可见写法。ESC 落在控制字符集合里，所以转义掉 ESC 就
+#: 等于让 ANSI 序列退化成普通字面量。
+_LOG_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: 日志格式用 ``" | "`` 分隔字段，字段里再出现分隔符就会伪造出一列。
+_LOG_COLUMN_SEPARATOR = "|"
+
+
+def _escape_log_control(match: re.Match[str]) -> str:
+    char = match.group(0)
+    if char == "\n":
+        return "\\n"
+    if char == "\r":
+        return "\\r"
+    if char == "\t":
+        return "\\t"
+    return f"\\x{ord(char):02x}"
+
+
+def sanitize_log_field(value: object) -> str:
+    """Return a log field that cannot forge extra lines or terminal escapes.
+
+    控制字符转成 ``\\n`` / ``\\x1b`` 这类**可见的等价写法**（不是占位符堆，原文仍可读），
+    字段内嵌的 ``|`` 转成 ``\\|``，这样「聊天 / 用户 / 类型 / 内容」四个字段的边界
+    只可能来自日志格式本身。空串原样返回，非字符串按 ``str()`` 处理（与 ``%s`` 一致）。
+    """
+
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return ""
+    text = _LOG_CONTROL_RE.sub(_escape_log_control, text)
+    return text.replace(_LOG_COLUMN_SEPARATOR, "\\|")
 
 
 def logging_resource_health_snapshot() -> dict[str, Any]:
