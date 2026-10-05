@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from bot.db.engine import init_db
 from bot.services.resource_health import (
@@ -75,13 +77,20 @@ class DatabaseLivenessProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(health["fatal"], health)
         self.assertIn("OperationalError", health["error"])
 
-    async def test_corrupted_write_ahead_log_flips_health_to_false(self) -> None:
+    async def test_write_ahead_log_io_error_flips_health_to_false(self) -> None:
+        """WAL 侧 I/O 错误必须让探测翻红——这是 C3-05 点名的场景之一。
+
+        故障注入用「查询报 ``disk I/O error``」本身，而不是往 ``-wal`` 里写垃圾字节：
+        后者在不同 SQLite 构建上判定不同——生产镜像里的构建把它当作「无效 WAL」直接
+        忽略（``SELECT 1`` 根本不碰 WAL，探测照样成功），macOS 上的构建才会抛错。
+        这里要钉死的是「I/O 错误必须被翻译成 ``probe_ok=False`` 且错误原样带出」，
+        真文件的两种损坏形态由本文件另外两条用例覆盖（主库搬走 / 主库缺失）。
+        """
+
         self.assertTrue(_database_health()["probe_ok"])
-        # 「WAL 异常」是这条 finding 点名的场景之一：主库文件还好好的，
-        # 计数器一样正常，但 WAL 侧写坏了，查询直接 disk I/O error。
-        with open(self.path + "-wal", "wb") as handle:
-            handle.write(b"corrupted wal" * 512)
-        health = _database_health()
+        failure = sqlite3.OperationalError("disk I/O error")
+        with patch("sqlite3.connect", side_effect=failure):
+            health = _database_health()
         self.assertFalse(health["probe_ok"], health)
         self.assertFalse(health["ok"], health)
         self.assertIn("disk I/O error", health["error"])
