@@ -1699,6 +1699,33 @@ def _apply_group_settings(
     return updated
 
 
+def _path_int(
+    request: web.Request,
+    key: str,
+    *,
+    code: str = "invalid_user_id",
+    message: str = "用户 ID 无效。",
+) -> int:
+    """把 ``{id}`` 这类路径参数解析成 int，非法/缺失一律 400（D3-20 / A-24）。
+
+    改前多个 handler 直接对 ``request.match_info`` 做裸 ``int()``，非数字会让
+    ``ValueError`` 冒到装饰器的兜底 ``except Exception`` → 500 "internal_error"：
+    明明是客户端把 URL 打错了，却回一个「服务器炸了」，既误导管理员，也让
+    真正的 5xx 混在这条噪声里。这里是全文件**唯一**的路径整数解析入口。
+    """
+
+    try:
+        return int(request.match_info[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _APIError(400, code, message) from exc
+
+
+def _group_id(request: web.Request) -> int:
+    return _path_int(
+        request, "id", code="invalid_group_id", message="群 ID 无效。"
+    )
+
+
 def register_settings_routes(
     app: web.Application,
     *,
@@ -1969,7 +1996,7 @@ def register_settings_routes(
 
     @authenticated
     async def delete_authorized_group_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         async with session_factory() as session:
             row = await session.get(AuthorizedGroup, group_id)
             if row is not None:
@@ -1983,7 +2010,7 @@ def register_settings_routes(
     async def list_group_admins_api(request: web.Request, user: Any) -> web.Response:
         # Group admins may read this list too: the Mini App call-admin picker
         # renders it for every group they manage. Mutations stay super-admin.
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         async with session_factory() as session:
             rows = (await session.scalars(
@@ -2017,7 +2044,7 @@ def register_settings_routes(
         Falls back to the locally authorized admin list (with roster display
         names) when the Telegram lookup is unavailable.
         """
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         admins: list[dict[str, Any]] = []
         get_admins = getattr(bot, "get_chat_administrators", None)
@@ -2068,7 +2095,7 @@ def register_settings_routes(
 
     @authenticated
     async def create_group_admin_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
+        group_id = _group_id(request)
         body = _AdminCreate.model_validate(await _json_object(request))
         async with session_factory() as session:
             authorized = await session.get(AuthorizedGroup, group_id)
@@ -2106,8 +2133,8 @@ def register_settings_routes(
 
     @authenticated
     async def delete_group_admin_api(request: web.Request, _user: Any) -> web.Response:
-        group_id = int(request.match_info["id"])
-        user_id = int(request.match_info["user_id"])
+        group_id = _group_id(request)
+        user_id = _path_int(request, "user_id")
         async with session_factory() as session:
             row = await session.scalar(select(Admin).where(
                 Admin.group_id == group_id,
@@ -2503,10 +2530,7 @@ def register_settings_routes(
 
     @any_admin
     async def put_group_settings(request: web.Request, user: Any) -> web.Response:
-        try:
-            group_id = int(request.match_info["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_group_id", "群 ID 无效。") from exc
+        group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
 
         request_body = await _json_object(request)
@@ -2711,24 +2735,6 @@ def register_settings_routes(
             {"group": document, "permission_apply": permission_apply}
         )
 
-    def _group_id(request: web.Request) -> int:
-        try:
-            return int(request.match_info["id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_group_id", "群 ID 无效。") from exc
-
-    def _path_int(
-        request: web.Request,
-        key: str,
-        *,
-        code: str = "invalid_user_id",
-        message: str = "用户 ID 无效。",
-    ) -> int:
-        try:
-            return int(request.match_info[key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, code, message) from exc
-
     @any_admin
     async def list_rules(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
@@ -2767,10 +2773,9 @@ def register_settings_routes(
     async def update_rule(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            rule_id = int(request.match_info["rule_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_rule_id", "群规 ID 无效。") from exc
+        rule_id = _path_int(
+            request, "rule_id", code="invalid_rule_id", message="群规 ID 无效。"
+        )
         body = _RuleUpdate.model_validate(await _json_object(request))
         if not body.model_fields_set:
             raise _APIError(400, "empty_rule_update", "至少需要修改一个字段。")
@@ -2798,10 +2803,9 @@ def register_settings_routes(
     async def delete_rule(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            rule_id = int(request.match_info["rule_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_rule_id", "群规 ID 无效。") from exc
+        rule_id = _path_int(
+            request, "rule_id", code="invalid_rule_id", message="群规 ID 无效。"
+        )
         async with session_factory() as session:
             row = await session.get(ModerationRule, rule_id)
             if row is None or int(row.group_id) != group_id:
@@ -3061,10 +3065,9 @@ def register_settings_routes(
     async def update_memory(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            memory_id = int(request.match_info["memory_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_memory_id", "记忆 ID 无效。") from exc
+        memory_id = _path_int(
+            request, "memory_id", code="invalid_memory_id", message="记忆 ID 无效。"
+        )
         body = _MemoryCreate.model_validate(await _json_object(request))
         content = clean_multiline_text(body.content, max_len=4000).strip()
         if not content:
@@ -3082,10 +3085,9 @@ def register_settings_routes(
     async def delete_memory(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
-        try:
-            memory_id = int(request.match_info["memory_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _APIError(400, "invalid_memory_id", "记忆 ID 无效。") from exc
+        memory_id = _path_int(
+            request, "memory_id", code="invalid_memory_id", message="记忆 ID 无效。"
+        )
         async with session_factory() as session:
             row = await session.get(GroupPermanentMemory, memory_id)
             if row is None or int(row.group_id) != group_id:
