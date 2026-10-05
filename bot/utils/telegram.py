@@ -91,6 +91,12 @@ class TelegramDeliveryResult:
 
 _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
 _TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
+#: A-22 / P4-3：已经打过失败日志的任务。观察点可能被走到两次（done 回调 + 关停时
+#: 的 ``flush_telegram_background_tasks``），同一个失败只该记一条。弱引用，任务
+#: 回收后条目自动消失。
+_TELEGRAM_BACKGROUND_REPORTED: "weakref.WeakSet[asyncio.Task[object]]" = (
+    weakref.WeakSet()
+)
 _TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
 _UNINITIALIZED_AUTO_DELETE_WARNED = False
 
@@ -108,15 +114,61 @@ def confirm_telegram_delivery(callback: Callable[[], None] | None) -> None:
         log.exception("Telegram delivery callback failed")
 
 
+def _background_task_label(task: asyncio.Task[object]) -> str:
+    """一个可定位的后台任务标签：名字（发起位置）+ id。
+
+    名字由发起处给出（``_schedule_telegram_background_task(name=...)`` /
+    ``asyncio.create_task(..., name=...)``，例如 ``delete-button:<chat>:<msg>``、
+    ``typing-send:<chat>``），所以排障时看到日志就能知道是哪一个投递炸了。
+    """
+
+    try:
+        name = task.get_name()
+    except Exception:  # pragma: no cover - 非 Task 对象
+        name = "?"
+    return f"{name}#{id(task):x}"
+
+
 def _observe_telegram_background_task(task: asyncio.Task[object]) -> None:
+    """回收一个后台任务，并把**失败原因**落到日志里（A-22 / P4-3）。
+
+    改前这里是 ``try: task.exception() except: pass``：后台任务炸了既没有日志、
+    也没有痕迹，只剩下「群里的操作没发生」。现在至少 ``log.exception`` 打出完整
+    traceback + 任务名。
+
+    **成败语义不变**：回收/记账照旧，异常不外抛，也不重试（重试是行为变化）。
+    """
+
     _TELEGRAM_BACKGROUND_TASKS.discard(task)
     _TELEGRAM_BACKGROUND_STARTED.pop(task, None)
     if task.cancelled():
         return
     try:
-        task.exception()
-    except (asyncio.CancelledError, Exception):
-        pass
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        # 连「取任务异常」本身都失败（自定义 Task / loop 已关）：仍然别静默。
+        log.exception(
+            "Telegram background task result unavailable | task=%s",
+            _background_task_label(task),
+        )
+        return
+    if exc is None:
+        return
+    if task in _TELEGRAM_BACKGROUND_REPORTED:
+        return
+    _TELEGRAM_BACKGROUND_REPORTED.add(task)
+    try:
+        # 在这里重新抛一次，只为拿到一个「正在处理中」的异常上下文：
+        # log.exception 依赖 sys.exc_info()，直接调用会打出一条没有 traceback 的日志。
+        raise exc
+    except BaseException:
+        log.exception(
+            "Telegram background task failed | task=%s error=%s",
+            _background_task_label(task),
+            type(exc).__name__,
+        )
 
 
 def _track_telegram_background_task(task: asyncio.Task[object]) -> None:
@@ -1740,7 +1792,17 @@ async def typing_action(
             else:
                 _track_telegram_background_task(task)
             raise
-        except Exception:
+        except Exception as exc:
+            # A-22 / P4-3：输入状态是装饰性的，失败只影响这一次心跳（返回 False，
+            # worker 随即收工），**不能**让它把整个上下文炸掉——但必须留下痕迹，
+            # 否则「群里一直没反应」在日志里完全看不出来。成败语义不变。
+            if task.done():
+                log.warning(
+                    "Telegram typing action send failed | task=%s chat=%s error=%s",
+                    _background_task_label(task),
+                    chat_id,
+                    type(exc).__name__,
+                )
             if not task.done():
                 task.cancel()
                 done, _pending = await asyncio.wait(
