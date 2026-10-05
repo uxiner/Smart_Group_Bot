@@ -97,8 +97,9 @@
   --space-5: 22px;
   --space-6: 30px;
 
-  /* Telegram 会话内的安全区（app.js 用 Telegram.safeAreaInset 覆写），
-     没有该值时回落到系统 env()。 */
+  /* Telegram 会话内的安全区。app.js 按每条边把 Telegram.safeAreaInset 与
+     Telegram.contentSafeAreaInset 取大后写进 --tg-safe-*；旧客户端没有这些
+     字段时它写 0px，所以这条 max() 永远有值。env() 覆盖独立 webview。 */
   --safe-top: max(env(safe-area-inset-top), var(--tg-safe-top, 0px));
   --safe-right: max(env(safe-area-inset-right), var(--tg-safe-right, 0px));
   --safe-bottom: max(env(safe-area-inset-bottom), var(--tg-safe-bottom, 0px));
@@ -192,6 +193,10 @@ select {
 .app-shell {
   min-height: 100vh;
   min-height: 100dvh;
+  /* Telegram 的可见高度可能比 WebView 的 dvh 小（半屏 Mini App、键盘、拖拽）。
+     取两者更小的一个：不会比真实视口高，缩小时会跟着收。SDK 没有这个字段时
+     app.js 会移除变量，这里回落到 100dvh。 */
+  min-height: min(100dvh, var(--tg-viewport-height, 100dvh));
 }
 
 /* ==========================================================================

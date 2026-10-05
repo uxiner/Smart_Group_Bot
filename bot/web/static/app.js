@@ -420,30 +420,56 @@
     }
     syncTelegramSafeArea();
     if (tg.onEvent) {
+      // Bot API 8.0+ exposes safeAreaInset / contentSafeAreaInset as objects and
+      // fires these when they change (rotation, fullscreen, Telegram chrome).
       tg.onEvent("safeAreaChanged", syncTelegramSafeArea);
       tg.onEvent("contentSafeAreaChanged", syncTelegramSafeArea);
+      tg.onEvent("fullscreenChanged", syncTelegramSafeArea);
       tg.onEvent("viewportChanged", syncTelegramSafeArea);
     }
   }
 
-  // Telegram reports its own safe-area / viewport insets in CSS pixels; env()
-  // only covers standalone webviews. Mirror both into custom properties so the
-  // topbar, drawer and sticky nav stay clear of the Telegram header/footer.
+  // Bot API 8.0 shapes, per the official WebApp docs:
+  //   safeAreaInset        : { top, bottom, left, right } in CSS pixels
+  //   contentSafeAreaInset : { top, bottom, left, right } in CSS pixels
+  //   viewportHeight / viewportStableHeight : numbers (pixels)
+  // env(safe-area-inset-*) only covers standalone webviews, so mirror the SDK
+  // numbers into custom properties. Every edge is rewritten on every sync, so
+  // an inset that drops back to 0 (leaving fullscreen, rotating to portrait)
+  // can never leave a stale value behind.
+  const SAFE_AREA_EDGES = ["top", "bottom", "left", "right"];
+
+  // Older SDKs omit the objects entirely and a misbehaving client can hand us
+  // NaN or a negative number. Anything that is not a finite positive number is
+  // treated as "no inset" so the layout falls back to env()/0 instead of
+  // emitting an invalid calc().
+  function telegramPixel(value) {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.round(value)
+      : 0;
+  }
+
   function syncTelegramSafeArea() {
-    const insets = {
-      "--tg-safe-top": tg?.safeAreaInset,
-      "--tg-safe-bottom": tg?.contentSafeAreaInset?.bottom ?? tg?.safeAreaInset,
-      "--tg-safe-left": tg?.safeAreaInset,
-      "--tg-safe-right": tg?.safeAreaInset,
-    };
-    const viewportHeight = tg?.viewport?.height;
-    for (const [property, value] of Object.entries(insets)) {
-      if (!value || typeof value !== "number") continue;
-      document.documentElement.style.setProperty(property, `${Math.max(0, Math.round(value))}px`);
+    const root = document.documentElement;
+    for (const edge of SAFE_AREA_EDGES) {
+      // contentSafeAreaInset additionally excludes Telegram's own chrome, so it
+      // is normally the larger of the two. Take the max per edge so neither
+      // source can be dropped (the old code read the object as a scalar, so
+      // every edge silently stayed 0 and left/right were never distinguished).
+      const device = telegramPixel(tg?.safeAreaInset?.[edge]);
+      const content = telegramPixel(tg?.contentSafeAreaInset?.[edge]);
+      root.style.setProperty(`--tg-safe-${edge}`, `${Math.max(device, content)}px`);
     }
-    if (typeof viewportHeight === "number" && viewportHeight > 0) {
-      document.documentElement.style.setProperty("--tg-viewport-height", `${Math.round(viewportHeight)}px`);
-    }
+    // viewportStableHeight does not jitter while the Mini App is dragged or the
+    // keyboard animates, so prefer it when the client provides it.
+    const stable = telegramPixel(tg?.viewportStableHeight);
+    const height = telegramPixel(tg?.viewportHeight) || stable;
+    // An unusable height removes the property instead of writing 0px: the CSS
+    // falls back to 100dvh, and min(100dvh, 0px) would collapse the page.
+    if (height) root.style.setProperty("--tg-viewport-height", `${height}px`);
+    else root.style.removeProperty("--tg-viewport-height");
+    if (stable) root.style.setProperty("--tg-viewport-stable-height", `${stable}px`);
+    else root.style.removeProperty("--tg-viewport-stable-height");
   }
 
   function authHeaders(hasBody = false) {
@@ -1048,7 +1074,7 @@
       </div>`;
     };
     return `
-      ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。保存后立即生效，无需重启。")}
+      ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。多数设置保存后立即生效；标记「需重启」的设置除外。")}
       <datalist id="parse-modes"><option value="HTML"></option><option value="Markdown"></option><option value="MarkdownV2"></option></datalist>
       <div class="section-stack">
         <section class="settings-section">
@@ -1061,7 +1087,7 @@
             ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "同时作用于 AI 自动回复等所有 Bot 生成内容")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新同一条 Telegram 消息")}
-            ${toggle("bot.enable_rich_messages", "启用富文本排版", "开启后按下方「消息解析格式」渲染粗体、斜体、代码块等样式；关闭则统一按纯文本发送。")}
+            ${toggle("bot.enable_rich_messages", "启用富文本排版", "开启后按上方「消息解析格式」渲染粗体、斜体、代码块等样式；关闭则统一按纯文本发送。")}
             ${advancedPanel("bot.streaming", "流式输出细调", "只在需要调整发送节奏时改动", `
               <div class="field-grid">
                 ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true, hint: "首个片段的最小长度，太小会频繁编辑同一条消息" })}
@@ -1074,14 +1100,14 @@
           <p class="field-hint">勾选的类别按所选方式清理，两种方式互斥：「自动删除」到点由 Bot 删除该类消息，秒数留空则使用上方全局秒数；「删除按钮」不定时删除，而是在每条消息下方附一个管理员可用的内联删除按钮（此模式下本行的秒数不生效）。</p>
         </section>
         <section class="settings-section">
-          ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，原始消息不会被删除。")}
+          ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回。摘要与召回不替代原文，原文按「原文保留天数」过期清理。")}
           <div class="field-grid three">
             ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
             ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
             ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
             ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
-            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "只影响「按当前问题从本群原始消息档案里检索相关消息」。", false, "这不是长期记忆的总开关：它不控制稳定事实（口味、身份、关系、约定等）的提炼、注入与写入，那部分由下一页的「启用长期记忆（总开关）」负责。关掉本页开关后，长期记忆仍会照常提炼与写入。")}
-            ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩近期窗口，原始档案不会删除。", false, "这是给仍在使用旧版压缩行为的群保留的兼容开关，新部署建议保持关闭：归档与召回已经能覆盖长对话，不需要额外压缩。")}
+            ${toggle("bot.memory_recall_enabled", "启用原始档案召回", "只影响「按当前问题从本群原始消息档案里检索相关消息」。", false, "这不是长期记忆的总开关：它只管按问题检索本群原始消息，不控制稳定事实（口味、身份、关系、约定等）的提炼、注入与写入，那部分由同页下方的「启用长期记忆（总开关）」负责。关掉它，长期记忆仍会照常提炼与写入。")}
+            ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩近期窗口，不会额外删除已归档的原文。", false, "这是给仍在使用旧版压缩行为的群保留的兼容开关，新部署建议保持关闭：归档与召回已经能覆盖长对话，不需要额外压缩。")}
             ${advancedPanel("bot.summary", "群摘要（后台）", "把更早的内容压成摘要，默认关闭", `
               <div class="field-grid three">
                 ${toggle("bot.group_summary_enabled", "启用后台群摘要", "开启后：近期原文 + 旧内容的后台摘要。原始消息与归档一条都不删，前台只读已发布的摘要，绝不等待摘要生成。")}
@@ -1124,7 +1150,7 @@
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("长期记忆", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定等）。这一页的开关保存后立即生效，无需重启。")}
+          ${sectionHead("长期记忆", "从对话里提炼「跨天还有用」的稳定事实（口味、身份、关系、约定等）。本组开关保存后立即生效，无需重启。")}
           <div class="field-grid three">
             ${toggle("bot.memory_facts_enabled", "启用长期记忆（总开关）", "关掉 = 不提炼、不注入、不写入（群聊注入、私聊召回与 /memory 命令都会先检查它）。", false, "关闭后已写入的事实不再注入，但库里的记录仍然保留，需要时可在群组页的「永久记忆」中手工清理。")}
             ${toggle("bot.memory_extract_enabled", "启用后台提炼", "从群聊/私聊原文里被动提炼事实；关掉后不再有新的提炼，已有事实仍会被召回注入")}

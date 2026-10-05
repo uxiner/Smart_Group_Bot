@@ -257,13 +257,48 @@ class NightCrystalLayoutTests(unittest.TestCase):
         self.assertRegex(self.css, r"outline: 2px solid var\(--focus-ring\);")
 
     def test_telegram_safe_area_is_consumed(self) -> None:
-        self.assertIn("--tg-safe-top", self.css)
-        self.assertIn("env(safe-area-inset-top)", self.css)
-        self.assertIn("--safe-bottom", self.css)
+        # The authoritative check for this is the browser run in
+        # tools/settings-ui-harness/checks/safe-area.mjs (object-shaped insets,
+        # events fired, computed styles read back). This contract only guards the
+        # shape of the code so the object-as-scalar bug cannot come back.
+        root = self.css.split(":root {", 1)[1].split("\n}", 1)[0]
+        for edge in ("top", "right", "bottom", "left"):
+            self.assertRegex(root, rf"--safe-{edge}: max\(env\(safe-area-inset-{edge}\), var\(--tg-safe-{edge}, 0px\)\);")
+        self.assertIn("min-height: min(100dvh, var(--tg-viewport-height, 100dvh));", self.css)
+
+    def test_telegram_insets_are_read_as_objects_not_scalars(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
-        self.assertIn("function syncTelegramSafeArea()", source)
-        self.assertIn('tg.onEvent("safeAreaChanged", syncTelegramSafeArea)', source)
-        self.assertIn("viewportChanged", source)
+        sync = source.split("function syncTelegramSafeArea()", 1)[1].split("\n  function authHeaders(", 1)[0]
+
+        # Bot API 8.0 SafeAreaInset / ContentSafeAreaInset are
+        # {top, bottom, left, right} objects; viewportHeight is a plain number.
+        self.assertIn('const SAFE_AREA_EDGES = ["top", "bottom", "left", "right"];', source)
+        self.assertIn("tg?.safeAreaInset?.[edge]", sync)
+        self.assertIn("tg?.contentSafeAreaInset?.[edge]", sync)
+        self.assertIn("tg?.viewportHeight", sync)
+        self.assertIn("tg?.viewportStableHeight", sync)
+        # No invented shape and no truthiness test: 0 is a valid inset, and a
+        # stale value has to be overwritten on every sync.
+        for forbidden in ("tg?.viewport?.height", "tg?.viewport.height"):
+            self.assertNotIn(forbidden, source)
+        self.assertNotIn("tg?.safeAreaInset,", sync)
+        self.assertIn("Number.isFinite(value) && value > 0", source)
+        for edge in ("top", "bottom", "left", "right"):
+            self.assertIn(f'root.style.setProperty(`--tg-safe-${{edge}}`', sync)
+        self.assertIn('root.style.removeProperty("--tg-viewport-height")', sync)
+        for event in ("safeAreaChanged", "contentSafeAreaChanged", "fullscreenChanged", "viewportChanged"):
+            self.assertIn(f'tg.onEvent("{event}", syncTelegramSafeArea)', source)
+
+    def test_harness_stub_matches_the_official_webapp_shapes(self) -> None:
+        stub = (_ROOT / "tools" / "settings-ui-harness" / "harness.py").read_text(encoding="utf-8")
+        self.assertIn("safeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 }", stub)
+        self.assertIn("contentSafeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 }", stub)
+        self.assertIn("viewportHeight: 0", stub)
+        self.assertIn("viewportStableHeight: 0", stub)
+        self.assertIn('emit("safeAreaChanged"', stub)
+        self.assertIn('emit("contentSafeAreaChanged"', stub)
+        self.assertIn('emit("viewportChanged"', stub)
+        self.assertTrue((_ROOT / "tools" / "settings-ui-harness" / "checks" / "safe-area.mjs").is_file())
 
 
 class ProgressiveDisclosureTests(unittest.TestCase):
@@ -388,6 +423,44 @@ class UserFacingCopyTests(unittest.TestCase):
         self.assertIn("留空会保留已保存值", source)
         for unit in ("（秒）", "（分钟）", "（毫秒）", "（小时）", "Token"):
             self.assertIn(unit, source)
+
+    def test_page_and_section_copy_never_over_promises(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        rendered = strip_js_comments(source)
+
+        # The Bot page carries bot.parse_mode, which is restart-required, so the
+        # page head must scope the hot-apply promise instead of promising all of it.
+        page_head = re.search(r'pageHead\("Bot 行为", "([^"]+)"\)', source)
+        self.assertIsNotNone(page_head)
+        description = page_head.group(1)
+        self.assertIn("多数设置保存后立即生效", description)
+        self.assertIn("需重启", description)
+        self.assertNotIn("无需重启", description)
+        self.assertNotRegex(description, r"(全部|所有|整页)[^。]*生效")
+
+        # A section-level claim is fine as long as it is scoped to that section.
+        memory_head = re.search(r'sectionHead\("长期记忆", "([^"]+)"\)', source)
+        self.assertIsNotNone(memory_head)
+        self.assertIn("本组开关保存后立即生效", memory_head.group(1))
+        self.assertNotIn("这一页", memory_head.group(1))
+
+        # Raw messages are cleaned up by the retention window; never claim otherwise.
+        for absolute in ("原始消息不会被删除", "原始档案不会删除", "原文不会删除"):
+            self.assertNotIn(absolute, rendered, f"{absolute!r} is not true: retention still cleans up")
+        self.assertIn("原文按「原文保留天数」过期清理", source)
+
+    def test_directional_copy_matches_the_real_layout(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        # bot.parse_mode is the first field of the 消息处理 grid, so the rich-text
+        # toggle below it may only point upwards.
+        self.assertIn("按上方「消息解析格式」", source)
+        self.assertNotIn("按下方「消息解析格式」", source)
+        # The long-term-memory master switch is a later section of the same page.
+        self.assertIn("同页下方的「启用长期记忆（总开关）」", source)
+        self.assertNotIn("下一页的「启用长期记忆", source)
+        # Group-resource hints that were already correct must stay that way.
+        for kept in ("留空使用上方全局秒数", "作为下方各类别的默认秒数"):
+            self.assertIn(kept, source)
 
     def test_memory_copy_still_explains_the_master_switch(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")

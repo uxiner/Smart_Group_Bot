@@ -43,39 +43,57 @@ CONTENT_TYPES = {
     ".ico": "image/x-icon",
 }
 
-TELEGRAM_STUB = """/* Loopback harness stub: never contacted by the real page. */
+TELEGRAM_STUB = """/* Loopback harness stub: never contacted by the real page.
+   Field names and types follow the official Telegram WebApp docs (Bot API 8.0+):
+     safeAreaInset        -> SafeAreaInset        { top, bottom, left, right }
+     contentSafeAreaInset -> ContentSafeAreaInset { top, bottom, left, right }
+     viewportHeight / viewportStableHeight -> numbers (CSS pixels)
+   __setInsets / __setViewport are harness-only drivers for the browser checks. */
 (function () {
   var listeners = {};
-  function emit(name, payload) {
-    (listeners[name] || []).forEach(function (fn) { fn(payload); });
-  }
-  window.Telegram = {
-    WebApp: {
-      initData: "harness=1",
-      initDataUnsafe: { user: { id: 42, first_name: "Fixture", language_code: "zh" } },
-      version: "harness",
-      platform: "harness",
-      colorScheme: "dark",
-      themeParams: { bg_color: "#0C1220", text_color: "#EEF3FC", hint_color: "#A8B5CC", link_color: "#71D9EF", button_color: "#71D9EF", button_text_color: "#062430" },
-      isExpanded: true,
-      viewportHeight: window.innerHeight,
-      viewportStableHeight: window.innerHeight,
-      safeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 },
-      contentSafeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 },
-      ready: function () {},
-      expand: function () {},
-      close: function () {},
-      setHeaderColor: function () {},
-      setBackgroundColor: function () {},
-      disableVerticalSwipes: function () {},
-      enableClosingConfirmation: function () {},
-      onEvent: function (name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
-      offEvent: function (name, fn) {
-        (listeners[name] || []).filter(function (item) { return item !== fn; });
-      },
-      emit: emit,
+  var webApp = {
+    initData: "harness=1",
+    initDataUnsafe: { user: { id: 42, first_name: "Fixture", language_code: "zh" } },
+    version: "8.0",
+    platform: "harness",
+    colorScheme: "dark",
+    themeParams: { bg_color: "#0C1220", text_color: "#EEF3FC", hint_color: "#A8B5CC", link_color: "#71D9EF", button_color: "#71D9EF", button_text_color: "#062430" },
+    isExpanded: true,
+    isActive: true,
+    isFullscreen: false,
+    viewportHeight: 0,
+    viewportStableHeight: 0,
+    safeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 },
+    contentSafeAreaInset: { top: 0, bottom: 0, left: 0, right: 0 },
+    ready: function () {},
+    expand: function () {},
+    close: function () {},
+    requestFullscreen: function () {},
+    exitFullscreen: function () {},
+    setHeaderColor: function () {},
+    setBackgroundColor: function () {},
+    disableVerticalSwipes: function () {},
+    enableClosingConfirmation: function () {},
+    onEvent: function (name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
+    offEvent: function (name, fn) {
+      listeners[name] = (listeners[name] || []).filter(function (item) { return item !== fn; });
+    },
+    emit: function (name, payload) {
+      (listeners[name] || []).slice().forEach(function (fn) { fn(payload); });
+    },
+    __setInsets: function (safe, content) {
+      webApp.safeAreaInset = Object.assign({ top: 0, bottom: 0, left: 0, right: 0 }, safe || {});
+      webApp.contentSafeAreaInset = Object.assign({ top: 0, bottom: 0, left: 0, right: 0 }, content || {});
+      webApp.emit("safeAreaChanged", webApp.safeAreaInset);
+      webApp.emit("contentSafeAreaChanged", webApp.contentSafeAreaInset);
+    },
+    __setViewport: function (height, stableHeight) {
+      webApp.viewportHeight = height;
+      webApp.viewportStableHeight = stableHeight;
+      webApp.emit("viewportChanged", { isStateStable: true });
     },
   };
+  window.Telegram = { WebApp: webApp };
 })();
 """
 

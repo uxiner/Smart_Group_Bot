@@ -29,6 +29,11 @@ python3 tools/settings-ui-harness/harness.py --port 8781
 另外有两个只用于自动化的端点：`GET /harness/requests`（请求日志）和
 `POST /harness/reset`（把内存状态复位回 fixture）。
 
+Telegram 桩按官方文档（Bot API 8.0+）的真实字段形状实现：
+`safeAreaInset` / `contentSafeAreaInset` 是 `{top, bottom, left, right}` 对象，
+`viewportHeight` / `viewportStableHeight` 是数字；`__setInsets` / `__setViewport`
+是给 `checks/safe-area.mjs` 用的驱动口（桩在 `tools/` 下，不随发布页出去）。
+
 ## 浏览器验收脚本（需要 Playwright + 本机 Chrome）
 
 脚本从 `playwright` 解析该包，所以要在装过它的目录里跑（仓库里没有 `node_modules`，
@@ -59,18 +64,39 @@ node $CHECKS/verify.mjs
 node $CHECKS/interact.mjs                                   # 26 项
 FAIL_HARNESS=http://127.0.0.1:8792 node $CHECKS/interact.mjs # 29 项（多 3 条保存失败路径）
 
-# 3) 对比度 + 角色可见性 + 错误态
+# 3) Telegram 安全区：真实 SDK 形状 + 发事件 + 读计算样式
+node $CHECKS/safe-area.mjs
+
+# 4) 文案真伪：热生效承诺、方向指代、原文保留策略
+node $CHECKS/copy-truth.mjs
+
+# 5) 对比度 + 角色可见性 + 错误态
 node $CHECKS/roles.mjs
 GROUP_HARNESS=http://127.0.0.1:8793 node $CHECKS/roles.mjs
 ERROR_HARNESS=http://127.0.0.1:8794 node $CHECKS/roles.mjs
 
-# 4) 截图像素抽样（确认深色主题真的渲染出来了）
+# 6) 截图像素抽样（确认深色主题真的渲染出来了）
 SHOTS=/tmp/dsh-ui-shots node $CHECKS/verify.mjs   # verify.mjs 会顺便截图
 node $CHECKS/pixels.mjs /tmp/dsh-ui-shots/*.png
 
-# 5) 保存按钮点击回归（改字段 → 真鼠标点击保存）
+# 7) 保存按钮点击回归（改字段 → 真鼠标点击保存）
 node $CHECKS/save-click-probe.mjs 8781
 ```
+
+`safe-area.mjs` 用桩上的 `__setInsets(safe, content)` / `__setViewport(height, stable)`
+驱动**官方真实形状**（`safeAreaInset` / `contentSafeAreaInset` 是
+`{top,bottom,left,right}` 对象，`viewportHeight` / `viewportStableHeight` 是数字），
+发 `safeAreaChanged` / `contentSafeAreaChanged` / `fullscreenChanged` / `viewportChanged`
+事件，然后同时读两处：
+
+- `inline`：`app.js` 实际写进 `--tg-safe-*` 的 px 字符串（逐边取 max 的结果）；
+- `probe`：一个 `padding: var(--safe-top) var(--safe-right) …` 的真实元素，
+  读回解析后的 px（`getPropertyValue()` 对未注册的自定义属性只会返回未求值的
+  `max(…)` 字符串，所以必须走真实元素）。
+
+再逐项验证：非对称 inset 生效、四个消费者（topbar / content 左右 / toast 底部）
+真的吃到了值、inset 归零不留残留、viewport 高度跟随、无效高度回落而不塌陷、
+旧 SDK（无这些字段）冷启动与热事件都不报错。
 
 `verify.mjs` 会把截图写到 `/tmp/dsh-ui-shots`（可用 `SHOTS=` 改），并把逐条
 检查结果写进 `$SHOTS/report.json`（仓库里提交的那份在 `docs/ui-night-crystal/layout-check-report.json`）。

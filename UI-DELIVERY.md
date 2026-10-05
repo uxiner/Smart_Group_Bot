@@ -194,7 +194,129 @@
 
 ---
 
-## 6. ⚠️ 交付中发现并修复的既有阻断级缺陷
+## 6. 父代理独立审查后的两项阻断修复
+
+审查 `43df85c` 后发现两个阻断，均已修复，附证据。
+
+### 6.1 `syncTelegramSafeArea()` 读错了 Telegram SDK 的数据形状
+
+**问题**（三个叠加的错误）：
+
+1. `tg.safeAreaInset` 是 **`SafeAreaInset` 对象** `{top, bottom, left, right}`
+   （官方文档，Bot API 8.0+），旧代码把它当标量用，`typeof value !== "number"`
+   直接 `continue` → **top / left / right 从来没被写进过**，`--safe-*` 一直是 0。
+2. bottom 用 `tg?.contentSafeAreaInset?.bottom ?? tg?.safeAreaInset`，
+   读到的是**对象**而不是数字，同样被 `continue` 丢掉；而且 `??` 配 truthy 判断
+   会把**有效的 0** 也当成"没有值"。
+3. `tg.viewport?.height` 根本不是 SDK 字段，真实字段是顶层的数字
+   `tg.viewportHeight` / `tg.viewportStableHeight`。
+4. 只在值有效时才 `setProperty`，从不写 0 → 一旦写过一个非零值，
+   **旋转/退出全屏后旧 inset 残留在 `:root` 上**。
+
+**修复**：按官方真实形状逐边处理，四条边每次同步都无条件重写。
+
+```js
+const SAFE_AREA_EDGES = ["top", "bottom", "left", "right"];
+
+function telegramPixel(value) {           // NaN / 负数 / 非数字 → 0
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.round(value) : 0;
+}
+
+for (const edge of SAFE_AREA_EDGES) {     // 每边取 max(device, content)
+  const device  = telegramPixel(tg?.safeAreaInset?.[edge]);
+  const content = telegramPixel(tg?.contentSafeAreaInset?.[edge]);
+  root.style.setProperty(`--tg-safe-${edge}`, `${Math.max(device, content)}px`);
+}
+const stable = telegramPixel(tg?.viewportStableHeight);
+const height = telegramPixel(tg?.viewportHeight) || stable;
+// 高度无效时**移除**变量而不是写 0px：min(100dvh, 0px) 会把页面压塌
+if (height) root.style.setProperty("--tg-viewport-height", `${height}px`);
+else root.style.removeProperty("--tg-viewport-height");
+```
+
+事件订阅补上 `fullscreenChanged`（insets 随全屏变化）。
+CSS 侧 `--safe-*` 仍是 `max(env(safe-area-inset-*), var(--tg-safe-*, 0px))`；
+新增消费点 `.app-shell { min-height: min(100dvh, var(--tg-viewport-height, 100dvh)); }`
+—— 取两者更小的一个，Telegram 可见高度变小时外壳跟着收，但不会被撑得比真实视口高。
+
+**harness 桩同步改成真实形状**：`safeAreaInset` / `contentSafeAreaInset` 是对象，
+`viewportHeight` / `viewportStableHeight` 是数字（默认 0，表示"未提供"），
+并加 `__setInsets()` / `__setViewport()` 驱动口。
+
+**新回归 `tools/settings-ui-harness/checks/safe-area.mjs`（42 项，全过）**：
+用真实形状的非对称 inset（device `{47,34,0,25}` / content `{0,21,28,7}`，
+逐边 max 期望 `47 / 34 / 28 / 25`），发 `safeAreaChanged`、`contentSafeAreaChanged`、
+`fullscreenChanged`、`viewportChanged`，然后**读两处**：
+
+- `inline`：`app.js` 实际写进 `--tg-safe-*` 的 px 字符串；
+- `probe`：一个 `padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left)`
+  的真实元素，读回解析后的 px。
+
+> 注：`getPropertyValue()` 对未注册的自定义属性只会返回**未求值**的 `max(…)` 字符串，
+> 所以必须走真实元素才能证明 CSS 层真的解析了。四个真实消费者
+> （topbar 上内边距 / content 左右内边距 / toast 底部）也逐一验证。
+
+覆盖：非对称逐边生效（device 与 content 各赢至少一条边）、inset 归零不留残留、
+viewport 高度跟随（640/700）、比 100dvh 更高时不拉伸外壳、
+`0 / -50 / NaN / undefined` 全部回落而不塌陷、旧 SDK 缺字段时热事件与冷启动都不报错。
+
+**负向对照**（同一份脚本指向 `43df85c` 的独立 worktree）：
+
+```
+43df85c（旧）:  15 passed, 27 failed
+本分支（新）:  42 passed,  0 failed
+```
+
+旧提交的失败项正好复现了审查结论：
+
+```
+FAIL  app.js wrote --tg-safe-top = max(device, content) = 47px ()      ← 从没写过
+FAIL  app.js wrote --tg-safe-left = max(device, content) = 28px ()     ← 从没写过
+FAIL  app.js wrote --tg-safe-bottom = max(device, content) = 34px (21px) ← 写成了 content 的值
+FAIL  toast region returns to the 14px base (35px)                      ← 旧 inset 残留 21px
+FAIL  --tg-viewport-height tracks viewportHeight ()                    ← 字段名不存在
+FAIL  a cold boot on an old SDK writes the 0px default on every edge ({"top":"","bottom":"","left":"","right":""})
+```
+
+源级契约同时收紧（`test_telegram_insets_are_read_as_objects_not_scalars`、
+`test_harness_stub_matches_the_official_webapp_shapes`），
+显式禁止 `tg?.viewport?.height` 这类臆造形状和 truthy 判断。
+
+### 6.2 用户说明不能承诺超出事实的话
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| Bot 行为页头 | `…保存后立即生效，无需重启。`（同页 `bot.parse_mode` 明确标着「需重启」） | `…多数设置保存后立即生效；标记「需重启」的设置除外。` |
+| 长期记忆分组头 | `…这一页的开关保存后立即生效，无需重启。`（「这一页」含 `parse_mode`） | `…本组开关保存后立即生效，无需重启。` |
+| 上下文与长期记忆分组说明 | `…原始消息不会被删除。`（存在按保留天数清理） | `…摘要与召回不替代原文，原文按「原文保留天数」过期清理。` |
+| 兼容旧自动压缩 hint | `…原始档案不会删除。` | `…不会额外删除已归档的原文。`（限定为本开关的作用范围） |
+| 启用富文本排版 hint | `按下方「消息解析格式」…`（实际在其**上方**第一格） | `按上方「消息解析格式」…` |
+| 原始档案召回 help | `…由**下一页**的「启用长期记忆（总开关）」负责`（同页下方的分组） | `…由**同页下方**的「启用长期记忆（总开关）」负责` |
+
+「需重启」徽标本身没有动，Bot 页面上仍渲染 1 个。
+
+**新回归 `tools/settings-ui-harness/checks/copy-truth.mjs`（14 项，全过）**：
+不只断言字符串，而是拿渲染后的 DOM 核对说法与页面是否一致——
+
+- Bot 页面上确实存在「需重启」徽标，页头却不再做全页热生效承诺；
+- 「消息解析格式」的几何位置**真的**在富文本开关上方（`286 < 506`），
+  hint 里的「上方」与之一致；
+- 「长期记忆」确实是同一页面里靠后的分组（`1 -> 2`），不是另一个页面；
+- 召回 help 指向同页下方，页面里不存在「下一页」这种跨页指代；
+- 页面上不存在「原始消息/档案/原文 不会被删除」这种绝对化说法，
+  且分组说明确实给出了保留策略、被指向的「原文保留天数」字段确实在这一页。
+
+顺带核对了群组页原有的 4 处方向指代（`锁群阈值…下方`、`下方勾选的管理员`、
+`下方单用户额度`、`下方仅显示并管理该群的管理员`），实际顺序都与文字一致，未改动。
+
+---
+
+## 7. 上一轮交付中发现并修复的既有阻断级缺陷（保存按钮）
+
+> 父代理已确认保留该最小修，会独立做基线复现与绿检。
+
+
 
 **症状**：在任意字段里改完值后，用真实鼠标点"保存全部"——**点了没有任何反应**，
 顶栏仍然显示"1 项更改待保存"，没有任何 toast，也没有发出任何请求。
@@ -239,7 +361,7 @@ if (saveButton.dataset.savePhase !== savePhase) {
 
 ---
 
-## 7. 测试
+## 8. 测试
 
 ### 环境说明（如实记录）
 
@@ -271,29 +393,50 @@ OK
 
 ### 改动后
 
+### 本轮（审查修复后）
+
 ```
 $ python3 tests/test_settings_frontend.py
-Ran 42 tests in 0.034s
+Ran 42 tests in 0.029s
 OK
 
 $ python3 tests/test_settings_night_crystal.py
-Ran 28 tests in 0.086s
+Ran 32 tests in 0.135s
 OK
 
 $ node --check bot/web/static/app.js
 OK
 
 $ LITELLM_MODE=PRODUCTION /tmp/dsh-nightcrystal-venv/bin/python -m pytest \
-      tests/test_settings_web.py tests/test_settings_api_helpers.py -q
-…（见下）
+      tests/test_settings_web.py tests/test_settings_api_helpers.py \
+      tests/test_p1_forkfeatures_d3_39_40_42_config_surface.py \
+      tests/test_settings_night_crystal.py -q
+86 passed, 33 subtests passed in 36.39s
 ```
+
+`test_settings_night_crystal.py` 从 28 条增加到 32 条，新增的 4 条是
+`test_telegram_insets_are_read_as_objects_not_scalars`、
+`test_harness_stub_matches_the_official_webapp_shapes`、
+`test_page_and_section_copy_never_over_promises`、
+`test_directional_copy_matches_the_real_layout`。
+
+### 上一轮（全量，父代理已在目标环境独立复跑全量）
+
+```
+$ LITELLM_MODE=PRODUCTION /tmp/dsh-nightcrystal-venv/bin/python -m pytest tests/ -q
+3681 passed, 50 warnings, 710 subtests passed in 1259.30s (0:20:59)
+```
+
+本轮按父代理要求**不重复旧全量**：改动只落在 `bot/web/static/{app.js,styles.css}`、
+`tools/settings-ui-harness/`、`tests/test_settings_night_crystal.py`，
+`bot/` 下没有任何文件变化；最终 SHA 的全量由父代理在本机和目标容器各跑一次。
 
 **现有测试一条都没有被删改，也没有被放松。**
 `tests/test_settings_frontend.py` 的 42 条断言全部保持原样通过——
 它们检查的都是字段路径、save/revision 保护、dirty tracking、secret 语义、
 分角色可见性、即时操作确认与交互锁、折叠状态捕获、校验定位等**行为契约**，
 没有一条是"断言施工备注文案"，因此不需要按产品语义改写。新增的
-`tests/test_settings_night_crystal.py`（28 条）是**视觉契约 / 布局 / 交互 / 文案 / 发布卫生**的增量回归。
+`tests/test_settings_night_crystal.py`（32 条）是**视觉契约 / 布局 / 交互 / 文案 / Telegram 安全区 / 发布卫生**的增量回归。
 
 ### 唯一一条按产品语义改写的既有测试
 
@@ -333,7 +476,13 @@ $ LITELLM_MODE=PRODUCTION /tmp/dsh-nightcrystal-venv/bin/python -m pytest tests/
 
 ### 真实浏览器验收（Playwright + 本机 Google Chrome，只监听 loopback，只用合成数据）
 
+本轮（审查修复后，五个 harness 实例同时在跑）全部重跑：
+
 ```
+### safe-area.mjs（新增）— 真实 SDK 形状 + 发事件 + 读计算样式
+42 safe-area checks passed, 0 failed
+### copy-truth.mjs（新增）— 热生效承诺 / 方向指代 / 原文保留策略
+14 copy-truth checks passed, 0 failed
 ### verify.mjs — 5 视口 × 10 页面 × 展开群卡片/分组/高级面板
 255 checks passed, 0 failed
 ### interact.mjs — 草稿、保存成功/失败、折叠态、对话框、抽屉、reduced-motion、焦点环
@@ -376,6 +525,48 @@ PASS  keyboard focus draws a >=2px outline ({"width":"2px","style":"solid","colo
 PASS  field hint contrast 7.98:1 / input placeholder contrast 4.82:1 / …（全部 ≥4.5）
 ```
 
+本轮新增两个脚本的关键通过项（原始输出见上文汇总）：
+
+```
+### safe-area.mjs
+PASS  a zero-inset SDK writes 0px on every edge ({"top":"0px","bottom":"0px","left":"0px","right":"0px"})
+PASS  app.js wrote --tg-safe-top = max(device, content) = 47px (47px)
+PASS  --safe-top resolves to 47px in a real element (47px)
+PASS  app.js wrote --tg-safe-bottom = max(device, content) = 34px (34px)
+PASS  app.js wrote --tg-safe-left = max(device, content) = 28px (28px)
+PASS  --safe-left resolves to 28px in a real element (28px)
+PASS  app.js wrote --tg-safe-right = max(device, content) = 25px (25px)
+PASS  contentSafeAreaInset wins on the left edge where it is larger
+PASS  content padding-left consumes --safe-left (28px)
+PASS  content padding-right consumes --safe-right (25px)
+PASS  toast region bottom consumes --safe-bottom (14px + 34px = 48px)
+PASS  topbar padding-top consumes --safe-top (8px base vs 47px inset = 47px)
+PASS  --safe-top is back to 0 after the inset is withdrawn (0px / 0px)      [×4 边]
+PASS  content padding-left returns to the 16px base (16px)
+PASS  toast region returns to the 14px base (14px)
+PASS  topbar returns to the 8px base (8px)
+PASS  --tg-viewport-height tracks viewportHeight (640px)
+PASS  --tg-viewport-stable-height tracks viewportStableHeight (700px)
+PASS  app shell shrinks to the Telegram viewport (640px)
+PASS  a Telegram viewport taller than 100dvh does not stretch the shell (900px)
+PASS  viewportHeight=0 / -50 / NaN / undefined falls back to 100dvh instead of collapsing the shell (900px)
+PASS  an old SDK without the fields raises no error (0)
+PASS  a cold boot on an old SDK raises no error (0)
+PASS  a cold boot on an old SDK writes the 0px default on every edge ({"top":"0px",...})
+
+### copy-truth.mjs
+PASS  the Bot page still marks restart-required fields (1 需重启 badges)
+PASS  the page head scopes the hot-apply promise and names the exception
+PASS  the page head no longer promises "保存后立即生效，无需重启" for the whole page
+PASS  the 长期记忆 section scopes its hot-apply claim to itself, not the page
+PASS  「消息解析格式」 is actually above the rich-text toggle (286 < 506)
+PASS  the rich-text hint points at 上方, matching the real order
+PASS  「长期记忆」 is a later section on the same page (1 -> 2)
+PASS  the recall help points at the master switch on the same page below
+PASS  the page no longer claims 原始消息/档案/原文 不会被删除
+PASS  the section copy states the retention policy instead of promising raw messages are kept
+```
+
 ### 截图（真实浏览器渲染，非画布伪造）
 
 | 路径 | 视口 | 页面 |
@@ -388,7 +579,7 @@ PASS  field hint contrast 7.98:1 / input placeholder contrast 4.82:1 / …（全
 像素抽样（`checks/pixels.mjs`，把 PNG 画进 canvas 逐像素统计）证明深色主题真的渲染了：
 
 ```
-mobile-390-bot-behavior.png  dark 93.9%  light 3.6%  cyan 0.35%  base=rgb(12,18,32)
+mobile-390-bot-behavior.png  dark 93.7%  light 3.7%  cyan 0.35%  base=rgb(12,18,32)
 mobile-390-groups.png       dark 94.9%  light 2.8%  violet 0.18% base=rgb(12,19,33)
 mobile-390-models.png       dark 94.9%  light 2.8%            base=rgb(12,18,32)
 desktop-1280-overview.png   dark 97.2%  light 1.2%  violet 0.07% base=rgb(15,23,38)
@@ -426,9 +617,11 @@ harness 只绑 `127.0.0.1`、只读 `tools/settings-ui-harness/fixtures/settings
 
 ---
 
-## 8. 功能与安全边界（未变动的证据）
+## 9. 功能与安全边界（未变动的证据）
 
-- 后端 `bot/` 下的任何文件都**没有**改动（`git diff --stat` 只有 3 个静态资源文件）。
+- 后端 `bot/` 下的任何文件**至今没有**被改动：两次提交加起来只碰了
+  `bot/web/static/{index.html,styles.css,app.js}`（以及 `tests/`、`tools/`、`docs/`、
+  `UI-DELIVERY.md`）。本轮只改了 `app.js` 与 `styles.css` 两个静态资源。
 - 字段路径、`save`/`revision` 并发保护、dirty tracking、secret masking / 清空语义、
   分角色可见性、即时操作确认与交互锁、取消/失败恢复语义：全部保留，
   `tests/test_settings_frontend.py` 的 42 条 + `tests/test_settings_web.py` 的回归未改一行。
@@ -446,10 +639,13 @@ harness 只绑 `127.0.0.1`、只读 `tools/settings-ui-harness/fixtures/settings
 
 ---
 
-## 9. 未验证 / 留给父代理的项
+## 10. 未验证 / 留给父代理的项
 
-1. **真机 Telegram WebView 未验证。** 本机只有桌面 Chrome，safe-area / viewport 事件
-   是用桩模拟的；`syncTelegramSafeArea()` 在 iOS/Android 客户端上的真实行为需要真机确认。
+1. **真机 Telegram WebView 未验证。** 本机只有桌面 Chrome。`safe-area.mjs` 用的是
+   **官方文档的真实字段形状**（对象形式的 inset + 数字形式的 viewportHeight），
+   但驱动它的是我写的桩，不是真的 Telegram 客户端；
+   `syncTelegramSafeArea()` 在 iOS/Android 客户端上的真实行为仍需真机确认。
+   特别值得在真机上看一眼的是 `fullscreenChanged` 之后四边是否真的归零。
 2. **父代理的隔离容器全量 suite。** 本机 `python3.12` venv 里
    `cryptography` 被迫降到 43.0.3（这台机器没有 44+ 的 wheel 也没有 Rust），
    跟生产 `requirements.lock` 不完全一致；`edge-tts` 等依赖也只按 `>=` 装了最新版。
@@ -458,5 +654,6 @@ harness 只绑 `127.0.0.1`、只读 `tools/settings-ui-harness/fixtures/settings
    渲染需要父代理再确认一遍。
 4. **深色是唯一主题。** 如果将来要支持 Telegram 的浅色主题，
    需要把整套 token 在浅色下再写一遍——不能只翻转 `--bg`。
-5. §6 的保存按钮修复属于既有缺陷，跨出了"纯视觉改造"的范围；
-   如果希望它单独成一个 commit / 单独回滚，告诉我即可。
+5. §7 的保存按钮修复属于既有缺陷，跨出了"纯视觉改造"的范围；父代理已确认保留。
+6. 本轮按父代理要求没有重复全量 suite（耗时约 21 分钟），只跑了 settings 相关的
+   86 条 + 前端 74 条；最终 SHA 的全量由父代理在本机与目标容器各跑一次。
