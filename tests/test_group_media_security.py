@@ -5,6 +5,36 @@ from unittest.mock import AsyncMock, patch
 from bot.handlers import group
 
 
+def bind_group_ops(**overrides):
+    """把 ``group_ops`` 字段绑进运行时配置（返回 stack 上下文管理器）。"""
+
+    from contextlib import contextmanager
+
+    from bot.config import Settings
+    from bot.services import policy_runtime
+
+    @contextmanager
+    def _bind():
+        previous = policy_runtime.bound_settings()
+        settings = previous or Settings(_env_file=None)
+        settings = settings.model_copy(deep=True)
+        unknown = set(overrides) - set(settings.group_ops.model_fields)
+        if unknown:
+            raise AssertionError(f"不是 group_ops 的字段名：{sorted(unknown)}")
+        settings.group_ops = settings.group_ops.model_copy(update=overrides)
+        policy_runtime.bind(settings)
+        try:
+            yield
+        finally:
+            if previous is None:
+                policy_runtime.unbind()
+            else:
+                policy_runtime.bind(previous)
+
+    return _bind()
+
+
+
 def _image_message(*, file_size: int = 3, mime: str = "image/png") -> SimpleNamespace:
     bot = SimpleNamespace(
         token="123456:TOP_SECRET_TOKEN",
@@ -29,7 +59,7 @@ def _image_message(*, file_size: int = 3, mime: str = "image/png") -> SimpleName
 class GroupMediaSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_declared_oversize_image_is_rejected_before_telegram_download(self) -> None:
         message = _image_message(file_size=101)
-        with patch.object(group, "_MAX_VISION_IMAGE_BYTES", 100):
+        with bind_group_ops(vision_image_max_bytes=100):
             data_uri = await group._build_telegram_image_data_uri(message)
 
         self.assertEqual(data_uri, "")
@@ -43,7 +73,7 @@ class GroupMediaSecurityTests(unittest.IsolatedAsyncioTestCase):
             destination.write(b"12345")
 
         message.bot.download_file.side_effect = write_too_much
-        with patch.object(group, "_MAX_VISION_IMAGE_BYTES", 4):
+        with bind_group_ops(vision_image_max_bytes=4):
             data_uri = await group._build_telegram_image_data_uri(message)
 
         self.assertEqual(data_uri, "")

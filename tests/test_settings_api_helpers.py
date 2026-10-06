@@ -2,21 +2,48 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot.web import settings_api
 
 
+
+
+@contextmanager
+def _bind_member_identity(**overrides):
+    """把 ``resources`` 里的身份查询字段绑进运行时配置（真实读路径）。
+
+    ``_MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS`` / ``_LOOKUP_CONCURRENCY`` 现在是
+    「未绑定时的默认值」；直接改模块常量不会影响读侧，所以测试必须配配置。
+    """
+
+    from bot.config import Settings
+    from bot.services import policy_runtime
+
+    previous = policy_runtime.bound_settings()
+    settings = previous or Settings(_env_file=None)
+    settings = settings.model_copy(deep=True)
+    unknown = set(overrides) - set(settings.resources.model_fields)
+    if unknown:
+        raise AssertionError(f"不是 resources 的字段名：{sorted(unknown)}")
+    settings.resources = settings.resources.model_copy(update=overrides)
+    policy_runtime.bind(settings)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime.unbind()
+        else:
+            policy_runtime.bind(previous)
+
+
 class MemberIdentityLookupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.original_timeout = (
-            settings_api._MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS
-        )
         self.original_cancel_grace = (
             settings_api._MEMBER_IDENTITY_CANCEL_GRACE_SECONDS
         )
-        self.original_concurrency = settings_api._MEMBER_IDENTITY_LOOKUP_CONCURRENCY
         self.original_orphan_limit = settings_api._MEMBER_IDENTITY_ORPHAN_LIMIT
         self.original_cooldown = (
             settings_api._MEMBER_IDENTITY_CIRCUIT_COOLDOWN_SECONDS
@@ -25,7 +52,12 @@ class MemberIdentityLookupTests(unittest.IsolatedAsyncioTestCase):
         settings_api._MEMBER_IDENTITY_INFLIGHT.clear()
         settings_api._MEMBER_IDENTITY_ORPHANS.clear()
         settings_api._MEMBER_IDENTITY_RPC_TASKS.clear()
-        settings_api._MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS = 0.05
+        # 超时与并发改成走运行时配置（真实读路径）；取消宽限与孤儿上限仍是常量。
+        self._policy = _bind_member_identity(
+            member_identity_lookup_timeout_seconds=0.05,
+            member_identity_lookup_concurrency=1,
+        )
+        self._policy.__enter__()
         settings_api._MEMBER_IDENTITY_CANCEL_GRACE_SECONDS = 0.01
         settings_api._MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL = 0.0
         settings_api._MEMBER_IDENTITY_LOOKUP_LOOP = None
@@ -33,9 +65,8 @@ class MemberIdentityLookupTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await settings_api.flush_member_identity_tasks(timeout_seconds=0.1)
-        settings_api._MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS = self.original_timeout
+        self._policy.__exit__(None, None, None)
         settings_api._MEMBER_IDENTITY_CANCEL_GRACE_SECONDS = self.original_cancel_grace
-        settings_api._MEMBER_IDENTITY_LOOKUP_CONCURRENCY = self.original_concurrency
         settings_api._MEMBER_IDENTITY_ORPHAN_LIMIT = self.original_orphan_limit
         settings_api._MEMBER_IDENTITY_CIRCUIT_COOLDOWN_SECONDS = self.original_cooldown
         settings_api._MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL = 0.0
@@ -106,7 +137,6 @@ class MemberIdentityLookupTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_resistant_child_keeps_real_concurrency_permit(self) -> None:
         release = asyncio.Event()
         calls: list[int] = []
-        settings_api._MEMBER_IDENTITY_LOOKUP_CONCURRENCY = 1
         settings_api._MEMBER_IDENTITY_LOOKUP_LOOP = None
         settings_api._MEMBER_IDENTITY_LOOKUP_SEMAPHORE = None
 

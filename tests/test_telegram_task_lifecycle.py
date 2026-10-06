@@ -5,11 +5,43 @@ import subprocess
 import sys
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot.utils import telegram
+
+
+
+
+@contextmanager
+def _bind_telegram_send(**overrides):
+    """把 ``telegram_send`` 字段绑进运行时配置（真实读路径）。
+
+    以前这里 patch 的是模块常量；那些常量现在是"未绑定时的默认值"，patch 它们
+    只会让测试"看起来在调、其实没调"。
+    """
+
+    from bot.config import Settings
+    from bot.services import policy_runtime
+
+    previous = policy_runtime.bound_settings()
+    settings = previous or Settings(_env_file=None)
+    settings = settings.model_copy(deep=True)
+    holder = settings.telegram_send
+    unknown = set(overrides) - set(holder.model_fields)
+    if unknown:
+        raise AssertionError(f"不是 telegram_send 的字段名：{sorted(unknown)}")
+    setattr(settings, "telegram_send", holder.model_copy(update=overrides))
+    policy_runtime.bind(settings)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime.unbind()
+        else:
+            policy_runtime.bind(previous)
 
 
 class TelegramTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -32,7 +64,7 @@ class TelegramTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         started = time.monotonic()
         with (
-            patch.object(telegram, "_TYPING_SEND_TIMEOUT_SECONDS", 0.01),
+            _bind_telegram_send(typing_send_timeout_seconds=0.01),
             patch.object(telegram, "_TELEGRAM_CANCEL_GRACE_SECONDS", 0.01),
             patch.object(telegram, "_TYPING_WORKER_CANCEL_GRACE_SECONDS", 0.05),
         ):

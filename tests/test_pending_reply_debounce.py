@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -11,6 +12,37 @@ from bot.services.doubao_tts import TTSDeliveryResult
 from bot.services.skills.base import SkillAnswerResult
 from bot.services.update_completion import UpdateCompletionReceipt
 from bot.utils.telegram import ReplyMessageOverlay, TelegramDeliveryResult
+
+
+
+
+@contextmanager
+def _bind_group_activity_debounce(**overrides):
+    """把 ``group_ops`` 字段绑进运行时配置（真实读路径）。
+
+    以前这里 patch 的是模块常量；那些常量现在是"未绑定时的默认值"，patch 它们
+    只会让测试"看起来在调、其实没调"。
+    """
+
+    from bot.config import Settings
+    from bot.services import policy_runtime
+
+    previous = policy_runtime.bound_settings()
+    settings = previous or Settings(_env_file=None)
+    settings = settings.model_copy(deep=True)
+    holder = settings.group_ops
+    unknown = set(overrides) - set(holder.model_fields)
+    if unknown:
+        raise AssertionError(f"不是 group_ops 的字段名：{sorted(unknown)}")
+    setattr(settings, "group_ops", holder.model_copy(update=overrides))
+    policy_runtime.bind(settings)
+    try:
+        yield
+    finally:
+        if previous is None:
+            policy_runtime.unbind()
+        else:
+            policy_runtime.bind(previous)
 
 
 def _settings(delay: float = 5.0) -> SimpleNamespace:
@@ -1667,7 +1699,7 @@ class GroupActivityCASTests(unittest.IsolatedAsyncioTestCase):
         settings = SimpleNamespace(bot=BotConfig())
 
         with (
-            patch.object(group, "_GROUP_ACTIVITY_DEBOUNCE_SECONDS", 0.01),
+            _bind_group_activity_debounce(activity_debounce_seconds=0.01),
             patch.object(group, "_persist_group_activity_cas", new=persist),
         ):
             first = await group._record_group_activity_cas(
