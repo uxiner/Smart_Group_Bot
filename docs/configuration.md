@@ -39,7 +39,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 
 改完 `.env` 要用 `docker compose up -d` 重新拉起容器才会加载新值；`docker compose restart` 只重启已有容器，不会重新读取 `.env`。
 
-容器还要求显式给出非零的 `APP_UID` / `APP_GID`（与 `data/` 目录属主一致）。建目录、改属主、启动与升级的完整命令见 [README 的部署一节](../README.md#部署)。
+容器还要求显式给出非零的 `APP_UID` / `APP_GID`（与 `data/` 目录属主一致）。建目录、改属主、启动与升级的完整命令见 [README 的从零部署一节](../README.md#从零部署)。
 
 ## 三、谁能改
 
