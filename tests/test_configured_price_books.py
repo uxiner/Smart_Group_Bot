@@ -18,8 +18,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import timedelta
 
 from bot.config import Settings
 from bot.db.engine import init_db
@@ -79,7 +78,6 @@ class ConfiguredPricePurchaseTests(unittest.IsolatedAsyncioTestCase):
     # -- helpers ---------------------------------------------------------
     async def _grant(self, user_id: int, points: int) -> None:
         from bot.db.models import MemberPointAward
-        from bot.services.checkin import available_points
 
         self._seed += 1
         async with self.session_factory() as session:
@@ -208,7 +206,7 @@ class ConfiguredPricePurchaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_price_change_mid_purchase_does_not_split_the_books(self) -> None:
         """菜单、扣费、退款、回执必须用同一份价格快照。"""
 
-        from bot.db.models import MemberPointAward, MemberPointSpend
+        from bot.db.models import MemberPointSpend
 
         await self._grant(7, 500)
         _bind({"tag_price_7d": 41})
@@ -345,8 +343,6 @@ class ConfiguredPricePurchaseTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_expiry_sweep_uses_the_configured_retry_and_batch(self) -> None:
-        from bot.services import point_shop
-
         await self._grant(7, 500)
         _bind({"tag_price_7d": 41})
         await self._buy_tag(FakeBot())

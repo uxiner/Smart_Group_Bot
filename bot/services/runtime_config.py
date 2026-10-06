@@ -1248,25 +1248,25 @@ class ResourceSettingsConfig(StrictModel):
     #: 端到端预算。普通更新 150s 必须盖住"防抖 + 同步审核/索引 + 群回复 worker
     #: 的整段预算"（后者群级可配、上界 120s），否则请求会在 handler 跑完之前被掐断。
     webhook_update_timeout_seconds: float = Field(
-        default=150.0, ge=5.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=150.0, ge=5.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     webhook_critical_update_timeout_seconds: float = Field(
-        default=60.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=60.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     webhook_security_update_timeout_seconds: float = Field(
-        default=120.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=120.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     webhook_auth_update_timeout_seconds: float = Field(
-        default=45.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=45.0, ge=1.0, le=1800.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     #: HTTP 响应超时必须 ≥ 最大的端到端预算，否则响应先于 handler 结束就断。
     webhook_http_response_timeout_seconds: float = Field(
-        default=155.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=155.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     #: durable inbox 的租约。**必须不小于最大的端到端预算**：租约先到期的话，
     #: 恢复循环会把一个仍在执行的 update 交给第二个 worker，造成重复处理。
     webhook_inbox_lease_seconds: float = Field(
-        default=300.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=300.0, ge=5.0, le=3600.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     #: durable inbox 的维护旋钮：每轮现取，热生效。
     webhook_inbox_recovery_batch: int = Field(default=64, ge=1, le=5000)
@@ -1279,13 +1279,13 @@ class ResourceSettingsConfig(StrictModel):
     webhook_inbox_cleanup_batch: int = Field(default=256, ge=1, le=10_000)
     #: 轮询（未启用 webhook 时的兜底传输）的三个超时。session 启动时建一次。
     polling_timeout_seconds: int = Field(
-        default=15, ge=1, le=300, json_schema_extra=_RESTART
+        default=15, ge=1, le=300, json_schema_extra=_HOT
     )
     polling_http_timeout_seconds: int = Field(
-        default=30, ge=1, le=600, json_schema_extra=_RESTART
+        default=30, ge=1, le=600, json_schema_extra=_HOT
     )
     polling_request_timeout_seconds: float = Field(
-        default=35.0, ge=1.0, le=600.0, allow_inf_nan=False, json_schema_extra=_RESTART
+        default=35.0, ge=1.0, le=600.0, allow_inf_nan=False, json_schema_extra=_HOT
     )
     #: 同一会话的并发发送上限。**每次发送现建信号量**（不是模块级长寿命闸门），
     #: 所以热生效是安全的：没有 slot 会被漏掉或泄漏。
@@ -1496,29 +1496,25 @@ class RuntimeConfig(StrictModel):
                 raise ValueError(f"embed fallback provider does not exist: {fallback.provider}")
         return self
 
-    def restart_changed_paths(self, previous: "RuntimeConfig") -> list[str]:
-        """这次保存里**真正变了**且属于 restart 字段的路径（只给字段名）。
+    def restart_pending_paths(self, applied: dict[str, Any] | None = None) -> list[str]:
+        """当前保存值与**进程实际在跑的值**不一致的 restart 字段（只给字段名）。
 
-        用来在 ``PUT /api/v1/settings`` 的响应里明确告诉管理员"这些要重启"，
-        而不是让页面自己猜。**只回字段名，不回任何值**（值里可能混着 secret）。
+        基准是"本进程启动时装配进去的那一份"，**不是上一次保存**：
+
+        * 先把 LLM 容量 8 改成 16 → 提示 ``resources.llm_request_capacity``；
+        * 再改一个热字段 → 提示**不会**被清掉（进程里仍然是 8）；
+        * 改回 8（= 实际运行值）→ 该字段的提示自动消失。
+
+        只回字段名，不回任何值（值里可能混着 secret）。
         """
 
-        changed: list[str] = []
-        for path in _restart_required_paths():
-            section, _, name = path.rpartition(".")
-            if section == "bot" and name == "parse_mode":
-                if previous.bot.parse_mode != self.bot.parse_mode:
-                    changed.append(path)
-                continue
-            if section != "resources":
-                continue
-            before = previous.resources
-            after = self.resources
-            if before is None or after is None:
-                continue
-            if getattr(before, name, None) != getattr(after, name, None):
-                changed.append(path)
-        return sorted(changed)
+        baseline = applied if applied is not None else applied_restart_values()
+        desired = _extract_restart_values(self)
+        return sorted(
+            path
+            for path in RESTART_REQUIRED_PATHS
+            if desired.get(path) != baseline.get(path)
+        )
 
     def secret_paths(self) -> set[str]:
         paths = set(_STATIC_SECRET_PATHS)
@@ -2309,7 +2305,9 @@ class RuntimeConfigManager:
         self._revision = 0
         self._lock = asyncio.Lock()
         self._on_applied: ConfigAppliedCallback | None = None
-        #: 上一次保存里"改了但要重启才生效"的字段名（只存名字，不存值）。
+        #: 本进程启动时实际装配的 restart 值（基准；只存非 secret 的量）。
+        self._applied_restart: dict[str, Any] = {}
+        #: 当前"保存值 ≠ 运行值"的 restart 字段名（每次保存重算，不只比上次）。
         self._restart_pending: list[str] = []
 
     @property
@@ -2419,6 +2417,9 @@ class RuntimeConfigManager:
                         )
 
             config.apply_to_settings(self.settings)
+            # 本进程"实际装配的 restart 值"就在这一刻定下来：之后的每次保存都拿它
+            # 当基准，所以 restart_pending 不会因为一次热字段保存就被清空。
+            self._applied_restart = record_applied_restart_values(config)
             # 热更之后，所有没有依赖注入的服务都从这里现取快照。
             policy_runtime.bind(self.settings)
             self._config = config
@@ -2551,7 +2552,9 @@ class RuntimeConfigManager:
 
             candidate.apply_to_settings(self.settings)
             policy_runtime.bind(self.settings)
-            self._restart_pending = candidate.restart_changed_paths(current)
+            self._restart_pending = candidate.restart_pending_paths(
+                self._applied_restart or applied_restart_values()
+            )
             self._config = candidate
             self._revision = revision
             await self._notify_applied(candidate)
@@ -2619,6 +2622,108 @@ def _restart_required_paths() -> list[str]:
 
 #: 需要重启才生效的字段（只含字段名，不含任何值）。
 RESTART_REQUIRED_PATHS: tuple[str, ...] = tuple(_restart_required_paths())
+
+#: **本进程启动时真正装配进去的** restart 字段值。
+#:
+#: 这是"标签与行为"一致性的关键：标了 ``_RESTART`` 的字段在运行期不会被偷偷改掉，
+#: 它们的读侧一律走这里，而不是 ``apply_to_settings`` 写下来的"期望值"。运维在
+#: Mini App 里改这些字段，保存是成功的（表里存的是期望值，API 照样回
+#: ``restart_pending``），但**下一次动作读到的仍是当前进程真正在跑的那个数**，
+#: 直到重启。启动路径用 :func:`record_applied_restart_values` 写入一次；没写过就
+#: 回落到 schema 默认值（等价于"干净进程"）。
+_APPLIED_RESTART_VALUES: dict[str, Any] = {}
+
+
+def _iter_restart_value_paths() -> list[tuple[str, str]]:
+    """restart 字段的 ``(路径, 段名)``；``bot.parse_mode`` 的段名留空。"""
+
+    result: list[tuple[str, str]] = [("bot.parse_mode", "")]
+    for path in RESTART_REQUIRED_PATHS:
+        if path == "bot.parse_mode":
+            continue
+        section, _, _name = path.rpartition(".")
+        result.append((path, section))
+    return result
+
+
+def _extract_restart_values(config: "RuntimeConfig") -> dict[str, Any]:
+    """从一份配置里取出所有 restart 字段的值。
+
+    对**缺字段的替身**保持宽容（``getattr`` + None 跳过）：单测会用只带
+    ``resources`` 的轻量替身调启动装配，不该因此炸掉——真正需要完整文档的地方
+    永远传真的 ``RuntimeConfig``。
+    """
+
+    values: dict[str, Any] = {}
+    for path, section in _iter_restart_value_paths():
+        if path == "bot.parse_mode":
+            bot = getattr(config, "bot", None)
+            if bot is not None:
+                values[path] = getattr(bot, "parse_mode", None)
+            continue
+        holder = getattr(config, section, None)
+        if holder is None:
+            continue
+        _sec, _, name = path.rpartition(".")
+        if hasattr(holder, name):
+            values[path] = getattr(holder, name)
+    return values
+
+
+def record_applied_restart_values(config: "RuntimeConfig") -> dict[str, Any]:
+    """记下"本进程启动时装配的 restart 值"（启动路径调用一次）。
+
+    只含非 secret 的标量/容量；``restart_pending`` 与各读侧都以它为基准。
+    """
+
+    global _APPLIED_RESTART_VALUES
+    # 合并而不是整体替换：调用方可能只带部分段（单测的轻量替身），不该把别的
+    # 已装配字段的基线抹掉。
+    merged = dict(_APPLIED_RESTART_VALUES)
+    merged.update(_extract_restart_values(config))
+    _APPLIED_RESTART_VALUES = merged
+    return dict(_APPLIED_RESTART_VALUES)
+
+
+def applied_restart_values() -> dict[str, Any]:
+    """本进程实际在跑的 restart 字段值（缺项回落到读侧视图的默认值）。"""
+
+    if _APPLIED_RESTART_VALUES:
+        return dict(_APPLIED_RESTART_VALUES)
+    from bot.config import ResourcesPolicyConfig as _Defaults
+
+    defaults = _Defaults()
+    values: dict[str, Any] = {"bot.parse_mode": "HTML"}
+    for path, _section in _iter_restart_value_paths():
+        if path == "bot.parse_mode":
+            continue
+        _sec, _, name = path.rpartition(".")
+        values[path] = getattr(defaults, name, None)
+    return values
+
+
+def applied_restart_value(path: str, fallback: Any = None) -> Any:
+    """单个 restart 字段的运行值。"""
+
+    return applied_restart_values().get(path, fallback)
+
+
+def override_applied_restart_values(values: dict[str, Any]) -> dict[str, Any]:
+    """**测试专用**：直接设定「本进程装配的 restart 值」，不做 schema 校验。
+
+    生产路径永远走 :func:`record_applied_restart_values`（喂进来的是已校验的
+    ``RuntimeConfig``）。这里之所以要留一道缝：单测要把租约压到**毫秒级**才能
+    复现「租约到期后恢复循环把仍在执行的 update 交给第二个 worker」这条路径，
+    而 schema 正确地禁止了小于 5 秒的租约——测试要的不是"一个合法的配置"，
+    而是"一个这样的进程状态"。把它显式命名为 override_，并在调用点写明理由，
+    比让测试去 patch 一个不存在的分支诚实。
+    """
+
+    global _APPLIED_RESTART_VALUES
+    merged = applied_restart_values()
+    merged.update(values)
+    _APPLIED_RESTART_VALUES = merged
+    return dict(_APPLIED_RESTART_VALUES)
 
 
 def _redact_database_url(url: str) -> str:

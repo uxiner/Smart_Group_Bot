@@ -791,7 +791,7 @@ class ResourcesPolicyConfig(BaseModel):
         return result
 
     @model_validator(mode="after")
-    def _validate_reserved_capacity(self) -> "ResourceSettingsConfig":
+    def _validate_reserved_capacity(self) -> "ResourcesPolicyConfig":
         """保留容量的不变式：关键名额 ≥1、背景 ≤ 普通 − 2、三级容量严格递减。"""
 
         total = self.llm_request_capacity

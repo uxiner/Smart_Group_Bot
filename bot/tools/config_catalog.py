@@ -133,7 +133,6 @@ def _unit(hint: str) -> str:
 def build_catalog() -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for section, model in SECTION_MODELS.items():
-        instance = model()
         for name, field in model.model_fields.items():
             path = f"{section}.{name}"
             entries.append(

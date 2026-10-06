@@ -1321,9 +1321,10 @@ def _bind_webhook_budget(**short):
     previous = policy_runtime.bound_settings()
     # 在已绑定的 settings 上叠加：嵌套使用时不丢掉外层的改动。
     settings = (previous or Settings(_env_file=None)).model_copy(deep=True)
-    settings.resources = settings.resources.model_copy(
-        update={f"webhook_{name}": value for name, value in short.items()}
-    )
+    unknown = set(short) - set(settings.resources.model_fields)
+    if unknown:
+        raise AssertionError(f"不是 ResourcesPolicyConfig 的字段名：{sorted(unknown)}")
+    settings.resources = settings.resources.model_copy(update=short)
     policy_runtime.bind(settings)
     try:
         yield
@@ -1890,7 +1891,7 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
         server.enable_webhook_route()
         try:
             with (
-                _bind_webhook_budget(update_timeout_seconds=0.01),
+                _bind_webhook_budget(webhook_update_timeout_seconds=0.01),
                 patch("bot.services.verify_web._WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS", 0.01),
             ):
                 response = await handler(

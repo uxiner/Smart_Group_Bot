@@ -42,8 +42,6 @@ from bot.services.background_health import record_background_failure
 from bot.services import policy_runtime
 from bot.services.checkin import available_points, local_today, spend_points
 from bot.services.policy_runtime import EconomySnapshot, pinned_section
-from bot.services.policy_runtime import EconomySnapshot
-from bot.services.policy_runtime import EconomySnapshot
 from bot.utils.timezone import now_shanghai_naive, now_shanghai_naive_precise
 
 log = logging.getLogger(__name__)

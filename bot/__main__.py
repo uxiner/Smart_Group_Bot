@@ -39,7 +39,6 @@ from bot.services.group_summary import (
     group_summary_config,
     init_group_summary_scheduler,
 )
-from bot.services.llm import _LLM_PRIORITY_GATE
 from bot.services.request_priority import ExecutionPriority
 from bot.services.group_permissions import (
     GroupPermissionService,
@@ -81,6 +80,7 @@ from bot.services.scheduled_messages import ScheduledMessageService
 from bot.services.archive_vector import archive_limits
 from bot.services.search_memory import search_memory_limits
 from bot.services.long_term_memory import memory_limits
+from bot.services import llm as llm_module
 from bot.services.startup_resources import (
     StartupResourceBusy,
     apply_startup_resources,
@@ -549,6 +549,35 @@ async def _initialize_runtime_services(
     return runtime_config, llm, memory
 
 
+def _build_group_summary_scheduler(
+    *, llm: Any, memory: Any, settings: Settings
+) -> Any:
+    """按当前进程的门禁对象注册后台群摘要调度器。
+
+    **在注册这一刻才取门禁对象**，绝不 ``from bot.services.llm import
+    _LLM_PRIORITY_GATE``：按值导入拿到的是 :func:`apply_startup_resources` 重绑
+    之前的那一个，于是后台摘要在旧容量池（8/4）上跑、回复走新容量池（16/8），
+    "背景 ≤ 2 且与回复共享 normal=4" 这条预留不变式就裂开了。
+
+    抽成独立函数是为了让测试能跑**这段真代码**，而不是在测试里抄一份。
+    """
+
+    summary_store_factory = getattr(memory, "group_summary_store", None)
+    if not callable(summary_store_factory):
+        return None
+    llm_priority_gate = llm_module._LLM_PRIORITY_GATE
+    return init_group_summary_scheduler(
+        llm=llm,
+        store=summary_store_factory(),
+        config_provider=lambda: group_summary_config(settings.bot),
+        slot_waiter=lambda: llm_priority_gate.has_waiting(ExecutionPriority.NORMAL),
+        background_capacity=lambda: llm_priority_gate.background_capacity,
+        # 有界入场等待由调度器做（归 queue_wait），拿到许可后交给请求任务；
+        # 模型/重试/fallback 才算执行期限。用的就是同一个门禁对象。
+        gate=llm_priority_gate,
+    )
+
+
 def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     """Install middleware on every update observer that needs its services."""
 
@@ -653,22 +682,8 @@ async def main() -> None:
 
     # 第②项：后台群摘要调度器（进程级单例）。前台只登记、只读已发布摘要；
     # 真正的模型调用走 BACKGROUND 优先级与独立容量（≤2、与回复共享 normal=4）。
-    summary_store_factory = getattr(memory, "group_summary_store", None)
-    summary_scheduler = (
-        init_group_summary_scheduler(
-            llm=llm,
-            store=summary_store_factory(),
-            config_provider=lambda: group_summary_config(settings.bot),
-            slot_waiter=lambda: _LLM_PRIORITY_GATE.has_waiting(
-                ExecutionPriority.NORMAL
-            ),
-            background_capacity=lambda: _LLM_PRIORITY_GATE.background_capacity,
-            # 有界入场等待由调度器做（归 queue_wait），拿到许可后交给请求任务；
-            # 模型/重试/fallback 才算执行期限。用的就是同一个门禁对象。
-            gate=_LLM_PRIORITY_GATE,
-        )
-        if callable(summary_store_factory)
-        else None
+    summary_scheduler = _build_group_summary_scheduler(
+        llm=llm, memory=memory, settings=settings
     )
 
     dp["settings"] = settings

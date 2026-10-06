@@ -498,14 +498,25 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     "resources.llm_tokenizer_concurrency": (
         "bot/services/startup_resources.py:apply_startup_resources",
     ),
+    # Telegram 三个容量**不由** apply_startup_resources 装配：它们在建
+    # ``PriorityAiohttpSession`` 时固化，而 Session 是 ``create_bot`` 建的。真实
+    # 调用链是 telegram_session_limits() → PriorityAiohttpSession.__init__ →
+    # bot/loader.py create_bot。登记成 apply_startup_resources 会指向一个根本不读
+    # 这三个字段的函数——"有登记"不等于"读侧是真的"。
     "resources.telegram_total_capacity": (
-        "bot/services/startup_resources.py:apply_startup_resources",
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot",
     ),
     "resources.telegram_noncritical_capacity": (
-        "bot/services/startup_resources.py:apply_startup_resources",
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot",
     ),
     "resources.telegram_normal_capacity": (
-        "bot/services/startup_resources.py:apply_startup_resources",
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot",
     ),
     "resources.pending_reply_execution_capacity": (
         "bot/services/startup_resources.py:apply_startup_resources",

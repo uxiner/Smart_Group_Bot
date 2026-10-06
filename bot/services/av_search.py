@@ -48,6 +48,8 @@ _STAR_ID_RE = re.compile(r"/star/([A-Za-z0-9]+)", re.IGNORECASE)
 _STAR_NAME_CACHE: dict[str, str] = {}
 _STAR_NAME_CACHE_MAX = 512
 _AV_QUERY_CONCURRENCY = 3
+#: 启动装配写回用的规范名（与其它闸门的 ``*_CONCURRENCY`` 命名对齐）。
+_AV_QUERY_CONCURRENT = _AV_QUERY_CONCURRENCY
 _AV_QUERY_DEADLINE_SECONDS = 45.0
 _AV_QUERY_ADMISSION_TIMEOUT_SECONDS = 2.0
 def av_query_limits() -> tuple[float, float, int]:

@@ -69,12 +69,18 @@ def polling_limits() -> dict[str, float | int]:
     aiohttp session 在启动时建一次，所以这三个值是 **restart** 字段——改完要重启。
     """
 
+    from bot.services.runtime_config import applied_restart_value
+
     resources = policy_runtime.resources_policy()
     return {
-        "timeout_seconds": resources.polling_timeout_seconds,
-        "http_timeout_seconds": resources.polling_http_timeout_seconds,
-        "request_timeout_seconds": resources.polling_request_timeout_seconds,
-        "webhook_max_connections": resources.webhook_max_concurrent_updates,
+        # 三个轮询超时是 hot：每轮 getUpdates 现读。
+        "timeout_seconds": int(resources.polling_timeout_seconds),
+        "http_timeout_seconds": int(resources.polling_http_timeout_seconds),
+        "request_timeout_seconds": float(resources.polling_request_timeout_seconds),
+        # 连接池上限是 restart：aiohttp connector 在启动时建一次。
+        "webhook_max_connections": int(
+            applied_restart_value("resources.webhook_max_concurrent_updates", 8)
+        ),
     }
 _POLLING_BACKOFF_CONFIG = BackoffConfig(
     min_delay=1.0,

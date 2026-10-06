@@ -19,6 +19,16 @@ from bot.services.runtime_config import RuntimeConfig
 
 
 def _bind(resources: dict) -> RuntimeConfig:
+    """绑定一份运行时配置。
+
+    冷容量（webhook 的 worker 数 / 队列容量、Telegram 的三个容量）**必须走真正的
+    装配入口** ``apply_startup_resources``：它们在建 ``_WebhookUpdateQueue`` /
+    ``PriorityAiohttpSession`` 时固化，只改 Settings 不会生效——那正是本轮修掉的
+    「标成 restart 却热读」那一类问题。
+    """
+
+    from bot.services.startup_resources import apply_startup_resources
+
     base = RuntimeConfig()
     payload = base.storage_payload()
     payload["resources"] = {**base.resources.model_dump(), **resources}
@@ -26,15 +36,18 @@ def _bind(resources: dict) -> RuntimeConfig:
     settings = Settings(_env_file=None)
     config.apply_to_settings(settings, apply_prompts=False)
     policy_runtime.bind(settings)
+    apply_startup_resources(config)
     return config
 
 
 class WebhookBudgetConsumerTests(unittest.TestCase):
     def setUp(self) -> None:
         policy_runtime.unbind()
+        _bind({})  # 回到默认装配
 
     def tearDown(self) -> None:
         policy_runtime.unbind()
+        _bind({})  # 别把上一条用例的冷容量留给下一条
 
     def test_defaults_equal_the_pre_change_constants(self) -> None:
         from bot.services.verify_web import webhook_budget
@@ -100,7 +113,6 @@ class WebhookBudgetConsumerTests(unittest.TestCase):
         数量仍必须由配置决定——否则就还有人靠改源码常量来调容量。
         """
 
-        import asyncio
         from unittest.mock import patch
 
         from bot.services import verify_web as verify_web_module

@@ -226,20 +226,47 @@ def webhook_budget() -> dict[str, float]:
     被固定进对象**，因此统一标成 restart，见 ``RESTART_REQUIRED_PATHS``。
     """
 
+    from bot.services.runtime_config import applied_restart_value
+
     resources = policy_runtime.resources_policy()
     return {
-        "max_concurrent_updates": resources.webhook_max_concurrent_updates,
-        "critical_concurrent_updates": resources.webhook_critical_concurrent_updates,
-        "security_concurrent_updates": resources.webhook_security_concurrent_updates,
-        "auth_concurrent_updates": resources.webhook_auth_concurrent_updates,
-        "critical_queue_capacity": resources.webhook_critical_queue_capacity,
-        "security_queue_capacity": resources.webhook_security_queue_capacity,
-        "auth_queue_capacity": resources.webhook_auth_queue_capacity,
-        "update_timeout_seconds": resources.webhook_update_timeout_seconds,
-        "critical_update_timeout_seconds": resources.webhook_critical_update_timeout_seconds,
-        "security_update_timeout_seconds": resources.webhook_security_update_timeout_seconds,
-        "auth_update_timeout_seconds": resources.webhook_auth_update_timeout_seconds,
-        "http_response_timeout_seconds": resources.webhook_http_response_timeout_seconds,
+        # worker 数与队列容量是 **restart**：它们在建 ``_WebhookUpdateQueue`` 时固化，
+        # 热换会漏掉在跑的 worker，所以读"本进程装配的那一份"。
+        "max_concurrent_updates": int(
+            applied_restart_value("resources.webhook_max_concurrent_updates", 8)
+        ),
+        "critical_concurrent_updates": int(
+            applied_restart_value("resources.webhook_critical_concurrent_updates", 4)
+        ),
+        "security_concurrent_updates": int(
+            applied_restart_value("resources.webhook_security_concurrent_updates", 4)
+        ),
+        "auth_concurrent_updates": int(
+            applied_restart_value("resources.webhook_auth_concurrent_updates", 2)
+        ),
+        "critical_queue_capacity": int(
+            applied_restart_value("resources.webhook_critical_queue_capacity", 64)
+        ),
+        "security_queue_capacity": int(
+            applied_restart_value("resources.webhook_security_queue_capacity", 128)
+        ),
+        "auth_queue_capacity": int(
+            applied_restart_value("resources.webhook_auth_queue_capacity", 64)
+        ),
+        # 以下全部是 **hot**：每条 update / 每次响应现读，没有长寿命对象持有它们。
+        "update_timeout_seconds": float(resources.webhook_update_timeout_seconds),
+        "critical_update_timeout_seconds": float(
+            resources.webhook_critical_update_timeout_seconds
+        ),
+        "security_update_timeout_seconds": float(
+            resources.webhook_security_update_timeout_seconds
+        ),
+        "auth_update_timeout_seconds": float(
+            resources.webhook_auth_update_timeout_seconds
+        ),
+        "http_response_timeout_seconds": float(
+            resources.webhook_http_response_timeout_seconds
+        ),
     }
 _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS = 2.0
 _WEBHOOK_DRAIN_TIMEOUT_SECONDS = 15.0
@@ -261,7 +288,9 @@ def inbox_limits() -> dict[str, float | int]:
 
     resources = policy_runtime.resources_policy()
     return {
-        "lease_seconds": resources.webhook_inbox_lease_seconds,
+        # 全部 hot：租约在每次 claim / renew 时现读，没有长寿命对象持有它。
+        # （关联约束仍在 schema 层：租约 >= 端到端预算与最大重试退避。）
+        "lease_seconds": float(resources.webhook_inbox_lease_seconds),
         "recovery_batch": resources.webhook_inbox_recovery_batch,
         "retry_max_seconds": resources.webhook_inbox_retry_max_seconds,
         "cleanup_interval_seconds": resources.webhook_inbox_cleanup_interval_seconds,

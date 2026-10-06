@@ -17,7 +17,10 @@ import unittest
 from typing import Any
 
 from bot.services import policy_runtime
-from bot.services.runtime_config import RuntimeConfig
+from bot.services.runtime_config import (
+    RuntimeConfig,
+    record_applied_restart_values,
+)
 from bot.services.startup_resources import (
     StartupResourceBusy,
     apply_startup_resources,
@@ -71,8 +74,6 @@ class StartupAssemblyTests(unittest.TestCase):
         policy_runtime.unbind()
 
     def tearDown(self) -> None:
-        from bot.services import llm as llm_module
-
         # 还原到默认容量，免得影响同进程里后续跑的测试。
         restore = _config(
             llm_request_capacity=_ORIGINAL_CAPACITY or 8,
@@ -188,7 +189,6 @@ class GateAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconfiguring_while_requests_are_in_flight_is_refused(self) -> None:
         from bot.services import llm as llm_module
-        from bot.services.request_priority import ExecutionPriority
 
         config = _config(
             llm_request_capacity=5,
@@ -226,35 +226,59 @@ class GateAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RestartContractTests(unittest.TestCase):
-    def test_restart_pending_names_only_fields_that_really_changed(self) -> None:
-        base = RuntimeConfig()
-        unchanged = RuntimeConfig.model_validate(base.storage_payload())
-        self.assertEqual(base.restart_changed_paths(unchanged), [])
+    """``restart_pending`` 的口径：**保存值 ≠ 进程实际运行值**。
 
-        payload = base.storage_payload()
-        payload["bot"]["parse_mode"] = "Markdown"
-        self.assertIn(
-            "bot.parse_mode",
-            RuntimeConfig.model_validate(payload).restart_changed_paths(base),
+    完整链路（真 manager + 真 SQLite、连续保存、CAS 冲突、重启）在
+    ``tests/test_restart_pending_e2e.py``；这里只钉住纯函数层的口径。
+    """
+
+    def setUp(self) -> None:
+        self.base = RuntimeConfig()
+        self.applied = record_applied_restart_values(self.base)
+        self.addCleanup(lambda: record_applied_restart_values(RuntimeConfig()))
+
+    def _with_resources(self, **overrides: object) -> RuntimeConfig:
+        payload = self.base.storage_payload()
+        payload["resources"] = {**self.base.resources.model_dump(), **overrides}
+        return RuntimeConfig.model_validate(payload)
+
+    def test_nothing_pending_when_the_saved_value_matches_the_running_one(self) -> None:
+        self.assertEqual(self.base.restart_pending_paths(self.applied), [])
+
+    def test_a_hot_field_change_never_asks_for_a_restart(self) -> None:
+        hot = self._with_resources(moderation_throttle_burst=4)
+        self.assertEqual(hot.restart_pending_paths(self.applied), [])
+
+    def test_a_restart_field_differs_from_the_running_value(self) -> None:
+        bumped = self._with_resources(
+            llm_request_capacity=16,
+            llm_request_noncritical_capacity=14,
+            llm_request_normal_capacity=8,
+            llm_request_background_capacity=3,
+        )
+        self.assertEqual(
+            bumped.restart_pending_paths(self.applied),
+            [
+                "resources.llm_request_background_capacity",
+                "resources.llm_request_capacity",
+                "resources.llm_request_noncritical_capacity",
+                "resources.llm_request_normal_capacity",
+            ],
         )
 
-        resources = dict(base.resources.model_dump())
-        resources["pending_reply_execution_capacity"] = 6
-        payload = base.storage_payload()
-        payload["resources"] = resources
+    def test_a_single_field_is_reported_on_its_own(self) -> None:
+        bumped = self._with_resources(pending_reply_execution_capacity=6)
         self.assertEqual(
-            RuntimeConfig.model_validate(payload).restart_changed_paths(base),
+            bumped.restart_pending_paths(self.applied),
             ["resources.pending_reply_execution_capacity"],
         )
 
-    def test_a_hot_field_change_does_not_ask_for_a_restart(self) -> None:
-        base = RuntimeConfig()
-        payload = base.storage_payload()
-        payload["economy"]["tag_price_7d"] = 40
-        payload["private_chat"]["per_user_daily_limit"] = 120
-        self.assertEqual(
-            RuntimeConfig.model_validate(payload).restart_changed_paths(base),
-            [],
+    def test_parse_mode_still_counts(self) -> None:
+        payload = self.base.storage_payload()
+        payload["bot"]["parse_mode"] = "Markdown"
+        self.assertIn(
+            "bot.parse_mode",
+            RuntimeConfig.model_validate(payload).restart_pending_paths(self.applied),
         )
 
 
@@ -277,20 +301,44 @@ class TelegramSessionLimitTests(unittest.TestCase):
         finally:
             policy_runtime.unbind()
 
-    def test_a_bound_config_changes_the_session_capacities(self) -> None:
+    def test_a_saved_telegram_capacity_does_not_change_the_running_session(self) -> None:
+        """保存 ≠ 生效：Session 在建 Bot 时就定死了，必须重启才换。"""
+
         from bot.config import Settings
 
+        base = RuntimeConfig()
+        record_applied_restart_values(base)
         settings = Settings(_env_file=None)
+        base.apply_to_settings(settings, apply_prompts=False)
         settings.resources = settings.resources.model_copy(
             update={"telegram_total_capacity": 32, "telegram_normal_capacity": 20}
         )
         policy_runtime.bind(settings)
         try:
             limits = telegram_session_limits()
-            self.assertEqual(limits["total_capacity"], 32)
-            self.assertEqual(limits["normal_capacity"], 20)
+            self.assertEqual(limits["total_capacity"], 64)
+            self.assertEqual(limits["normal_capacity"], 44)
         finally:
             policy_runtime.unbind()
+            record_applied_restart_values(RuntimeConfig())
+
+    def test_a_restart_rebases_the_session_capacities(self) -> None:
+        base = RuntimeConfig()
+        payload = base.storage_payload()
+        payload["resources"] = {
+            **base.resources.model_dump(),
+            "telegram_total_capacity": 32,
+            "telegram_noncritical_capacity": 30,
+            "telegram_normal_capacity": 20,
+        }
+        record_applied_restart_values(RuntimeConfig.model_validate(payload))
+        try:
+            limits = telegram_session_limits()
+            self.assertEqual(limits["total_capacity"], 32)
+            self.assertEqual(limits["noncritical_capacity"], 30)
+            self.assertEqual(limits["normal_capacity"], 20)
+        finally:
+            record_applied_restart_values(RuntimeConfig())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -19,7 +19,6 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
 from aiohttp.test_utils import TestClient, TestServer
