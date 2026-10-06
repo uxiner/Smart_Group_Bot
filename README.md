@@ -16,8 +16,9 @@
 群聊、调用技能查资料，也能做内容审核、入群验证、爆破防护、民主投票封禁，全部配置在 Telegram Mini App 里完成。
 
 本 fork 在它之上加了一批自研功能，并修了一批部署面与配置面的坑。下面每条都标了**默认值**还是
-**写死的常量**：标「默认」的是运营参数，可以在 Mini App 的「运营参数」页改（字段与上下界见
-[docs/configuration.md](docs/configuration.md)）；**协议、安全与算法层的常量不提供开关**，例如 Telegram
+**写死的常量**：标「默认」的是运营参数，可以在 Mini App 的「运营参数」页改（怎么配见
+[docs/configuration.md](docs/configuration.md)，字段与上下界见
+[docs/configuration-reference.md](docs/configuration-reference.md)）；**协议、安全与算法层的常量不提供开关**，例如 Telegram
 单条消息 4096 的上限、`/av` 私聊每小时 10 次限流、头衔长度的 16 字上界、活跃度得分公式里的
 系数——这些是刻意固定的不变量，改动它们需要改代码而不是改配置。
 
@@ -28,8 +29,9 @@
 ### 1️⃣ 成员积分与自助命令（全新）
 
 上游没有「成员激励」这一层。本 fork 加了一套积分经济。**下面所有数字都是 schema 默认值**，
-可以在 Mini App 的「运营参数」页改，字段与上下界见
-[docs/configuration.md](docs/configuration.md)。
+可以在 Mini App 的「运营参数」页改，怎么配见
+[docs/configuration.md](docs/configuration.md)，字段与上下界见
+[docs/configuration-reference.md](docs/configuration-reference.md)。
 
 | 能力 | 说明（默认值） |
 |---|---|
@@ -232,8 +234,11 @@ API 流程（三步，无可复制示例——凭据与整份配置文档都不�
 
 ## 配置
 
-配置分三层。每一项的默认值、上下界、真实消费者、可编辑角色与迁移注意事项，见
-**[docs/configuration.md](docs/configuration.md)**；机器可读目录见
+配置分三层。**部署与日常管理看
+[docs/configuration.md](docs/configuration.md)**（要配什么、谁能改、改完何时生效）；
+每一项的默认值、上下界、真实消费者与迁移注意事项见
+**[docs/configuration-reference.md](docs/configuration-reference.md)**（开发者参考），
+机器可读目录见
 [`docs/configuration-fields.json`](docs/configuration-fields.json)（由
 `python -m bot.tools.config_catalog` 从 schema 生成，测试保证它不与代码漂移）。
 
@@ -261,7 +266,7 @@ API 流程（三步，无可复制示例——凭据与整份配置文档都不�
 **不提供开关、也不该被「关掉」的**：鉴权与最高管理员判定、Telegram 协议硬上限（单条消息
 4096、`callback_data` / start payload 前缀）、退款与财务幂等键、SSRF 校验、资源健康看门狗。
 这些是安全 / 协议 / 算法不变量，做成开关只会制造「关掉之后就不安全了」的错觉，逐条见
-[docs/configuration.md](docs/configuration.md#保持固定的参数不提供开关)。
+[docs/configuration-reference.md](docs/configuration-reference.md#保持固定的参数不提供开关)。
 
 ## 部署
 
@@ -275,8 +280,9 @@ API 流程（三步，无可复制示例——凭据与整份配置文档都不�
   与 `/verify`，必须把它反代到后端监听地址；没有它，设置中心与入群验证都用不了
 - **群管理员权限**：机器人必须被设为**群管理员**（至少「封禁用户」；置顶、删消息、限制成员
   同样依赖管理员权限），启动时会自检并在日志中告警
-- **`.env` 最少三项**：`BOT_TOKEN`、`SUPER_ADMIN_ID`（你的 Telegram 数字 id，正整数）、
-  `CONFIG_MASTER_KEY`（数据库里所有第三方密钥的解密钥匙，**必须与数据库一起备份**）
+- **`.env` 最少四项**：`BOT_TOKEN`、`SUPER_ADMIN_ID`（你的 Telegram 数字 id，正整数）、
+  `CONFIG_MASTER_KEY`（数据库里所有第三方密钥的解密钥匙，**必须与数据库一起备份**）、
+  `MINIAPP_PUBLIC_BASE_URL`（上面那个公网 HTTPS 源站）
 
 ### 新部署
 
@@ -312,7 +318,9 @@ APP_UID=<上面看到的 uid> APP_GID=<上面看到的 gid> docker compose up -d
 备份 API（`VACUUM INTO` / `sqlite3.backup()`）。代码更新走「备份 → 拷已测产物 → 逐文件哈希
 核对 → 重启 → 验活」，不是 `git pull`。
 
-启动之后在 Mini App 里配置模型供应商、授权群与管理员权限——这三样**没有**可直接用的默认值。
+启动之后由**最高管理员私聊机器人发 `/settings`** 打开设置中心，在里面配置模型供应商、授权群与
+管理员权限——这三样**没有**可直接用的默认值。完整路径见
+**[docs/configuration.md](docs/configuration.md)**。
 
 ### 运行时要点
 

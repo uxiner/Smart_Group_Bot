@@ -1,392 +1,151 @@
-# 配置指南
+# 配置手册（部署与日常管理）
 
-这份文档说明这个 bot 的**三层配置**：哪一层改完什么时候生效、每个字段的默认值与
-上下界、谁能编辑、真实的读侧消费者在哪、以及从旧版本迁移过来要注意什么。
+这份手册回答四件事：**要配哪些参数、每一项是干什么的、谁能改、改完什么时候生效**。只想把机器人跑起来，读到第四节就够了；逐字段的默认值、上下界与实现细节放在[配置参考手册](./configuration-reference.md)。
 
-机器可读版本在 [`docs/configuration-fields.json`](./configuration-fields.json)
-（由 `python -m bot.tools.config_catalog` 从 schema 生成；
-`tests/test_configurable_policy_catalog.py` 会保证它不与代码漂移）。
-每条记录都带 `path` / `default` / `bounds` / `reload_kind` / `read_consumers` /
-`api_role` / `test_node`。
+## 一、先走通一条路
 
----
+1. 把 [`.env.example`](../.env.example) 复制成 `.env`，填好下面「必填」四项。
+2. 起服务并看日志：`APP_UID=<data 属主 uid> APP_GID=<data 属主 gid> docker compose up -d --build`。
+3. 用**最高管理员**的 Telegram 账号**私聊**机器人，发 `/settings`，点它回你的「打开设置中心」按钮。
+4. 在「模型」页加一个 API 供应商并填好主模型；到「权限封禁」页授权群组、授予群管理员。
+5. 其余设置先保持默认，用到再回来改。
 
-## 三层配置
+设置中心必须从 Telegram 里的按钮进入：直接用浏览器打开 `/settings` 只会得到一个空壳页面，所有数据请求都会被拒绝。`SUPER_ADMIN_ID` 填你自己的 Telegram 数字用户 id（正整数），只有它能打开并编辑全局设置。
 
-| 层 | 载体 | 改完生效 | 谁能改 |
-| --- | --- | --- | --- |
-| ① 部署引导（bootstrap） | `.env` / 进程环境变量 | **必须重启** | 有部署权限的人 |
-| ② 热配置 | `runtime_config` 表（Mini App / API） | 保存即生效或**需重启**（见下） | 仅最高管理员 |
-| ③ 群级覆盖 | `group_settings`（群组页） | 保存即生效 | 该群管理员 / 最高管理员 |
+## 二、首次部署必须配置的 .env
 
-### ① 部署引导（`.env`）
+这一组只有**有服务器部署权限的人**能改，在 `.env` 文件里；除这四项外其余项都可以沿用默认。
 
-只有**进程启动时必须知道**的东西在这里：Telegram token、最高管理员 id、配置加密
-主密钥、数据库地址、Mini App 监听与公网地址、webhook。模板见
-[`.env.example`](../.env.example)，所有敏感项默认为空。
-
-`config.toml` 是**一次性导入源**：只有当 `runtime_config` 表里还没有记录时，
-`RuntimeConfigManager.initialize()` 才会把它读进去，之后该文件被忽略。
-它不是第三套优先级，别拿它当"热配置通道"。
-
-### ② 热配置（运行时配置）
-
-Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存走
-`PUT /api/v1/settings`，带 `revision` 做乐观并发控制；`extra="forbid"`，多余的键
-直接 **400 `validation_error`**（不是 422——这些路由跑在 aiohttp 上，不经过 FastAPI 的
-校验器）。
-
-几条必须按实现来理解的语义：
-
-* **`config` 是整份替换，不是嵌套 patch。** 后端只对提交的 payload 做
-  `RuntimeConfig.model_validate()`，**不与库里的现值做深合并**：漏掉的字段会回到 schema
-  默认值，而不是保留旧值。所以调用方必须先 `GET` 整份文档、改完再整份 `PUT` 回去
-  （内置的 Mini App 正是这么做的）。`revision` 对不上返回 **409 `revision_conflict`**。
-* **secret 字段是只写的。** 响应里这些字段恒为空串，`configured_secrets` 只回**键名**。
-  密钥改动走 `secret_changes`：`keep` 保留、`clear` 清空、`replace` 换新值（`replace`
-  必须带非空 `value`，否则 400 `invalid_settings`）。**空串表示「不变」，永远不是
-  「清空」**——想清空只能显式发 `clear`。
-* **接口鉴权走 Telegram WebApp 的 `initData`**：`Authorization` 头使用的方案名是 `tma`，
-  凭据是 Telegram 打开 Mini App 时下发的 WebApp `initData` 字符串。本仓库没有别的鉴权方案，
-  且该接口仅最高管理员可调用。
-
-**只有最高管理员能读写全局配置。** 群管理员拿不到 `/api/v1/settings`（后端
-`require_super_admin`），前端也只渲染"群组设置"页——所以群管理员既看不到也改不了
-全局经济、资源与交接字段。他们能改的仍然只有该群的 `group_settings`。
-
-#### 热更 vs 重启
-
-判定口径只有一条：**这个值在启动时被写进了某个长寿命对象吗？**
-
-* 写进了 —— 就是 `restart`。准入 gate、aiohttp Session 的连接池、webhook 的
-  worker 池与有界队列、tokenizer 线程槽位。它们换掉之前，进程里已经在跑的东西会
-  被漏掉或泄漏。
-* **没有**写进任何长寿命对象、每次操作现读 —— 就是 `hot`。各级超时、durable inbox
-  的租约与保留期、批量与阈值。
-
-口径必须与真实行为一致：曾经有一批字段被标成 `restart` 却每次现读（webhook 的各级
-超时、inbox 租约、轮询超时、Telegram 的准入超时），结果是「保存成功」与「实际生效」
-对不上号，管理员无法信任 `restart_pending`。现在它们一律标 `hot`；真正冷的只有容量类。
-标 `restart` 的字段，读侧读的是**本进程装配的那一份**
-（`runtime_config.applied_restart_values()`），保存只更新期望值并把它列进
-`restart_pending`，重启才换。
-
-这是最重要的一条区分，不要含糊：
-
-* **标量**（价格、配额、超时、批量、阈值、条数）——**热生效**。每个动作开始时现取
-  一次快照，管理员保存后下一次动作就用新值。
-* **进程级闸门**（`asyncio.Semaphore` / `ReservedCapacityGate` /
-  `PriorityAiohttpSession` / tokenizer 线程槽位）——**需要重启**。它们在 import 或
-  建 Bot 时固化，热替换会漏掉正在执行的请求、泄漏 slot，或者让新旧两个闸门同时
-  存在。它们只在 `bot.__main__._initialize_runtime_services()` 里
-  `apply_startup_resources()` 装配一次，排在**模型元数据预取、建 Bot、任何收发消息
-  之前**。
-
-  这些字段各自带 `json_schema_extra={"reload_kind": "restart"}`，清单由
-  `runtime_config.RESTART_REQUIRED_PATHS` 统一生成，API 的
-  `restart_required_paths` 与 `restart_pending` 都会回它（**只给字段名，不回值**）。
-  Mini App 上这些输入框带"需重启"标记，保存后的 toast 与概览页会逐条列出刚刚改动
-  的那几项。
-
-  重复调用 `apply_startup_resources()` 是安全的：配置没变就是 no-op；闸门里还有
-  在跑的请求时它直接抛 `StartupResourceBusy`，**不会**硬拆闸门。
-
-#### 一次操作只取一份快照
-
-价格、批量这类东西在一次交易的中途被改掉，不应该让用户看到"菜单写 30 分、实际扣
-了 80 分"。所以 `policy_runtime.pinned_section("economy")` 会在操作入口钉一份
-不可变快照（`ContextVar`，asyncio 每个 Task 各自一份），显示 → 扣费 → 退款 → 回执
-整条流程都读同一份。作用域最外层优先，嵌套调用复用最外层那份。
-
----
-
-## 字段目录
-
-下面按段列出本轮新增的可配字段。`reload` 省略即"热生效"。
-
-### `moderation` — 部署绑定（最高管理员）
-
-| 字段 | 默认 | 范围 | 说明 |
-| --- | --- | --- | --- |
-| `log_channel_id` | `0` | `0` 或 `-1009999999999 … -1000000000000` | 审核命中证据频道。**默认 0 = 未配置**：公开部署开箱即用时不会向任何频道（含任何私人频道）投递，命中证据按既有 fallback 路径私聊最高管理员。部署者在 Mini App 审核面板或 `PUT /api/v1/settings` 显式写入后热生效。`config.toml` 只在首次导入时读；环境变量对本段无效。 |
-| `review_handover_mention` | `""` | 空串或 `@[A-Za-z][A-Za-z0-9_]{3,31}` | 规则调整交接时 @ 的对象。**默认空 = 不 @ 任何人**，只发交接文案。空值时不会构造 mention 实体（不会退化成"对空串做 `rfind`"那种凭空造一个假 mention 的 bug）。含换行 / HTML 的一律拒绝。 |
-
-既有字段（`enabled` / `warn_threshold` / `nsfw_image_guard_enabled` …）的语义与
-默认值一字未改：`nsfw_image_guard_enabled`、`punish_quoted_author_enabled`、
-`admin_moderation_enabled` 仍然是**默认关闭的 opt-in** 执法开关，公开树不会因为
-升级就扩大执法范围。
-
-> **机器目录只覆盖这一段里的两个字段。** `configuration-fields.json` 的
-> `moderation.*` 条目只有 `log_channel_id` 与 `review_handover_mention`
-> （`bot/tools/config_catalog.py:56-59` 里写死的 `MODERATION_FIELDS`）；上面提到的
-> opt-in 开关、`log_channel_enabled`、`admin_alert_super_admin_enabled` 都不在目录里，
-> 它们的默认值以 `bot/services/runtime_config.py` 的 schema 为准。
-
-### `private_chat` — 私聊额度（最高管理员）
-
-| 字段 | 默认 | 范围 | 单位 |
-| --- | --- | --- | --- |
-| `per_user_daily_limit` | `100` | 1 … 100000 | 条/天/人 |
-| `admin_per_user_daily_limit` | `500` | 1 … 100000 | 条/天/人 |
-| `global_daily_limit` | `20000` | 1 … 10000000 | 条/天/全网 |
-| `admin_global_daily_limit` | `100000` | 1 … 10000000 | 条/天/全网 |
-| `input_max_chars` | `1000` | 1 … 4096 | 字符 |
-| `reply_max_chars` | `3800` | 512 … 4096 | 字符（Telegram 协议上限 4096） |
-| `vision_budget_seconds` | `30.0` | 5 … 120 | 秒 |
-| `memory_turns` | `12` | 1 … 200 | 轮（**仅内存兜底缓冲**；真正的历史按 token 预算读库） |
-| `access_ttl_seconds` | `60.0` | 1 … **60** | 秒 |
-| `search_daily_limit` | `2000` | 1 … 100000 | 次/天 |
-| `voice_max_segments` | `6` | 1 … 20 | 段 |
-
-两组档位互相独立：管理员花掉的额度不占普通成员的全局计数。关联校验：全局上限不得
-小于同档单人上限。
-
-`access_ttl_seconds` 的上界**就是今天的值 60**，不是"忘了设上界"。准入缓存里除了
-档位还带着"已确认他在哪些授权群里"，被踢出群之后这个集合要尽快过期；调大 TTL
-等于放大越权窗口，所以这个旋钮只允许收紧。TTL 变小会**立刻**对存量条目生效
-（按当前 TTL 重新判龄），不会让已被移出群的成员"复活"。
-
-`search_daily_limit` 热改**不会**重置当天已消耗的次数：计数只按自然日滚动。
-
-### `economy` — 签到与积分商店（最高管理员）
-
-| 字段 | 默认 | 范围 |
+| 参数 | 用途 | 要不要填 |
 | --- | --- | --- |
-| `checkin_daily_point_cap` | `10` | 1 … 100 |
-| `checkin_rank_limit` | `10` | 1 … 100 |
-| `checkin_violation_window_days` | `30` | 1 … 365 |
-| `challenge_skip_cost` | `2` | **1** … 1000 |
-| `tag_price_7d` / `tag_days_7d` | `30` / `7` | 0 … 100000 / 1 … 3650 |
-| `tag_price_30d` / `tag_days_30d` | `80` / `30` | 0 … 100000 / 1 … 3650 |
-| `pin_price` / `pin_hours` | `20` / `6` | 0 … 100000 / 1 … 720 |
-| `lottery_price` / `lottery_daily_limit` | `5` / `10` | 1 … 100000 / 1 … 1000 |
-| `lottery_prizes` | 见下 | 1 … 32 档，每档 `payout` 0…1000000、`weight` 1…1000000、`label` ≤32 字 |
-| `tag_max_length` | `16` | 1 … **16** |
-| `expiry_check_seconds` | `300.0` | 30 … 86400 |
-| `expiry_pass_deadline_seconds` | `120.0` | 10 … 3600 |
-| `expiry_batch_limit` | `200` | 1 … 5000 |
-| `expiry_retry_seconds` | `900.0` | 30 … 86400 |
+| `BOT_TOKEN` | BotFather 发给你的机器人身份令牌 | 必填 |
+| `SUPER_ADMIN_ID` | 你自己的 Telegram 数字用户 id | 必填 |
+| `CONFIG_MASTER_KEY` | 加密数据库里第三方密钥的主密钥 | 必填 |
+| `MINIAPP_PUBLIC_BASE_URL` | 公网 HTTPS 源站地址，需反代到后端 | 必填 |
 
-**下界是安全约束，不是笔误：**
+主密钥随机生成一次，之后保持不变：
 
-* `challenge_skip_cost` 不得为 `0`——那等于"免费绕过审核质询"。
-* `tag_max_length` 不得大于 `16`——Telegram 原生头衔长度上限。
-* `lottery_prizes` 的权重之和必须 `> 0`。
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-**总权重是派生的，不另存一份。** 奖池里 `weight` 是相对权重，
-`EconomySnapshot.lottery_total_weight` 直接对表求和，所以不存在"表改了、总权重
-忘了改"这种错账。随机算法（一次 `randbelow(总权重)` + 前缀和）逐字未变，财务幂等
-键（`lottery_spend_ref` / `lottery_prize_ref`）也完全不受影响。
+它要**和数据库一起备份**：主密钥丢了或换了，库里已保存的第三方密钥就读不出来。
 
-**头衔防冒充词表与长租标记固定在代码里**（`bot/services/point_shop.py` 的
-`TAG_BLOCKLIST` / `TAG_LONG_MARKERS`），不提供配置开关——配置不应该能删掉防冒充
-词。
+沿用默认、不用改的项：
 
-**已购买的权益不追改。** `expires_at` 与收据在购买那一刻定死；改价只影响之后的新
-购买。
+- `DATABASE_URL` 默认就是 SQLite（`./data/bot.db`），单机部署不用动。
+- `MINIAPP_LISTEN_HOST=0.0.0.0`、`MINIAPP_LISTEN_PORT=8480` 是**容器内部**的监听地址。对外发布由 `MINIAPP_BIND_ADDRESS` 决定，默认只绑 `127.0.0.1:8480` 给同机反向代理用。别把容器里的 `0.0.0.0` 理解成端口已经对外开放；真要让别的机器直连，才显式设 `MINIAPP_BIND_ADDRESS=0.0.0.0` 并自行配好防火墙。
+- `WEBHOOK_URL` 与 `WEBHOOK_SECRET` 选填、且必须成对填写；默认留空走长轮询，多数部署不需要动。
 
-### `activity` — 每周活跃激励（最高管理员）
+改完 `.env` 要用 `docker compose up -d` 重新拉起容器才会加载新值；`docker compose restart` 只重启已有容器，不会重新读取 `.env`。
 
-| 字段 | 默认 | 范围 |
+容器还要求显式给出非零的 `APP_UID` / `APP_GID`（与 `data/` 目录属主一致）。建目录、改属主、启动与升级的完整命令见 [README 的部署一节](../README.md#部署)。
+
+## 三、谁能改
+
+| 身份 | 能改什么 |
+| --- | --- |
+| 最高管理员 | 全部全局设置（本手册第四、五、六节的页面） |
+| 被授权的群管理员 | 只有他获授权的那个群的群组设置 |
+| 服务器部署者 | `.env` 与容器 |
+| 普通成员 | 没有设置中心权限 |
+
+三件容易搞混的事：
+
+- **机器人在群里是管理员，和谁能改配置是两件事。** 机器人的管理员权限只决定它自己在群里能不能删消息、封人、置顶。
+- **Telegram 群管理员不会自动获得后台权限。** 想让某个人进后台管设置，最高管理员要先授权群组，再把这个人加为该群的「群管理员」（也可以私聊机器人发 `/authadmin`）；Telegram 那边被撤权之后，后台权限也会随之失效。
+- **群管理员只看到「群组设置」一页**，看不到也改不了全局的模型、积分与审核配置。
+
+## 四、第一次打开设置中心，先做这三件事
+
+### 1. 模型页：至少配好供应商和主模型
+
+- **添加至少一个 API 供应商**：取一个唯一名称（只能用字母、数字、下划线、连字符），选协议，填 Base URL 和 API Key。Base URL 留空表示用该协议的官方地址。
+- **主模型**：选择刚建的供应商，填模型名。这两项不填无法保存。
+- 其余角色（视觉、决策、审核、压缩、技能、向量）**留空即继承上级模型**，默认就能跑。
+- 注意：向量角色留空时只继承主模型的**供应商**，模型名默认是 `text-embedding-004`；主模型的供应商如果不提供嵌入接口，就要给它另配一个支持 embedding 的模型名，否则语义检索会一直失败。
+
+API Key 属于密钥字段：**留空表示保留已保存的值**，要更换就重新输入，要清空用界面上的清除操作。
+
+### 2. 权限封禁页：授权群组和管理员
+
+这一页分三块：授权群组、群管理员、全局封禁。机器人只在**已授权的群**里工作；群管理员决定谁能进后台管这个群；全局封禁是跨群的名单。
+
+### 3. Prompts 页：把默认人设改成自己的
+
+「角色人格」是一份具体的、有名字的人设模板，开箱即用的就是它，建议按自己的产品改写语气。它和「运营参数 → 对外文案」里的**显示名是两处独立设置**：显示名只改称呼，不改说话风格。
+
+## 五、日常可选设置
+
+按设置中心左侧的页面分：
+
+- **审核验证**：违规判定阈值、bot 白名单、入群验证服务（Turnstile / hCaptcha 及密钥）、自动巡检、呼叫管理员、投票封禁、爆破防护；多数项可由群管理员逐群覆盖。
+- **Bot 行为**：收消息范围、上下文与长期记忆预算、主动发言节奏。「上下文上限模式」保持 `auto` 最省心；设成 `fixed` 还要自己保证上限够大。
+- **媒体能力**：语音合成、音乐检索、AV 检索、贴纸回退，按需开通，不用的保持关闭。
+- **外部服务**：影片信息服务（IMDb / TMDB），拿到适用于机器人用途的授权后再启用。
+- **Prompts**：各模型任务的系统提示词。
+- **群组设置**：逐群覆盖全局行为、群规、关键词回复、定时消息与成员名单。
+
+### 审核验证里三个默认值值得知道
+
+- 审核证据频道默认 0 = 未配置，开箱不会向任何频道投递，命中证据仍走私聊最高管理员；想启用就先在频道里给机器人发帖权限，再填以 `-100` 开头的频道 ID（键名 `log_channel_id`）。
+- 交接对象默认留空 = 不 @ 任何人，只发交接文案。
+- 「管理员也走审核」「群内色情图片处置」「处罚被引用的原作者」默认都是**关闭**的，想开就在设置中心显式打开，不打开就保持原有行为。
+
+### 运营参数：最常改的一页
+
+这一页全是积分、活跃、私聊额度、签到提醒与对外文案，**只有最高管理员能改**；下面是默认值，先按默认跑也没问题。
+
+| 设置 | 用途 | 默认 |
 | --- | --- | --- |
-| `min_message_text_length` | `2` | 1 … 100 |
-| `max_daily_messages` | `20` | 1 … 500 |
-| `min_active_days` | `3` | 1 … 365 |
-| `min_weekly_messages` | `10` | 1 … 100000 |
-| `weekly_reward_points` | `[25,12,12,4,4,4,4,4,4,4]` | 1 … 100 项，每项 0 … 100000，合计 > 0 |
+| 签到每日封顶 `checkin_daily_point_cap` | 连签第 N 天最多给多少分 | 10 |
+| 积分榜人数 `checkin_rank_limit` | 排行榜展示的名次数量 | 10 |
+| 质询免除价 `challenge_skip_cost` | 花多少分跳过审核质询 | 2 |
+| 头衔 7 天 `tag_price_7d` `tag_days_7d` | 短租头衔的价格与天数 | 30 分 / 7 天 |
+| 头衔 30 天 `tag_price_30d` `tag_days_30d` | 长租头衔的价格与天数 | 80 分 / 30 天 |
+| 消息置顶 `pin_price` `pin_hours` | 把求助消息置顶的价格与时长 | 20 分 / 6 小时 |
+| 抽奖单价 `lottery_price` | 每次抽奖扣多少分 | 5 |
+| 抽奖次数 `lottery_daily_limit` | 每人每天最多抽几次 | 10 |
+| 抽奖奖池 `lottery_prizes` | 每档的中奖分值、权重与标签 | 7 档，可增删 |
+| 活跃每日上限 `max_daily_messages` | 一天内多少条消息计入活跃 | 20 |
+| 活跃天数门槛 `min_active_days` | 一周内至少活跃几天 | 3 |
+| 活跃条数门槛 `min_weekly_messages` | 一周内至少发多少条消息 | 10 |
+| 周奖励向量 `weekly_reward_points` | 按名次依次给多少分 | 前 10 名 |
+| 私聊·普通成员单人 `per_user_daily_limit` | 每人每天能私聊多少条 | 100 |
+| 私聊·管理员单人 `admin_per_user_daily_limit` | 群管理员每天能私聊多少条 | 500 |
+| 私聊·普通成员全网 `global_daily_limit` | 全体普通成员每天的总条数 | 20000 |
+| 私聊·管理员全网 `admin_global_daily_limit` | 全体管理员每天的总条数 | 100000 |
+| 提醒时段 `checkin_reminder.slots` | 命令接受哪些整点小时 | 9、12、15、18 |
+| 提醒自动删除 `checkin_reminder.auto_delete_seconds` | 发出后多久自动删除，0 = 不删 | 600 秒 |
+| 显示名 `display.bot_display_name` | 用户看到的名字，也会从问句里剥掉 | 助手 |
+| 语音条标题 `display.private_voice_title` | 私聊语音消息的标题 | 语音回复 |
+| 检索前缀 `display.search_query_prefixes` | 从问句里剥掉的称呼词 | 诶、嗯哼、呀、欸 |
 
-榜单长度（`weekly_top_n`）与周奖励总额（`weekly_total_points`）**都从这个向量
-派生**，不再单独存一份会互相矛盾的数。得分公式
-（`messages + 2 × active_days + replies_received`）不随配置变化。
+改价只影响之后的新购买，已经买到的头衔和置顶按购买时的价格与时长算，不追改。
 
-结算时取一次快照：发奖写账整轮用同一份向量，不受中途改配置影响，也不影响已经发
-出去的奖励（`weekly-activity:<iso week>:<user_id>` 上的唯一索引仍然是唯一的幂等
-保证）。
+## 六、保存之后
 
-### `checkin_reminder` — 签到提醒（最高管理员）
+- **大部分设置保存后，下一次动作就用新值**，不用重启。
+- **标「需重启」的项**（并发容量一类的进程级设置），以及概览页出现 `restart_pending` 时，需要部署者重启 bot 进程或容器才生效。
+- **签到提醒的时段只约束命令接受哪些小时**，真正几点发由服务器上的 cron 决定：默认不配 cron 就不会发提醒，改了时段记得同步改 crontab。
+- **保存失败按界面提示处理**；提示版本冲突就重新加载页面再改，不要去绕过鉴权。
+- **密钥字段留空 = 保留原值**，只有显式清除才会删掉。
 
-| 字段 | 默认 | 范围 |
-| --- | --- | --- |
-| `slots` | `[9,12,15,18]` | 1 … 12 项，每项 0 … 23，自动去重排序 |
-| `slot_greetings` | `{9:"早上好",12:"中午好",15:"下午好",18:"晚上好"}` | 键必须 ⊆ `slots`；值 ≤32 字且不含 HTML |
-| `auto_delete_seconds` | `600` | 0 … 86400（**0 = 不自动删除**） |
-| `roster_max_names` | `20` | 1 … 200 |
-| `stale_grace_seconds` | `900` | 60 … 86400 |
+安全上守住三：`.env` 不进版本库；备份数据库时必须一并备份主密钥；反代用 HTTPS。另外不要直接改数据库，改坏了设置中心读不出来。
 
-> **与 cron 的关系（重要）**：`slots` 只约束"命令/CLI 接受哪些 `--slot`"。**真正几点
-> 发由外部 cron 决定**——`bot/tools/checkin_reminder.py` 的 docstring 里有可直接
-> 复制的样例 crontab（每个时段一行，`CRON_TZ=Asia/Shanghai` 或 UTC 换算两种写法）。
-> 改了 `slots` 之后，部署侧必须同步改 crontab，否则只是放宽/收紧命令行校验而已。
-> 防重复提醒的幂等占位（`checkin_reminder_posts` 唯一索引）不随本段变化。
+## 七、通常不必改
 
-### `display` — 对外文案（最高管理员）
+- 「运营参数」页底部的「高级资源」面板——超时、线程数、连接容量——保持默认即可。它们是给高并发部署预留的旋钮，默认值就是当前真实生效的值，以界面上的「需重启」标记为准。
+- 有一批安全、协议与算法层的常量刻意**不提供开关**（鉴权判定、Telegram 协议上限、退款幂等键、抓取地址校验等），要改它们需要改代码而不是改设置，逐条见参考手册的[「保持固定的参数（不提供开关）」](./configuration-reference.md#保持固定的参数不提供开关)。
 
-| 字段 | 默认 |
-| --- | --- |
-| `bot_display_name` | `助手` |
-| `private_voice_title` | `语音回复` |
-| `checkin_button_text` | `✅ 一键签到` |
-| `shop_button_text` | `🛒 积分商店` |
-| `search_query_prefixes` | `["诶","嗯哼","呀","欸"]` |
-| `private_not_member_notice` | 抱歉，私聊只对已授权的群里成员开放… |
-| `private_limit_notice` | 今天聊得有点多啦… |
-| `private_global_limit_notice` | 今天找我聊天的人有点多… |
-| `private_media_unsupported_notice` | 私聊里我目前只能看文字和图片… |
+## 八、从旧版本升级
 
-`search_query_prefixes` 会与 `bot_display_name` 一起参与"从问句里剥掉称呼"，
-所以换品牌不用改代码。**协议标识不在这里**：`checkin:v1` 这个 callback_data、
-`shop_<群号>` 这个深链前缀都是解析契约，配置改它们会让线上按钮失效。
+1. 先备份数据库和 `.env`。
+2. 升级后原有设置会保留，不需要重填。
+3. 如果你之前用的是自定义的旧显示名，到「运营参数 → 对外文案」把显示名、语音条标题、检索前缀按原样填回去；人设提示词在 Prompts 页单独设置，别和显示名混为一谈。
+4. `config.toml` 只在数据库里还没有任何配置记录时导入一次，之后不再读它，不要拿它当日常配置通道。
 
-人设提示词本身已经有运行时编辑（Mini App 的 Prompts 页，`prompts.persona` 在 12 个可编辑
-提示词里），本页**不会**再造第二份人格。
+## 九、想看更多细节
 
-但**「显示层中性」不等于「开箱中性人设」**，这两件事必须分开看：
-
-- `display` 段的默认值确实是中性的（`bot_display_name = "助手"`），这一层不绑定任何品牌；
-- `prompts` 段的默认值直接来自仓库里的 `prompt/*.md`（`PromptSettingsConfig.defaults()` →
-  `load_prompt_defaults()`），其中 `prompt/persona.md` **是一份具体的、有名字的人设模板**。
-  fresh install 之后它就是默认人设，除非部署者在 Prompts 页改掉。
-
-也就是说，公开部署者应当在 Prompts 页按自己的产品改写这份人设模板——本页既不替你改它，
-也不声称它已经是中性的。
-
-### `resources` — 高级资源与进程级预算（最高管理员）
-
-默认全部等于当前代码里真实生效的值，不配就是默认值。Mini App 上这一段在「运营参数」页
-底部那个可折叠的「高级资源」面板里。
-
-**需要重启的字段**：清单的**单一来源**是 `runtime_config.RESTART_REQUIRED_PATHS`
-（`bot/services/runtime_config.py:2779`），它由每个字段自己的
-`json_schema_extra["reload_kind"] == "restart"` 生成，外加历史遗留的 `bot.parse_mode`
-（它在 Bot 构造时固化）。API 返回的 `restart_required_paths`、
-[`configuration-fields.json`](./configuration-fields.json) 的 `restart_required_paths`
-与 Mini App 的「需重启」标记都直接取它——**本文档不重写这个数量**，以那几处为准。
-按组划分：
-
-- **LLM 容量**：`llm_request_capacity`（8）、`llm_request_noncritical_capacity`（7）、
-  `llm_request_normal_capacity`（4）、`llm_request_background_capacity`（2）
-- **tokenizer 并发**：`llm_tokenizer_concurrency`（2）
-- **待回复执行**：`pending_reply_execution_capacity`（4）
-- **Telegram 三级容量**：`telegram_total_capacity`（64）、
-  `telegram_noncritical_capacity`（60）、`telegram_normal_capacity`（44）
-- **TTS 三级并发**：`tts_synthesis_concurrency`（3）、`tts_transcode_concurrency`（2）、
-  `tts_private_concurrency`（2）
-- **AV 查询并发**：`av_query_concurrency`（3）
-- **webhook 总并发与三条车道**：`webhook_max_concurrent_updates`，以及 `auth` /
-  `critical` / `security` 三条车道各自的 `*_concurrent_updates` 与 `*_queue_capacity`
-
-保留容量的不变式在 schema 里强校验，改非法组合会被直接拒绝：
-
-* `1 ≤ background ≤ normal − 2`（普通回复永远至少保留 2 个名额）
-* `1 ≤ normal ≤ noncritical < total`（**至少留 1 个关键名额**）
-* `2 ≤ telegram_normal ≤ telegram_noncritical < telegram_total`
-
-**热生效**（每次动作现取）：`llm_stage_deadlines`（默认
-decision/moderation 35、embed 60、compress/vision 90、main/skill 120、synopsis 20、
-group_summary 15）、Telegram 各级准入超时、群待回复预算、管理员告警窗口/合并阈值/
-状态上限/截断字数、送审整形的 burst/间隔/等待上限、TTS 段数与超时、AV 查询预算
-与名字缓存、判定阶段历史预算、长期记忆各项、检索留档清理间隔与召回条数、向量归档
-批大小/回填/扫描/候选/查询超时/维护间隔/索引租约。
-
-`llm_stage_deadlines` 是**单一来源**：角色上显式设置的 `total_deadline_sec` 仍然
-优先（0/未设置才用这里），`group_summary` 不再有第二份硬编码表。取消/超时/持有
-语义一个字没改。
-
-`archive_indexing_lease_seconds` 必须不小于 `archive_query_timeout_seconds`
-（schema 校验），否则一个慢查询会在租约过期后被第二个 worker 抢走同一批消息，
-造成重复写。
-
-**webhook / 轮询 / 出站发送**（`resources.webhook_*` / `polling_*` /
-`telegram_send_chat_parallel`）：这一段**不是**整段 restart，也不是整段 hot，**按项区分**：
-
-- **restart**：webhook 服务的 worker 数与队列容量（`webhook_max_concurrent_updates`
-  与三条车道各自的 `*_concurrent_updates` / `*_queue_capacity`），它们在
-  `VerifyWebServer` / aiohttp session 构造时固化；
-- **hot**：durable inbox 的租约、恢复批量、退避上限、清理间隔与批量，以及各级超时
-  （`webhook_*_update_timeout_seconds`、`webhook_http_response_timeout_seconds`）与探测
-  参数——这些每轮现取；
-- **hot**：`polling_timeout_seconds` / `polling_http_timeout_seconds` /
-  `polling_request_timeout_seconds`，它们只在**未启用 webhook** 的兜底轮询下生效；
-- **hot**：`telegram_send_chat_parallel`，每次发送现取。
-
-逐项的 `reload_kind` 以 [`configuration-fields.json`](./configuration-fields.json) 为准。
-
-关联约束在 schema 里强校验，每一条都对应一个真实故障模式：
-
-| 约束 | 不满足会怎样 |
-| --- | --- |
-| `webhook_inbox_lease_seconds` ≥ 最大的 update 端到端预算 | 租约先到期 → 恢复循环把**仍在执行**的 update 交给第二个 worker → 管理员的 /ban、/unban 回调**被执行两次** |
-| `webhook_inbox_lease_seconds` ≥ `webhook_inbox_retry_max_seconds` | 一次合法重试被恢复循环判成僵尸 |
-| `webhook_http_response_timeout_seconds` ≥ 最大的端到端预算 | handler 还在跑，HTTP 层已断开 → Telegram 重投 |
-| 每条车道并发 ≤ `webhook_max_concurrent_updates` | "独立车道"的隔离承诺不成立（车道比总池还大） |
-| 每条车道队列容量 ≥ 该车道并发 | 队列比 worker 还小 = 立刻丢更新 |
-
-`webhook_max_concurrent_updates` 同时是 webhook 连接池的上限；`polling_*` 只在
-**未启用 webhook** 的兜底轮询下生效。
-
----
-
-## 保持固定的参数（不提供开关）
-
-这些是安全 / 协议 / 算法不变量，**不是**运营参数，做成开关只会制造"关掉之后就不
-安全了"的错觉：
-
-* **身份与授权**：最高管理员判定、管理员缓存 TTL 上限、群授权列表。
-* **SSRF / 抓取**：`bot/services/skills/platform_common.py` 的 URL 语法校验、
-  host allowlist 与 DNS 钉扎。只允许 http/https、禁 URL 内嵌凭据、host 必须在
-  allowlist 内。
-* **协议硬上限**：Telegram 单条消息 4096、流式安全线 3800、webhook 请求体上限、
-  callback_data / start payload 前缀、实体偏移的 UTF-16 规则。
-* **租约与终态**：入群验证的 nonce 宽限、准备中/终态租约、解封恢复宽限。
-* **退款与财务幂等**：`ref` 键的构造、唯一索引、"先扣再用"的退款路径。
-* **资源健康看门狗**：fatal 阈值与进程退出行为。
-* **上下文安全门禁**：业务总预算与输出预留的相对关系（预留必须小于总预算，0 不能
-  关掉门禁）。上界取 `bot.utils.budget` 的单一来源。
-
----
-
-## 从旧版本迁移
-
-1. **不需要数据库迁移。** 新字段全部带默认值；`runtime_config` 里已有的文档在
-   `RuntimeConfig.model_validate()` 时自动补齐，原有值一个字不动。
-2. **旧 payload 缺新字段** → 走 schema 默认值，正是"没配置"的行为。
-3. **`display` 的默认显示名会从旧人设别名变成中性词，需要你手工迁移。**
-   旧版本把品牌名**硬编码**在源码里，出现在人设提示词、语音条标题与检索称呼前缀三处。
-   本轮**只把显示层抽成了 `display` 段**（语音条标题、检索称呼前缀、以及文案里出现的
-   显示名），公开树的默认值是**中性的**（`bot_display_name = "助手"`、
-   `private_voice_title = "语音回复"`、`search_query_prefixes = ["诶","嗯哼","呀","欸"]`）。
-   升级到这一版之后：
-
-   * **人设提示词既没有被抽走、也没有被改写**——`prompts.persona` 仍是原来那一份
-     （含它自己的名字与语气框架），说话风格、称呼与互动方式保持原样；抽出来的只有
-     "显示名"这一层，不是人格本身；
-   * 但**凡是依赖"显示名"的行为会换掉**：检索查询词的称呼剥离、私聊语音条标题，
-     以及群公告/文案里出现显示名的地方。要保持升级前的观感，升级时请在 Mini App
-     里按旧配置**就地写入** `display.bot_display_name`、`display.private_voice_title`
-     与 `display.search_query_prefixes`（把旧别名加进前缀列表，它会被自动并入一起
-     剥离）。
-
-   本文档**不填任何具体生产名称或账号**——那是部署者自己的数据。
-4. **其余私有设置同样就地保留，不要从本 fork 复制。** 审核频道 id（默认 `0`）、
-   交接对象（默认空）、提示词、其它文案都是部署者自己的数据。
-5. **重启一次。** 换过进程级闸门字段（`resources.*` 的 restart 段）之后必须重启；
-   只改热字段不需要。
-6. **`checkin_reminder.slots` 不会、也无法自动更新外部 cron。** 它只改命令行白名单
-   （`--slot` 接受哪些值）与相关文案；真正几点发由部署侧 crontab 决定。改完请同步
-   修改 crontab，否则新时段不会真的被触发。Mini App 的运营参数页对此有同样说明。
-7. **`config.toml`** 只在首次导入时读，升级不会重新导入。
-
----
-
-## 相关文件
-
-| 关注点 | 文件 |
-| --- | --- |
-| strict schema、持久化、secret、revision | `bot/services/runtime_config.py` |
-| 读侧视图（默认值镜像） | `bot/config.py` |
-| 快照与消费者登记表 | `bot/services/policy_runtime.py` |
-| 启动装配 | `bot/services/startup_resources.py` |
-| API 与权限 | `bot/web/settings_api.py`、`bot/web/auth.py` |
-| Mini App | `bot/web/static/app.js`、`bot/web/static/styles.css` |
-| 机器可读目录生成 | `bot/tools/config_catalog.py` |
-| 常量分类与「无法验证的点」 | [`docs/constant-classification.md`](./constant-classification.md) |
+- 完整字段清单与实现细节：[配置参考手册](./configuration-reference.md)
+- 机器可读字段目录：[`docs/configuration-fields.json`](./configuration-fields.json)。它只覆盖本次配置化新增的字段，不是全部字段的集合；默认值与上下界以设置中心界面为准。
