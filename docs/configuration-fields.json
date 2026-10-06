@@ -11,9 +11,6 @@
     "resources.llm_request_normal_capacity",
     "resources.llm_tokenizer_concurrency",
     "resources.pending_reply_execution_capacity",
-    "resources.polling_http_timeout_seconds",
-    "resources.polling_request_timeout_seconds",
-    "resources.polling_timeout_seconds",
     "resources.telegram_noncritical_capacity",
     "resources.telegram_normal_capacity",
     "resources.telegram_total_capacity",
@@ -22,17 +19,11 @@
     "resources.tts_transcode_concurrency",
     "resources.webhook_auth_concurrent_updates",
     "resources.webhook_auth_queue_capacity",
-    "resources.webhook_auth_update_timeout_seconds",
     "resources.webhook_critical_concurrent_updates",
     "resources.webhook_critical_queue_capacity",
-    "resources.webhook_critical_update_timeout_seconds",
-    "resources.webhook_http_response_timeout_seconds",
-    "resources.webhook_inbox_lease_seconds",
     "resources.webhook_max_concurrent_updates",
     "resources.webhook_security_concurrent_updates",
-    "resources.webhook_security_queue_capacity",
-    "resources.webhook_security_update_timeout_seconds",
-    "resources.webhook_update_timeout_seconds"
+    "resources.webhook_security_queue_capacity"
   ],
   "fields": [
     {
@@ -1460,7 +1451,7 @@
         "ge": 1,
         "le": 600
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/update_delivery.py:polling_limits"
@@ -1476,7 +1467,7 @@
         "ge": 1.0,
         "le": 600.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/update_delivery.py:polling_limits"
@@ -1492,7 +1483,7 @@
         "ge": 1,
         "le": 300
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/update_delivery.py:polling_limits"
@@ -1575,7 +1566,9 @@
       "reload_kind": "restart",
       "unit": "",
       "read_consumers": [
-        "bot/services/startup_resources.py:apply_startup_resources"
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -1607,7 +1600,9 @@
       "reload_kind": "restart",
       "unit": "",
       "read_consumers": [
-        "bot/services/startup_resources.py:apply_startup_resources"
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -1655,7 +1650,9 @@
       "reload_kind": "restart",
       "unit": "",
       "read_consumers": [
-        "bot/services/startup_resources.py:apply_startup_resources"
+        "bot/services/startup_resources.py:telegram_session_limits",
+        "bot/services/telegram_session.py:PriorityAiohttpSession",
+        "bot/loader.py:create_bot"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -1796,7 +1793,7 @@
         "ge": 1.0,
         "le": 1800.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
@@ -1844,7 +1841,7 @@
         "ge": 1.0,
         "le": 1800.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
@@ -1860,7 +1857,7 @@
         "ge": 5.0,
         "le": 3600.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
@@ -1908,7 +1905,7 @@
         "ge": 5.0,
         "le": 3600.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:inbox_limits"
@@ -2005,7 +2002,7 @@
         "ge": 1.0,
         "le": 1800.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
@@ -2021,7 +2018,7 @@
         "ge": 5.0,
         "le": 1800.0
       },
-      "reload_kind": "restart",
+      "reload_kind": "hot",
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"

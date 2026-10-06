@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Iterable
 from typing import Any, Callable
 
 from bot.config import (
+    Settings,
     load_bootstrap_settings,
     log_enforcement_switch_state,
     log_process_identity,
