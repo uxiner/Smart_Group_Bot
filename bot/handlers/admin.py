@@ -23,6 +23,7 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from bot.services import policy_runtime
 from bot.config import Settings
 from bot.db.models import (
     BotScreening,
@@ -126,9 +127,27 @@ log = logging.getLogger(__name__)
 
 _MUTE_ALL_REPLIES_KEY = "mute_all_replies"
 _LIST_PAGE_SIZE = 5
+
+
+def admin_ops() -> Any:
+    """管理端操作节奏的当前快照（现取配置，默认 = 改造前逐字相同）。"""
+
+    return policy_runtime.admin_ops_policy()
+
+
+def list_page_size() -> int:
+    """各列表的分页大小（行/页）。"""
+
+    return admin_ops().list_page_size
 # `/exemptlist` in a group delivers the card to the operator's DM and leaves only
 # this one-line receipt behind; it removes itself so the group stays clean.
 _ROSTER_NOTICE_AUTO_DELETE_SECONDS = 5
+
+
+def roster_notice_auto_delete_seconds() -> int:
+    """名单通知发出后延时自动删除的秒数（0 = 不自动删）。"""
+
+    return admin_ops().roster_notice_auto_delete_seconds
 _LEGACY_ACTION_RESPONSE_RE = re.compile(
     r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
 )
@@ -455,7 +474,7 @@ def _parse_int(value: str, *, default: int = 0) -> int:
 
 
 def _clamp_list_page(page: int, total: int) -> int:
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     return min(max(int(page), 0), total_pages - 1)
 
 
@@ -509,8 +528,8 @@ async def _load_warning_list_page(
                 select(UserWarning)
                 .where(*predicate)
                 .order_by(*ordering)
-                .offset(page * _LIST_PAGE_SIZE)
-                .limit(_LIST_PAGE_SIZE)
+                .offset(page * list_page_size())
+                .limit(list_page_size())
             )
         )
         .scalars()
@@ -527,11 +546,11 @@ def _build_auth_group_list_page(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Render one already-paged slice of authorized groups.
 
-    ``rows`` holds at most ``_LIST_PAGE_SIZE`` rows and ``total`` is the
+    ``rows`` holds at most one page of rows and ``total`` is the
     unpaged row count; the table is never fully loaded for one page (A-05).
     """
 
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
 
@@ -585,7 +604,7 @@ def _build_admin_list_page(
     page: int,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     total = len(rows)
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
@@ -643,12 +662,12 @@ def _build_warning_list_page(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     """Render one already-paged slice of the group warning list.
 
-    ``rows`` holds at most ``_LIST_PAGE_SIZE`` rows; ``total`` and
+    ``rows`` holds at most one page of rows; ``total`` and
     ``banned_count`` come from two ``select(count(...))`` queries so the
     command stops instantiating the whole table per page (A-05).
     """
 
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
 
@@ -703,7 +722,7 @@ def _build_rule_list_page(
     page: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     total = len(rules)
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
@@ -1268,17 +1287,28 @@ async def _run_group_actions_bounded(
     group_ids: list[int],
     operation: Callable[[int], Awaitable[bool]],
     *,
-    concurrency: int = _PRIVILEGED_GROUP_CONCURRENCY,
-    deadline_seconds: float = _PRIVILEGED_GROUP_DEADLINE_SECONDS,
+    concurrency: int | None = None,
+    deadline_seconds: float | None = None,
 ) -> list[_GroupActionOutcome]:
     """Run idempotent Telegram group operations with bounded concurrency."""
 
-    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+    ops = admin_ops()
+    semaphore = asyncio.Semaphore(
+        max(
+            1,
+            int(concurrency if concurrency is not None else ops.privileged_group_concurrency),
+        )
+    )
+    per_group_deadline = float(
+        deadline_seconds
+        if deadline_seconds is not None
+        else ops.privileged_group_deadline_seconds
+    )
 
     async def run_one(group_id: int) -> _GroupActionOutcome:
         async with semaphore:
             try:
-                async with asyncio.timeout(max(0.1, float(deadline_seconds))):
+                async with asyncio.timeout(max(0.1, per_group_deadline)):
                     succeeded = bool(await operation(int(group_id)))
             except asyncio.CancelledError:
                 raise
@@ -2744,7 +2774,7 @@ async def cmd_spam(
             ),
             lane="critical_bulk",
             priority=10,
-            timeout_seconds=_PRIVILEGED_JOB_DEADLINE_SECONDS,
+            timeout_seconds=admin_ops().privileged_job_deadline_seconds,
         )
         if not submission.accepted:
             await _publish_privileged_result(
@@ -3054,7 +3084,7 @@ async def on_ban_scope_choice(
             operation=run_claimed_job,
             lane="critical_bulk" if scope == "g" else "critical",
             priority=10 if scope == "g" else 0,
-            timeout_seconds=_PRIVILEGED_JOB_DEADLINE_SECONDS,
+            timeout_seconds=admin_ops().privileged_job_deadline_seconds,
         )
         if not submission.accepted:
             async with _BAN_SCOPE_LOCK:
@@ -3834,7 +3864,7 @@ async def on_rule_delete(
         await callback.answer(f"已删除: {pattern_label}")
         return
 
-    total_pages = max(1, (len(rules) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (len(rules) + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page_hint, 0), total_pages - 1)
     text, keyboard = _build_rule_list_page(rules, page=page)
     try:
@@ -4851,7 +4881,7 @@ def _build_moderation_roster_page(
     total = len(entries)
     exempt_count = sum(1 for item in entries if item.kind in ("exempt", "bot"))
     mute_count = sum(1 for item in entries if item.kind == "mute")
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page, 0), total_pages - 1)
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
@@ -5056,13 +5086,13 @@ async def cmd_exemptlist(message: Message, session: AsyncSession, settings: Sett
         )
         accepted = await schedule_message_auto_delete_durable(
             receipt,
-            _ROSTER_NOTICE_AUTO_DELETE_SECONDS,
+            roster_notice_auto_delete_seconds(),
         )
         log.info(
             "roster receipt posted | chat=%s message=%s auto_delete=%ss scheduled=%s",
             message.chat.id,
             getattr(receipt, "message_id", None),
-            _ROSTER_NOTICE_AUTO_DELETE_SECONDS,
+            roster_notice_auto_delete_seconds(),
             accepted,
         )
         return
@@ -5201,7 +5231,7 @@ async def on_exemptlist_delete(
     entries, mute_all = await _load_moderation_roster(session, group_id)
     group_row = await session.get(Group, group_id)
     await session.commit()
-    total_pages = max(1, (len(entries) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    total_pages = max(1, (len(entries) + _LIST_PAGE_SIZE - 1) // list_page_size())
     page = min(max(page_hint, 0), total_pages - 1)
     text, keyboard = _build_moderation_roster_page(
         entries,

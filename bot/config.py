@@ -873,6 +873,77 @@ class ResourcesPolicyConfig(BaseModel):
             )
 
 
+class AdminOpsPolicyConfig(BaseModel):
+    """管理端名单通知 / 分页 / 特权批处理的操作节奏。
+
+    全是**显示与调度**参数：不动任何判定、授权或财务语义。默认逐字等于改造前。
+    """
+
+    #: 名单通知发出后延时自动删除（秒）。0 = 不自动删除。
+    roster_notice_auto_delete_seconds: int = Field(default=5, ge=0, le=3600)
+    #: 管理端各列表的分页大小（行/页）。
+    list_page_size: int = Field(default=5, ge=1, le=50)
+    #: 特权任务（封禁/接管这类批量 Telegram 操作）同时处理的群数。
+    privileged_group_concurrency: int = Field(default=4, ge=1, le=16)
+    #: 单个群的截止预算（秒）。
+    privileged_group_deadline_seconds: float = Field(
+        default=45.0, ge=5.0, le=120.0, allow_inf_nan=False
+    )
+    #: 整个特权任务的截止预算（秒）。**必须严格大于单群预算**，否则内层还没跑完
+    # 外层就掐断了。
+    privileged_job_deadline_seconds: float = Field(
+        default=300.0, ge=30.0, le=900.0, allow_inf_nan=False
+    )
+
+class GroupOpsPolicyConfig(BaseModel):
+    """群内视觉判定的输入上限与活跃度写库的节奏。
+
+    视觉下载的**体积上限是内存安全线**（只可收紧），超时是取消边界；活跃度那两项
+    是防刷屏的写放大保护。都不改变判定口径。
+    """
+
+    #: 群内图片视觉判定：单张下载的体积上限（字节）。上界 20MiB 是内存安全线，
+    #: **只能收紧**；0 不表示"无限"。
+    vision_image_max_bytes: int = Field(
+        default=5 * 1024 * 1024, ge=256 * 1024, le=20 * 1024 * 1024
+    )
+    #: 视觉下载的超时（秒）。超时即取消下载并放弃本次判定。
+    vision_download_timeout_seconds: float = Field(
+        default=20.0, ge=5.0, le=60.0, allow_inf_nan=False
+    )
+    #: 视觉描述文本注入的字符上限。
+    vision_text_max_chars: int = Field(default=800, ge=100, le=4096)
+    #: reply_target_candidates 注入给 LLM 的字符上限（le = 现值 = 预算上限）。
+    reply_targets_max_chars: int = Field(default=4000, ge=512, le=4000)
+    #: NSFW 图片告警的自动删除（秒）。0 = 不自动删除；只影响展示节奏。
+    nsfw_warning_auto_delete_seconds: int = Field(default=120, ge=0, le=86400)
+    #: 群活跃度写库的合并去抖窗口（秒）。
+    activity_debounce_seconds: float = Field(
+        default=1.0, ge=0.0, le=10.0, allow_inf_nan=False
+    )
+    #: 群活跃度写库的重试次数。
+    activity_max_attempts: int = Field(default=8, ge=1, le=20)
+
+
+class TelegramSendPolicyConfig(BaseModel):
+    """出站发送的分片、typing 与流式节流预算。"""
+
+    #: 单次发送（含重试分片）的整体超时（秒）。必须大于单次 HTTP 超时。
+    send_total_deadline_seconds: float = Field(
+        default=60.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    #: 流式回复的最大增量编辑次数。
+    stream_max_incremental_edits: int = Field(default=12, ge=1, le=50)
+    #: 流式回复的节流总时长（秒）。
+    stream_max_pacing_seconds: float = Field(
+        default=8.0, ge=1.0, le=60.0, allow_inf_nan=False
+    )
+    #: typing 动作发送的超时（秒）。超时静默降级，不影响正文。
+    typing_send_timeout_seconds: float = Field(
+        default=3.0, ge=0.5, le=10.0, allow_inf_nan=False
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -1163,6 +1234,9 @@ class Settings(BaseSettings):
     checkin_reminder: CheckinReminderPolicyConfig = CheckinReminderPolicyConfig()
     display: DisplayPolicyConfig = DisplayPolicyConfig()
     resources: ResourcesPolicyConfig = ResourcesPolicyConfig()
+    admin_ops: AdminOpsPolicyConfig = AdminOpsPolicyConfig()
+    group_ops: GroupOpsPolicyConfig = GroupOpsPolicyConfig()
+    telegram_send: TelegramSendPolicyConfig = TelegramSendPolicyConfig()
 
 
 # Common vendor names people type that map onto litellm's native provider ids.

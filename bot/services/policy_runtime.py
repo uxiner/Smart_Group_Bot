@@ -33,6 +33,9 @@ from typing import TYPE_CHECKING
 
 from bot.config import (
     ActivityPolicyConfig,
+    AdminOpsPolicyConfig,
+    GroupOpsPolicyConfig,
+    TelegramSendPolicyConfig,
     CheckinReminderPolicyConfig,
     DisplayPolicyConfig,
     EconomyPolicyConfig,
@@ -353,6 +356,42 @@ def resources_policy() -> ResourcesPolicyConfig:
     if isinstance(view, ResourcesPolicyConfig):
         return view
     return ResourcesPolicyConfig()
+
+
+
+
+def admin_ops_policy() -> AdminOpsPolicyConfig:
+    """管理端名单通知 / 分页 / 特权批处理的操作节奏（现取配置）。"""
+
+    settings = _settings
+    if settings is None:
+        return AdminOpsPolicyConfig()
+    view = getattr(settings, "admin_ops", None)
+    return view if isinstance(view, AdminOpsPolicyConfig) else AdminOpsPolicyConfig()
+
+
+def group_ops_policy() -> GroupOpsPolicyConfig:
+    """群内视觉判定输入上限与活跃度写库节奏（现取配置）。"""
+
+    settings = _settings
+    if settings is None:
+        return GroupOpsPolicyConfig()
+    view = getattr(settings, "group_ops", None)
+    return view if isinstance(view, GroupOpsPolicyConfig) else GroupOpsPolicyConfig()
+
+
+def telegram_send_policy() -> TelegramSendPolicyConfig:
+    """出站发送的分片 / typing / 流式节流预算（现取配置）。"""
+
+    settings = _settings
+    if settings is None:
+        return TelegramSendPolicyConfig()
+    view = getattr(settings, "telegram_send", None)
+    return (
+        view
+        if isinstance(view, TelegramSendPolicyConfig)
+        else TelegramSendPolicyConfig()
+    )
 
 
 def moderation_handover_policy() -> ModerationPolicySnapshot:
@@ -708,6 +747,35 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     "resources.telegram_send_chat_parallel": (
         "bot/utils/telegram.py:chat_send_parallel",
     ),
+    # --- 管理端操作节奏 -----------------------------------------------------
+    "admin_ops.roster_notice_auto_delete_seconds": (
+        "bot/handlers/admin.py:roster_notice_auto_delete_seconds",
+    ),
+    "admin_ops.list_page_size": ("bot/handlers/admin.py:list_page_size",),
+    "admin_ops.privileged_group_concurrency": ("bot/handlers/admin.py:admin_ops",),
+    "admin_ops.privileged_group_deadline_seconds": ("bot/handlers/admin.py:admin_ops",),
+    "admin_ops.privileged_job_deadline_seconds": ("bot/handlers/admin.py:admin_ops",),
+    # --- 群内视觉 / 活跃度 --------------------------------------------------
+    "group_ops.vision_image_max_bytes": ("bot/handlers/group.py:group_ops",),
+    "group_ops.vision_download_timeout_seconds": ("bot/handlers/group.py:group_ops",),
+    "group_ops.vision_text_max_chars": ("bot/handlers/group.py:group_ops",),
+    "group_ops.reply_targets_max_chars": ("bot/handlers/group.py:group_ops",),
+    "group_ops.nsfw_warning_auto_delete_seconds": ("bot/handlers/group.py:group_ops",),
+    "group_ops.activity_debounce_seconds": ("bot/handlers/group.py:group_ops",),
+    "group_ops.activity_max_attempts": ("bot/handlers/group.py:group_ops",),
+    # --- 出站发送 -----------------------------------------------------------
+    "telegram_send.send_total_deadline_seconds": (
+        "bot/utils/telegram.py:send_budget",
+    ),
+    "telegram_send.stream_max_incremental_edits": (
+        "bot/utils/telegram.py:send_budget",
+    ),
+    "telegram_send.stream_max_pacing_seconds": (
+        "bot/utils/telegram.py:send_budget",
+    ),
+    "telegram_send.typing_send_timeout_seconds": (
+        "bot/utils/telegram.py:send_budget",
+    ),
 }
 
 
@@ -733,6 +801,9 @@ _SECTION_SNAPSHOTS: ContextVar[dict[str, object] | None] = ContextVar(
 
 _SNAPSHOT_BUILDERS = {
     "private_chat": private_chat_policy,
+    "admin_ops": admin_ops_policy,
+    "group_ops": group_ops_policy,
+    "telegram_send": telegram_send_policy,
     "economy": economy_policy,
     "activity": activity_policy,
     "checkin_reminder": checkin_reminder_policy,

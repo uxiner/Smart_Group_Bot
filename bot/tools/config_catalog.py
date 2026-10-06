@@ -29,11 +29,14 @@ from bot.services.policy_runtime import consumer_paths
 from bot.services.runtime_config import (
     RESTART_REQUIRED_PATHS,
     ActivitySettingsConfig,
+    AdminOpsSettingsConfig,
     CheckinReminderSettingsConfig,
     DisplaySettingsConfig,
     EconomySettingsConfig,
+    GroupOpsSettingsConfig,
     PrivateChatSettingsConfig,
     ResourceSettingsConfig,
+    TelegramSendSettingsConfig,
 )
 
 #: 本轮新增的段 → 读侧视图类型。
@@ -44,6 +47,9 @@ SECTION_MODELS: dict[str, type[BaseModel]] = {
     "checkin_reminder": CheckinReminderSettingsConfig,
     "display": DisplaySettingsConfig,
     "resources": ResourceSettingsConfig,
+    "admin_ops": AdminOpsSettingsConfig,
+    "group_ops": GroupOpsSettingsConfig,
+    "telegram_send": TelegramSendSettingsConfig,
 }
 
 #: 审核段里本轮新增的两个**部署绑定**字段。

@@ -4376,7 +4376,7 @@ async def _run_group_activity_writer(group_id: int) -> None:
     retry_delay = 0.5
     attempts = 0
     try:
-        await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
+        await asyncio.sleep(group_ops().activity_debounce_seconds)
         while True:
             pending = _GROUP_ACTIVITY_PENDING.get(group_id)
             if pending is None:
@@ -4397,7 +4397,7 @@ async def _run_group_activity_writer(group_id: int) -> None:
                 raise
             except Exception:
                 attempts += 1
-                if attempts >= _GROUP_ACTIVITY_MAX_ATTEMPTS:
+                if attempts >= group_ops().activity_max_attempts:
                     log.error(
                         "[%s] deferred group activity flush abandoned after %d attempts",
                         group_id,
@@ -4420,7 +4420,7 @@ async def _run_group_activity_writer(group_id: int) -> None:
                 return
             retry_delay = 0.5
             attempts = 0
-            await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
+            await asyncio.sleep(group_ops().activity_debounce_seconds)
     finally:
         current = _GROUP_ACTIVITY_PENDING.get(group_id)
         if current is not None and current.task is asyncio.current_task():
@@ -4615,21 +4615,21 @@ def _extract_video_thumbnail_file_info(message: Message) -> tuple[str, str, int]
 async def _build_vision_data_uri(
     message: Message, file_id: str, mime: str, declared_size: int
 ) -> str:
-    if declared_size > _MAX_VISION_IMAGE_BYTES:
+    if declared_size > group_ops().vision_image_max_bytes:
         log.warning("【视觉】跳过超限图片 | 声明大小=%dB | 类型=%s", declared_size, mime)
         return ""
 
     try:
-        async with asyncio.timeout(_VISION_DOWNLOAD_TIMEOUT_SEC):
+        async with asyncio.timeout(group_ops().vision_download_timeout_seconds):
             tg_file = await message.bot.get_file(file_id)
             remote_size = int(getattr(tg_file, "file_size", 0) or 0)
-            if remote_size > _MAX_VISION_IMAGE_BYTES:
+            if remote_size > group_ops().vision_image_max_bytes:
                 log.warning("【视觉】跳过超限图片 | 远端大小=%dB | 类型=%s", remote_size, mime)
                 return ""
             if not tg_file.file_path:
                 return ""
 
-            buf = _LimitedBytesIO(_MAX_VISION_IMAGE_BYTES)
+            buf = _LimitedBytesIO(group_ops().vision_image_max_bytes)
             await message.bot.download_file(tg_file.file_path, destination=buf)
     except TimeoutError:
         log.warning("【视觉】图片下载超时")
@@ -4727,7 +4727,7 @@ VISION_TEXT_MAX_CHARS = 800
 
 
 def _cap_vision_text(value: Any) -> str:
-    """把视觉描述硬截断到 :data:`VISION_TEXT_MAX_CHARS`（保留末尾判定行）。
+    """把视觉描述硬截断到配置上限（``resources`` 之外的 ``group_ops.vision_text_max_chars``）。
 
     NSFW 守卫那一路要求判定 JSON 在**最后一行**，所以不能一刀切在末尾截断——
     那会把 ``NSFW_DECISION {"nsfw": "yes"}`` 砍成半行，判定直接失效（宁可漏判）。
@@ -4735,13 +4735,13 @@ def _cap_vision_text(value: Any) -> str:
     """
 
     text = str(value or "").strip()
-    if len(text) <= VISION_TEXT_MAX_CHARS:
+    if len(text) <= group_ops().vision_text_max_chars:
         return text
     lines = text.splitlines()
     if len(lines) > 1 and _NSFW_DECISION_LINE_RE.match(lines[-1]):
         tail = lines[-1]
         head = "\n".join(lines[:-1])
-        head_budget = max(0, VISION_TEXT_MAX_CHARS - len(tail) - 1)
+        head_budget = max(0, group_ops().vision_text_max_chars - len(tail) - 1)
         if head_budget < len(head):
             log.warning(
                 "【视觉】描述超长，已截断正文（保留末尾判定行）| chars=%d",
@@ -4749,9 +4749,9 @@ def _cap_vision_text(value: Any) -> str:
             )
             return "\n".join([head[:head_budget].rstrip(), tail])
     log.warning(
-        "【视觉】描述超长，已截断 | chars=%d -> %d", len(text), VISION_TEXT_MAX_CHARS
+        "【视觉】描述超长，已截断 | chars=%d -> %d", len(text), group_ops().vision_text_max_chars
     )
-    return text[:VISION_TEXT_MAX_CHARS].rstrip() + " ..."
+    return text[:group_ops().vision_text_max_chars].rstrip() + " ..."
 
 
 def _nsfw_decision_payload(vision_text: str) -> dict[str, Any] | None:
@@ -5157,7 +5157,7 @@ async def _apply_nsfw_image_guard(
                     await answer_with_auto_delete(
                         message,
                         f"{warn_target} {_NSFW_IMAGE_WARNING_REASON}",
-                        auto_delete_seconds=_NSFW_IMAGE_WARNING_AUTO_DELETE_SECONDS,
+                        auto_delete_seconds=group_ops().nsfw_warning_auto_delete_seconds,
                         sanitize_mentions=False,
                         parse_mode="HTML",
                     )
@@ -5757,7 +5757,7 @@ def _build_reply_targets_context(items: list[_PendingReplyItem]) -> tuple[str, d
         wrap_untrusted_multiline(
             REPLY_TARGETS_UNTRUSTED_LABEL,
             "\n".join(lines),
-            max_len=REPLY_TARGETS_MAX_CHARS,
+            max_len=group_ops().reply_targets_max_chars,
         ),
         alias_map,
     )
@@ -8406,6 +8406,12 @@ _ADMIN_ALERT_WINDOW_SECONDS = 600.0
 _ADMIN_ALERT_AGGREGATE_AFTER = 5
 _ADMIN_ALERT_STATE_LIMIT = 512
 _ADMIN_ALERT_TEXT_LIMIT = 900
+
+
+def group_ops():
+    """群内视觉判定输入上限与活跃度写库节奏（现取配置，默认 = 改造前逐字相同）。"""
+
+    return policy_runtime.group_ops_policy()
 
 
 def _admin_alert_limits() -> tuple[float, int, int, int]:

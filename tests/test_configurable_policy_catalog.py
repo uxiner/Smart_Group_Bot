@@ -56,7 +56,18 @@ class CatalogTests(unittest.TestCase):
             path
             for path in policy_runtime.CONSUMER_REGISTRY
             if not path.split(".")[0]
-            in {"private_chat", "economy", "activity", "checkin_reminder", "display", "resources", "moderation"}
+            in {
+                "private_chat",
+                "economy",
+                "activity",
+                "checkin_reminder",
+                "display",
+                "resources",
+                "moderation",
+                "admin_ops",
+                "group_ops",
+                "telegram_send",
+            }
         ]
         self.assertEqual(missing, [], "CONSUMER_REGISTRY 里出现了未知段的字段")
 

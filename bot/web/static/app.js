@@ -1485,6 +1485,25 @@
               ${field("resources.archive_indexing_lease_seconds", "索引租约（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true, hint: "必须不短于查询超时，否则会重复写" })}
               ${field("resources.telegram_send_chat_parallel", "同会话并发发送", { type: "number", min: 1, max: 32, step: 1, required: true, hint: "每次发送现建信号量，热生效" })}
             </div>`)}
+          ${advancedPanel("admin_ops.all", "管理端与群内操作节奏", "分页、名单通知、特权批处理、视觉输入上限、出站发送", `
+            <div class="field-grid three">
+              ${field("admin_ops.list_page_size", "列表分页（行/页）", { type: "number", min: 1, max: 50, step: 1, required: true, hint: "管理端所有列表共用一个页大小" })}
+              ${field("admin_ops.roster_notice_auto_delete_seconds", "名单通知自动删除（秒）", { type: "number", min: 0, max: 3600, step: 1, required: true, hint: "0 = 不自动删除" })}
+              ${field("admin_ops.privileged_group_concurrency", "特权批处理并发群数", { type: "number", min: 1, max: 16, step: 1, required: true })}
+              ${field("admin_ops.privileged_group_deadline_seconds", "单群截止（秒）", { type: "number", min: 5, max: 120, step: 0.5, required: true })}
+              ${field("admin_ops.privileged_job_deadline_seconds", "特权任务总截止（秒）", { type: "number", min: 30, max: 900, step: 1, required: true, hint: "必须严格大于单群截止，否则内层还没跑完外层就掐断" })}
+              ${field("group_ops.vision_image_max_bytes", "视觉下载体积上限（字节）", { type: "number", min: 262144, max: 20971520, step: 1024, required: true, hint: "默认 5 MiB；这是内存安全线，只可收紧，0 不表示无限" })}
+              ${field("group_ops.vision_download_timeout_seconds", "视觉下载超时（秒）", { type: "number", min: 5, max: 60, step: 0.5, required: true, hint: "超时即取消下载并放弃本次判定" })}
+              ${field("group_ops.vision_text_max_chars", "视觉描述注入上限（字符）", { type: "number", min: 100, max: 4096, step: 1, required: true })}
+              ${field("group_ops.reply_targets_max_chars", "回复候选注入上限（字符）", { type: "number", min: 512, max: 4000, step: 1, required: true, hint: "上界 4000 = 现值 = 预算上限，不可放大" })}
+              ${field("group_ops.nsfw_warning_auto_delete_seconds", "NSFW 告警自动删除（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "0 = 不自动删除；只影响展示节奏，不影响判定与封禁" })}
+              ${field("group_ops.activity_debounce_seconds", "活跃度写库去抖（秒）", { type: "number", min: 0, max: 10, step: 0.1, required: true })}
+              ${field("group_ops.activity_max_attempts", "活跃度写库重试次数", { type: "number", min: 1, max: 20, step: 1, required: true, hint: "调过小会放大写放大" })}
+              ${field("telegram_send.send_total_deadline_seconds", "单次发送总预算（秒）", { type: "number", min: 5, max: 300, step: 0.5, required: true, hint: "含重试分片；必须大于单条 HTTP 超时（30s）" })}
+              ${field("telegram_send.stream_max_incremental_edits", "流式最大增量编辑", { type: "number", min: 1, max: 50, step: 1, required: true, hint: "受 Telegram 编辑限流约束" })}
+              ${field("telegram_send.stream_max_pacing_seconds", "流式节流总时长（秒）", { type: "number", min: 1, max: 60, step: 0.5, required: true })}
+              ${field("telegram_send.typing_send_timeout_seconds", "typing 发送超时（秒）", { type: "number", min: 0.5, max: 10, step: 0.1, required: true, hint: "超时静默降级，不影响正文" })}
+            </div>`)}
         </section>
 
         <section class="settings-section">

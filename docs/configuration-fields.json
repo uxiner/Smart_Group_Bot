@@ -117,6 +117,86 @@
       "test_node": "tests/test_activity_incentive.py"
     },
     {
+      "path": "admin_ops.list_page_size",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 1,
+        "le": 50
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/admin.py:list_page_size"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "admin_ops.privileged_group_concurrency",
+      "type": "integer",
+      "default": 4,
+      "bounds": {
+        "ge": 1,
+        "le": 16
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/admin.py:admin_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "admin_ops.privileged_group_deadline_seconds",
+      "type": "number",
+      "default": 45.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 120.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/admin.py:admin_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "admin_ops.privileged_job_deadline_seconds",
+      "type": "number",
+      "default": 300.0,
+      "bounds": {
+        "ge": 30.0,
+        "le": 900.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/admin.py:admin_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "admin_ops.roster_notice_auto_delete_seconds",
+      "type": "integer",
+      "default": 5,
+      "bounds": {
+        "ge": 0,
+        "le": 3600
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/admin.py:roster_notice_auto_delete_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "checkin_reminder.auto_delete_seconds",
       "type": "integer",
       "default": 600,
@@ -647,6 +727,118 @@
       "unit": "",
       "read_consumers": [
         "bot/services/point_shop.py:buy_member_tag"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.activity_debounce_seconds",
+      "type": "number",
+      "default": 1.0,
+      "bounds": {
+        "ge": 0.0,
+        "le": 10.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.activity_max_attempts",
+      "type": "integer",
+      "default": 8,
+      "bounds": {
+        "ge": 1,
+        "le": 20
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.nsfw_warning_auto_delete_seconds",
+      "type": "integer",
+      "default": 120,
+      "bounds": {
+        "ge": 0,
+        "le": 86400
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.reply_targets_max_chars",
+      "type": "integer",
+      "default": 4000,
+      "bounds": {
+        "ge": 512,
+        "le": 4000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.vision_download_timeout_seconds",
+      "type": "number",
+      "default": 20.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.vision_image_max_bytes",
+      "type": "integer",
+      "default": 5242880,
+      "bounds": {
+        "ge": 262144,
+        "le": 20971520
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "group_ops.vision_text_max_chars",
+      "type": "integer",
+      "default": 800,
+      "bounds": {
+        "ge": 100,
+        "le": 4096
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/handlers/group.py:group_ops"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -2022,6 +2214,70 @@
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "telegram_send.send_total_deadline_seconds",
+      "type": "number",
+      "default": 60.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 300.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/utils/telegram.py:send_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "telegram_send.stream_max_incremental_edits",
+      "type": "integer",
+      "default": 12,
+      "bounds": {
+        "ge": 1,
+        "le": 50
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/utils/telegram.py:send_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "telegram_send.stream_max_pacing_seconds",
+      "type": "number",
+      "default": 8.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 60.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/utils/telegram.py:send_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "telegram_send.typing_send_timeout_seconds",
+      "type": "number",
+      "default": 3.0,
+      "bounds": {
+        "ge": 0.5,
+        "le": 10.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/utils/telegram.py:send_budget"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"

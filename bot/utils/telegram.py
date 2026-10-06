@@ -398,6 +398,12 @@ _TELEGRAM_BACKGROUND_SOFT_LIMIT = 16
 _TELEGRAM_BACKGROUND_FATAL_LIMIT = 32
 _TELEGRAM_BACKGROUND_MAX_AGE_SECONDS = 60.0
 _SEND_TOTAL_DEADLINE_SECONDS = 60.0
+
+
+def send_budget():
+    """出站发送的分片 / typing / 流式节流预算（现取配置）。"""
+
+    return policy_runtime.telegram_send_policy()
 _STREAM_MAX_INCREMENTAL_EDITS = 12
 _STREAM_MAX_PACING_SECONDS = 8.0
 _SEND_SEMAPHORES: weakref.WeakValueDictionary[int, asyncio.Semaphore] = (
@@ -458,7 +464,7 @@ def _send_total_deadline_seconds() -> float:
         return 12.0
     if priority <= ExecutionPriority.HIGH:
         return 30.0
-    return _SEND_TOTAL_DEADLINE_SECONDS
+    return send_budget().send_total_deadline_seconds
 
 
 def sanitize_outgoing_mentions(text: str, *, monospace: bool = True) -> str:
@@ -1811,7 +1817,7 @@ async def typing_action(
         try:
             done, _pending = await asyncio.wait(
                 {task},
-                timeout=_TYPING_SEND_TIMEOUT_SECONDS,
+                timeout=send_budget().typing_send_timeout_seconds,
             )
             if task in done:
                 await task
@@ -2432,8 +2438,8 @@ async def send_reply(
         # reply-batch deadline before the final text landed.
         adaptive_chunk_size = max(
             int(stream_chunk_size),
-            max(1, (len(segment) + _STREAM_MAX_INCREMENTAL_EDITS - 1)
-                // _STREAM_MAX_INCREMENTAL_EDITS),
+            max(1, (len(segment) + send_budget().stream_max_incremental_edits - 1)
+                // send_budget().stream_max_incremental_edits),
         )
         chunks = _stream_chunks(segment, chunk_size=adaptive_chunk_size)
         if len(chunks) <= 1 and len(segment) >= 18:
@@ -2462,7 +2468,7 @@ async def send_reply(
         last_edit_ts = time.monotonic()
         effective_interval = min(
             max(0.0, float(stream_interval)),
-            _STREAM_MAX_PACING_SECONDS / max(1, len(chunks) - 1),
+            send_budget().stream_max_pacing_seconds / max(1, len(chunks) - 1),
         )
         for chunk in chunks[1:]:
             merged += chunk
