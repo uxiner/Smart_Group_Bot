@@ -144,3 +144,24 @@ total`）在 schema 里强校验，`tests/test_startup_resources.py` 另有一�
 | 入群验证的终态判定、nonce 宽限、准备中/终态租约、解封恢复宽限 | `bot/services/join_verification.py` | 并发正确性的前提：终态不可回退、租约防重复执行。已在 `KeptFixedFamiliesTests` 里逐条钉住没有被做成开关。 |
 | `context_reserve_tokens` vs `group_history_reserve_tokens` | `bot/config.py`、`bot/services/runtime_config.py` | **不是缺口**：`context_reserve_tokens` 是权威值，`group_history_reserve_tokens` 是兼容字段，覆盖顺序按 `model_fields_set` 判断而不是猜默认值。两者已有 runtime/schema/apply/migration 完整链路，本轮不动，只在此澄清。 |
 | search maintenance 与 archive provider 的注册点 | `bot/__main__.py` | 已在上一轮抽走（`resources.search_prune_interval_seconds`、`resources.archive_*`），本轮不重复造同类字段。 |
+
+
+---
+
+## 敏感信息扫描的证据
+
+扫描面：**全部跟踪文件（源码 + Markdown + 图形文档清单）** ＋ **本分支新增提交触及的
+文件**。两条都不能因为"归档里没有 .git"就跳过。
+
+* 跟踪文件面：`git ls-files` → 逐个文本扫描（`tests/test_public_artifact_scan.py`
+  的 `test_no_private_deployment_binding_in_tracked_files`）。覆盖 Telegram 频道 id、
+  个人家目录路径、隧道/内网主机名；身份 id 需要落在身份上下文里才算命中，明显占位
+  （重复位、顺序串、日期戳）不报。
+* 提交面：`test_committed_history_carries_no_new_secret` 断言本分支相对冻结基线新增的
+  文件里**没有** `.env` / `.db` / `.sqlite3` / `.pem` / `.key`。
+* 上游署名反向检查：`test_upstream_attribution_is_still_present` 确认 LICENSE 的 MIT 与
+  ``bot/utils/project_info.py`` 的作者/仓库署名仍在——清理私人信息不等于可以抹掉开源归属。
+* 图形文档（`docs/ui-night-crystal/*.png`）：只做文件清单与尺寸核对，**没有**逐像素
+  确认里面没有部署信息——这一点在「无法验证」里如实列出。
+* 若需要在没有 `.git` 的归档里复跑，用固定 SHA 的 detached clone（父代理已验证该
+  路径可行）；本仓库的扫描测试在缺 `.git` 时**跳过**基线对比那一项，而不是静默通过。
