@@ -25,6 +25,7 @@ python3 tools/settings-ui-harness/harness.py --port 8781
 | `--group-admin` | 以普通群管理员身份进入（`can_manage_global = false`），验证越权时页面只剩群组页 |
 | `--fail-save` | 所有写操作返回 503，用于验证保存失败与草稿保留 |
 | `--no-groups` | 群组列表返回 503，用于验证错误态 |
+| `--conflict-save` | 第一次 `PUT /api/v1/settings` 返回 409（revision 冲突），之后恢复正常 |
 
 另外有两个只用于自动化的端点：`GET /harness/requests`（请求日志）和
 `POST /harness/reset`（把内存状态复位回 fixture）。
@@ -53,6 +54,7 @@ python3 tools/settings-ui-harness/harness.py --port 8781 &
 python3 tools/settings-ui-harness/harness.py --port 8792 --fail-save &
 python3 tools/settings-ui-harness/harness.py --port 8793 --group-admin &
 python3 tools/settings-ui-harness/harness.py --port 8794 --no-groups &
+python3 tools/settings-ui-harness/harness.py --port 8795 --conflict-save &
 
 # 终端 2
 cd /tmp/ui-verify
@@ -82,9 +84,12 @@ node $CHECKS/pixels.mjs /tmp/dsh-ui-shots/*.png
 # 7) 保存按钮点击回归（改字段 → 真鼠标点击保存）
 node $CHECKS/save-click-probe.mjs 8781
 
-# 8) 运营参数页（移动端不横溢 / 44px 触达 / 键盘焦点 / 重启标记 / 奖池结构化编辑器 /
-#    同一次点击 blur 不吞保存 / 群管理员看不到这一页）
+# 8) 运营参数页：保存成功 / 503 保留草稿 / 409 冲突可重载 / 群管理员禁全局 /
+#    移动端 360·390·430 真实进入该页 / 44px 触达 / 焦点可见 / blur 不吞保存
+#    （每项都读回合成 API 的真实落库值与请求日志，不只检查 DOM 里有输入框）
 node $CHECKS/operations.mjs
+FAIL_HARNESS=http://127.0.0.1:8792 node $CHECKS/operations.mjs
+CONFLICT_HARNESS=http://127.0.0.1:8795 node $CHECKS/operations.mjs
 GROUP_HARNESS=http://127.0.0.1:8793 node $CHECKS/operations.mjs
 ```
 

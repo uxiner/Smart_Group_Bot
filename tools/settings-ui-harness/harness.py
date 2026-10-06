@@ -16,6 +16,7 @@ Then open http://127.0.0.1:8781/settings
 Flags:
     --group-admin   serve the group-admin session (can_manage_global = false)
     --fail-save     make every PUT answer 503 so the error path can be seen
+    --conflict-save make the next settings PUT answer 409 (revision conflict)
     --no-groups     make /api/v1/groups fail so the error state can be seen
 """
 from __future__ import annotations
@@ -110,11 +111,22 @@ RESOURCE_TYPES = {
 
 
 class State:
-    def __init__(self, fixture: dict, *, group_admin: bool, fail_save: bool, no_groups: bool):
+    def __init__(
+        self,
+        fixture: dict,
+        *,
+        group_admin: bool,
+        fail_save: bool,
+        no_groups: bool,
+        conflict_save: bool = False,
+    ):
         self.fixture = fixture
         self.group_admin = group_admin
         self.fail_save = fail_save
         self.no_groups = no_groups
+        #: 第一次 settings PUT 回 409 之后自动恢复，用来验"冲突可重载"。
+        self.conflict_save = conflict_save
+        self._conflict_armed = conflict_save
         self.settings = deepcopy(fixture["settings"])
         self.groups = deepcopy(fixture["groups"]["groups"])
         self.resources = deepcopy(fixture["resources"])
@@ -207,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
                     group_admin=state.group_admin,
                     fail_save=state.fail_save,
                     no_groups=state.no_groups,
+                    conflict_save=state.conflict_save,
                 )
                 return self._json({"reset": True})
             if path.startswith("/api/v1/"):
@@ -250,6 +263,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(403, "只有最高管理员可以查看全局配置", "forbidden")
                 return self._json(state.settings)
             if method in {"PUT", "PATCH"}:
+                if state.conflict_save and state._conflict_armed:
+                    state._conflict_armed = False
+                    return self._error(
+                        409,
+                        f"runtime config revision changed: expected {int(state.settings['revision']) - 1}, "
+                        f"got {int(state.settings['revision'])}",
+                        "group_revision_conflict",
+                    )
                 if state.fail_save:
                     return self._error(503, "模拟保存失败：后端拒绝了这次写入", "runtime_config_unavailable")
                 body = self._body()
@@ -383,6 +404,11 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="ignored unless it is a loopback address")
     parser.add_argument("--group-admin", action="store_true", help="serve the group-admin session")
     parser.add_argument("--fail-save", action="store_true", help="make every write answer 503")
+    parser.add_argument(
+        "--conflict-save",
+        action="store_true",
+        help="the first settings PUT answers 409 (revision conflict)",
+    )
     parser.add_argument("--no-groups", action="store_true", help="make the group list fail")
     args = parser.parse_args()
 
@@ -398,12 +424,15 @@ def main() -> int:
         group_admin=args.group_admin,
         fail_save=args.fail_save,
         no_groups=args.no_groups,
+        conflict_save=args.conflict_save,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     mode = "群管理员（无全局权限）" if args.group_admin else "最高管理员"
     print(f"settings UI harness on http://{args.host}:{args.port}/settings  [session: {mode}]")
     if args.fail_save:
         print("  writes are failing on purpose (--fail-save)")
+    if args.conflict_save:
+        print("  the first settings PUT answers 409 on purpose (--conflict-save)")
     if args.no_groups:
         print("  the group list is failing on purpose (--no-groups)")
     try:

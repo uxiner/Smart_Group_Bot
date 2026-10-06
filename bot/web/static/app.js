@@ -1326,11 +1326,12 @@
   }
 
   function renderOperations() {
-    const restartNotice = restartChanges().length
-      ? `<div class="notice info">${icon("rotate-ccw")}<span>本页带「需重启」标记的字段保存后要重启进程才生效；其余字段下一次动作即生效。</span></div>`
-      : "";
+    // 提示**始终**在页面上，不只在"有未保存的改动"时出现：这一页同时含热字段与
+    // 冷字段，只在 dirty 时提示等于在保存后立刻把"这些要重启"的话收走。
+    const pendingRestart = state.document?.restart_pending || [];
+    const restartNotice = `<div class="notice info">${icon("rotate-ccw")}<span><strong>三种生效时机</strong>：一般业务项保存后立即生效（业务动作开始时现取）；带「需重启」标记的资源容量已经保存，但要重启进程才真正生效；提醒时段只改命令/CLI 接受哪些 --slot，还需要你同步修改外部 cron 的时间表。${pendingRestart.length ? `<br>当前等待重启生效：${escapeHtml(pendingRestart.join("、"))}` : ""}</span></div>`;
     return `
-      ${pageHead("运营参数", "积分、活跃激励、私聊额度、签到提醒与对外文案。全部由最高管理员编辑，保存后立即生效。")}
+      ${pageHead("运营参数", "积分、活跃激励、私聊额度、签到提醒与对外文案。全部由最高管理员编辑。一般业务项保存后立即生效；带「需重启」标记的资源容量要重启进程才生效；提醒时段还需要同步修改外部 cron。")}
       ${restartNotice}
       <div class="section-stack">
         <section class="settings-section">
@@ -1403,9 +1404,9 @@
         </section>
 
         <section class="settings-section">
-          ${sectionHead("签到提醒", "时段只约束命令/CLI 接受哪些 --slot；真正几点发由外部 cron 决定，改这里不会改 cron 的时间表。")}
+          ${sectionHead("签到提醒", "时段只约束命令/CLI 接受哪些 --slot；真正几点发由外部 cron 决定。改这里不会、也无法自动更新 cron 的时间表——保存后需要你同步修改部署侧的 crontab。")}
           <div class="field-grid three">
-            ${field("checkin_reminder.slots", "提醒时段（本地小时）", { kind: "array", hint: "逗号分隔的整点小时，默认 9, 12, 15, 18。必须 0-23 且去重排序。", help: "调度由外部 cron 决定（bot/tools/checkin_reminder.py 的 docstring 里有样例 crontab）。改完这一项后，部署侧必须同步改 crontab，否则只影响「命令是否接受这个 --slot」。", helpLabel: "与 cron 的关系" })}
+            ${field("checkin_reminder.slots", "提醒时段（本地小时）", { kind: "array", hint: "逗号分隔的整点小时，默认 9, 12, 15, 18。必须 0-23 且去重排序。", help: "这里改的是**命令行白名单与文案**，不是调度表。真正几点发由外部 cron 决定（bot/tools/checkin_reminder.py 的 docstring 里有样例 crontab）；保存后需要你同步修改部署侧的 crontab，否则新时段不会真的被触发。", helpLabel: "与 cron 的关系" })}
             ${field("checkin_reminder.slot_greetings", "时段问候语", { kind: "json-object", full: true, rows: 4, hint: "形如 {\"9\": \"早上好\"}；键必须落在上面的时段里，值不能含 HTML 标签。" })}
             ${field("checkin_reminder.auto_delete_seconds", "发出后自动删除（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "0 = 不自动删除" })}
             ${field("checkin_reminder.roster_max_names", "名单最多昵称数", { type: "number", min: 1, max: 200, step: 1, required: true })}

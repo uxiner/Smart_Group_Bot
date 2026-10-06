@@ -6,6 +6,8 @@ project dependencies installed::
 
     LITELLM_MODE=PRODUCTION python tools/settings-ui-harness/make_fixture.py
 
+（脚本自己把仓库根加进 ``sys.path``，从任何工作目录跑都可以。）
+
 The produced JSON is 100% synthetic: the runtime configuration comes from the
 project's own default ``RuntimeConfig`` (no .env, no database, no network) and
 every group / resource row is invented here. It is committed so the harness can
@@ -15,7 +17,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+# 从任意工作目录调用都能 import 到本仓的 bot 包（夹具生成器是本地工具，
+# 不该要求调用者先设 PYTHONPATH）。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
 
@@ -25,7 +34,6 @@ from bot.services.runtime_config import (  # noqa: E402
 )
 from bot.web.settings_api import _public_group_settings  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[2]
 OUT = Path(__file__).resolve().parent / "fixtures" / "settings.json"
 
 # Prompts are trimmed to short synthetic text: the fixture exists to exercise
