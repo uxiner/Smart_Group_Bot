@@ -6,7 +6,7 @@
 结论先说清楚，以免被误读成"全盘无遗漏"：
 
 * **本轮实现并接上真实消费者的**：见
-  [`configuration-fields.json`](./configuration-fields.json) 的 122 个字段（29 个 restart、93 个 hot；每一项都
+  [`configuration-fields.json`](./configuration-fields.json) 的 153 个字段（20 个 restart、133 个 hot；每一项都
   带 `read_consumers`，且 `tests/test_configurable_policy_catalog.py` 会验证登记的
   读侧符号真的存在于那个文件里）。
 * **逐条判定后判定为"保持固定"的**：见下面各表，附判定理由。

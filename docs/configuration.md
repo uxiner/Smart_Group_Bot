@@ -42,6 +42,21 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
 
 #### 热更 vs 重启
 
+判定口径只有一条：**这个值在启动时被写进了某个长寿命对象吗？**
+
+* 写进了 —— 就是 `restart`。准入 gate、aiohttp Session 的连接池、webhook 的
+  worker 池与有界队列、tokenizer 线程槽位。它们换掉之前，进程里已经在跑的东西会
+  被漏掉或泄漏。
+* **没有**写进任何长寿命对象、每次操作现读 —— 就是 `hot`。各级超时、durable inbox
+  的租约与保留期、批量与阈值。
+
+口径必须与真实行为一致：曾经有一批字段被标成 `restart` 却每次现读（webhook 的各级
+超时、inbox 租约、轮询超时、Telegram 的准入超时），结果是「保存成功」与「实际生效」
+对不上号，管理员无法信任 `restart_pending`。现在它们一律标 `hot`；真正冷的只有容量类。
+标 `restart` 的字段，读侧读的是**本进程装配的那一份**
+（`runtime_config.applied_restart_values()`），保存只更新期望值并把它列进
+`restart_pending`，重启才换。
+
 这是最重要的一条区分，不要含糊：
 
 * **标量**（价格、配额、超时、批量、阈值、条数）——**热生效**。每个动作开始时现取
@@ -209,7 +224,7 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
 
 默认全部等于今天真实生效的值，不配就逐字等于改造前。
 
-**需要重启**（`reload_kind: "restart"`，共 29 项，进程级闸门与服务构造）：
+**需要重启**（`reload_kind: "restart"`，共 20 项，进程级闸门与服务构造）：
 
 `llm_request_capacity` 8 · `llm_request_noncritical_capacity` 7 ·
 `llm_request_normal_capacity` 4 · `llm_request_background_capacity` 2 ·
