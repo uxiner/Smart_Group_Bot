@@ -71,6 +71,21 @@ def _reset_applied() -> None:
     record_applied_restart_values(RuntimeConfig())
 
 
+def _retention_ago() -> "datetime":
+    """把行放到**当前生效的保留期之外**。
+
+    保留期是数据生命周期参数（`resources.webhook_inbox_retention_seconds`），
+    改它要过 schema 的下界与"不得短于去重窗口"校验，所以测试不去压小它，
+    而是把被清理的行放到真实的保留期之外——验的是同一件事。
+    """
+
+    from bot.services.verify_web import inbox_lifecycle_limits
+
+    return now_shanghai_naive() - timedelta(
+        seconds=float(inbox_lifecycle_limits()["retention_seconds"]) + 60.0
+    )
+
+
 def _unbind_policy() -> None:
     """复位进程级绑定（每个用例的前后都必须做，否则会串味）。"""
 
@@ -482,13 +497,18 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         await queue._ensure_durable_update(1105, payload)
 
         delays: list[float] = []
-        with (
-            patch("bot.services.verify_web._WEBHOOK_INBOX_MAX_ATTEMPTS", 3),
-            patch("bot.services.verify_web._WEBHOOK_INBOX_RETRY_BASE_SECONDS", 0.05),
-            _bind_policy(
-                webhook_inbox_retry_max_seconds=1.0,
-                webhook_inbox_lease_seconds=60.0,
-            ),
+        # 次数上限与退避基数是配置（`_WEBHOOK_INBOX_MAX_ATTEMPTS` /
+        # `_WEBHOOK_INBOX_RETRY_BASE_SECONDS` 现在是"未绑定时的默认值"）。退避基数
+        # 的下界是 0.1s，所以这里用合法值 0.1，并按它算期望——不去 patch 一个
+        # 已经不读的常量。
+        from bot.services.runtime_config import RuntimeConfig as _RC
+
+        base_delay = float(_RC().resources.webhook_inbox_retry_base_seconds)
+        with _bind_policy(
+            webhook_inbox_max_attempts=3,
+            webhook_inbox_retry_base_seconds=base_delay,
+            webhook_inbox_retry_max_seconds=5.0,
+            webhook_inbox_lease_seconds=60.0,
         ):
             for attempt in range(1, 4):
                 lease = await queue._claim_durable_update(1105)
@@ -531,7 +551,8 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(row.next_attempt_at)
                     self.assertIsNone(await queue._claim_durable_update(1105))
 
-        self.assertGreaterEqual(delays[0], 0.045)
+        # 第一次退避 ≥ 基数；第二次是指数退避（≥ 第一次的 1.8 倍，含抖动下限）。
+        self.assertGreaterEqual(delays[0], base_delay * 0.9)
         self.assertGreaterEqual(delays[1], delays[0] * 1.8)
         snapshot = queue.health_snapshot()
         self.assertEqual(snapshot["dead_lettered_updates"], 1)
@@ -575,7 +596,6 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_recovery_loop_periodically_prunes_completed_rows(self) -> None:
         queue = self._queue()
         with (
-            patch("bot.services.verify_web._WEBHOOK_INBOX_RETENTION_SECONDS", 0.01),
             _bind_policy(webhook_inbox_cleanup_interval_seconds=0.01),
             patch("bot.services.verify_web._WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS", 0.01),
         ):
@@ -586,7 +606,7 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     update(WebhookInboxUpdate)
                     .where(WebhookInboxUpdate.update_id == 1107)
                     .values(
-                        completed_at=now_shanghai_naive() - timedelta(seconds=1),
+                        completed_at=_retention_ago(),
                         lease_until=None,
                     )
                 )

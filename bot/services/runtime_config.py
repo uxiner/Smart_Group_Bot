@@ -1294,6 +1294,59 @@ class ResourceSettingsConfig(StrictModel):
     #: 所以热生效是安全的：没有 slot 会被漏掉或泄漏。
     telegram_send_chat_parallel: int = Field(default=3, ge=1, le=32, json_schema_extra=_HOT)
 
+    # --- 成员身份解析（Mini App 侧）-------------------------------------------
+    #: 单次身份查询的上游预算（秒）。超时按"查不到"处理，不阻塞页面。
+    member_identity_lookup_timeout_seconds: float = Field(
+        default=5.0, ge=1.0, le=15.0, allow_inf_nan=False
+    )
+    #: 身份查询的并发上限。**并发门不能因为"每请求重新实例化"被绕过**——闸门
+    #: 由 :func:`_member_identity_gate` 持有，模块级单例，热替换即拒绝。
+    member_identity_lookup_concurrency: int = Field(default=8, ge=1, le=32)
+    #: 身份缓存的条数上限。
+    member_identity_cache_max_entries: int = Field(default=4096, ge=64, le=65536)
+
+    # --- 入群验证的巡检节奏（终态语义不动）-----------------------------------
+    #: 验证状态机的恢复巡检重试档（秒）。三档都只是"多久再看一次"，
+    #: **不得改动终态判定 / 去重 / 租约 / nonce**——那是安全不变量。
+    verification_recovery_retry_seconds: int = Field(
+        default=15 * 60, ge=60, le=604800
+    )
+    verification_operator_action_retry_seconds: int = Field(
+        default=60 * 60, ge=60, le=604800
+    )
+    verification_unreachable_group_retry_seconds: int = Field(
+        default=12 * 60 * 60, ge=60, le=604800
+    )
+    #: 单轮 sweep 的整体截止预算（秒）：超预算中止**本轮**，不丢状态。
+    verification_sweep_deadline_seconds: float = Field(
+        default=300.0, ge=30.0, le=900.0, allow_inf_nan=False
+    )
+
+    # --- webhook 健康探针与 durable inbox 生命周期 ---------------------------
+    # 探针：失败达阈值就降级为轮询，恢复后切回。纯"什么时候去看一眼"的节奏。
+    webhook_watch_interval_seconds: float = Field(
+        default=15.0, ge=5.0, le=300.0, allow_inf_nan=False
+    )
+    webhook_failure_threshold: int = Field(default=3, ge=1, le=10)
+    webhook_probe_timeout_seconds: float = Field(
+        default=8.0, ge=1.0, le=30.0, allow_inf_nan=False
+    )
+    webhook_probe_attempts: int = Field(default=3, ge=1, le=10)
+    #: durable inbox 的保留期 / DLQ 保留期（数据生命周期，不是容量）。
+    #: 下界是 1 小时，且**不得短于 dedup 窗口**（去重窗口本身见
+    #: ``_WEBHOOK_DEDUP_TTL_SECONDS``，60 分钟是固定值），否则改小会让还在去重
+    #: 窗口里的旧行被清掉，重复投递又被当成新行执行一次。
+    webhook_inbox_retention_seconds: float = Field(
+        default=7 * 24 * 60 * 60, ge=3600.0, le=90 * 24 * 60 * 60, allow_inf_nan=False
+    )
+    webhook_inbox_dlq_retention_seconds: float = Field(
+        default=30 * 24 * 60 * 60, ge=3600.0, le=365 * 24 * 60 * 60, allow_inf_nan=False
+    )
+    webhook_inbox_max_attempts: int = Field(default=12, ge=1, le=50)
+    webhook_inbox_retry_base_seconds: float = Field(
+        default=2.0, ge=0.1, le=600.0, allow_inf_nan=False
+    )
+
     @field_validator("llm_stage_deadlines", mode="before")
     @classmethod
     def _validate_stage_deadlines(cls, value: object) -> dict[str, float]:
@@ -1393,6 +1446,18 @@ class ResourceSettingsConfig(StrictModel):
         if self.webhook_http_response_timeout_seconds < longest:
             raise ValueError(
                 "webhook HTTP 响应超时应不小于最大的端到端预算"
+            )
+        if self.webhook_inbox_retry_base_seconds > self.webhook_inbox_retry_max_seconds:
+            raise ValueError("durable inbox 的重试基数不能大于重试退避上限")
+        if self.webhook_inbox_dlq_retention_seconds <= self.webhook_inbox_retention_seconds:
+            raise ValueError("DLQ 保留期必须长于正常保留期，否则死信会比正常行先被清掉")
+        # 去重窗口（60 分钟，固定常量）必须落在保留期内：否则同一 update 的重投
+        # 会在去重记录被清掉之后又被当成新行执行一次。
+        dedup_window = 60 * 60.0
+        if self.webhook_inbox_retention_seconds < dedup_window:
+            raise ValueError(
+                f"durable inbox 保留期不能短于去重窗口 {int(dedup_window)} 秒，"
+                "否则重投会被当成新行重复执行"
             )
 
 

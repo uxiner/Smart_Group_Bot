@@ -776,6 +776,51 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     "telegram_send.typing_send_timeout_seconds": (
         "bot/utils/telegram.py:send_budget",
     ),
+    "resources.webhook_watch_interval_seconds": (
+        "bot/services/update_delivery.py:webhook_probe_limits",
+    ),
+    "resources.webhook_failure_threshold": (
+        "bot/services/update_delivery.py:webhook_probe_limits",
+    ),
+    "resources.webhook_probe_timeout_seconds": (
+        "bot/services/update_delivery.py:webhook_probe_limits",
+    ),
+    "resources.webhook_probe_attempts": (
+        "bot/services/update_delivery.py:webhook_probe_limits",
+    ),
+    "resources.webhook_inbox_retention_seconds": (
+        "bot/services/verify_web.py:inbox_lifecycle_limits",
+    ),
+    "resources.webhook_inbox_dlq_retention_seconds": (
+        "bot/services/verify_web.py:inbox_lifecycle_limits",
+    ),
+    "resources.webhook_inbox_max_attempts": (
+        "bot/services/verify_web.py:inbox_lifecycle_limits",
+    ),
+    "resources.webhook_inbox_retry_base_seconds": (
+        "bot/services/verify_web.py:inbox_lifecycle_limits",
+    ),
+    "resources.member_identity_lookup_timeout_seconds": (
+        "bot/web/settings_api.py:member_identity_limits",
+    ),
+    "resources.member_identity_lookup_concurrency": (
+        "bot/web/settings_api.py:member_identity_limits",
+    ),
+    "resources.member_identity_cache_max_entries": (
+        "bot/web/settings_api.py:member_identity_limits",
+    ),
+    "resources.verification_recovery_retry_seconds": (
+        "bot/services/join_verification.py:verification_ops",
+    ),
+    "resources.verification_operator_action_retry_seconds": (
+        "bot/services/join_verification.py:verification_ops",
+    ),
+    "resources.verification_unreachable_group_retry_seconds": (
+        "bot/services/join_verification.py:verification_ops",
+    ),
+    "resources.verification_sweep_deadline_seconds": (
+        "bot/services/join_verification.py:verification_ops",
+    ),
 }
 
 

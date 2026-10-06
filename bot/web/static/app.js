@@ -1504,6 +1504,24 @@
               ${field("telegram_send.stream_max_pacing_seconds", "流式节流总时长（秒）", { type: "number", min: 1, max: 60, step: 0.5, required: true })}
               ${field("telegram_send.typing_send_timeout_seconds", "typing 发送超时（秒）", { type: "number", min: 0.5, max: 10, step: 0.1, required: true, hint: "超时静默降级，不影响正文" })}
             </div>`)}
+          ${advancedPanel("webhook_probe.all", "webhook 探针与 durable inbox 生命周期", "健康巡检节奏、留档保留与重试上限", `
+            <div class="field-grid three">
+              ${field("resources.webhook_watch_interval_seconds", "webhook 健康巡检间隔（秒）", { type: "number", min: 5, max: 300, step: 1, required: true })}
+              ${field("resources.webhook_failure_threshold", "连续失败降级阈值", { type: "number", min: 1, max: 10, step: 1, required: true, hint: "达到该次数就降级为轮询" })}
+              ${field("resources.webhook_probe_timeout_seconds", "探针超时（秒）", { type: "number", min: 1, max: 30, step: 0.5, required: true })}
+              ${field("resources.webhook_probe_attempts", "探针重试次数", { type: "number", min: 1, max: 10, step: 1, required: true })}
+              ${field("resources.webhook_inbox_retention_seconds", "inbox 留档保留（秒）", { type: "number", min: 3600, max: 7776000, step: 3600, required: true, hint: "下界 1 小时，且不得短于去重窗口 60 分钟" })}
+              ${field("resources.webhook_inbox_dlq_retention_seconds", "死信保留（秒）", { type: "number", min: 3600, max: 31536000, step: 3600, required: true, hint: "必须长于正常保留期" })}
+              ${field("resources.webhook_inbox_max_attempts", "重试上限（次）", { type: "number", min: 1, max: 50, step: 1, required: true, hint: "超过即入死信" })}
+              ${field("resources.webhook_inbox_retry_base_seconds", "重试退避基数（秒）", { type: "number", min: 0.1, max: 600, step: 0.1, required: true, hint: "不能大于退避上限" })}
+              ${field("resources.member_identity_lookup_timeout_seconds", "身份查询超时（秒）", { type: "number", min: 1, max: 15, step: 0.5, required: true, hint: "超时按「查不到」处理，不阻塞页面" })}
+              ${field("resources.member_identity_lookup_concurrency", "身份查询并发", { type: "number", min: 1, max: 32, step: 1, required: true })}
+              ${field("resources.member_identity_cache_max_entries", "身份缓存条数上限", { type: "number", min: 64, max: 65536, step: 64, required: true, hint: "缓存 TTL 属鉴权邻接，固定不可配" })}
+              ${field("resources.verification_recovery_retry_seconds", "验证恢复重试（秒）", { type: "number", min: 60, max: 604800, step: 60, required: true, hint: "只调巡检节奏，终态判定与去重不变" })}
+              ${field("resources.verification_operator_action_retry_seconds", "操作员动作重试（秒）", { type: "number", min: 60, max: 604800, step: 60, required: true })}
+              ${field("resources.verification_unreachable_group_retry_seconds", "不可达群重试（秒）", { type: "number", min: 60, max: 604800, step: 60, required: true })}
+              ${field("resources.verification_sweep_deadline_seconds", "单轮 sweep 截止（秒）", { type: "number", min: 30, max: 900, step: 5, required: true, hint: "超预算中止本轮，不丢状态" })}
+            </div>`)}
         </section>
 
         <section class="settings-section">

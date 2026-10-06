@@ -63,6 +63,22 @@ _POLLING_HTTP_TIMEOUT_SECONDS = 30
 _POLLING_REQUEST_TIMEOUT_SECONDS = 35.0
 
 
+def webhook_probe_limits() -> dict[str, float | int]:
+    """webhook 健康探针的节奏（现取配置）。
+
+    纯「多久去看一眼、连挂几次才降级」；降到轮询之后的恢复逻辑不受影响。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "watch_interval_seconds": resources.webhook_watch_interval_seconds,
+        "failure_threshold": resources.webhook_failure_threshold,
+        "probe_timeout_seconds": resources.webhook_probe_timeout_seconds,
+        "probe_attempts": resources.webhook_probe_attempts,
+        "probe_backoff_seconds": _WEBHOOK_PROBE_BACKOFF_SECONDS,
+    }
+
+
 def polling_limits() -> dict[str, float | int]:
     """轮询兜底传输的超时（现取配置）。
 
@@ -1389,9 +1405,9 @@ async def _probe_webhook_endpoint(webhook: WebhookConfig) -> str | None:
     invalid_secret = "smart_group_bot_webhook_probe"
     if invalid_secret == webhook.secret:
         invalid_secret += "_invalid"
-    timeout = aiohttp.ClientTimeout(total=_WEBHOOK_PROBE_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(total=webhook_probe_limits()["probe_timeout_seconds"])
     issue = "Webhook probe did not run"
-    for attempt in range(1, _WEBHOOK_PROBE_ATTEMPTS + 1):
+    for attempt in range(1, webhook_probe_limits()["probe_attempts"] + 1):
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -1421,7 +1437,7 @@ async def _probe_webhook_endpoint(webhook: WebhookConfig) -> str | None:
         except Exception as exc:
             issue = f"无法访问 WEBHOOK_URL：{exc}"
 
-        if attempt >= _WEBHOOK_PROBE_ATTEMPTS:
+        if attempt >= webhook_probe_limits()["probe_attempts"]:
             break
         delay = _WEBHOOK_PROBE_BACKOFF_SECONDS[
             min(attempt - 1, len(_WEBHOOK_PROBE_BACKOFF_SECONDS) - 1)
@@ -1430,7 +1446,7 @@ async def _probe_webhook_endpoint(webhook: WebhookConfig) -> str | None:
             "Webhook 公网端点自检失败，%.1f 秒后重试（%d/%d）：%s",
             delay,
             attempt,
-            _WEBHOOK_PROBE_ATTEMPTS,
+            webhook_probe_limits()["probe_attempts"],
             issue,
         )
         await asyncio.sleep(delay)
@@ -1509,7 +1525,7 @@ async def _watch_webhook(
     consecutive_failures = 0
     last_seen_error_date = initial_error_date
     while True:
-        await asyncio.sleep(_WEBHOOK_WATCH_INTERVAL_SECONDS)
+        await asyncio.sleep(webhook_probe_limits()["watch_interval_seconds"])
         issue: str | None = None
         if webhook_runtime_failure is not None:
             try:
@@ -1563,16 +1579,16 @@ async def _watch_webhook(
             continue
 
         consecutive_failures += 1
-        if consecutive_failures < _WEBHOOK_FAILURE_THRESHOLD:
+        if consecutive_failures < webhook_probe_limits()["failure_threshold"]:
             log.warning(
                 "%s；保持 webhook 模式并复查（%d/%d）。",
                 issue,
                 consecutive_failures,
-                _WEBHOOK_FAILURE_THRESHOLD,
+                webhook_probe_limits()["failure_threshold"],
             )
             continue
         return (
-            f"{issue}（连续 {_WEBHOOK_FAILURE_THRESHOLD} 次健康检查失败）"
+            f"{issue}（连续 {webhook_probe_limits()["failure_threshold"]} 次健康检查失败）"
         )
 
 

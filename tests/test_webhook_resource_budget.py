@@ -42,12 +42,14 @@ def _bind(resources: dict) -> RuntimeConfig:
 
 class WebhookBudgetConsumerTests(unittest.TestCase):
     def setUp(self) -> None:
+        _bind({})      # 回到默认装配
         policy_runtime.unbind()
-        _bind({})  # 回到默认装配
 
     def tearDown(self) -> None:
+        # 先恢复默认装配，再**解绑**：反过来的话会把这个测试自己造的 Settings
+        # 留给同进程里后面的用例，它们会读到别人的 bot / 模型配置。
+        _bind({})
         policy_runtime.unbind()
-        _bind({})  # 别把上一条用例的冷容量留给下一条
 
     def test_defaults_equal_the_pre_change_constants(self) -> None:
         from bot.services.verify_web import webhook_budget

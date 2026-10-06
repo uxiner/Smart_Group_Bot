@@ -63,6 +63,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
+from bot.services import policy_runtime
 from bot.db.models import AuthorizedGroup, JoinVerification, UserWarning
 from bot.services.authz import (
     is_group_authorized,
@@ -101,6 +102,21 @@ from bot.services.checkin import (
 log = logging.getLogger(__name__)
 
 _VERIFICATION_SWEEP_DEADLINE_SECONDS = 300.0
+
+
+def verification_ops() -> dict[str, float]:
+    """恢复巡检的节奏与单轮 sweep 预算（现取配置）。
+
+    **只调巡检节奏**：终态判定、去重、租约与 nonce 一律不动。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "recovery_retry_seconds": resources.verification_recovery_retry_seconds,
+        "operator_action_retry_seconds": resources.verification_operator_action_retry_seconds,
+        "unreachable_group_retry_seconds": resources.verification_unreachable_group_retry_seconds,
+        "sweep_deadline_seconds": resources.verification_sweep_deadline_seconds,
+    }
 
 _MODERATION_CHALLENGE_LOCKS: weakref.WeakValueDictionary[
     tuple[int, int], asyncio.Lock
@@ -2677,7 +2693,7 @@ async def resume_group_verification_recovery(
     """
 
     current = now or now_shanghai_naive()
-    isolated_after = current + timedelta(seconds=RECOVERY_RETRY_SECONDS)
+    isolated_after = current + timedelta(seconds=verification_ops()["recovery_retry_seconds"])
     safe_resume_at = current + timedelta(
         seconds=TERMINAL_LEASE_SECONDS + UNBAN_RECOVERY_GRACE_SECONDS
     )
@@ -4846,7 +4862,7 @@ class JoinVerificationSweeper:
         consecutive_failures = 0
         while True:
             try:
-                async with asyncio.timeout(_VERIFICATION_SWEEP_DEADLINE_SECONDS):
+                async with asyncio.timeout(verification_ops()["sweep_deadline_seconds"]):
                     await self.sweep_once()
             except asyncio.CancelledError:
                 raise
@@ -5695,10 +5711,10 @@ class JoinVerificationSweeper:
         failure: _TelegramRecoveryResult | None,
     ) -> int:
         if failure is not None and failure.group_unreachable:
-            return UNREACHABLE_GROUP_RETRY_SECONDS
+            return verification_ops()["unreachable_group_retry_seconds"]
         if failure is not None and failure.operator_action_required:
-            return OPERATOR_ACTION_RETRY_SECONDS
-        return RECOVERY_RETRY_SECONDS
+            return verification_ops()["operator_action_retry_seconds"]
+        return verification_ops()["recovery_retry_seconds"]
 
     async def _defer_prepared_record(
         self,
@@ -5877,7 +5893,7 @@ class JoinVerificationSweeper:
         try:
             async with self.session_factory() as session:
                 retry_lease = now_shanghai_naive() + timedelta(
-                    seconds=RECOVERY_RETRY_SECONDS
+                    seconds=verification_ops()["recovery_retry_seconds"]
                 )
                 released = await renew_join_verification_lease(
                     session,

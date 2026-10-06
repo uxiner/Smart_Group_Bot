@@ -769,7 +769,28 @@ class ResourcesPolicyConfig(BaseModel):
     )
     #: 同一会话的并发发送上限。**每次发送现建信号量**（不是模块级长寿命闸门），
     #: 所以热生效是安全的：没有 slot 会被漏掉或泄漏。
-    telegram_send_chat_parallel: int = Field(default=3, ge=1, le=32)
+    telegram_send_chat_parallel: int = 3
+
+    # --- 成员身份解析（Mini App 侧）---
+    member_identity_lookup_timeout_seconds: float = 5.0
+    member_identity_lookup_concurrency: int = 8
+    member_identity_cache_max_entries: int = 4096
+
+    # --- 入群验证的巡检节奏（终态语义不动）---
+    verification_recovery_retry_seconds: int = 15 * 60
+    verification_operator_action_retry_seconds: int = 60 * 60
+    verification_unreachable_group_retry_seconds: int = 12 * 60 * 60
+    verification_sweep_deadline_seconds: float = 300.0
+
+    # --- 本轮补充：webhook 探针与 durable inbox 生命周期（默认 = 改造前）---
+    webhook_watch_interval_seconds: float = 15.0
+    webhook_failure_threshold: int = 3
+    webhook_probe_timeout_seconds: float = 8.0
+    webhook_probe_attempts: int = 3
+    webhook_inbox_retention_seconds: float = 7 * 24 * 60 * 60
+    webhook_inbox_dlq_retention_seconds: float = 30 * 24 * 60 * 60
+    webhook_inbox_max_attempts: int = 12
+    webhook_inbox_retry_base_seconds: float = 2.0
 
     @field_validator("llm_stage_deadlines", mode="before")
     @classmethod

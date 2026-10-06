@@ -28,6 +28,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from bot.services import policy_runtime
 from bot.config import Settings
 from bot.db.models import (
     Admin,
@@ -222,6 +223,21 @@ _JSON_BODY_ORPHAN_LIMIT = 32
 _JSON_BODY_ORPHANS: set[asyncio.Task[Any]] = set()
 _JSON_BODY_TASKS: set[asyncio.Task[Any]] = set()
 _MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
+def member_identity_limits() -> dict[str, float | int]:
+    """成员身份解析的上游预算与缓存容量（现取配置）。
+
+    **缓存 TTL 不在这里**：``_MEMBER_IDENTITY_CACHE_TTL_SECONDS`` 与
+    ``_NEGATIVE_CACHE_TTL_SECONDS`` 属鉴权邻接，只允许收紧、不得放大，保持常量。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "lookup_timeout_seconds": resources.member_identity_lookup_timeout_seconds,
+        "lookup_concurrency": resources.member_identity_lookup_concurrency,
+        "cache_max_entries": resources.member_identity_cache_max_entries,
+    }
 _MEMBER_IDENTITY_CANCEL_GRACE_SECONDS = 0.2
 _MEMBER_IDENTITY_REQUEST_LOOKUP_LIMIT = 8
 _MEMBER_IDENTITY_REQUEST_BUDGET_SECONDS = 4.0
@@ -923,7 +939,7 @@ def _member_identity_lookup_semaphore() -> asyncio.Semaphore:
         # loops; completed value-cache entries remain safe.
         _MEMBER_IDENTITY_LOOKUP_LOOP = loop
         _MEMBER_IDENTITY_LOOKUP_SEMAPHORE = asyncio.Semaphore(
-            _MEMBER_IDENTITY_LOOKUP_CONCURRENCY
+            member_identity_limits()["lookup_concurrency"]
         )
         _MEMBER_IDENTITY_INFLIGHT.clear()
     return _MEMBER_IDENTITY_LOOKUP_SEMAPHORE
@@ -940,14 +956,14 @@ def _cache_member_identity(
         else _MEMBER_IDENTITY_NEGATIVE_CACHE_TTL_SECONDS
     )
     _MEMBER_IDENTITY_CACHE[key] = (now + ttl, value)
-    if len(_MEMBER_IDENTITY_CACHE) <= _MEMBER_IDENTITY_CACHE_MAX_ENTRIES:
+    if len(_MEMBER_IDENTITY_CACHE) <= member_identity_limits()["cache_max_entries"]:
         return
     for cached_key, (expires_at, _cached_value) in list(
         _MEMBER_IDENTITY_CACHE.items()
     ):
         if expires_at <= now:
             _MEMBER_IDENTITY_CACHE.pop(cached_key, None)
-    while len(_MEMBER_IDENTITY_CACHE) > _MEMBER_IDENTITY_CACHE_MAX_ENTRIES:
+    while len(_MEMBER_IDENTITY_CACHE) > member_identity_limits()["cache_max_entries"]:
         _MEMBER_IDENTITY_CACHE.pop(next(iter(_MEMBER_IDENTITY_CACHE)), None)
 
 
@@ -1018,7 +1034,7 @@ async def _await_member_identity_lookup(
 
     task.add_done_callback(_retire_rpc)
     timeout = (
-        _MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS
+        member_identity_limits()["lookup_timeout_seconds"]
         if timeout_seconds is None
         else max(0.0, float(timeout_seconds))
     )

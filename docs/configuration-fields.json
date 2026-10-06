@@ -1428,6 +1428,54 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.member_identity_cache_max_entries",
+      "type": "integer",
+      "default": 4096,
+      "bounds": {
+        "ge": 64,
+        "le": 65536
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/web/settings_api.py:member_identity_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.member_identity_lookup_concurrency",
+      "type": "integer",
+      "default": 8,
+      "bounds": {
+        "ge": 1,
+        "le": 32
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/web/settings_api.py:member_identity_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.member_identity_lookup_timeout_seconds",
+      "type": "number",
+      "default": 5.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 15.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/web/settings_api.py:member_identity_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.memory_candidate_row_limit",
       "type": "integer",
       "default": 200,
@@ -1946,6 +1994,70 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.verification_operator_action_retry_seconds",
+      "type": "integer",
+      "default": 3600,
+      "bounds": {
+        "ge": 60,
+        "le": 604800
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/join_verification.py:verification_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.verification_recovery_retry_seconds",
+      "type": "integer",
+      "default": 900,
+      "bounds": {
+        "ge": 60,
+        "le": 604800
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/join_verification.py:verification_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.verification_sweep_deadline_seconds",
+      "type": "number",
+      "default": 300.0,
+      "bounds": {
+        "ge": 30.0,
+        "le": 900.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/join_verification.py:verification_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.verification_unreachable_group_retry_seconds",
+      "type": "integer",
+      "default": 43200,
+      "bounds": {
+        "ge": 60,
+        "le": 604800
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/join_verification.py:verification_ops"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.webhook_auth_concurrent_updates",
       "type": "integer",
       "default": 2,
@@ -2042,6 +2154,22 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.webhook_failure_threshold",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 10
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:webhook_probe_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.webhook_http_response_timeout_seconds",
       "type": "number",
       "default": 155.0,
@@ -2090,6 +2218,22 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.webhook_inbox_dlq_retention_seconds",
+      "type": "number",
+      "default": 2592000,
+      "bounds": {
+        "ge": 3600.0,
+        "le": 31536000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_lifecycle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.webhook_inbox_lease_seconds",
       "type": "number",
       "default": 300.0,
@@ -2106,6 +2250,22 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "resources.webhook_inbox_max_attempts",
+      "type": "integer",
+      "default": 12,
+      "bounds": {
+        "ge": 1,
+        "le": 50
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_lifecycle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "resources.webhook_inbox_recovery_batch",
       "type": "integer",
       "default": 64,
@@ -2117,6 +2277,38 @@
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:inbox_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_retention_seconds",
+      "type": "number",
+      "default": 604800,
+      "bounds": {
+        "ge": 3600.0,
+        "le": 7776000
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_lifecycle_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_inbox_retry_base_seconds",
+      "type": "number",
+      "default": 2.0,
+      "bounds": {
+        "ge": 0.1,
+        "le": 600.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/verify_web.py:inbox_lifecycle_limits"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -2150,6 +2342,38 @@
       "read_consumers": [
         "bot/services/update_delivery.py:polling_limits",
         "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_probe_attempts",
+      "type": "integer",
+      "default": 3,
+      "bounds": {
+        "ge": 1,
+        "le": 10
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:webhook_probe_limits"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_probe_timeout_seconds",
+      "type": "number",
+      "default": 8.0,
+      "bounds": {
+        "ge": 1.0,
+        "le": 30.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:webhook_probe_limits"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"
@@ -2214,6 +2438,22 @@
       "unit": "",
       "read_consumers": [
         "bot/services/verify_web.py:webhook_budget"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
+      "path": "resources.webhook_watch_interval_seconds",
+      "type": "number",
+      "default": 15.0,
+      "bounds": {
+        "ge": 5.0,
+        "le": 300.0
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/update_delivery.py:webhook_probe_limits"
       ],
       "api_role": "super_admin",
       "test_node": "tests/test_configurable_policy_catalog.py"

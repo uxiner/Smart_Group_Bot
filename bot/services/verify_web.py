@@ -296,6 +296,23 @@ def inbox_limits() -> dict[str, float | int]:
         "cleanup_interval_seconds": resources.webhook_inbox_cleanup_interval_seconds,
         "cleanup_batch": resources.webhook_inbox_cleanup_batch,
     }
+
+
+def inbox_lifecycle_limits() -> dict[str, float | int]:
+    """durable inbox 的保留 / 重试上限（现取配置）。
+
+    保留期是**数据生命周期**不是容量：改小会让还在去重窗口里的旧行被清掉，重投
+    就被当成新行再执行一次——schema 强制 ``retention >= 去重窗口(60 分钟)``。
+    去重与隔离规则本身不随这些值变化。
+    """
+
+    resources = policy_runtime.resources_policy()
+    return {
+        "retention_seconds": resources.webhook_inbox_retention_seconds,
+        "dlq_retention_seconds": resources.webhook_inbox_dlq_retention_seconds,
+        "max_attempts": resources.webhook_inbox_max_attempts,
+        "retry_base_seconds": resources.webhook_inbox_retry_base_seconds,
+    }
 _WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS = 2.0
 _WEBHOOK_INBOX_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _WEBHOOK_INBOX_DLQ_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -1457,7 +1474,7 @@ class _WebhookUpdateQueue:
                     WebhookInboxUpdate.update_id == int(update_id),
                     WebhookInboxUpdate.completed_at.is_(None),
                     WebhookInboxUpdate.dead_lettered_at.is_(None),
-                    WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                    WebhookInboxUpdate.attempts < inbox_lifecycle_limits()["max_attempts"],
                     or_(
                         WebhookInboxUpdate.next_attempt_at.is_(None),
                         WebhookInboxUpdate.next_attempt_at <= now,
@@ -1551,7 +1568,7 @@ class _WebhookUpdateQueue:
         exponent = max(0, int(attempts) - 1)
         base_delay = min(
             float(inbox_limits()["retry_max_seconds"]),
-            _WEBHOOK_INBOX_RETRY_BASE_SECONDS * (2**exponent),
+            inbox_lifecycle_limits()["retry_base_seconds"] * (2**exponent),
         )
         # Stable per-update jitter avoids a wave of poison/transient rows all
         # becoming claimable on the same recovery tick after an outage.
@@ -1584,7 +1601,7 @@ class _WebhookUpdateQueue:
             if row is None:
                 return "lost"
             attempts = max(0, int(row[0] or 0))
-            is_dead = attempts >= _WEBHOOK_INBOX_MAX_ATTEMPTS
+            is_dead = attempts >= inbox_lifecycle_limits()["max_attempts"]
             next_attempt_at = None
             if not is_dead:
                 next_attempt_at = now + timedelta(
@@ -1670,8 +1687,8 @@ class _WebhookUpdateQueue:
             return 0
         assert self.session_factory is not None
         now = now_shanghai_naive()
-        completed_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_RETENTION_SECONDS)
-        dead_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_DLQ_RETENTION_SECONDS)
+        completed_cutoff = now - timedelta(seconds=inbox_lifecycle_limits()["retention_seconds"])
+        dead_cutoff = now - timedelta(seconds=inbox_lifecycle_limits()["dlq_retention_seconds"])
         cleaned_total = 0
         cleanup_deadline = time.monotonic() + 0.25
         # Drain several batches per pass while yielding between commits.  A
@@ -1733,7 +1750,7 @@ class _WebhookUpdateQueue:
                 .where(
                     WebhookInboxUpdate.completed_at.is_(None),
                     WebhookInboxUpdate.dead_lettered_at.is_(None),
-                    WebhookInboxUpdate.attempts >= _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                    WebhookInboxUpdate.attempts >= inbox_lifecycle_limits()["max_attempts"],
                     or_(
                         WebhookInboxUpdate.lease_until.is_(None),
                         WebhookInboxUpdate.lease_until <= now,
@@ -1770,7 +1787,7 @@ class _WebhookUpdateQueue:
             eligibility = (
                 WebhookInboxUpdate.completed_at.is_(None),
                 WebhookInboxUpdate.dead_lettered_at.is_(None),
-                WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                WebhookInboxUpdate.attempts < inbox_lifecycle_limits()["max_attempts"],
                 or_(
                     WebhookInboxUpdate.next_attempt_at.is_(None),
                     WebhookInboxUpdate.next_attempt_at <= now,
