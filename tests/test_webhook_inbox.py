@@ -4,7 +4,7 @@ import asyncio
 from contextlib import contextmanager
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -71,7 +71,7 @@ def _reset_applied() -> None:
     record_applied_restart_values(RuntimeConfig())
 
 
-def _retention_ago() -> "datetime":
+def _retention_ago() -> datetime:
     """把行放到**当前生效的保留期之外**。
 
     保留期是数据生命周期参数（`resources.webhook_inbox_retention_seconds`），
