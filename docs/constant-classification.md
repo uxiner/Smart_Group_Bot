@@ -131,3 +131,16 @@ total`）在 schema 里强校验，`tests/test_startup_resources.py` 另有一�
    读图确认里面没有部署信息。
 6. **上游同步**：`upstream/main` 未合并、未逐行 diff（用户明确要求不拉最新上游）。
    本分支与 `upstream/main` 之间的差异面**未**做全量审计。
+
+---
+
+## 补齐记录：telegram_task_lifecycle / verify_web / join_verification 的保留理由
+
+| 保留项 | 位置 | 理由 |
+| --- | --- | --- |
+| shutdown / orphan 安全防线（取消宽限、worker 停止超时、排空预算、孤儿上报年龄） | `bot/services/telegram_task_lifecycle.py`、`bot/services/update_delivery.py` 的 `_WEBHOOK_*_STOP_TIMEOUT` / `_POLLING_*_DRAIN` | 这些是**进程正确性**的边界：调大＝关机时排不干净、取消后任务泄漏；调小＝正常请求被误杀。属于安全不变量，不做成运营旋钮。 |
+| durable inbox 的去重窗口（`_WEBHOOK_DEDUP_TTL_SECONDS` 60 分钟）与 dedup 上限 | `bot/services/verify_web.py` | 去重窗口决定"同一 update 的重投算不算同一次"。**可配的保留期被强制 ≥ 该窗口**（schema 校验），所以调小保留期不会让重投被当成新行执行。dedup 容量本身是内存上界，保持固定。 |
+| DLQ 与未完成 inbox 的删除规则 | `bot/services/verify_web.py` 清理循环 | 只有 `completed_at` 超过保留期的**已完成**行、以及 `dead_lettered_at` 超过死信保留期的死信行才会被删；**未完成（有 lease 或未完成）永不被静默删除**。保留期可配，但这条删除规则本身不随配置变化。 |
+| 入群验证的终态判定、nonce 宽限、准备中/终态租约、解封恢复宽限 | `bot/services/join_verification.py` | 并发正确性的前提：终态不可回退、租约防重复执行。已在 `KeptFixedFamiliesTests` 里逐条钉住没有被做成开关。 |
+| `context_reserve_tokens` vs `group_history_reserve_tokens` | `bot/config.py`、`bot/services/runtime_config.py` | **不是缺口**：`context_reserve_tokens` 是权威值，`group_history_reserve_tokens` 是兼容字段，覆盖顺序按 `model_fields_set` 判断而不是猜默认值。两者已有 runtime/schema/apply/migration 完整链路，本轮不动，只在此澄清。 |
+| search maintenance 与 archive provider 的注册点 | `bot/__main__.py` | 已在上一轮抽走（`resources.search_prune_interval_seconds`、`resources.archive_*`），本轮不重复造同类字段。 |
