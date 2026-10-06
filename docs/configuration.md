@@ -33,8 +33,21 @@
 
 Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存走
 `PUT /api/v1/settings`，带 `revision` 做乐观并发控制；`extra="forbid"`，多余的键
-直接 422。所有 secret 字段单独走 `secret_changes`（`keep` / `clear` / `replace`），
-响应只回 `configured_secrets` 的**键名**，绝不回值。
+直接 **400 `validation_error`**（不是 422——这些路由跑在 aiohttp 上，不经过 FastAPI 的
+校验器）。
+
+几条必须按实现来理解的语义：
+
+* **`config` 是整份替换，不是嵌套 patch。** 后端只对提交的 payload 做
+  `RuntimeConfig.model_validate()`，**不与库里的现值做深合并**：漏掉的字段会回到 schema
+  默认值，而不是保留旧值。所以调用方必须先 `GET` 整份文档、改完再整份 `PUT` 回去
+  （内置的 Mini App 正是这么做的）。`revision` 对不上返回 **409 `revision_conflict`**。
+* **secret 字段是只写的。** 响应里这些字段恒为空串，`configured_secrets` 只回**键名**。
+  密钥改动走 `secret_changes`：`keep` 保留、`clear` 清空、`replace` 换新值（`replace`
+  必须带非空 `value`，否则 400 `invalid_settings`）。**空串表示「不变」，永远不是
+  「清空」**——想清空只能显式发 `clear`。
+* **接口鉴权用的是 Telegram WebApp 的 `initData`**（请求头
+  `Authorization: tma <initData>`），本仓库没有 Bearer / JWT / API Key 鉴权路径。
 
 **只有最高管理员能读写全局配置。** 群管理员拿不到 `/api/v1/settings`（后端
 `require_super_admin`），前端也只渲染"群组设置"页——所以群管理员既看不到也改不了
@@ -101,6 +114,12 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
 默认值一字未改：`nsfw_image_guard_enabled`、`punish_quoted_author_enabled`、
 `admin_moderation_enabled` 仍然是**默认关闭的 opt-in** 执法开关，公开树不会因为
 升级就扩大执法范围。
+
+> **机器目录只覆盖这一段里的两个字段。** `configuration-fields.json` 的
+> `moderation.*` 条目只有 `log_channel_id` 与 `review_handover_mention`
+> （`bot/tools/config_catalog.py:56-59` 里写死的 `MODERATION_FIELDS`）；上面提到的
+> opt-in 开关、`log_channel_enabled`、`admin_alert_super_admin_enabled` 都不在目录里，
+> 它们的默认值以 `bot/services/runtime_config.py` 的 schema 为准。
 
 ### `private_chat` — 私聊额度（最高管理员）
 
@@ -217,23 +236,43 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
 所以换品牌不用改代码。**协议标识不在这里**：`checkin:v1` 这个 callback_data、
 `shop_<群号>` 这个深链前缀都是解析契约，配置改它们会让线上按钮失效。
 
-人设提示词本身已经有运行时编辑（Mini App 的 Prompts 页），本页**不会**再造第二份
-人格。fresh install 不绑定任何具体人设。
+人设提示词本身已经有运行时编辑（Mini App 的 Prompts 页，`prompts.persona` 在 12 个可编辑
+提示词里），本页**不会**再造第二份人格。
+
+但**「显示层中性」不等于「开箱中性人设」**，这两件事必须分开看：
+
+- `display` 段的默认值确实是中性的（`bot_display_name = "助手"`），这一层不绑定任何品牌；
+- `prompts` 段的默认值直接来自仓库里的 `prompt/*.md`（`PromptSettingsConfig.defaults()` →
+  `load_prompt_defaults()`），其中 `prompt/persona.md` **是一份具体的、有名字的人设模板**。
+  fresh install 之后它就是默认人设，除非部署者在 Prompts 页改掉。
+
+也就是说，公开部署者应当在 Prompts 页按自己的产品改写这份人设模板——本页既不替你改它，
+也不声称它已经是中性的。
 
 ### `resources` — 高级资源与进程级预算（最高管理员）
 
-默认全部等于今天真实生效的值，不配就逐字等于改造前。
+默认全部等于当前代码里真实生效的值，不配就是默认值。Mini App 上这一段在「运营参数」页
+底部那个可折叠的「高级资源」面板里。
 
-**需要重启**（`reload_kind: "restart"`，共 20 项，进程级闸门与服务构造）：
+**需要重启的字段**：清单的**单一来源**是 `runtime_config.RESTART_REQUIRED_PATHS`
+（`bot/services/runtime_config.py:2779`），它由每个字段自己的
+`json_schema_extra["reload_kind"] == "restart"` 生成，外加历史遗留的 `bot.parse_mode`
+（它在 Bot 构造时固化）。API 返回的 `restart_required_paths`、
+[`configuration-fields.json`](./configuration-fields.json) 的 `restart_required_paths`
+与 Mini App 的「需重启」标记都直接取它——**本文档不重写这个数量**，以那几处为准。
+按组划分：
 
-`llm_request_capacity` 8 · `llm_request_noncritical_capacity` 7 ·
-`llm_request_normal_capacity` 4 · `llm_request_background_capacity` 2 ·
-`llm_tokenizer_concurrency` 2 · `telegram_total_capacity` 64 ·
-`telegram_noncritical_capacity` 60 · `telegram_normal_capacity` 44 ·
-`pending_reply_execution_capacity` 4 · `tts_synthesis_concurrency` 3 ·
-`tts_transcode_concurrency` 2 · `tts_private_concurrency` 2 ·
-`av_query_concurrency` 3
-（外加历史遗留的 `bot.parse_mode`）
+- **LLM 容量**：`llm_request_capacity`（8）、`llm_request_noncritical_capacity`（7）、
+  `llm_request_normal_capacity`（4）、`llm_request_background_capacity`（2）
+- **tokenizer 并发**：`llm_tokenizer_concurrency`（2）
+- **待回复执行**：`pending_reply_execution_capacity`（4）
+- **Telegram 三级容量**：`telegram_total_capacity`（64）、
+  `telegram_noncritical_capacity`（60）、`telegram_normal_capacity`（44）
+- **TTS 三级并发**：`tts_synthesis_concurrency`（3）、`tts_transcode_concurrency`（2）、
+  `tts_private_concurrency`（2）
+- **AV 查询并发**：`av_query_concurrency`（3）
+- **webhook 总并发与三条车道**：`webhook_max_concurrent_updates`，以及 `auth` /
+  `critical` / `security` 三条车道各自的 `*_concurrent_updates` 与 `*_queue_capacity`
 
 保留容量的不变式在 schema 里强校验，改非法组合会被直接拒绝：
 
@@ -257,9 +296,19 @@ group_summary 15）、Telegram 各级准入超时、群待回复预算、管理�
 造成重复写。
 
 **webhook / 轮询 / 出站发送**（`resources.webhook_*` / `polling_*` /
-`telegram_send_chat_parallel`）：webhook 服务的 worker 数、队列容量、连接池上限都在
-`VerifyWebServer` / aiohttp session 构造时固化，所以这一段是 **restart**；durable
-inbox 的维护旋钮（恢复批量、重试退避上限、清理间隔与批量）每轮现取，**热生效**。
+`telegram_send_chat_parallel`）：这一段**不是**整段 restart，也不是整段 hot，**按项区分**：
+
+- **restart**：webhook 服务的 worker 数与队列容量（`webhook_max_concurrent_updates`
+  与三条车道各自的 `*_concurrent_updates` / `*_queue_capacity`），它们在
+  `VerifyWebServer` / aiohttp session 构造时固化；
+- **hot**：durable inbox 的租约、恢复批量、退避上限、清理间隔与批量，以及各级超时
+  （`webhook_*_update_timeout_seconds`、`webhook_http_response_timeout_seconds`）与探测
+  参数——这些每轮现取；
+- **hot**：`polling_timeout_seconds` / `polling_http_timeout_seconds` /
+  `polling_request_timeout_seconds`，它们只在**未启用 webhook** 的兜底轮询下生效；
+- **hot**：`telegram_send_chat_parallel`，每次发送现取。
+
+逐项的 `reload_kind` 以 [`configuration-fields.json`](./configuration-fields.json) 为准。
 
 关联约束在 schema 里强校验，每一条都对应一个真实故障模式：
 
@@ -301,13 +350,15 @@ inbox 的维护旋钮（恢复批量、重试退避上限、清理间隔与批�
    `RuntimeConfig.model_validate()` 时自动补齐，原有值一个字不动。
 2. **旧 payload 缺新字段** → 走 schema 默认值，正是"没配置"的行为。
 3. **`display` 的默认显示名会从旧人设别名变成中性词，需要你手工迁移。**
-   旧版本把品牌名**硬编码**在源码里（人设提示词、语音条标题、检索称呼前缀都指向
-   同一个具体别名）。本轮把它们抽成了 `display` 段，公开树的默认值是**中性的**
-   （`bot_display_name = "助手"`、`private_voice_title = "语音回复"`、
-   `search_query_prefixes = ["诶","嗯哼","呀","欸"]`）。升级到这一版之后：
+   旧版本把品牌名**硬编码**在源码里，出现在人设提示词、语音条标题与检索称呼前缀三处。
+   本轮**只把显示层抽成了 `display` 段**（语音条标题、检索称呼前缀、以及文案里出现的
+   显示名），公开树的默认值是**中性的**（`bot_display_name = "助手"`、
+   `private_voice_title = "语音回复"`、`search_query_prefixes = ["诶","嗯哼","呀","欸"]`）。
+   升级到这一版之后：
 
-   * **人设提示词本身没有被改动**——`prompts.persona` 仍是原来那份，产品的说话风格、
-     称呼与互动方式保持原样；
+   * **人设提示词既没有被抽走、也没有被改写**——`prompts.persona` 仍是原来那一份
+     （含它自己的名字与语气框架），说话风格、称呼与互动方式保持原样；抽出来的只有
+     "显示名"这一层，不是人格本身；
    * 但**凡是依赖"显示名"的行为会换掉**：检索查询词的称呼剥离、私聊语音条标题，
      以及群公告/文案里出现显示名的地方。要保持升级前的观感，升级时请在 Mini App
      里按旧配置**就地写入** `display.bot_display_name`、`display.private_voice_title`
