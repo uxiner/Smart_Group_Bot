@@ -232,35 +232,48 @@ API 语义备忘：`PUT` 是**整份替换**而不是嵌套 patch（漏掉的字
 机器人**不会**自己决定几点发。周报、周活跃结算、签到提醒都由**宿主机 cron** 调用容器内的
 工具触发；不配 cron 就没有周报和签到提醒。
 
-```bash
-# 每周一早上发上周周报（任务自带上周活跃结算）
+用 `crontab -e` 添加下面的条目，把 `/opt/smart-group-bot` 换成你自己的**项目绝对路径**
+（`pwd` 能看到）。cron 按**宿主机时区**触发，容器里的 `TZ` 不改变宿主的调度时刻，
+下面的时间要按你的宿主时区换算：
+
+```cron
+# 每周一早上 9:00 发上周周报（任务自带上周活跃结算）
 0 9 * * 1 cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.weekly_report
 
-# 手动补跑活跃结算（正常情况周报已经带过，不必单独排）
-cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.activity_award --dry-run
-cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.activity_award
-
-# 签到提醒：每个时段一条，小时要与设置中心「提醒时段」一致
-0 9  * * * cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.checkin_reminder --slot 9
-0 12 * * * cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.checkin_reminder --slot 12
-
-# 商店到期清理：进程内常驻服务默认每 5 分钟跑一轮，通常只需手工补跑
-cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.shop_expire --dry-run
+# 签到提醒：每天 9:00 一条，小时要与设置中心「提醒时段」一致
+0 9 * * * cd /opt/smart-group-bot && docker compose exec -T bot python -m bot.tools.checkin_reminder --slot 9
 ```
 
-`--slot` 按**本地（Asia/Shanghai）时段**取值；工具本身不判断「现在几点」，设置中心的
-`checkin_reminder.slots` 也只是命令行白名单与文案，**改了时段不会自动更新 crontab**。
-`bot/tools/checkin_reminder.py` 的块 docstring 里有可复制的样例 crontab。
+手动补跑和自检用下面这些命令（在项目目录里直接执行）：
+
+```bash
+docker compose exec -T bot python -m bot.tools.activity_award --dry-run
+docker compose exec -T bot python -m bot.tools.activity_award
+docker compose exec -T bot python -m bot.tools.weekly_report --dry-run
+docker compose exec -T bot python -m bot.tools.shop_expire --dry-run
+```
+
+`--slot` 按**容器内时区（默认 Asia/Shanghai）**取值；工具本身不判断「现在几点」，
+设置中心的 `checkin_reminder.slots` 也只是命令白名单与文案，**改了时段不会自动更新
+crontab**。`bot/tools/checkin_reminder.py` 的块 docstring 里有可复制的样例 crontab。
 
 ---
 
 ## 升级已有部署
 
-已有库**不要**照抄新部署的 `chown -R`——那会改掉现有数据的属主。正确做法是沿用现有属主：
+已有库**不要**照抄新部署的 `chown -R`——那会把现有数据的属主一起改掉。正确做法是沿用现有属主，
+把它写进 `.env`（和新部署同一个文件，`APP_UID`、`APP_GID` 两项都要写）：
 
 ```bash
-ls -nd data                       # 先看清 data 现在的 uid:gid
-APP_UID=<上面看到的 uid> APP_GID=<上面看到的 gid> docker compose up -d --build
+ls -nd data            # 先看清 data 现在的 uid:gid
+id -u data             # 或者用这个拿 uid
+id -g data             # 或者用这个拿 gid
+```
+
+把上面查到的数值填进 `.env` 的 `APP_UID` / `APP_GID`，然后重建镜像并重新创建容器：
+
+```bash
+docker compose up -d --build bot
 ```
 
 升级前先备份：数据库是 SQLite **WAL 模式**，直接 `cp` 数据文件会拿到不一致的快照，
