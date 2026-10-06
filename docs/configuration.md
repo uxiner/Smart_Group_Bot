@@ -46,8 +46,9 @@ Mini App 的每个面板都对应 `runtime_config` 文档里的一段。保存�
   密钥改动走 `secret_changes`：`keep` 保留、`clear` 清空、`replace` 换新值（`replace`
   必须带非空 `value`，否则 400 `invalid_settings`）。**空串表示「不变」，永远不是
   「清空」**——想清空只能显式发 `clear`。
-* **接口鉴权用的是 Telegram WebApp 的 `initData`**（请求头
-  `Authorization: tma <initData>`），本仓库没有 Bearer / JWT / API Key 鉴权路径。
+* **接口鉴权走 Telegram WebApp 的 `initData`**：`Authorization` 头使用的方案名是 `tma`，
+  凭据是 Telegram 打开 Mini App 时下发的 WebApp `initData` 字符串。本仓库没有别的鉴权方案，
+  且该接口仅最高管理员可调用。
 
 **只有最高管理员能读写全局配置。** 群管理员拿不到 `/api/v1/settings`（后端
 `require_super_admin`），前端也只渲染"群组设置"页——所以群管理员既看不到也改不了

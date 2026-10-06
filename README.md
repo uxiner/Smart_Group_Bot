@@ -15,8 +15,11 @@
 上游是一个**大模型驱动的群聊管理机器人**：把「聊天陪伴」和「群组治理」放在同一条消息管线里——既能自然参与
 群聊、调用技能查资料，也能做内容审核、入群验证、爆破防护、民主投票封禁，全部配置在 Telegram Mini App 里完成。
 
-本 fork 在它之上加了一批自研功能（下面逐项列出，**所有数字都是可配置的默认值，不是写死的协议常量**），
-并修了一批部署面与配置面的坑。
+本 fork 在它之上加了一批自研功能，并修了一批部署面与配置面的坑。下面每条都标了**默认值**还是
+**写死的常量**：标「默认」的是运营参数，可以在 Mini App 的「运营参数」页改（字段与上下界见
+[docs/configuration.md](docs/configuration.md)）；**协议、安全与算法层的常量不提供开关**，例如 Telegram
+单条消息 4096 的上限、`/av` 私聊每小时 10 次限流、头衔长度的 16 字上界、活跃度得分公式里的
+系数——这些是刻意固定的不变量，改动它们需要改代码而不是改配置。
 
 ---
 
@@ -104,7 +107,7 @@
 - **质量报表**：`/modstats`（命中构成、边缘判定、**误伤率**）；`/health`（今日命中、待完成质询、归档量、当前模型通道）。
 - **名单管理**：`/exemptlist`（豁免 / 回复静默名单，可翻页、一键移除）、`/unaiexempt`（取消某用户的 AI 审核豁免）。
 - **规则扫描范围**：每条正则/关键词规则可选 `message`（默认，只扫成员自己写的正文）/ `message+quote`（并入被引用正文）/ `message+vision`（并入机器人图片描述）/ 组合；机器人图片描述默认**不参与**正则，避免「描述购物界面 → 秒杀/优惠券命中 → 误删」（Mini App 可改）。
-- **引用广告连坐**：引用/转发命中 ban 规则且高置信度时，**被引用消息的原作者**一并处置（删消息 + 记违规 + 质询）；限真实用户、管理员/群主/豁免跳过、同一条只处置一次、超过 7 天不追溯、警示式引用双方都不处理；`moderation.punish_quoted_author_enabled` **默认关闭（opt-in）**。
+- **引用广告连坐**：引用/转发命中 ban 规则且高置信度时，**被引用消息的原作者**一并处置（删消息 + 记违规 + 质询）；限真实用户、管理员/群主/豁免跳过、同一条只处置一次、超过 `moderation.quoted_author_max_age_seconds`（默认 7 天）不追溯、警示式引用双方都不处理；`moderation.punish_quoted_author_enabled` **默认关闭（opt-in）**。
 - **管理员也受审核**：除**最高管理员**（完全豁免）外的管理员/群主不再整段跳过——照常判定，命中后只**删消息 + 群内 @警示 + 记违规（delete）**，不质询/不封禁/不禁言/不累计警告；NSFW 图同样删图 + @警告但不质询；手动豁免名单仍完全跳过；`moderation.admin_moderation_enabled` **默认关闭（opt-in）**。
 - **管理员违规证据私聊**：管理员违规时把完整证据（对象/身份/时间/规则/置信度/理由/送审原文/已执行/回链，带图附图片）私聊最高管理员；best-effort 不影响群内处置，同一人 10 分钟内 ≥5 次合并成一条；`moderation.admin_alert_super_admin_enabled` 默认开启；**只有频道投递真的开着**（`log_channel_enabled` 且 `log_channel_id` 填了频道）这条私聊路径才被取代——默认频道未配置，所以默认走的还是私聊。
 - **审核证据 → 频道 + 人工放行**：群里**所有**被处置的命中都往「审核日志」频道发一条完整证据卡，**每条单独发**，每张卡带「人工放行 / 放行收回」按钮，只有最高管理员可点。**放行**：`review_state=released` + 立即解除该成员限制（作废质询超时封禁，不添加永久豁免）+ 频道新发 `🟢 人工放行 · 待调整规则` 交接消息（@your_bot mention，由 `moderation.review_handover_mention` 配置，留空则不 @ 任何人）。**收回**：按该 case 的**原始处置**重新施加限制（challenge → 重新禁言 + 重新质询；ban → 重新封禁；delete/warn → 无限制可恢复），结果写进频道状态行与 `🔴 放行收回 · 无需调整` 交接消息；最高管理员与手动豁免名单跳过。开关 `moderation.log_channel_enabled`（默认开）/ `log_channel_id`（默认 `0`，即未配置——所以**默认状态下这一整条其实没启用**，见下一节）；关掉回到私聊老路径；**不新增 LLM 调用**。
@@ -122,45 +125,37 @@
 
 怎么改（覆盖入口，从推荐到不推荐）：
 
-1. **Mini App「审核验证」页（推荐）** — 这两个字段在界面上都有控件：`证据投递到频道`
-   开关与 `证据频道 ID` 输入框，`交接对象` 输入框在同一段里。保存即热生效，不需要重启。
-2. **API `PUT /api/v1/settings`** — 见下面的完整示例。鉴权用的是 **Telegram WebApp 的
-   `initData`**（请求头 `Authorization: tma <initData>`），**不是 Bearer token**；
-   本仓库没有任何 Bearer / JWT / API Key 鉴权路径，且该接口**仅最高管理员**可调用。
+1. **Mini App「审核验证」页（推荐）** — 上表这三个字段在界面上都有控件：`证据投递到频道`
+   开关、`证据频道 ID` 输入框、`交接对象` 输入框在同一段里。保存即热生效，不需要重启。
+2. **API `PUT /api/v1/settings`** — 流程见下面三步。鉴权走 `Authorization` 头，方案名是
+   `tma`，后面的凭据是 Telegram 打开 Mini App 时下发的 WebApp `initData` 字符串；不是
+   Bearer token，本仓库也没有别的鉴权方案。该接口**仅最高管理员**可调用。
 3. **`config.toml` 的 `[moderation]` 段** — **仅**在数据库里还没有 `runtime_config` 行时
    做一次性导入；一旦导入完成该文件即被忽略，之后只认数据库里的值。
 4. **环境变量** — **无效**。`ModerationConfig` 不是 `BaseSettings`，`Settings` 也没有
    `env_nested_delimiter`，写 `MODERATION__LOG_CHANNEL_ID` 不会被读取。
-5. **直接改 `runtime_config` 表** — **不要这么做**。payload 是加密存储、带 schema 校验与
-   `revision` 乐观锁的，手改会绕过加密、校验与版本控制，Mini App 下次保存就会覆盖掉。
+5. **直接改 `runtime_config` 表** — **不要这么做**。`runtime_config.payload` 存的是
+   非密钥 JSON，手改会绕过 schema 校验、`revision` 乐观锁与密钥操作接口（密钥另存
+   `runtime_config_secrets` 并加密），Mini App 下次保存就会把你的改动覆盖掉。
 
-API 示例（`GET` → 改 → `PUT` 整份文档）：
+API 流程（三步，无可复制示例——凭据与整份配置文档都不适合写进 README）：
 
-```bash
-# 1. 取当前文档：revision 在顶层，config 是完整配置，所有密钥字段回显为空串
-curl -s -H "Authorization: tma $INIT_DATA" \
-     "$BASE/api/v1/settings"
+1. `GET /api/v1/settings`，从响应里取 `revision` 与 `config`——两者**与 `ok` 平级、直接在
+   响应顶层**（响应里没有 `data` 这一层包裹）。
+2. 在**完整的** `config` 上改 `moderation.log_channel_id`，其余字段原样保留。
+3. `PUT /api/v1/settings`，请求体只有三个顶层字段：`revision`（第 1 步取到的值）、
+   `config`（改完的整份文档）、`secret_changes`（本例不需要密钥变更，可传空对象）。
 
-# 2. 在返回的 config 里改一个字段，然后原样回传整份文档
-curl -s -X PUT -H "Authorization: tma $INIT_DATA" \
-     -H "Content-Type: application/json" \
-     -d '{
-           "revision": <上一步返回的 revision>,
-           "config": { ...上一步返回的完整 config，只改 moderation.log_channel_id... },
-           "secret_changes": {}
-         }' \
-     "$BASE/api/v1/settings"
-```
+几条语义，改之前值得知道：
 
 - `PUT` 是**整份替换**，不是嵌套 patch：漏掉的字段会**回到 schema 默认值**，不会保留旧值，
   所以必须先 `GET` 再把整份文档回传。
-- 密钥字段在 `GET` 里恒为空串，而**空串表示「不变」而不是「清空」**；要清空只能用
-  `secret_changes`：`{"<密钥路径>": {"action": "clear"}}`，`replace` 同理带 `value`，
-  不写或写 `{"action": "keep"}` 表示保留。响应只回 `configured_secrets`（**键名**），
-  绝不回密钥值。
+- `config` 里密钥字段恒为空串，而**空串表示「不变」而不是「清空」**；要清空只能用
+  `secret_changes`（`clear` / `replace` / `keep`），响应只回 `configured_secrets`
+  （**键名**），绝不回密钥值。
 - `revision` 对不上（别人先保存过）返回 **409 `revision_conflict`**；未知键或取值非法返回
-  **400**；`extra="forbid"`，多余的键直接被拒。保存成功后若改到了需要重启的字段，响应里
-  的 `restart_pending` 会列出字段名（只给名字，不给值）。
+  **400**（`extra="forbid"`）。保存成功后若改到了需要重启的字段，响应里的
+  `restart_pending` 会列出字段名（只给名字，不给值）。
 
 </details>
 
@@ -170,13 +165,22 @@ curl -s -X PUT -H "Authorization: tma $INIT_DATA" \
 - `bot/services/llm_metrics.py`：进程内用量累加器，60 秒惰性落盘；主回复路径**不写库、不抛异常**
 - `bot/tools/weekly_report.py`：每周把「群健康 + 活跃榜」发进各授权群；**成本摘要只私发给最高管理员**（不在群里晒运营花销）
 
-### 6️⃣ 工程质量与加固（在原版之上）
+### 6️⃣ 工程质量与加固（在上游原版之上）
 
 - **管理命令自动清理**：`ManagementCommandCleanupMiddleware` 在 5 秒后删掉群里的 `/ban`、`/mute` 等管理命令行（只碰管理命令，不动成员命令），走持久队列、重启不漏删
 - **路由完整性回归**：[`tests/test_router_route_integrity.py`](tests/test_router_route_integrity.py) 防止「helper 插在装饰器与处理器之间」导致**整个群机器人静默失效**（真实事故，已固化为回归）
-- **测试**：[`tests/`](tests/) 是 unittest 套件，提交前跑
-  `python -m unittest discover -s tests`。这里**不写「多少条用例全绿」**——测试数每次提交都在变，
-  写死的数字只会变成误导；要看就自己跑一次。
+- **测试**：[`tests/`](tests/) 里既有 `unittest.TestCase` 用例，也有 pytest 风格的用例
+  （例如 [`tests/test_tools_bootstrap_settings.py`](tests/test_tools_bootstrap_settings.py)
+  用了 fixture 与 parametrize），所以**用 pytest 跑全套**，别用 `unittest discover`
+  （它不会收集那两个纯 pytest 模块，也不会加载
+  [`tests/conftest.py`](tests/conftest.py) 里的环境隔离）：
+
+  ```bash
+  pip install pytest          # 测试依赖；运行时依赖见 requirements.lock
+  python -m pytest tests
+  ```
+
+  这里**不写「多少条用例全绿」**——测试数每次提交都在变，写死的数字只会变成误导；要看就自己跑一次。
 - 事务边界与幂等测试、`prompt/`（决策 / 审核 / 人格 / 闲聊）按实际运营调过、`docker-compose.yml` 与 `requirements.lock` 有本地调整
 
 <details>
@@ -320,7 +324,6 @@ APP_UID=<上面看到的 uid> APP_GID=<上面看到的 gid> docker compose up -d
 ## 许可
 
 MIT。仓库根目录的 [`LICENSE`](LICENSE) 是上游的 MIT 全文与原版权声明
-（`Copyright (c) 2025 Sanite&Ava`），**逐字保留、本 fork 不做任何修改**；本 fork 的改动
-同样以 MIT 发布，不附加任何额外限制。许可范围、必须保留的署名、「AS IS」与无担保的含义，
-以及依赖 / 第三方服务 / 数据 / 图片各自按什么条款走，见
-**[docs/licensing.md](docs/licensing.md)**。
+（`Copyright (c) 2025 Sanite&Ava`），本 fork 原样保留、不改写；本 fork 的改动同样以 MIT
+发布，不附加额外限制。许可范围、必须保留的声明、商业使用与再许可的边界，以及依赖 /
+第三方服务 / 数据 / 图片各自按什么条款走，见 **[docs/licensing.md](docs/licensing.md)**。
