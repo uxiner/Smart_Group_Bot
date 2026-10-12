@@ -135,6 +135,20 @@ from bot.services.point_shop import (
     render_shop_menu,
     resolve_pin_target,
 )
+# 近 30 天积分流水：只读聚合三本真实台账，分页状态走有界短 token（无新表）
+from bot.services.points_history import (
+    PointsHistoryReadError,
+    PointsHistoryReadUnreleased,
+    PointsHistorySession,
+    PointsHistorySessionStore,
+    PointsHistorySnapshotUnavailable,
+    consistent_read,
+    freeze_history,
+    load_history_page,
+    open_history,
+    render_entry_line,
+    resolve_window,
+)
 from bot.services.skills import SkillService
 from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
@@ -162,6 +176,20 @@ _AV_SEARCH_PAGE_SIZE = 6
 _AV_SEED_PAGE_SIZE = 1
 _LIST_PAGE_SIZE = 5
 _AV_SESSION_STORE = AVQuerySessionStore(ttl_seconds=15 * 60, max_sessions=256)
+# /points 近 30 天流水的翻页状态：有界短 token 描述符、10 分钟真实过期，每条
+# 只装那一次查询的冻结窗口/摘要/三表高水位（O(1)），页面文本与完整历史一律不
+# 存——翻页时按水位现查现读。既不缓存余额，也不建新表。进程重启即失效，会提示
+# 重新 /points。
+_POINTS_HISTORY_TTL_SECONDS = 10 * 60
+_POINTS_HISTORY_MAX_SESSIONS = 128
+_POINTS_HISTORY_STORE = PointsHistorySessionStore(
+    ttl_seconds=_POINTS_HISTORY_TTL_SECONDS,
+    max_sessions=_POINTS_HISTORY_MAX_SESSIONS,
+)
+# callback_data 形状：phs:<8 位 token>:<页码>，远小于 Telegram 的 64 字节上限。
+_POINTS_HISTORY_CALLBACK_PREFIX = "phs:"
+# 读失败时的唯一回执文案：不透露异常原文与任何数据库细节。
+_POINTS_READ_FAILED_TEXT = "积分流水暂时无法读取，请稍后再试。"
 _AV_GROUP_ENABLE_KEY = "av_enabled"
 
 # ---------------------------------------------------------------------------
@@ -290,9 +318,11 @@ async def _answer(
     *,
     auto_delete_seconds: int | None = None,
     **kwargs: object,
-) -> None:
+) -> Message:
+    """渲染并发送，返回真正发出的那条消息（调用方多数用不到返回值）。"""
+
     formatted_text = _render_action_response(text)
-    await answer_with_auto_delete(
+    return await answer_with_auto_delete(
         message,
         formatted_text,
         auto_delete_seconds=(
@@ -3089,13 +3119,66 @@ async def on_checkin_button(
     await _refresh_checkin_reminder_roster(callback, session, group_id=group_id)
 
 
+def _points_page_argument(message: Message) -> int | None:
+    """``/points [页码]`` 里的页码（1 起）；没有参数或不是数字都返回 None。
+
+    只解析页码，**不接受**任何用户/群参数——身份只能来自 message 本身。
+    负数/0/垃圾参数按「第一页」处理，越界由 :meth:`PointsHistorySession.clamp`
+    夹到最后一页，都不报错。
+    """
+
+    text = str(getattr(message, "text", "") or "")
+    argument = text.partition(" ")[2].strip()
+    if not argument:
+        return None
+    try:
+        value = int(argument.split()[0])
+    except (TypeError, ValueError):
+        return None
+    return value - 1
+
+
+def _points_history_keyboard(
+    record: PointsHistorySession,
+    *,
+    page_index: int,
+) -> InlineKeyboardMarkup | None:
+    """上一页/下一页按钮；只有一页时不带键盘。"""
+
+    if record.page_count <= 1:
+        return None
+    page = record.clamp(page_index)
+    row: list[InlineKeyboardButton] = []
+    if page > 0:
+        row.append(
+            InlineKeyboardButton(
+                text="上一页",
+                callback_data=f"{_POINTS_HISTORY_CALLBACK_PREFIX}{record.token}:{page - 1}",
+            )
+        )
+    if page < record.page_count - 1:
+        row.append(
+            InlineKeyboardButton(
+                text="下一页",
+                callback_data=f"{_POINTS_HISTORY_CALLBACK_PREFIX}{record.token}:{page + 1}",
+            )
+        )
+    if not row:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
 @router.message(Command("points"))
 async def cmd_points(
     message: Message,
     session: AsyncSession,
     settings: Settings,
 ) -> None:
-    """查看自己的签到积分（只读，不签到）。"""
+    """查看自己的签到积分与近 30 天流水（只读，不签到）。
+
+    群/用户只能来自 ``message.chat`` 与 ``message.from_user``：这个命令没有、
+    也不会接受任何指定他人或其它群的参数。机器人账户没有积分账可查，直接拒绝。
+    """
 
     if not is_group(message):
         await _answer(message, settings, "该命令仅可在群内使用。")
@@ -3103,13 +3186,51 @@ async def cmd_points(
     if not await ensure_group_authorized(message, session, settings):
         return
     user = getattr(message, "from_user", None)
-    if user is None:
+    if user is None or bool(getattr(user, "is_bot", False)):
+        # 机器人身份无权查账（P04）：不查、不回卡片，也不主动发群消息。
         return
 
-    outcome = await summarize(
-        session, group_id=int(message.chat.id), user_id=int(user.id)
-    )
-    await session.commit()
+    group_id = int(message.chat.id)
+    user_id = int(user.id)
+    requested = _points_page_argument(message)
+
+    # 余额、签到状态、30 天摘要、三表高水位与当前页在**同一个读事务**里读：
+    # SQLite 不显式 BEGIN 时每条 SELECT 各拿一个快照，中间提交的新行会让卡片上
+    # 的数字来自不同两代。时刻只取一次并同时交给 summarize 与窗口，避免跨午夜
+    # 出现两套时钟。
+    try:
+        async with consistent_read(session):
+            moment = now_shanghai_naive()
+            window = resolve_window(moment)
+            outcome = await summarize(
+                session, group_id=group_id, user_id=user_id, now=moment
+            )
+            snapshot = await open_history(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+                window=window,
+                page=0 if requested is None else requested,
+            )
+    except PointsHistoryReadUnreleased:
+        # 读事务没能确认交还连接：连一条回执都不发（回执也是网络），只记日志。
+        log.warning("points history read transaction not released; reply suppressed")
+        return
+    except asyncio.CancelledError:
+        raise
+    except (PointsHistorySnapshotUnavailable, PointsHistoryReadError):
+        # 建不起快照就明确失败：绝不退回「各读各的」再拼一张混代卡片。
+        # 这个分支上的读事务已经确认释放，所以可以安全回一条友好提示。
+        log.warning("points history snapshot unavailable", exc_info=True)
+        await _answer(message, settings, _POINTS_READ_FAILED_TEXT)
+        return
+    except Exception:
+        log.warning("points history read failed", exc_info=True)
+        await _answer(message, settings, _POINTS_READ_FAILED_TEXT)
+        return
+    # 走到这里 consistent_read 已经**确认**这次读占用的连接与快照都交还了：
+    # 发送期间不持有任何读连接（显式 BEGIN 与复用调用方事务两种情形都算过）。
+
     today_line = (
         f"今日已签到（连续 {outcome.streak} 天，下次可得 +{outcome.next_award} 分）"
         if outcome.already
@@ -3120,15 +3241,294 @@ async def cmd_points(
         if outcome.spent_points
         else ""
     )
-    await _answer(
-        message,
-        settings,
+    head = (
         "<b>我的积分</b>\n"
         f"可用 <b>{outcome.available_points}</b> 分{spent_line}\n"
         f"连续 {outcome.streak} 天｜共签到 {outcome.total_days} 天\n"
         f"{today_line}\n"
-        f"广告质询时可用 {challenge_skip_cost()} 积分直接免除。",
+        f"广告质询时可用 {challenge_skip_cost()} 积分直接免除。"
     )
+
+    record = freeze_history(snapshot=snapshot, head=head)
+    page = record.clamp(snapshot.page)
+    # token 必须在拼键盘**之前**就定下来：callback_data 里带的就是它。真正的注册
+    # 要等消息确实发出去、拿到 message_id 之后（见下）。
+    record.token = _POINTS_HISTORY_STORE.new_token()
+    keyboard = _points_history_keyboard(record, page_index=page)
+    extra = {"reply_markup": keyboard} if keyboard is not None else {}
+    # 一致读事务已在上面的 with 退出时结束：发送前不持有任何读连接。
+    sent = await _answer(
+        message,
+        settings,
+        record.render(
+            page, tuple(render_entry_line(entry) for entry in snapshot.entries)
+        ),
+        **extra,
+    )
+    sent_message_id = getattr(sent, "message_id", None)
+    if sent_message_id is None:
+        # 拿不到真实消息 id 就不注册翻页状态：token 只属于「真正发出去的那条
+        # 消息」，不能变成可以编辑任意消息的通行证；发送失败同样不留可用状态。
+        log.warning("points history message id unavailable; paging disabled")
+        return
+    _POINTS_HISTORY_STORE.create(
+        record,
+        owner_user_id=user_id,
+        group_id=group_id,
+        message_id=int(sent_message_id),
+    )
+
+
+async def _points_history_safe_answer(
+    callback: CallbackQuery,
+    text: str | None = None,
+    *,
+    alert: bool = False,
+) -> None:
+    """回调里的回执永远不能把异常抛回路由（网络失败也只是一次静默/alert）。"""
+
+    try:
+        if text is None:
+            await callback.answer()
+        else:
+            await callback.answer(text, show_alert=alert)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning("points history callback receipt failed", exc_info=True)
+
+
+async def _points_group_still_authorized(
+    session: AsyncSession, group_id: int
+) -> bool:
+    """按现读状态核验群授权（只读；未知错误 fail closed）。
+
+    这次只读也走 :func:`consistent_read`：它保证返回或抛错之前把读连接**确认**
+    交还，所以调用方后面去发 alert / 编辑都不占着数据库。释放无法确认时抛
+    :class:`PointsHistoryReadUnreleased`，调用方必须保持静默。
+    """
+
+    try:
+        async with consistent_read(session):
+            return bool(await is_group_authorized(session, group_id))
+    except asyncio.CancelledError:
+        raise
+    except PointsHistoryReadUnreleased:
+        raise
+    except Exception:
+        log.warning("points history authorization check failed", exc_info=True)
+        return False
+
+
+@router.callback_query(F.data.startswith(_POINTS_HISTORY_CALLBACK_PREFIX))
+async def on_points_history_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    """翻页：只在原查询人、原群、原消息、未过期且群仍授权时编辑原消息。
+
+    按钮只带一个短 token 和页码，**不带**用户 id / 群 id：身份只认点击者本身与
+    冻结在原消息上的归属。别人点只给 alert，不查询、不编辑；token 只能编辑最初
+    真正发出的那一条消息。
+    """
+
+    data = str(getattr(callback, "data", "") or "")
+    if not data:
+        await _points_history_safe_answer(callback)
+        return
+    if session is None:
+        await _points_history_safe_answer(
+            callback, "会话未就绪，请重新 /points", alert=True
+        )
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        await _points_history_safe_answer(
+            callback, "查询已失效，请重新 /points", alert=True
+        )
+        return
+    token = parts[1]
+    record = _POINTS_HISTORY_STORE.get(token)
+    if record is None:
+        await _points_history_safe_answer(
+            callback, "查询已过期，请重新 /points", alert=True
+        )
+        return
+
+    clicker = getattr(callback, "from_user", None)
+    msg = getattr(callback, "message", None)
+    if (
+        clicker is None
+        or bool(getattr(clicker, "is_bot", False))
+        or msg is None
+        or getattr(msg, "chat", None) is None
+    ):
+        await _points_history_safe_answer(
+            callback, "消息已失效，请重新 /points", alert=True
+        )
+        return
+
+    # 只认原查询人：别人的按钮点了也不查、不编辑，避免借 token 查他人流水。
+    if int(clicker.id) != int(record.owner_user_id):
+        await _points_history_safe_answer(callback, "只能查看自己的积分流水", alert=True)
+        return
+    if int(msg.chat.id) != int(record.group_id):
+        await _points_history_safe_answer(
+            callback, "查询已失效，请重新 /points", alert=True
+        )
+        return
+
+    # 群授权可能已被撤销：点击时按现读状态核验一次。这里用只读检查而不是
+    # ensure_group_authorized——后者会往群里发提示，而回调绝不能主动发群消息。
+    # 释放确认不了就读连接还挂着，那时连 alert 都不能发（alert 也是网络）。
+    try:
+        authorized = await _points_group_still_authorized(
+            session, int(record.group_id)
+        )
+    except PointsHistoryReadUnreleased:
+        log.warning("points history authorization read not released; receipt suppressed")
+        return
+    if not authorized:
+        await _points_history_safe_answer(
+            callback, "当前群未授权，请重新 /points", alert=True
+        )
+        return
+
+    # 只绑最初真正发出的那条消息：同一个 token 配另一条消息也不编辑。
+    if record.message_id is None or int(
+        getattr(msg, "message_id", 0) or 0
+    ) != int(record.message_id):
+        await _points_history_safe_answer(
+            callback, "查询已失效，请重新 /points", alert=True
+        )
+        return
+
+    target = _parse_int(parts[2], default=-1)
+    if target < 0:
+        await _points_history_safe_answer(
+            callback, "查询已失效，请重新 /points", alert=True
+        )
+        return
+
+    try:
+        # 同一会话的翻页串行执行：旧请求不会覆盖新请求。
+        async with record.lock:
+            # 排队等锁期间状态可能已经失效：重新确认这条会话还在、还是同一个
+            # 对象、没有被 TTL 或容量淘汰，再按现读状态重新核验群授权。
+            if _POINTS_HISTORY_STORE.get(token) is not record:
+                await _points_history_safe_answer(
+                    callback, "查询已过期，请重新 /points", alert=True
+                )
+                return
+            try:
+                async with consistent_read(session):
+                    authorized = bool(
+                        await is_group_authorized(session, int(record.group_id))
+                    )
+                    page_result = (
+                        await load_history_page(
+                            session,
+                            group_id=int(record.group_id),
+                            user_id=int(record.owner_user_id),
+                            window=record.window,
+                            high_water=record.high_water,
+                            page=target,
+                        )
+                        if authorized
+                        else None
+                    )
+            except PointsHistoryReadUnreleased:
+                # 读事务没能确认交还：编辑与 alert 都是网络，一律不发。
+                log.warning("points history page read not released; receipt suppressed")
+                return
+            except asyncio.CancelledError:
+                raise
+            except (PointsHistorySnapshotUnavailable, PointsHistoryReadError):
+                log.warning("points history page read failed", exc_info=True)
+                await _points_history_safe_answer(
+                    callback, "刷新失败，请重新 /points", alert=True
+                )
+                return
+            except Exception:
+                log.warning("points history page read failed", exc_info=True)
+                await _points_history_safe_answer(
+                    callback, "刷新失败，请重新 /points", alert=True
+                )
+                return
+            # 上面的 with 已经**确认**读连接与读快照交还，编辑期间不占着数据库。
+            if page_result is None:
+                await _points_history_safe_answer(
+                    callback, "当前群未授权，请重新 /points", alert=True
+                )
+                return
+            # 冻结口径必须对得上：水位把新账挡在外面且账表只追加，摘要不一致
+            # 说明这次读不可信，宁可让用户重新查询，也不把两代数字拼在一起。
+            if page_result.summary != record.summary:
+                await _points_history_safe_answer(
+                    callback, "查询已失效，请重新 /points", alert=True
+                )
+                return
+            page = page_result.page
+            lines = tuple(render_entry_line(entry) for entry in page_result.entries)
+            if len(lines) != record.page_item_count(page):
+                await _points_history_safe_answer(
+                    callback, "查询已失效，请重新 /points", alert=True
+                )
+                return
+            body = record.render(page, lines)
+            keyboard = _points_history_keyboard(record, page_index=page)
+            try:
+                await msg.edit_text(
+                    body,
+                    reply_markup=preserve_delete_button(msg, keyboard),
+                    disable_web_page_preview=True,
+                )
+            except TelegramBadRequest as exc:
+                detail = str(exc).lower()
+                if "message is not modified" in detail:
+                    # 屏幕上已经是这一页：等同编辑成功，不改回旧页。
+                    record.applied_page = page
+                    record.applied_seq += 1
+                    await _points_history_safe_answer(callback)
+                    return
+                if (
+                    "message to edit not found" in detail
+                    or "message can't be edited" in detail
+                ):
+                    await _points_history_safe_answer(
+                        callback, "消息已失效，请重新 /points", alert=True
+                    )
+                    return
+                # 未知结果：保持原状态，用户再点同一页会真的重试一次编辑。
+                await _points_history_safe_answer(
+                    callback, "刷新失败，请重新 /points", alert=True
+                )
+                return
+            except TelegramForbiddenError:
+                await _points_history_safe_answer(
+                    callback, "这条消息已无法编辑，请重新 /points", alert=True
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("points history page edit failed", exc_info=True)
+                await _points_history_safe_answer(
+                    callback, "刷新失败，请重新 /points", alert=True
+                )
+                return
+            # 只有真的编辑成功（或确认屏幕内容已经一致）之后才记录已应用页：
+            # 失败/取消时状态保持原样，重试才会真正进入一次编辑。
+            record.applied_page = page
+            record.applied_seq += 1
+            await _points_history_safe_answer(callback)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning("points history paging failed", exc_info=True)
+        await _points_history_safe_answer(callback, "刷新失败，请重新 /points", alert=True)
 
 
 _RANK_MEDALS = ("🥇", "🥈", "🥉")
