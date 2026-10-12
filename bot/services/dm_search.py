@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from bot.services.checkin import local_today
-from bot.services import policy_runtime
+from bot.services import policy_runtime, usage_scope
 from bot.services.search_memory import SCOPE_PRIVATE, record_search_for_result
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.websearch import WebSearchSkill
@@ -245,7 +245,12 @@ def render_results_block(result: SkillRunResult) -> str:
 
 
 async def _plain_answer(llm: Any, messages: list[dict[str, Any]], *, stage: str) -> str:
-    return str(await llm.chat(messages, stage=stage) or "").strip()
+    # 私聊检索汇总：后台可选。显式绑 private + background_optional，避免继承
+    # 发起检索的那次私聊上下文之外的任何东西。
+    with usage_scope.lenient_scope(
+        kind=usage_scope.SCOPE_PRIVATE, purpose=usage_scope.PURPOSE_BACKGROUND_OPTIONAL
+    ):
+        return str(await llm.chat(messages, stage=stage) or "").strip()
 
 
 async def answer_with_search(

@@ -555,17 +555,126 @@ class BackgroundGetterTests(PolicyBindingMixin):
         self.assertIn("apply_startup_resources(", source)
 
     def test_startup_resources_runs_before_any_prefetch_or_bot_build(self) -> None:
-        import inspect
+        """**真跑一遍完整启动装配路径**并动态记录次序（不再对源码做字符串切片）。
+
+        历史：``_initialize_runtime_services`` 后来被拆成薄包装器，真正的初始化
+        移到了 ``_initialize_runtime_services_inner``；旧断言切的是包装器源码，
+        重构后失效。**契约本身没变**：进程级闸门（并发/保留容量/tokenizer 槽位）
+        必须排在模型元数据预取、建 LLM、建记忆服务、建 Bot 之前。这里改成调用
+        真实装配函数（只替换最外层 I/O 叶子），用调用次序钉住这条不变式，重构后
+        依然有效。属于测试同步修复，不是产品缺陷。
+        """
+
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         from bot import __main__ as main_module
+        from bot.services import budget_alerts
+        from bot.services import group_budget as budget_module
+        from bot.services import llm as llm_module
+        from bot.web import settings_api
 
-        source = inspect.getsource(main_module._initialize_runtime_services)
-        self.assertIn("apply_startup_resources(", source)
+        order: list[str] = []
+
+        def record_resources(_config: object) -> None:
+            order.append("startup_resources")
+
+        async def record_prefetch(*_args: object, **_kwargs: object) -> None:
+            order.append("prefetch_model_context_metadata")
+
+        class _StubConfigManager:
+            """真实 RuntimeConfigManager 的最小替身：只保证 ``.config`` 可用。"""
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.config = RuntimeConfig()
+
+            async def initialize(self) -> None:
+                order.append("runtime_config_initialize")
+
+        class _StubLLM:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                order.append("llm_build")
+
+            def _chat_candidates(self, *_args: object, **_kwargs: object) -> list:
+                return []
+
+            def chat_configuration_issue(self, *_args: object, **_kwargs: object) -> str:
+                return ""  # pragma: no cover - 候选为空时走不到
+
+        class _StubMemory:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                order.append("memory_build")
+
+            async def bootstrap(self) -> None:
+                order.append("memory_bootstrap")
+
+        consumer = SimpleNamespace(
+            recover_expired_leases=AsyncMock(),
+            mark_uncertain_dispatches=AsyncMock(),
+            start=MagicMock(),
+            stop=AsyncMock(),
+        )
+
+        async def run() -> tuple:
+            with (
+                patch.object(main_module, "apply_startup_resources", record_resources),
+                patch.object(
+                    main_module, "_prefetch_model_context_metadata", record_prefetch
+                ),
+                patch.object(main_module, "configure_logging", MagicMock()),
+                patch.object(main_module, "RuntimeConfigManager", _StubConfigManager),
+                patch.object(main_module, "LLMService", _StubLLM),
+                patch.object(main_module, "MemoryService", _StubMemory),
+                patch.object(
+                    main_module,
+                    "memory_holder",
+                    SimpleNamespace(init=MagicMock()),
+                ),
+                patch.object(
+                    main_module, "SQLiteArchiveVectorRecallProvider", MagicMock()
+                ),
+                patch.object(settings_api, "configure_price_store", MagicMock()),
+                patch.object(settings_api, "restore_price_catalog", AsyncMock()),
+                patch.object(
+                    budget_alerts,
+                    "BudgetAlertConsumer",
+                    MagicMock(return_value=consumer),
+                ),
+                patch.object(budget_module, "configure_alert_enqueuer", MagicMock()),
+                patch.object(
+                    budget_module, "shared_service", MagicMock(return_value=object())
+                ),
+                patch.object(
+                    budget_module,
+                    "llm_budget_guard",
+                    MagicMock(return_value=MagicMock()),
+                ),
+                patch.object(llm_module, "configure_cost_guard", MagicMock()),
+            ):
+                return await main_module._initialize_runtime_services(
+                    settings=Settings(_env_file=None), session_factory=MagicMock()
+                )
+
+        runtime_config, llm, memory = asyncio.run(run())
+
+        self.assertIsNotNone(runtime_config)
+        self.assertIsInstance(llm, _StubLLM, "必须真的走到建 LLM 这一步")
+        self.assertIsInstance(memory, _StubMemory, "必须真的走到建记忆服务这一步")
+        self.assertIn("startup_resources", order, "启动资源装配必须真的被调用")
+        self.assertIn("prefetch_model_context_metadata", order)
         self.assertLess(
-            source.index("apply_startup_resources("),
-            source.index("_prefetch_model_context_metadata"),
+            order.index("startup_resources"),
+            order.index("prefetch_model_context_metadata"),
             "进程级闸门必须在模型预取之前装配",
         )
+        for later in ("llm_build", "memory_build", "memory_bootstrap"):
+            self.assertIn(later, order, f"完整路径必须包含 {later}")
+            self.assertLess(
+                order.index("startup_resources"),
+                order.index(later),
+                f"进程级闸门必须排在 {later} 之前",
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

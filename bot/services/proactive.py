@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import BotConfig, Settings
 from bot.services.background_health import record_background_failure
 from bot.services.memory import MemoryService
+from bot.services import usage_scope
 from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.project_info import build_bot_project_info_context
 from bot.utils.runtime_context import build_current_time_context
@@ -586,7 +587,12 @@ class ProactiveTopicService:
             ),
         )
         messages = build_proactive_prompt_payload(task_brief=task_brief, history=history)["messages"]
-        generated = (await self.llm.chat(messages)).strip()
+        # 后台主动话题：显式绑到**这个群**。不绑的话它会继承触发它的那个
+        # 管理者的 update 上下文（甚至 system），成本就会记到别人的私聊上。
+        with usage_scope.lenient_scope(
+            kind=usage_scope.SCOPE_GROUP, group_id=group_id, stage="proactive"
+        ):
+            generated = (await self.llm.chat(messages)).strip()
         reply = clean_text(generated, max_len=240)
 
         finished_at = _now_local()

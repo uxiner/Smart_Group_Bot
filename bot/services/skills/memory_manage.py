@@ -5,6 +5,12 @@ import re
 
 from bot.services import memory_holder
 from bot.services.manage_intent import GroupIntentService
+from bot.services.memory import (
+    PM_REPLACE_INVALID_CONTENT,
+    PM_REPLACE_NOT_FOUND,
+    PM_REPLACE_UNCONFIRMED,
+    PM_REPLACE_UPDATED,
+)
 from bot.services.message_templates import render_data_brief, truncate_telegram_text
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
@@ -176,20 +182,46 @@ class MemoryManageSkill:
                     skill=self.name,
                     summary="请明确要改哪条永久记忆，以及改成什么内容。",
                 )
-            deleted, created_row, created_new = await memory.replace_permanent_memory(
+            outcome = await memory.replace_permanent_memory_outcome(
                 group_id,
                 target=target,
                 new_content=new_content,
                 created_by=context.sender_user_id,
             )
-            if not created_row:
+            if outcome.status == PM_REPLACE_INVALID_CONTENT:
                 return SkillRunResult(
                     ok=True,
                     skill=self.name,
-                    summary="永久记忆修改失败，新内容为空或无效。",
+                    summary="新内容为空或无效，未做任何改动。",
                 )
-            action_text = "已更新" if deleted else "未命中旧记忆，已新增"
-            write_mode = "新增" if created_new else "复用"
+            if outcome.status == PM_REPLACE_NOT_FOUND:
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary=(
+                        "没找到要修改的永久记忆，未做任何改动。\n"
+                        "可以用 /lm 查看列表后按编号重试。"
+                    ),
+                )
+            if outcome.status == PM_REPLACE_UNCONFIRMED:
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary=(
+                        "未能确认这次永久记忆修改是否已生效，"
+                        "请重新查看列表后再决定是否重试。"
+                    ),
+                )
+            if outcome.status != PM_REPLACE_UPDATED:
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary="永久记忆修改未执行，未做任何改动。",
+                )
+            deleted_count = int(outcome.deleted_count or 0)
+            # 「删除数量」是本次真实替换掉的旧行数；旧实现这里用的是本地列表长度，
+            # 且 `action_text` 还留着一个不可达的「未命中旧记忆，已新增」分支。
+            write_mode = "新增" if outcome.created_new else "复用"
             return SkillRunResult(
                 ok=True,
                 skill=self.name,
@@ -202,17 +234,18 @@ class MemoryManageSkill:
                     "<b>内容</b>: {content}\n\n"
                     "如需删除，请使用 /lm。"
                 ).format(
-                    action_text=action_text,
-                    deleted_count=len(deleted),
+                    action_text="已更新",
+                    deleted_count=deleted_count,
                     write_mode=write_mode,
-                    mem_id=created_row.id,
-                    content=html.escape(_truncate_text(created_row.content or "", 180)),
+                    mem_id=outcome.memory_id,
+                    content=html.escape(_truncate_text(outcome.content or "", 180)),
                 ),
                 payload={
                     "action": "replace",
-                    "memory_id": created_row.id,
-                    "deleted_count": len(deleted),
-                    "created_new": created_new,
+                    "memory_id": outcome.memory_id,
+                    "deleted_count": deleted_count,
+                    "created_new": bool(outcome.created_new),
+                    "status": outcome.status,
                 },
             )
 

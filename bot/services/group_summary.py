@@ -41,7 +41,7 @@ import logging
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -55,7 +55,10 @@ from bot.db.models import (
     GroupMessageArchive,
     GroupSummary,
     GroupSummaryFailureState,
+    OperationsRun,
 )
+from bot.services import usage_scope
+from bot.services.operations_guard import PersistedGuard, guard_predicate, verify_guard
 from bot.services.request_priority import ExecutionPriority
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.model_limits import (
@@ -683,6 +686,8 @@ class SqlGroupSummaryStore:
         allow_watermark_rewind: bool = False,
         reset_coverage: bool = False,
         expected_source_revision: int | None = None,
+        guard_run_key: str | None = None,
+        guard: "PersistedGuard | None" = None,
     ) -> PublishedSummary | None:
         """原子发布（条件 UPDATE / INSERT，**真正的 CAS**）。
 
@@ -696,6 +701,14 @@ class SqlGroupSummaryStore:
         * ``expected_source_revision``（归档**内容变更**计数）作为**同一句 SQL 里的条件**
           （标量子查询）：生成期间原文被改/被删 → 条件不成立 → rowcount=0 → 不发布。
           这是"守卫与发布之间没有 TOCTOU"的保证，不是"生成前后各查一次"。
+        * ``guard_run_key``（运营中心的 run_key）：把"这次 run 没有被持久化取消"
+          也放进**同一句 SQL**（``NOT EXISTS(operations_runs.cancel_requested)``）。
+          发布前的一次无锁取消回调不足以覆盖"检查之后、CAS 之前取消提交"的窗口。
+        * ``guard``（返工 v3 的 :class:`PersistedGuard`）：把**完整**的持久复核
+          （本群仍有机器人 + 发起人此刻仍是本群管理员（真超管豁免）+ 持久配置
+          revision 未变 + 本次 run 未被持久化取消）一并放进**同一句 SQL**。
+          生成摘要要跨模型调用，期间撤权/改配置完全可能已经提交——只在 adapter.run
+          起点查一次，等于把授权窗口和真实发布之间留出任意长的 await。
         """
 
         normalized = (summary or "").strip()
@@ -803,6 +816,25 @@ class SqlGroupSummaryStore:
             statement = statement.where(
                 func.coalesce(revision_subquery, 0) == int(guard_revision)
             )
+            # R6（返工 v2）：取消必须进入**同一条写语句**的谓词，而不是发布前的一次
+            # 无锁检查——检查通过之后、CAS 真正执行之前，取消完全可能已经提交。
+            # ``NOT EXISTS(operations_runs … cancel_requested)`` 与发布在同一个
+            # SQL 原子语句里判定：取消先提交 → 命中不到行；发布先执行 → 如实成功
+            # （取消不承诺撤销已经发布的版本）。
+            if guard_run_key:
+                cancelled_guard = ~(
+                    select(OperationsRun.id)
+                    .where(
+                        OperationsRun.run_key == str(guard_run_key),
+                        OperationsRun.cancel_requested.is_(True),
+                    )
+                    .exists()
+                )
+                statement = statement.where(cancelled_guard)
+            if guard is not None:
+                # 返工 v3：授权/发起人/配置 revision/取消四条一起进同一句 UPDATE 的
+                # WHERE（``guard_predicate`` 已包含 run_key 的取消判定）。
+                statement = statement.where(guard_predicate(guard))
             if not allow_watermark_rewind and new_through > 0:
                 # 水位必须前进（首次发布时现有水位为 0，条件天然成立）。
                 statement = statement.where(GroupSummary.covered_through_id < new_through)
@@ -835,6 +867,10 @@ class SqlGroupSummaryStore:
                 insert_source = insert_source.where(
                     func.coalesce(revision_subquery, 0) == int(guard_revision)
                 )
+                if guard_run_key:
+                    insert_source = insert_source.where(cancelled_guard)
+                if guard is not None:
+                    insert_source = insert_source.where(guard_predicate(guard))
                 try:
                     inserted = await session.execute(
                         insert(GroupSummary).from_select(
@@ -1331,6 +1367,78 @@ class GroupSummaryScheduler:
             )
         return max(1, limit)
 
+    # --- 运营任务中心（B13a）：只读观测 + 手动触发 ---------------------------
+
+    def group_is_running(self, group_id: int) -> bool:
+        """该群是否正在跑一次摘要（手动触发前必须看，避免同群并发）。"""
+
+        return int(group_id) in self._running
+
+    def group_backoff_until(self, group_id: int) -> float:
+        """失败退避到什么时候（0 = 没有退避）。手动触发**不绕**退避。"""
+
+        return float(self._backoff_until.get(int(group_id), 0.0))
+
+    def active_count(self) -> int:
+        """当前正在跑的摘要任务数（含手动触发）。"""
+
+        return len(self._running)
+
+    def capacity(self, cfg: GroupSummaryConfig) -> int:
+        """有效并发上限（含主门禁的背景容量夹取）。"""
+
+        return self._effective_concurrency(cfg)
+
+    async def manual_pending_count(
+        self, group_id: int, cfg: GroupSummaryConfig
+    ) -> int:
+        """手动触发的**只读**判断：还有多少条没进摘要的消息。
+
+        口径与 ``_run_group_inner`` 一致（同一个 store、同一份 baseline），只是
+        不施加自动触发的消息阈值 —— 手动触发本来就允许处理"有内容但没到阈值"的
+        归档。它**只读**：不写水位、不入队、不占执行槽。
+        """
+
+        gid = int(group_id)
+        store = self._store
+        previous = await store.load(gid)
+        baseline_id = (
+            int(previous.covered_through_id)
+            if previous is not None and previous.usable
+            else 0
+        )
+        return int(
+            await store.pending_count(
+                gid,
+                recent_raw_messages=cfg.recent_raw_messages,
+                after_id=baseline_id,
+            )
+        )
+
+    async def run_manual(
+        self,
+        group_id: int,
+        cfg: GroupSummaryConfig,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        guard_run_key: str | None = None,
+        guard: "PersistedGuard | None" = None,
+    ) -> str:
+        """手动触发生成一次摘要：只把 ``trigger_messages`` 阈值放宽到 1。
+
+        ``enabled`` / 输入预算 / 后台专用 lane 与价格预算（``gate`` 许可）/ 每群并发 /
+        退避 / 发布时的 source revision CAS **全部照旧**：手动触发不是"绕过安全闸门"，
+        只是不必等到消息条数阈值。
+        """
+
+        return await self.run_group(
+            int(group_id),
+            replace(cfg, trigger_messages=1),
+            cancelled=cancelled,
+            guard_run_key=guard_run_key,
+            guard=guard,
+        )
+
     async def _pump(self) -> None:
         self._tasks = {task for task in self._tasks if not task.done()}
         cfg = self._config_provider()
@@ -1490,8 +1598,22 @@ class GroupSummaryScheduler:
             return group_id
         return None
 
-    async def run_group(self, group_id: int, cfg: GroupSummaryConfig) -> str:
-        """执行一个群的摘要（测试直接调用它）。返回结果标记。"""
+    async def run_group(
+        self,
+        group_id: int,
+        cfg: GroupSummaryConfig,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        guard_run_key: str | None = None,
+        guard: "PersistedGuard | None" = None,
+    ) -> str:
+        """执行一个群的摘要（测试直接调用它）。返回结果标记。
+
+        ``cancelled`` 是调用方（运营任务中心）传进来的取消探针：它在**发布 CAS
+        之前**被检查，用来阻止"取消已经持久化、版本却仍然被发布"。
+        ``guard_run_key`` 让同一条件进入发布 CAS 的 SQL 谓词（R6），覆盖"检查通过
+        之后、CAS 执行之前取消才提交"的窗口。
+        """
 
         gid = int(group_id)
         self._running.add(gid)
@@ -1510,7 +1632,13 @@ class GroupSummaryScheduler:
                 # 模型调用内部仍保留它自己的 ``asyncio.timeout``（那一次会先命中，
                 # 走既有的 ``deadline_exceeded`` 分支）。
                 async with asyncio.timeout(cfg.deadline_seconds):
-                    outcome = await self._run_group_inner(gid, cfg)
+                    outcome = await self._run_group_inner(
+                        gid,
+                        cfg,
+                        cancelled=cancelled,
+                        guard_run_key=guard_run_key,
+                        guard=guard,
+                    )
             except asyncio.CancelledError:
                 raise
             except (TimeoutError, asyncio.TimeoutError):
@@ -1570,7 +1698,15 @@ class GroupSummaryScheduler:
         self._pending.pop(gid, None)
         self._remove_from_order(gid)
 
-    async def _run_group_inner(self, group_id: int, cfg: GroupSummaryConfig) -> str:
+    async def _run_group_inner(
+        self,
+        group_id: int,
+        cfg: GroupSummaryConfig,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        guard_run_key: str | None = None,
+        guard: "PersistedGuard | None" = None,
+    ) -> str:
         gid = int(group_id)
         intact_fn = getattr(self._store, "coverage_intact", None)
         revision_fn = getattr(self._store, "content_revision", None)
@@ -1701,10 +1837,18 @@ class GroupSummaryScheduler:
                     call_kwargs["max_tokens"] = cfg.max_summary_tokens
                 if self._summary_accepts_permit and permit is not None:
                     call_kwargs["permit"] = permit
-                raw = await self._llm.background_summary_completion(
-                    messages,
-                    **call_kwargs,
-                )
+                # 摘要显式归属到**这个群**的后台可选桶：它是离线跑的，
+                # 不该继承触发摘要的那次 update 的上下文。
+                with usage_scope.lenient_scope(
+                    kind=usage_scope.SCOPE_GROUP,
+                    group_id=int(group_id),
+                    purpose=usage_scope.PURPOSE_BACKGROUND_OPTIONAL,
+                    stage="group_summary",
+                ):
+                    raw = await self._llm.background_summary_completion(
+                        messages,
+                        **call_kwargs,
+                    )
             # A client may swallow cancellation and return a late value.
             if deadline.expired():
                 raise TimeoutError
@@ -1777,7 +1921,21 @@ class GroupSummaryScheduler:
                 )
                 return "source_changed"
 
+        if cancelled is not None and cancelled():
+            # R6：取消已经持久化。必须在发布 CAS **之前**退出，否则"取消"只落在
+            # run 审计上，真实版本照样发布（late version）。
+            log.info("group summary cancelled before publish | group=%s", gid)
+            return "cancelled"
+
         rebuilding = previous is not None and not previous_valid
+        # R6：只有带了 run_key 的调用（运营中心手动运行）才需要把"这次 run 没有被
+        # 持久化取消"塞进发布 CAS；自动/后台运行没有 run_key，传 None 与不传完全
+        # 等价，因此这里**按需**才带上这个关键字，避免改变既有的 publish 调用契约。
+        guard_kwargs: dict[str, Any] = {}
+        if guard_run_key:
+            guard_kwargs["guard_run_key"] = guard_run_key
+        if guard is not None:
+            guard_kwargs["guard"] = guard
         published = await self._store.publish(
             gid,
             summary=body,
@@ -1791,8 +1949,41 @@ class GroupSummaryScheduler:
             allow_watermark_rewind=rebuilding,
             reset_coverage=rebuilding,
             expected_source_revision=source_revision,
+            **guard_kwargs,
         )
         if published is None:
+            if cancelled is not None and cancelled():
+                # R6：CAS 的 SQL 谓词里带着"这次 run 没有持久化取消"，所以能走到
+                # 这里说明取消是在 CAS 之前提交的（或行已被更新的版本占住）。
+                log.info("group summary publish blocked by durable cancel | group=%s", gid)
+                return "cancelled"
+            if guard is not None:
+                # 返工 v3：发布 CAS 被拒且不是取消——可能是复核不通过（授权被撤、
+                # 发起人已不是管理员、持久配置已变更），也可能只是来源变了/迟到。
+                # 这里单独复核一次，把"守卫挡住"如实报成 guard_blocked，而不是
+                # 含糊地报 source_changed，让运营看到"要重新预览"而不是"再试一次"。
+                try:
+                    guard_session_factory = getattr(
+                        self._store, "_session_factory", None
+                    )
+                    if guard_session_factory is None:
+                        raise RuntimeError("group summary store has no session factory")
+                    async with guard_session_factory() as guard_session:
+                        allowed = await verify_guard(guard_session, guard)
+                except Exception:
+                    log.warning(
+                        "group summary guard recheck failed | group=%s",
+                        gid,
+                        exc_info=True,
+                    )
+                    allowed = False
+                if not allowed:
+                    self.metrics.failure_total += 1
+                    log.info(
+                        "group summary publish blocked by operations guard | group=%s",
+                        gid,
+                    )
+                    return "guard_blocked"
             # 发布被拒：区分"来源在生成期间变了"（需要重建）与"只是迟到"（有更新的版本）。
             if callable(revision_fn) and source_revision is not None:
                 if int(await revision_fn(gid)) != int(source_revision):

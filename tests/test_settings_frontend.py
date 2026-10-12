@@ -722,6 +722,172 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         self.assertIn("state.groupApiModelQuerySecretChanges.clear();", reload_groups)
         self.assertIn("state.groupApiModelQuerySecretChanges.clear();", reload_all)
 
+    def test_group_operations_task_panel_is_read_only_and_lazy(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        panel = source.split("function renderOperationsStatusPanel", 1)[1].split(
+            "function resourceOperationKey", 1
+        )[0]
+        rows = source.split("function operationsTaskRow", 1)[1].split(
+            "function renderOperationsStatusPanel", 1
+        )[0]
+        loader = source.split("async function loadGroupOperations", 1)[1].split(
+            "async function loadAccess", 1
+        )[0]
+        section_call = source.split("key: OPERATIONS_SECTION_KEY", 1)[1].split(
+            "})}", 1
+        )[0]
+
+        # 折叠分节挂在逐群卡片里，并且可以从不编辑任何群设置——恒无「待保存」。
+        self.assertIn('"operations-status"', source)
+        # B13b：这个分节从「只读状态」扩成运营中心（状态 + 来源/计划 + 六类任务
+        # 预览/确认）。诚实性要求标题不能再说整节只读，但**状态读取那一段仍然是
+        # 只读、懒加载、按群隔离**，下面继续逐条钉住。
+        self.assertIn('"运营任务"', source)
+        self.assertNotIn("运营任务（只读）", source)
+        self.assertIn("上面这段是只读状态", source)
+        self.assertIn("data-action=\"jump-group-section\"", source)
+        self.assertNotIn("defaultOpen", section_call)
+        self.assertNotIn("operations-status", source.split(
+            "const GROUP_SECTION_SETTING_KEYS", 1
+        )[1].split("};", 1)[0])
+
+        # 只读：只读一个聚合端点，不弹补跑、不发送、不改设置。
+        self.assertIn("/operations/task-status", loader)
+        self.assertIn("data-action=\"load-group-operations\"", panel)
+        self.assertIn("data-operations-panel", panel)
+        self.assertIn("只读", panel)
+        self.assertNotIn("setInterval", loader)
+        self.assertNotIn("setTimeout", loader)
+        self.assertNotIn("method:", loader)
+
+        # 逐群隔离 + 迟到响应自弃：A 群的响应绝不会画到 B 群。
+        state_decl = source.split("const state = {", 1)[1].split("\n  };", 1)[0]
+        self.assertIn("groupOperations: new Map(),", state_decl)
+        self.assertIn("groupOperationsLoads: new Map(),", state_decl)
+        self.assertIn("state.groupOperationsLoads.get(key) !== requestToken", loader)
+        self.assertEqual(loader.count("apiFetch("), 1)
+
+        # 诚实性：没有证据就显示原因文案，绝不伪造成「成功」或占位时间。
+        self.assertIn("OPERATIONS_SOURCE_LABEL[source.implemented]", rows)
+        self.assertIn("(operationsReason(nextRun.reason) || \"未记录\")", rows)
+        self.assertIn("(operationsReason(success.reason) || \"未记录\")", rows)
+        self.assertIn('external_schedule_unknown: "外部计划未接入"', source)
+        self.assertIn("nextRun.at", rows)
+        self.assertNotIn("Date.now", rows)
+
+    def test_group_operations_panel_refresh_keeps_dirty_drafts(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        branch = source.split('if (action === "load-group-operations")', 1)[1].split(
+            "if (action === \"load-access\")", 1
+        )[0]
+        loader = source.split("async function loadGroupOperations", 1)[1].split(
+            "async function loadAccess", 1
+        )[0]
+
+        # 刷新只碰 state.groupOperations；草稿由 renderContent() 自己捕获，不清 dirty。
+        self.assertIn("loadGroupOperations(button.dataset.groupId)", branch)
+        self.assertNotIn("captureResourceFormDrafts", branch)
+        self.assertNotIn("state.config", branch)
+        self.assertNotIn("state.config", loader)
+        self.assertIn("renderContent()", loader)
+        # 刷新失败要把旧数据标成过期，而不是冒充实时成功。
+        self.assertIn("stale: true", loader)
+        self.assertIn("上次刷新失败", source)
+
+    def test_group_operations_panel_never_retries_implicitly(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        loader = source.split("async function loadGroupOperations", 1)[1].split(
+            "async function loadAccess", 1
+        )[0]
+        toggle_block = source.split("// 「运营任务」分节默认折叠", 1)[1].split("}, true);", 1)[0]
+        jump_branch = source.split(
+            "if (button.dataset.groupSection === OPERATIONS_SECTION_KEY) {", 1
+        )[1].split("}", 1)[0]
+        panel = source.split("function renderOperationsStatusPanel", 1)[1].split(
+            "function resourceOperationKey", 1
+        )[0]
+        rows = source.split("function operationsTaskRow", 1)[1].split(
+            "function renderOperationsStatusPanel", 1
+        )[0]
+
+        # R1：同群在飞去重，并且「已经试过」要被记住——渲染、重开、切页回来都不再隐式重试。
+        self.assertIn("if (previous?.loading || previous?.refreshing) return;", loader)
+        self.assertGreaterEqual(loader.count("attempted: true"), 2)
+        self.assertIn("entry?.attempted", toggle_block)
+        self.assertIn("entry?.attempted", jump_branch)
+
+        # R2：刷新同样是 in-flight（loading 与 refreshing 同时为真），按钮双属性一致置忙。
+        self.assertIn("loading: true,", loader)
+        self.assertIn("refreshing: Boolean(previous?.loaded)", loader)
+        self.assertIn("const busy = Boolean(entry?.loading || entry?.refreshing);", panel)
+        self.assertIn('aria-busy="${busy ? "true" : "false"}"', panel)
+
+        # 渲染优先级：读取中 > 首次失败 > 未读取 > 有数据；错误分支不许被「未加载」遮住。
+        busy_index = panel.index("if (busy && !hasData) {")
+        error_index = panel.index("} else if (failedFirstLoad) {")
+        empty_index = panel.index("} else if (!hasData) {")
+        self.assertLess(busy_index, error_index)
+        self.assertLess(error_index, empty_index)
+        self.assertIn("首次读取失败后不会自动重试", panel)
+
+        # R4：待重试是「已安排、尚未完成」，数量单位由后端 count_meaning 标注，不写成失败次数。
+        self.assertIn("OPERATIONS_COUNT_MEANING_LABEL[failure.count_meaning]", rows)
+        self.assertIn("pending_retry_at", rows)
+        self.assertIn("尚未重试", rows)
+        self.assertIn("待重试记录", rows)
+        self.assertIn("最多已尝试", rows)
+        self.assertNotIn("失败 ${failureCount} 次", rows)
+        self.assertIn('scheduled_messages_pending_retry_occurrences: "待重试记录"', source)
+        self.assertIn('group_summary_cumulative_failures: "累计失败次数"', source)
+
+        # R4 负例：整块「待重试」只对定时消息 + 后端标注的排队语义成立；其它任务的 count
+        # 是失败次数（如摘要的累计失败次数），按失败次数外推「待重试 N 条」就是虚构排队。
+        self.assertIn(
+            'const retryConfirmed = task.task_id === "scheduled_messages"\n'
+            '      && failure.count_meaning === "scheduled_messages_pending_retry_occurrences";',
+            rows,
+        )
+        self.assertIn("const retryParts = retryConfirmed", rows)
+        self.assertNotIn("if (failureCount) retryParts.push", rows)
+        self.assertNotIn("if (failure.pending_retry_at) retryParts.push", rows)
+
+        # R4：重试三态（已到期 / 有生效租约 / 未来退避）各有中文口径，且都只表示「尚未完成」。
+        self.assertIn('retry_due: "已到期，等待执行"', source)
+        self.assertIn('retry_in_flight: "已有记录在处理中（持租约），尚未完成"', source)
+        self.assertIn("OPERATIONS_RETRY_STATE_LABEL[failure.retry_state]", rows)
+
+        # R4-2：计划到期与未来计划是两个维度，同时存在时都要能看到。
+        self.assertIn("details.earliest_planned_at", rows)
+        self.assertIn("details.due_now_pending_count", rows)
+        self.assertIn("后续计划", rows)
+        self.assertIn("到期待处理", rows)
+        self.assertIn("条配置已到执行时刻，等待投递", rows)
+
+    def test_group_operations_panel_styles_are_responsive_and_plain(self) -> None:
+        styles = _STYLES_CSS.read_text(encoding="utf-8")
+        block = styles.split("/* 只读「运营任务」状态面板", 1)[1].split(
+            ".resource-refresh-notice", 1
+        )[0]
+
+        self.assertIn(".operations-panel", block)
+        self.assertIn(".operations-task-list", block)
+        self.assertIn(".operations-task-facts", block)
+        self.assertIn("min-height: 44px", block)
+        self.assertIn("@media (min-width: 768px)", block)
+        self.assertIn("overflow-wrap: anywhere", block)
+        self.assertNotIn("gradient", block)
+        self.assertNotIn("!important", block)
+
+    def test_settings_assets_carry_the_operations_panel_cache_buster(self) -> None:
+        source = _INDEX_HTML.read_text(encoding="utf-8")
+        script_version = re.search(r'/settings-assets/app\.js\?v=([^"]+)', source)
+        style_version = re.search(r'/settings-assets/styles\.css\?v=([^"]+)', source)
+
+        self.assertIsNotNone(script_version)
+        self.assertIsNotNone(style_version)
+        self.assertEqual(script_version.group(1), style_version.group(1))
+        self.assertIn("operations-task-status-readonly-panel", script_version.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()

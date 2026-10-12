@@ -19,7 +19,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, Message
 
 from bot.config import Settings
-from bot.services import policy_runtime
+from bot.services import operation_budget, policy_runtime
 from bot.db.models import Group
 from bot.services.resource_health import register_resource_health_provider
 from bot.utils.telegram import (
@@ -1300,6 +1300,20 @@ class DoubaoTTSService:
                 error="too_many_segments",
             )
 
+        # 功能操作额度：排在文本/分段预检**之后**、首个供应商合成**之前**。
+        # 一次逻辑发送只扣一次（不对每个 segment 扣）；音频格式降级发生在
+        # synthesize 层、不再回到这里，所以不会因分段或降级重复消费。
+        message_chat = getattr(message, "chat", None)
+        budget_error = await operation_budget.consume_tts(
+            operation_budget.group_id_for(
+                getattr(message_chat, "id", 0) if message_chat is not None else 0
+            )
+        )
+        if budget_error is not None:
+            return TTSDeliveryResult(
+                requested_segments=segments, error=budget_error
+            )
+
         sent_segment_count = 0
         telegram_message_ids: list[int] = []
         for idx, segment in enumerate(segments):
@@ -1421,6 +1435,15 @@ class DoubaoTTSService:
             return TTSDeliveryResult(
                 requested_segments=segments,
                 error="too_many_segments",
+            )
+
+        # 同上：预检之后、首个供应商合成之前，一次逻辑发送扣一次。
+        budget_error = await operation_budget.consume_tts(
+            operation_budget.group_id_for(chat_id)
+        )
+        if budget_error is not None:
+            return TTSDeliveryResult(
+                requested_segments=segments, error=budget_error
             )
 
         fallback_caption_html = ""

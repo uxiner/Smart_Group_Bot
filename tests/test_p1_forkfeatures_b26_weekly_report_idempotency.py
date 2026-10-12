@@ -184,7 +184,9 @@ class WeeklyReportSendLoopTests(unittest.IsolatedAsyncioTestCase):
                 sent_to.append(int(chat_id))
                 return SimpleNamespace(message_id=len(sent_to))
 
-        async def _render_quality(session, *, group_id, days, activity_lines):  # noqa: ANN001
+        async def _render_quality(
+            session, *, group_id, days, activity_lines, **_kwargs
+        ):  # noqa: ANN001
             return f"<b>审核质量 · 近{days}天</b> 群 {group_id}"
 
         async def _cost_digest(session, *, days):  # noqa: ANN001

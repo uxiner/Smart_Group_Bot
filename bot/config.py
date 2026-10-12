@@ -36,6 +36,12 @@ except ModuleNotFoundError:
 
 class ProviderProfile(BaseModel):
     provider: str
+    #: 配置里的**逻辑槽名**（providers[].name）。
+    #:
+    #: ``provider`` 是协议名（openai_compatible / gemini / anthropic …），两个
+    #: 不同的第三方网关用同一协议时它完全一样 —— 拿它当计价口径就分不开这两家。
+    #: 槽名是运维自己起的、能对上配置项的那个名字，既稳定又可读。
+    slot: str = ""
     api_key: str | None = None
     api_base: str | None = None
     stream: bool = False
@@ -46,6 +52,9 @@ class ProviderProfile(BaseModel):
 class ChatEndpointConfig(BaseModel):
     model: str = "gemini/gemini-2.0-flash"
     provider: str = ""
+    #: 逻辑配置槽名（见 ``ProviderProfile.slot``）。成本台账与价格目录按它匹配，
+    #: 绝不按协议名或 model 的 vendor 前缀 —— 那会把两个不同网关算成同一家。
+    slot: str = ""
     api_key: str | None = None
     api_base: str | None = None
     stream: bool = False
@@ -72,6 +81,7 @@ class ModelConfig(ChatEndpointConfig):
 class EmbedEndpointConfig(BaseModel):
     model: str = "gemini/text-embedding-004"
     provider: str = ""
+    slot: str = ""
     api_key: str | None = None
     api_base: str | None = None
     endpoint_path: str = "/v1beta/models"
@@ -915,6 +925,9 @@ class AdminOpsPolicyConfig(BaseModel):
     privileged_job_deadline_seconds: float = Field(
         default=300.0, ge=30.0, le=900.0, allow_inf_nan=False
     )
+    #: 运营任务中心的预览令牌有效期（秒）：预览到确认必须在这个窗口内完成，
+    #: 过期即拒绝确认，没有"自动续期"。
+    operations_preview_ttl_seconds: int = Field(default=120, ge=30, le=600)
 
 class GroupOpsPolicyConfig(BaseModel):
     """群内视觉判定的输入上限与活跃度写库的节奏。
@@ -1466,6 +1479,7 @@ def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderPro
         )
         profiles[name] = ProviderProfile(
             provider=effective_provider,
+            slot=name,
             api_key=api_key,
             api_base=api_base,
             stream=_env_truthy(fields.get("stream")),
@@ -1539,6 +1553,9 @@ def _build_chat_config(
     cfg = ModelConfig(
         model=resolved_model,
         provider=profile.provider,
+        # 逻辑配置槽名必须一路带到底：``provider`` 存的是**协议**，两个都用
+        # openai_compatible 的网关在台账上会并成一家，金额上限也就分不开。
+        slot=provider_name,
         api_key=profile.api_key,
         api_base=profile.api_base,
         stream=profile.stream,
@@ -1572,6 +1589,7 @@ def _build_chat_config(
             ChatEndpointConfig(
                 model=fallback_model,
                 provider=fb_profile.provider,
+                slot=fb_provider_name,  # 回退候选同样带槽名
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
                 stream=fb_profile.stream,
@@ -1613,6 +1631,7 @@ def _build_embed_config(
     cfg = EmbedConfig(
         model=_build_litellm_model(profile.provider, model_name, api_base=profile.api_base),
         provider=profile.provider,
+        slot=provider_name,
         api_key=profile.api_key,
         api_base=profile.api_base,
         endpoint_path=profile.endpoint_path,
@@ -1638,6 +1657,7 @@ def _build_embed_config(
                     api_base=fb_profile.api_base,
                 ),
                 provider=fb_profile.provider,
+                slot=fb_provider_name,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
                 endpoint_path=fb_profile.endpoint_path,

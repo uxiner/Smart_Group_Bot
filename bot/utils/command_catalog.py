@@ -16,7 +16,7 @@ class CommandEntry:
 _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/help", "/help", "查看完整帮助", "用户问你有哪些命令、怎么用、功能总览", "核心入口"),
     CommandEntry("/settings", "/settings", "打开可视化设置中心", "最高管理员要配置机器人", "核心入口"),
-    CommandEntry("/lm", "/lm", "查看永久记忆列表，支持翻页和删除", "用户想查看、删除永久记忆，或找不到某条记忆", "核心入口"),
+    CommandEntry("/lm", "/lm", "查看永久记忆列表，支持翻页和删除（仅群管理员）", "用户想查看、删除永久记忆，或找不到某条记忆", "核心入口"),
     CommandEntry("/lm add", "/lm add <内容>", "新增一条永久记忆", "用户想显式通过命令写入永久记忆", "核心入口"),
     CommandEntry(
         "/lm replace",
@@ -106,7 +106,7 @@ def build_help_text() -> str:
         "<b>核心入口</b>\n"
         "/help：查看帮助\n"
         "/settings：最高管理员打开可视化设置中心\n"
-        "/lm：永久记忆列表，支持翻页和删除\n"
+        "/lm：永久记忆列表，支持翻页和删除（仅群管理员）\n"
         "/lm add &lt;内容&gt;：新增永久记忆\n"
         "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;：修改永久记忆\n"
         "/addrule &lt;自然语言&gt;：新增群规\n"
@@ -115,6 +115,8 @@ def build_help_text() -> str:
         "/voteban：回复用户消息后发起民主投票封禁\n"
         "/report：回复要举报的消息后转交管理员，机器人会先复核一遍\n"
         "/find &lt;关键词&gt;：在本群保留期聊天记录里搜索消息\n"
+        "永久记忆：管理员维护的群级背景；长期记忆：机器人提炼或主动记下的稳定事实（个人或群公共信息）。\n"
+        "聊天原文归档供 /find 查找；群摘要、联网检索留档供回复参考，不是上述两类记忆。\n"
         "/memory：看机器人记得我什么（长期记忆，支持 /memory 2 翻页）\n"
         "/memory forget &lt;编号&gt;：删掉一条关于自己的长期记忆\n"
         "/memory off / memory on：关闭或重新打开本人的长期记忆\n"

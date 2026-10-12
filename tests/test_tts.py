@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,7 +10,9 @@ from aiogram.exceptions import TelegramBadRequest
 
 from bot.config import Settings
 from bot.handlers import admin
+from bot.db.engine import init_db
 from bot.services import doubao_tts as doubao_tts_module
+from bot.services import group_budget, pricing
 from bot.services.doubao_tts import DoubaoTTSService, TTSDeliveryResult
 from bot.services.doubao_tts import (
     TTS_MODE_ALWAYS,
@@ -195,6 +199,24 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         receipt.assert_called_once_with()
 
     async def test_chat_delivery_reports_partial_segments(self) -> None:
+        # 群语音现在要求预算护栏已装配：这里装一个**真实**的共享服务，
+        # 并让该群没有预算行（unconfigured）—— 合同规定此时功能可用且不计数。
+        _budget_tmp = tempfile.TemporaryDirectory()
+        _budget_engine, _budget_sf = await init_db(
+            f"sqlite+aiosqlite:///{_budget_tmp.name}/budget.db"
+        )
+        group_budget.reset_shared_service()
+        group_budget.shared_service(_budget_sf, lambda: pricing.PriceCatalog(
+            version=1, entries=()
+        ))
+        # cleanup 是 LIFO：注册顺序 = 清理顺序的倒序。
+        # 先解除共享服务 → **真正 await** 关掉引擎 → 最后才删临时目录。
+        # 之前那个 addCleanup(create_task(engine.dispose())) 只是把任务派出去、
+        # 从不 await，事件循环一关就永远完不成，目录删除时连接还开着。
+        self.addCleanup(_budget_tmp.cleanup)
+        self.addAsyncCleanup(_budget_engine.dispose)
+        self.addCleanup(group_budget.reset_shared_service)
+
         settings = _settings()
         settings.doubao_tts_enabled = True
         settings.doubao_tts_app_id = "app-id"
@@ -636,6 +658,52 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(group_row.settings["tts_mode"], TTS_MODE_ALWAYS)
         session.flush.assert_awaited()
         self.assertIn("始终使用 TTS 输出", answer_mock.await_args.args[2])
+
+
+class BudgetEngineCleanupIsAwaitedTests(unittest.IsolatedAsyncioTestCase):
+    """预算引擎的清理必须**真的被 await**，而且顺序不能反。
+
+    这条回归盯的是上一轮那个缺陷：清理写成
+    ``addCleanup(() => create_task(engine.dispose()))`` —— 只是把协程派出去，
+    从不 await 它。事件循环一关那个任务就永远完不成，于是临时目录被删的时候
+    连接还开着（macOS 上安静地留下垃圾，Linux 上会报目录非空）。
+
+    这里不 assert 源码字符串，而是真的跑一遍清理顺序：
+    unittest 的 cleanup 是 LIFO，所以**最先注册**的那条最后跑，正好用来做断言。
+    """
+
+    async def test_dispose_is_awaited_and_runs_before_the_directory_goes_away(self) -> None:
+        order: list[str] = []
+        tmp = tempfile.TemporaryDirectory()
+        directory = tmp.name
+        engine, _ = await init_db(f"sqlite+aiosqlite:///{directory}/budget.db")
+        # 真建一条连接：不 await dispose 的话，池子里这个连接会活到循环关闭。
+        async with engine.connect() as connection:
+            await connection.exec_driver_sql("select 1")
+
+        real_dispose = engine.dispose
+
+        async def dispose() -> None:
+            order.append("dispose:start")
+            await real_dispose()
+            order.append("dispose:done")
+
+        # 注册顺序 = 清理顺序的倒序。最后注册的最先跑。
+        self.addCleanup(self._assert_cleanup_order, order, directory)
+        self.addCleanup(order.append, "tmp:cleanup")
+        self.addCleanup(tmp.cleanup)
+        self.addAsyncCleanup(dispose)
+        self.addCleanup(order.append, "reset:shared_service")
+
+    def _assert_cleanup_order(self, order: list[str], directory: str) -> None:
+        self.assertEqual(
+            order,
+            ["reset:shared_service", "dispose:start", "dispose:done", "tmp:cleanup"],
+            "清理顺序必须是：解除共享服务 → 真的 await 关引擎 → 才删临时目录",
+        )
+        self.assertFalse(
+            os.path.exists(directory), "临时目录必须在引擎真正 dispose 之后才被删掉"
+        )
 
 
 if __name__ == "__main__":

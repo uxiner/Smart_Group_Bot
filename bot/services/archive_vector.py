@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import GroupMessageArchive, GroupMessageArchiveEmbedding
 from bot.services.llm import EmbeddingBatchResult, LLMService
-from bot.services import policy_runtime
+from bot.services import policy_runtime, usage_scope
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -292,36 +292,74 @@ class SQLiteArchiveVectorRecallProvider:
             except TimeoutError:
                 pass
 
+    async def _next_group_for_indexing(self, space_id: str) -> int | None:
+        """挑一个还有**可认领**行的群（``None`` = 没有）。
+
+        一次 embed 只覆盖一个群，所以这里返回的是**一个**群 id 而不是一批行；
+        认领时按它过滤，后面的文本、预留与账都挂在同一个群上。
+
+        可认领口径必须与 :meth:`_claim_pending_batch` 完全一致（包括"已 ready
+        但向量空间变了"那一类）——两处各写一份判据，迟早有一处漏掉，于是
+        换了模型之后某些群永远排不上队。
+        """
+
+        now = now_shanghai_naive()
+        cutoff = now - timedelta(days=self.retention_days)
+        async with self._session_factory() as session:
+            row = await session.execute(
+                select(GroupMessageArchiveEmbedding.group_id)
+                .where(
+                    self._eligible_predicate(space_id, now=now, cutoff=cutoff)
+                )
+                .limit(1)
+            )
+            found = row.first()
+        return None if found is None else int(found[0])
+
+    def _eligible_predicate(self, space_id: str, *, now: Any, cutoff: Any) -> Any:
+        """当前可被认领的行（唯一判据，两处共用）。"""
+
+        retry_ready = or_(
+            GroupMessageArchiveEmbedding.next_attempt_at.is_(None),
+            GroupMessageArchiveEmbedding.next_attempt_at <= now,
+        )
+        return or_(
+            GroupMessageArchiveEmbedding.status == "pending",
+            and_(GroupMessageArchiveEmbedding.status == "failed", retry_ready),
+            and_(GroupMessageArchiveEmbedding.status == "indexing", retry_ready),
+            and_(
+                GroupMessageArchiveEmbedding.status == "ready",
+                GroupMessageArchiveEmbedding.space_id != space_id,
+            ),
+            and_(
+                GroupMessageArchiveEmbedding.status == "expired",
+                GroupMessageArchiveEmbedding.updated_at <= cutoff,
+            ),
+        )
+
     async def _claim_pending_batch(
         self,
         *,
         space_id: str,
         limit: int,
+        group_id: int | None = None,
     ) -> tuple[list[_IndexSource], int]:
+        """认领一批待索引行。
+
+        ``group_id`` 用来**按群分批**：一次 embed 调用只发一批文本，如果这一批
+        里混了 A、B 两个群，那些 token 就没法归属 —— 只能记到某一群头上，另一群
+        的账单凭空消失（而这正是"按群成本"最不能出错的地方）。调用方按群轮转。
+        """
+
         now = now_shanghai_naive()
         cutoff = now - timedelta(days=self.retention_days)
         lease_until = now + timedelta(
             seconds=float(archive_limits()["indexing_lease_seconds"])
         )
-        retry_ready = or_(
-            GroupMessageArchiveEmbedding.next_attempt_at.is_(None),
-            GroupMessageArchiveEmbedding.next_attempt_at <= now,
-        )
-        eligible = or_(
-            GroupMessageArchiveEmbedding.status == "pending",
-            and_(
-                GroupMessageArchiveEmbedding.status == "failed",
-                retry_ready,
-            ),
-            and_(
-                GroupMessageArchiveEmbedding.status == "indexing",
-                retry_ready,
-            ),
-            and_(
-                GroupMessageArchiveEmbedding.status == "ready",
-                GroupMessageArchiveEmbedding.space_id != space_id,
-            ),
-        )
+        eligible = self._eligible_predicate(space_id, now=now, cutoff=cutoff)
+
+        if group_id is not None:
+            eligible = and_(eligible, GroupMessageArchiveEmbedding.group_id == int(group_id))
 
         async with self._session_factory() as session:
             rows = (
@@ -512,17 +550,31 @@ class SQLiteArchiveVectorRecallProvider:
                 space_id = self._llm.primary_embedding_space_id()
                 if not space_id:
                     return processed
+                # 一次 embed 只覆盖**一个群**：认领时就把 group_id 固定下来，
+                # 后面整批文本、整批预留、整笔账都挂在同一个群上。
+                batch_group = await self._next_group_for_indexing(space_id)
+                if batch_group is None:
+                    return processed
                 sources, skipped = await self._claim_pending_batch(
                     space_id=space_id,
                     limit=min(self.batch_size, target - processed),
+                    group_id=batch_group,
                 )
                 processed += skipped
                 if not sources:
-                    return processed
+                    continue
+                actual_group = int(sources[0].group_id)
 
-                result = await self._llm.embed_primary_with_space(
-                    [source.text for source in sources],
-                )
+                # 索引 embedding 是后台作业，显式归属到被索引的群。
+                with usage_scope.lenient_scope(
+                    kind=usage_scope.SCOPE_GROUP,
+                    group_id=actual_group,
+                    purpose=usage_scope.PURPOSE_BACKGROUND_OPTIONAL,
+                    stage="embed",
+                ):
+                    result = await self._llm.embed_primary_with_space(
+                        [source.text for source in sources],
+                    )
                 if result is None:
                     await self._mark_failed(
                         sources,

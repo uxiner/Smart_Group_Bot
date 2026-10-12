@@ -34,8 +34,9 @@ from contextvars import Context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from html import escape
+from typing import Mapping
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -422,6 +423,10 @@ class WeeklyActivityResult:
     qualified: int           # 达标人数
     total_points: int        # 榜单应发放的总额（满 10 人时是 77）
     awarded_points: int      # 本次实际入账的分（重复结算时为 0）
+    #: 返工 v3（R2）：本次结算在写边界被拒绝的原因（``""`` = 正常）。
+    #: ``guard_blocked``＝授权/配置/取消复核不通过；``plan_changed``＝执行时的名次或
+    #: 点数方案与确认方案不一致。两种情况下**一个字都没有写**，调用方应回滚。
+    award_rejected: str = ""
 
 
 async def _week_totals(
@@ -520,28 +525,115 @@ async def _write_award(
     points: int,
     ref: str,
     created_at: datetime | None = None,
+    guard: object = None,
 ) -> bool:
     """写一条奖励流水；同一 (群, 用户, ref) 已经存在时返回 False（不报错）。
 
     ``ON CONFLICT DO NOTHING + RETURNING``：冲突时 SQLite 不返回行，所以既能
     判断"这次到底发没发出去"，又不会像裸 INSERT 那样撞唯一索引抛异常。
+
+    ``guard``（B13a 返工 v4 / R2）：非空时把
+    :func:`bot.services.operations_guard.guard_predicate` 直接编进**这条 INSERT
+    自己**（``INSERT ... SELECT ... WHERE <guard>``）。于是"还算不算合法执行"和
+    "这一行到底写不写"是同一条语句、同一次 writer 准入——``session.execute`` 抢到
+    SQLite 写锁之后才求值，撤销/改配置/取消只要在那之前 commit，这里就一行都不插。
+    调用方在此之前做的任何 ``verify_guard`` SELECT 都只是提前退出，**不能**替代
+    这里（它不持 writer 锁，等待写锁期间别人仍然可以先 commit）。
+
+    返回 ``False`` 有两种可能：这一行早已入账（幂等跳过），或守卫没通过（一个字都
+    没写）。调用方需要用 :func:`_award_row_exists` 区分，别把"没写"记成"已入账"。
     """
 
-    stmt = (
-        sqlite_insert(MemberPointAward)
-        .values(
-            group_id=int(group_id),
-            user_id=int(user_id),
-            points=int(points),
-            reason=AWARD_REASON_WEEKLY_ACTIVITY,
-            ref=str(ref),
-            created_at=created_at or now_shanghai_naive(),
+    moment = created_at or now_shanghai_naive()
+    if guard is None:
+        stmt = (
+            sqlite_insert(MemberPointAward)
+            .values(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                points=int(points),
+                reason=AWARD_REASON_WEEKLY_ACTIVITY,
+                ref=str(ref),
+                created_at=moment,
+            )
+            .on_conflict_do_nothing(index_elements=["group_id", "user_id", "ref"])
+            .returning(MemberPointAward.id)
         )
-        .on_conflict_do_nothing(index_elements=["group_id", "user_id", "ref"])
-        .returning(MemberPointAward.id)
-    )
+    else:
+        # 局部导入：activity 与 operations_guard 都在 bot.services 下，模块级互相
+        # import 没有必要（operations_guard 也不需要 activity）。
+        from bot.services.operations_guard import guard_predicate
+
+        stmt = (
+            sqlite_insert(MemberPointAward)
+            .from_select(
+                ["group_id", "user_id", "points", "reason", "ref", "created_at"],
+                select(
+                    literal(int(group_id)),
+                    literal(int(user_id)),
+                    literal(int(points)),
+                    literal(AWARD_REASON_WEEKLY_ACTIVITY),
+                    literal(str(ref)),
+                    literal(moment),
+                ).where(guard_predicate(guard)),
+            )
+            .on_conflict_do_nothing(index_elements=["group_id", "user_id", "ref"])
+            .returning(MemberPointAward.id)
+        )
     written = (await session.execute(stmt)).scalar_one_or_none()
     return written is not None
+
+
+async def _award_row_exists(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    ref: str,
+) -> bool:
+    """这一条奖励流水是不是已经入账了（用来区分"幂等跳过"和"守卫没通过"）。"""
+
+    found = await session.scalar(
+        select(MemberPointAward.id)
+        .where(
+            MemberPointAward.group_id == int(group_id),
+            MemberPointAward.user_id == int(user_id),
+            MemberPointAward.ref == str(ref),
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
+def _rejected_activity_result(
+    *,
+    group_id: int,
+    start: date,
+    end: date,
+    week: str,
+    ranked: list[WeeklyActivityEntry],
+    participants: int,
+    reason: str,
+) -> WeeklyActivityResult:
+    """被守卫/方案挡住时的结果：对外一律"一个字都没写"。
+
+    ``awarded`` 全 False、``awarded_points`` 为 0，并且带上 ``award_rejected``。
+    调用方（两个运营适配器）看到 ``award_rejected`` 必须 ``rollback``：循环里可能
+    已经写进去的行属于本次未生效的写入，不能留下来变成"部分发分"。
+    """
+
+    return WeeklyActivityResult(
+        group_id=int(group_id),
+        week_start=start.isoformat(),
+        week_end=end.isoformat(),
+        week=week,
+        entries=tuple(replace(entry, awarded=False) for entry in ranked),
+        participants=int(participants),
+        qualified=len(ranked),
+        total_points=sum(entry.points for entry in ranked),
+        awarded_points=0,
+        award_rejected=reason,
+    )
 
 
 async def settle_weekly_activity(
@@ -551,13 +643,33 @@ async def settle_weekly_activity(
     now: object = None,
     week_start: date | None = None,
     award: bool = True,
+    only_refs: set[str] | None = None,
+    guard: object = None,
+    expected_points: Mapping[str, int] | None = None,
 ) -> WeeklyActivityResult:
     """结算一个完整自然周并发奖；重复调用安全（不会重复加分，也不会抛异常）。
 
     ``week_start`` 不给就用最近一个完整自然周（上周一）。``award=False`` 只算
     不发（dry-run / 报表预览用）。
 
-    不在这里 commit：调用方决定事务边界（周报与命令行入口各自提交）。
+    ``only_refs`` 是运营中心"确认时选中的目标"对应的幂等键集合（R2）：给了就只对
+    这些 ref 写分，确认之后才达标的人不会被顺带发放。``None`` 表示没有目标快照，
+    按老口径给所有达标成员发（周报与命令行入口）。
+
+    ``guard`` / ``expected_points``（返工 v3，返工 v4 更正）：把"这一次还算不算合法
+    执行"和"确认的（周、成员、点数）方案"带进**写边界**。``expected_points`` 是
+    ``ref -> 确认点数``，执行时重新排名后若名次/点数与确认方案不一致（例如确认后又有
+    同分成员出现），立刻返回 ``award_rejected='plan_changed'`` 并且**一个字都不写**。
+
+    ``guard`` 的准入保证**不在**这个函数开头的 ``verify_guard`` SELECT 上：那只是一次
+    提前退出（不持 writer 锁，DML 等待写锁期间别人仍可先 commit 撤销/改配置/取消）。
+    真正的线性化点是每一行的 :func:`_write_award`：谓词被编进那条
+    ``INSERT ... SELECT ... WHERE``，抢到 SQLite 写锁之后才求值。任何一行因此没写成
+    且库里并没有这一行，就立刻停下、返回 ``award_rejected='guard_blocked'``。
+
+    不在这里 commit：调用方决定事务边界（周报与命令行入口各自提交）。**调用方拿到
+    非空 ``award_rejected`` 必须 ``rollback``**——多行循环里可能已经有行插进去过，
+    不 rollback 就成了"部分发分 + 回执说没发"。两个运营适配器都这么做。
     """
 
     gid = int(group_id)
@@ -569,21 +681,81 @@ async def settle_weekly_activity(
     names = await _latest_display_names(session, group_id=gid, start=start, end=end)
     ranked = rank_week(totals, names)
 
+    blocked = ""
+    if guard is not None:
+        from bot.services.operations_guard import verify_guard
+
+        try:
+            allowed = await verify_guard(session, guard)
+        except Exception:
+            # 复核查询本身失败 ⇒ 视为不通过（fail-closed）：宁可一个字都不写，
+            # 也绝不因为"查不出来"就照旧发分。
+            log.warning(
+                "weekly activity guard recheck failed | group=%s", gid, exc_info=True
+            )
+            allowed = False
+        if not allowed:
+            blocked = "guard_blocked"
+    if not blocked and expected_points is not None:
+        actual = {
+            award_ref(key, entry.user_id): int(entry.points) for entry in ranked
+        }
+        for ref, points in expected_points.items():
+            if actual.get(str(ref)) != int(points):
+                blocked = "plan_changed"
+                break
+
+    if blocked:
+        return _rejected_activity_result(
+            group_id=gid,
+            start=start,
+            end=end,
+            week=key,
+            ranked=ranked,
+            participants=len(totals),
+            reason=blocked,
+        )
+
     entries: list[WeeklyActivityEntry] = []
     awarded_points = 0
     for entry in ranked:
         written = False
-        if award and entry.points > 0:
+        ref = award_ref(key, entry.user_id)
+        if (
+            award
+            and entry.points > 0
+            and (only_refs is None or ref in only_refs)
+        ):
             written = await _write_award(
                 session,
                 group_id=gid,
                 user_id=entry.user_id,
                 points=entry.points,
-                ref=award_ref(key, entry.user_id),
+                ref=ref,
+                guard=guard,
             )
+            if not written and guard is not None:
+                # 写这一行时复核已经不通过（撤销/停群/改配置/取消抢在了真正的 writer
+                # 准入之前）：立刻停止循环，循环里已经写进去的行由调用方 rollback。
+                if not await _award_row_exists(
+                    session, group_id=gid, user_id=entry.user_id, ref=ref
+                ):
+                    blocked = "guard_blocked"
+                    break
         if written:
             awarded_points += entry.points
         entries.append(replace(entry, awarded=written))
+
+    if blocked:
+        return _rejected_activity_result(
+            group_id=gid,
+            start=start,
+            end=end,
+            week=key,
+            ranked=ranked,
+            participants=len(totals),
+            reason=blocked,
+        )
 
     return WeeklyActivityResult(
         group_id=gid,

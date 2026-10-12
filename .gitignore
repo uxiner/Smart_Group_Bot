@@ -80,3 +80,23 @@ pnpm-debug.log*
 backups/
 data.pre-migration-*/
 *.bak-*
+
+# 本地验收证据（红/绿原始日志、基准输出、截图）。**刻意不入库**：
+# 它是某台机器某次跑出来的原始记录，不是产品代码，混进仓库只会让 review
+# 变成翻日志。交付报告里引用这些文件的**结论**，不引用它们的路径依赖。
+.acceptance/
+
+# B10 local test artifacts
+.b10-tmp/
+
+# B11 local evidence
+.b11-tmp/
+
+# B12 dev temp
+.b12-tmp/
+
+# B13a dev temp
+.b13a-tmp/
+
+# B13b dev temp
+.b13b-tmp/

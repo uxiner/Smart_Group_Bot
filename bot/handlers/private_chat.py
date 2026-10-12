@@ -195,7 +195,16 @@ async def _image_description(message: Message, llm) -> str:
             data_uri = await _build_vision_data_uri(message, *info)
             if not data_uri:
                 return ""
-            return str(await llm.vision_describe(data_uri, DM_VISION_PROMPT) or "").strip()
+            # 私聊看图是陪伴/娱乐用途：可选，可以被预算护栏暂停。
+            return str(
+                await llm.vision_describe(
+                    data_uri,
+                    DM_VISION_PROMPT,
+                    purpose="optional",
+                    stage="vision",
+                )
+                or ""
+            ).strip()
     except TimeoutError:
         log.warning("private chat: 认图超预算 | user=%s", message.from_user.id if message.from_user else 0)
         return ""

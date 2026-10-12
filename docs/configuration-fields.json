@@ -133,6 +133,22 @@
       "test_node": "tests/test_configurable_policy_catalog.py"
     },
     {
+      "path": "admin_ops.operations_preview_ttl_seconds",
+      "type": "integer",
+      "default": 120,
+      "bounds": {
+        "ge": 30,
+        "le": 600
+      },
+      "reload_kind": "hot",
+      "unit": "",
+      "read_consumers": [
+        "bot/services/operations_runs.py:preview_ttl_seconds"
+      ],
+      "api_role": "super_admin",
+      "test_node": "tests/test_configurable_policy_catalog.py"
+    },
+    {
       "path": "admin_ops.privileged_group_concurrency",
       "type": "integer",
       "default": 4,

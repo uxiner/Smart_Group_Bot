@@ -169,6 +169,7 @@ from bot.services.update_completion import (
     current_update_completion,
     request_current_update_retry,
 )
+from bot.utils.message_links import message_evidence_link
 from bot.utils.prompts import build_content_boundaries_context
 from bot.utils.security import format_history_message_line, wrap_untrusted_multiline
 from bot.utils.timezone import (
@@ -2681,9 +2682,18 @@ async def _reapply_restriction_mute(
 
 
 async def _edit_review_channel_status(
-    callback: CallbackQuery, settings: Settings, violation: object, *, line: str
+    callback: CallbackQuery,
+    settings: Settings,
+    violation: object,
+    *,
+    line: str,
+    drop_buttons: bool = False,
 ) -> None:
-    """在频道那条证据消息上追加一行状态（best-effort，失败只记日志）。"""
+    """在频道那条证据消息上追加一行状态（best-effort，失败只记日志）。
+
+    ``drop_buttons=True`` 用于「第二次点击已执行完」的终态（放行/封禁已落地）：
+    这时按钮要**消失**（空键盘 = Telegram 移除按钮），避免卡片看起来还能操作。
+    """
 
     bot = getattr(callback, "bot", None)
     message = getattr(callback, "message", None)
@@ -2710,13 +2720,26 @@ async def _edit_review_channel_status(
         )
         return
     new_text = f"{current.rstrip()}\n\n{line}"
+    # 必须显式带上键盘：editMessageText **不带** reply_markup 时，Telegram 会把这条
+    # 频道消息原有的 inline 键盘一起删掉（2026-10-06 在频道里实测复现：点第一下「待确认」
+    # 后按钮就消失，第二下根本点不到）。所以每次改文案都要把同一对按钮贴回去。
     try:
-        await edit(
-            chat_id=target_chat_id,
-            message_id=message_id,
-            text=new_text,
-            parse_mode="HTML",
-        )
+        violation_id = int(getattr(violation, "id", 0) or 0)
+    except (TypeError, ValueError):
+        violation_id = 0
+    edit_kwargs: dict[str, object] = {
+        "chat_id": target_chat_id,
+        "message_id": message_id,
+        "text": new_text,
+        "parse_mode": "HTML",
+    }
+    if drop_buttons:
+        # 终态：把键盘清空（Telegram 用空 inline_keyboard 移除按钮）。
+        edit_kwargs["reply_markup"] = InlineKeyboardMarkup(inline_keyboard=[])
+    elif violation_id > 0:
+        edit_kwargs["reply_markup"] = _build_review_action_keyboard(violation_id)
+    try:
+        await edit(**edit_kwargs)
     except Exception:
         log.warning(
             "review status edit failed | violation=%s", getattr(violation, "id", 0)
@@ -2955,6 +2978,7 @@ async def _review_do_release(
         settings,
         violation,
         line="🟢 已人工放行 · 已解除该成员限制 · 待规则调整",
+        drop_buttons=True,
     )
     await _send_review_handover(
         callback=callback,
@@ -3076,6 +3100,7 @@ async def _review_do_ban(
         settings,
         violation,
         line="🔴 确认封禁 · 判定准确，已立即封禁",
+        drop_buttons=True,
     )
     await _send_review_handover(
         callback=callback,
@@ -4888,7 +4913,15 @@ async def _nsfw_video_thumbnail_vision_text(message: Message, llm: LLMService) -
     try:
         vision_text = (
             await _await_hard_deadline(
-                llm.vision_describe(data_uri, vision_prompt),
+                # 执法用途的视觉：这次识别的结果直接决定要不要处置成员。
+                # 标成 safety，预算不足时**不得**把它当可选功能停掉 —— 停了等于
+                # 让 NSFW 图片在群里畅通无阻。
+                llm.vision_describe(
+                    data_uri,
+                    vision_prompt,
+                    purpose="safety",
+                    stage="moderation_vision",
+                ),
                 timeout_seconds=20.0,
             )
         ).strip()
@@ -5251,7 +5284,9 @@ async def _apply_nsfw_image_guard(
                     "未封禁/未禁言/未累计",
                 ),
                 message_link=_message_evidence_link(
-                    getattr(message, "chat", None), _source_message_id(message)
+                    getattr(message, "chat", None),
+                    _source_message_id(message),
+                    getattr(message, "message_thread_id", None),
                 ),
             ),
         )
@@ -5293,7 +5328,15 @@ async def _append_image_context(
         try:
             vision_text = (
                 await _await_hard_deadline(
-                    llm.vision_describe(data_uri, vision_prompt),
+                    # 这段描述带 ``[image-vision]`` 标记进审核正文，是
+                    # ``scan_scope=+vision`` 规则的输入。停掉它 = 审核看不见
+                    # 图片证据，所以按 safety 归属。
+                    llm.vision_describe(
+                        data_uri,
+                        vision_prompt,
+                        purpose="safety",
+                        stage="moderation_vision",
+                    ),
                     timeout_seconds=20.0,
                 )
             ).strip()
@@ -8608,7 +8651,9 @@ def _violation_evidence(
         submitted_text=str(submitted_text or ""),
         executed=tuple(executed),
         message_link=_message_evidence_link(
-            getattr(message, "chat", None), _source_message_id(message)
+            getattr(message, "chat", None),
+            _source_message_id(message),
+            getattr(message, "message_thread_id", None),
         ),
     )
 
@@ -8752,24 +8797,17 @@ def _admin_identity_label(*, is_owner: bool, is_tg_admin: bool) -> str:
     return ""
 
 
-def _message_evidence_link(chat: object, message_id: object) -> str:
-    """能给就给一条 t.me 消息回链，拿不到返回空串。"""
+def _message_evidence_link(
+    chat: object, message_id: object, message_thread_id: object = None
+) -> str:
+    """能给就给一条 t.me 消息回链，拿不到返回空串。
 
-    try:
-        mid = int(message_id or 0)
-        chat_id = int(getattr(chat, "id", 0) or 0)
-    except (TypeError, ValueError):
-        return ""
-    if mid <= 0 or chat_id == 0:
-        return ""
-    username = str(getattr(chat, "username", "") or "").strip().lstrip("@")
-    if username:
-        return f"https://t.me/{username}/{mid}"
-    # 超级群内部链接：-100XXXXXXXXXX → t.me/c/XXXXXXXXXX/<message_id>
-    raw = str(chat_id)
-    if raw.startswith("-100") and len(raw) > 4:
-        return f"https://t.me/c/{raw[4:]}/{mid}"
-    return ""
+    形状统一在 ``bot/utils/message_links.py``（与 /find、/memory、透明面共用同一
+    实现）。``message_thread_id`` 只允许来自可信来源（实时 Telegram 消息对象或归档
+    行）；不传时输出与改动前逐字一致（非 Topics 形状）。
+    """
+
+    return message_evidence_link(chat, message_id, message_thread_id)
 
 
 def _admin_alert_attachment(message: Message) -> tuple[str, str] | None:
@@ -9095,7 +9133,9 @@ async def _apply_admin_moderation(
         submitted_text=input_text,
         executed=tuple(executed),
         message_link=_message_evidence_link(
-            getattr(message, "chat", None), _source_message_id(message)
+            getattr(message, "chat", None),
+            _source_message_id(message),
+            getattr(message, "message_thread_id", None),
         ),
     )
     await _deliver_moderation_evidence(

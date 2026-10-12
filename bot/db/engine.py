@@ -55,6 +55,30 @@ _SQLITE_VOTE_BAN_INDEX_SQL = (
     "ON vote_ban_sessions (group_id, target_user_id) "
     "WHERE status IN ('active', 'enforcing')"
 )
+#: 配置变更历史的两个索引。``create_all`` 只会给**新建**的表建索引，对已经存在
+#: 的表（半发版留下的"有表没索引"）什么都不会做——所以必须由启动路径显式补齐，
+#: 否则 revision 唯一约束形同虚设：同一版 revision 能被记进历史两次，审计链就断了
+#: （和 ix_vote_ban_open_target 同一类事故）。
+_SQLITE_RUNTIME_CONFIG_HISTORY_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_runtime_config_history_revision "
+    "ON runtime_config_history (revision)",
+    "CREATE INDEX IF NOT EXISTS ix_runtime_config_history_updated_at "
+    "ON runtime_config_history (updated_at)",
+)
+
+#: 永久备忘的群内内容唯一键。``create_memory`` 的查重发生在写锁之外（查重走
+#: ``AsyncSession.scalar``，写锁到 ``commit()`` 才获取），所以两个并发同内容
+#: POST 都能通过查重、各插一行。查重只留作省一次写锁往返的快路径，唯一索引
+#: 才是最终保证。和上面的历史索引同一类事故：``create_all`` 对**已存在**的表
+#: 不补索引，必须由启动路径显式补。
+_SQLITE_GROUP_PERMANENT_MEMORY_CONTENT_INDEX = (
+    "ix_group_permanent_memories_group_content"
+)
+_SQLITE_GROUP_PERMANENT_MEMORY_CONTENT_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    f"{_SQLITE_GROUP_PERMANENT_MEMORY_CONTENT_INDEX} "
+    "ON group_permanent_memories (group_id, content)"
+)
 
 _SQLITE_ARCHIVE_FTS_TABLE = "group_message_archive_fts"
 _SQLITE_ARCHIVE_FTS_TRIGGER_NAMES = (
@@ -584,6 +608,205 @@ async def _sqlite_migrate_violation_rule_fk(conn) -> bool:
         f"; cleared {repaired} orphan reference(s)" if repaired else "",
     )
     return True
+
+
+async def _sqlite_migrate_moderation_replay(conn) -> bool:
+    """审核回放三张表的列/索引对齐（幂等，可重复执行）。
+
+    和 ``_sqlite_migrate_violation_rule_fk`` 同一套做法：新库由 ``create_all``
+    直接建全，老库（已经建过同名的中间版本表）在这里补列 + 补索引。老库根本
+    没有这三张表时直接返回 —— ``create_all`` 会建好，轮不到这里补。
+    """
+    changed = False
+    columns_by_table = {
+        "moderation_replay_samples": (
+            ("source_kind", "source_kind VARCHAR(24) NOT NULL DEFAULT 'manual'"),
+            ("source_violation_id", "source_violation_id INTEGER"),
+            ("redacted_text", "redacted_text TEXT NOT NULL DEFAULT ''"),
+            ("redacted_context", "redacted_context TEXT NOT NULL DEFAULT ''"),
+            ("gold_label", "gold_label VARCHAR(16)"),
+            ("label_source", "label_source VARCHAR(24) NOT NULL DEFAULT ''"),
+            # --- 人工金标（见 ModerationReplaySample 的 docstring） ---
+            ("label_state", "label_state VARCHAR(16) NOT NULL DEFAULT 'unlabelled'"),
+            ("label_reviewed_by", "label_reviewed_by BIGINT NOT NULL DEFAULT 0"),
+            ("label_reviewed_at", "label_reviewed_at DATETIME"),
+            ("provenance", "provenance JSON NOT NULL DEFAULT '{}'"),
+            ("created_by", "created_by BIGINT NOT NULL DEFAULT 0"),
+            ("created_at", "created_at DATETIME"),
+            ("expires_at", "expires_at DATETIME"),
+        ),
+        "moderation_replay_runs": (
+            ("baseline_version", "baseline_version VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("baseline_digest", "baseline_digest VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("baseline_snapshot", "baseline_snapshot JSON NOT NULL DEFAULT '{}'"),
+            ("candidate_version", "candidate_version VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("candidate_digest", "candidate_digest VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("candidate_rules", "candidate_rules JSON NOT NULL DEFAULT '[]'"),
+            ("candidate_prompt", "candidate_prompt TEXT NOT NULL DEFAULT ''"),
+            ("status", "status VARCHAR(16) NOT NULL DEFAULT 'queued'"),
+            ("stats", "stats JSON NOT NULL DEFAULT '{}'"),
+            ("error", "error TEXT NOT NULL DEFAULT ''"),
+            ("created_by", "created_by BIGINT NOT NULL DEFAULT 0"),
+            ("created_at", "created_at DATETIME"),
+            ("started_at", "started_at DATETIME"),
+            ("finished_at", "finished_at DATETIME"),
+            ("idempotency_key", "idempotency_key VARCHAR(64) NOT NULL DEFAULT ''"),
+            # --- 模型绑定 + 租约 + 取消（回放的执行模型） ---
+            ("model_binding", "model_binding JSON NOT NULL DEFAULT '{}'"),
+            ("model_digest", "model_digest VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("fidelity", "fidelity JSON NOT NULL DEFAULT '{}'"),
+            ("cancel_requested", "cancel_requested BOOLEAN NOT NULL DEFAULT 0"),
+            ("lease_owner", "lease_owner VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("lease_expires_at", "lease_expires_at DATETIME"),
+            ("attempt", "attempt INTEGER NOT NULL DEFAULT 0"),
+        ),
+        "moderation_replay_label_audits": (
+            ("sample_id", "sample_id INTEGER NOT NULL DEFAULT 0"),
+            ("group_id", "group_id BIGINT NOT NULL DEFAULT 0"),
+            ("previous_label", "previous_label VARCHAR(16)"),
+            ("new_label", "new_label VARCHAR(16)"),
+            ("action", "action VARCHAR(24) NOT NULL DEFAULT ''"),
+            ("actor_id", "actor_id BIGINT NOT NULL DEFAULT 0"),
+            ("changed_at", "changed_at DATETIME"),
+        ),
+        "moderation_replay_results": (
+            ("run_id", "run_id INTEGER NOT NULL DEFAULT 0"),
+            ("group_id", "group_id BIGINT NOT NULL DEFAULT 0"),
+            ("sample_id", "sample_id INTEGER NOT NULL DEFAULT 0"),
+            ("baseline_verdict", "baseline_verdict VARCHAR(16) NOT NULL DEFAULT ''"),
+            ("baseline_conclusive", "baseline_conclusive BOOLEAN NOT NULL DEFAULT 0"),
+            ("baseline_confidence", "baseline_confidence FLOAT"),
+            (
+                "baseline_match_source",
+                "baseline_match_source VARCHAR(24) NOT NULL DEFAULT ''",
+            ),
+            ("baseline_latency_ms", "baseline_latency_ms INTEGER"),
+            ("baseline_error", "baseline_error VARCHAR(32) NOT NULL DEFAULT ''"),
+            ("baseline_usage", "baseline_usage JSON NOT NULL DEFAULT '{}'"),
+            ("candidate_verdict", "candidate_verdict VARCHAR(16) NOT NULL DEFAULT ''"),
+            (
+                "candidate_conclusive",
+                "candidate_conclusive BOOLEAN NOT NULL DEFAULT 0",
+            ),
+            ("candidate_confidence", "candidate_confidence FLOAT"),
+            (
+                "candidate_match_source",
+                "candidate_match_source VARCHAR(24) NOT NULL DEFAULT ''",
+            ),
+            ("candidate_latency_ms", "candidate_latency_ms INTEGER"),
+            ("candidate_error", "candidate_error VARCHAR(32) NOT NULL DEFAULT ''"),
+            ("candidate_usage", "candidate_usage JSON NOT NULL DEFAULT '{}'"),
+            ("changed", "changed BOOLEAN NOT NULL DEFAULT 0"),
+        ),
+    }
+    for table, columns in columns_by_table.items():
+        if not await _sqlite_table_exists(conn, table):
+            continue
+        for column, column_def in columns:
+            changed |= await _sqlite_ensure_column(conn, table, column, column_def)
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_samples_group_created "
+        "ON moderation_replay_samples (group_id, created_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "ix_moderation_replay_samples_group_violation "
+        "ON moderation_replay_samples (group_id, source_violation_id)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_samples_expires_at "
+        "ON moderation_replay_samples (expires_at)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_samples_label_state "
+        "ON moderation_replay_samples (group_id, label_state)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_runs_group_created "
+        "ON moderation_replay_runs (group_id, created_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_moderation_replay_runs_idempotency_key "
+        "ON moderation_replay_runs (idempotency_key)",
+        # 租约接管的扫描路径只看 running，按租到期时间找可接管的行。
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_runs_lease "
+        "ON moderation_replay_runs (status, lease_expires_at)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_results_run_sample "
+        "ON moderation_replay_results (run_id, sample_id)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_results_group_run "
+        "ON moderation_replay_results (group_id, run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_label_audits_sample "
+        "ON moderation_replay_label_audits (sample_id, changed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_replay_label_audits_group "
+        "ON moderation_replay_label_audits (group_id, changed_at)",
+    ):
+        await conn.execute(text(index_sql))
+    changed |= await _sqlite_downgrade_machine_derived_gold_labels(conn)
+    return changed
+
+
+#: 老版本把**机器信号**当金标写进去的 ``label_source`` 取值（逐字对应旧代码）。
+#: 命中这些值的行一律降级回无标注，机器信号搬进 ``provenance``。
+_MACHINE_DERIVED_LABEL_SOURCES = ("high_confidence_hit", "admin_release")
+
+
+async def _sqlite_downgrade_machine_derived_gold_labels(conn) -> bool:
+    """把机器派生的"金标"降级回无标注，信号搬进 ``provenance``。
+
+    为什么必须做（而且是启动时做，不是"以后导入时注意"）：已经落库的行**已经**
+    在过去的报告里冒充过答案键了。留着它们，下一次回放照样会把机器输出当金标算
+    FP/FN —— 而且**没有任何人看得出来**，因为字段名还叫 ``gold_label``。
+
+    只降级**机器派生**的两类：``high_confidence_hit``（纯置信度阈值）与
+    ``admin_release``（"人工放行"多数时候确实是误伤，但也可能是刻意宽免，
+    不能静默等同于"确认误判"）。``admin_ban`` 是管理员在证据卡上按过
+    "确认封禁 · 判定准确" 的**显式确认**，保留为金标（仍可被管理员修正）。
+    """
+
+    if not await _sqlite_table_exists(conn, "moderation_replay_samples"):
+        return False
+    columns = await _sqlite_table_columns(conn, "moderation_replay_samples")
+    if not {"label_state", "provenance"} <= columns:
+        return False
+    placeholders = ", ".join(
+        f":src{index}" for index, _ in enumerate(_MACHINE_DERIVED_LABEL_SOURCES)
+    )
+    params: dict[str, Any] = {
+        f"src{index}": value
+        for index, value in enumerate(_MACHINE_DERIVED_LABEL_SOURCES)
+    }
+    result = await conn.execute(
+        text(
+            "UPDATE moderation_replay_samples "
+            "SET gold_label = NULL, "
+            "label_state = 'unlabelled', "
+            "label_source = '', "
+            "label_reviewed_by = 0, "
+            "label_reviewed_at = NULL, "
+            "provenance = json_patch("
+            "  COALESCE(json(provenance), json('{}')), "
+            "  json_object("
+            "    'relabelled_by_migration', 1, "
+            "    'previous_machine_label_source', label_source, "
+            "    'previous_machine_label', gold_label"
+            "  )"
+            ") "
+            f"WHERE label_source IN ({placeholders})"
+        ),
+        params,
+    )
+    downgraded = int(result.rowcount or 0)
+    if downgraded:
+        log.warning(
+            "Migrated: downgraded %d machine-derived replay gold labels to unlabelled",
+            downgraded,
+        )
+    # 紧接着**回填**人工确认过的那些：``label_state`` 是后加的列，老库里它们带
+    # ``gold_label`` 但 ``label_state`` 还是建列时的默认值 ``'unlabelled'``。
+    # 不回填的话，一升级就把这些**真人金标**当成无标注 —— 那是另一种（更隐蔽的）
+    # 把金标丢掉的事故。放在降级**之后**，所以刚被清掉的那批不会被回填回来。
+    backfilled = await conn.execute(
+        text(
+            "UPDATE moderation_replay_samples "
+            "SET label_state = 'labelled' "
+            "WHERE gold_label IS NOT NULL "
+            "AND (label_state IS NULL OR label_state = '' OR label_state = 'unlabelled')"
+        )
+    )
+    relabelled = int(backfilled.rowcount or 0)
+    if relabelled:
+        log.info("Migrated: marked %d replay samples as labelled", relabelled)
+    return bool(downgraded or relabelled)
 
 
 async def _sqlite_migrate_profile_screen_scope(conn) -> bool:
@@ -1632,6 +1855,123 @@ async def _sqlite_ensure_vote_ban_open_index(conn) -> None:
     await conn.execute(text(_SQLITE_VOTE_BAN_INDEX_SQL))
 
 
+async def _sqlite_ensure_runtime_config_history_indexes(conn) -> None:
+    """保证配置变更历史的两个索引在**任何**已有库上都存在（幂等）。
+
+    ``create_all`` 只建新表；一个"表已经建了但索引没建"的半发版库必须靠这里
+    补上，否则同一版 revision 可以被重复写进历史，审计链断掉却毫无报错。
+    唯一索引建不起来（老库里已经有重复 revision）时，保留 id 最小的那条、
+    其余删除并打告警——重复行本身就是 bug 产物，审计上以最早那条为准。
+    """
+
+    if not await _sqlite_table_exists(conn, "runtime_config_history"):
+        return
+    canonical = await _sqlite_named_index_matches(
+        conn,
+        table="runtime_config_history",
+        name="ix_runtime_config_history_revision",
+        columns=("revision",),
+        unique=True,
+    )
+    if not canonical:
+        # 先确认真的有重复再删：这条 DELETE 会全表扫，如果索引只是"名字对不上"
+        # （某个开发发版自己建的），每次启动都扫一遍历史表就越攒越贵。
+        duplicated = await conn.scalar(
+            text(
+                "SELECT 1 FROM runtime_config_history "
+                "GROUP BY revision HAVING COUNT(*) > 1 LIMIT 1"
+            )
+        )
+        if duplicated is not None:
+            dropped = await conn.execute(
+                text(
+                    "DELETE FROM runtime_config_history WHERE id NOT IN ("
+                    "SELECT MIN(id) FROM runtime_config_history GROUP BY revision)"
+                )
+            )
+            log.warning(
+                "Migrated: dropped %d duplicate runtime config history row/rows "
+                "so the revision unique index could be created",
+                int(dropped.rowcount or 0),
+            )
+    for statement in _SQLITE_RUNTIME_CONFIG_HISTORY_INDEX_SQL:
+        await conn.execute(text(statement))
+
+
+async def _sqlite_ensure_group_permanent_memory_unique_key(conn) -> bool:
+    """Make Mini App permanent-memory creation idempotent per group.
+
+    ``create_memory`` 的查重在写锁之外（查重走 ``AsyncSession.scalar``，写锁到
+    ``commit()`` 才获取），所以两个并发同内容 POST 都能通过查重、各插一行。
+    这里把「群内内容唯一」变成数据库层面的保证。已有的重复行必须先收敛，
+    否则唯一索引建不起来——保留 id 最大的一行，与 message_vectors 的
+    ``MAX(rowid)`` 去重语义一致。
+    """
+
+    if not await _sqlite_table_exists(conn, "group_permanent_memories"):
+        return False
+    columns = await _sqlite_table_columns(conn, "group_permanent_memories")
+    if not {"group_id", "content"}.issubset(columns):
+        return False
+    if await _sqlite_has_unique_index(
+        conn, "group_permanent_memories", ("group_id", "content")
+    ):
+        return False
+
+    # 先确认真的有重复再删：这条 DELETE 全表扫，只在确实要建索引时才付代价。
+    duplicated = await conn.scalar(
+        text(
+            "SELECT 1 FROM group_permanent_memories "
+            "GROUP BY group_id, content HAVING COUNT(*) > 1 LIMIT 1"
+        )
+    )
+    if duplicated is not None:
+        dropped = await conn.execute(
+            text(
+                "DELETE FROM group_permanent_memories WHERE id NOT IN ("
+                "SELECT MAX(id) FROM group_permanent_memories "
+                "GROUP BY group_id, content)"
+            )
+        )
+        log.warning(
+            "Migrated: dropped %d duplicate permanent memory row/rows "
+            "so the (group_id, content) unique index could be created",
+            max(0, int(dropped.rowcount or 0)),
+        )
+    # 早期版本可能用同一个名字建过非唯一索引，SQLite 不能原地替换，只能重建。
+    await conn.execute(
+        text(f"DROP INDEX IF EXISTS {_SQLITE_GROUP_PERMANENT_MEMORY_CONTENT_INDEX}")
+    )
+    await conn.execute(text(_SQLITE_GROUP_PERMANENT_MEMORY_CONTENT_INDEX_SQL))
+    log.info("Migrated: permanent memories content key enforced")
+    return True
+
+
+async def _sqlite_ensure_group_task_policy_unique_key(conn) -> bool:
+    """Enforce one policy row per ``(group_id, task_id)`` on already-created DBs.
+
+    ``group_task_policies`` 是新表，``create_all`` 建表时会带上唯一约束；但在
+    **已存在该表**的库上 ``create_all`` 不补索引。策略写入的 CAS 依赖这一行
+    只可能有一条，所以这里显式补唯一索引（幂等）。
+    """
+
+    if not await _sqlite_table_exists(conn, "group_task_policies"):
+        return False
+    columns = await _sqlite_table_columns(conn, "group_task_policies")
+    if not {"group_id", "task_id", "revision"}.issubset(columns):
+        return False
+    if await _sqlite_has_unique_index(conn, "group_task_policies", ("group_id", "task_id")):
+        return False
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_group_task_policies_identity "
+            "ON group_task_policies (group_id, task_id)"
+        )
+    )
+    log.info("Migrated: group task policy identity key enforced")
+    return True
+
+
 async def _sqlite_migrate_telegram_delete_jobs(conn) -> None:
     """Bring development/legacy cleanup tables to the durable scheduler schema."""
 
@@ -1960,6 +2300,48 @@ async def _sqlite_upgrade_moderation_rule_scan_scopes(
     return changed
 
 
+async def _sqlite_migrate_user_fact_revisions(conn) -> bool:
+    """C3：老库的 ``user_facts`` 补修订号与人工纠错/可信 thread 列（幂等）。
+
+    ``revision`` 用**常量**默认值补列（SQLite 的 ``ADD COLUMN ... NOT NULL
+    DEFAULT 1`` 允许），再显式回填 ``NULL → 1``：旧行因此拿到明确的初始版本 1，
+    而不是 NULL、也不是拿时间戳冒充版本。``source_thread_id`` / ``corrected_by``
+    / ``corrected_at`` 一律可空 —— 旧行没有可信 thread、没被人工纠错过，NULL
+    就是"没有"，**不许捏造**。
+    """
+
+    if not await _sqlite_table_exists(conn, "user_facts"):
+        return False
+    changed = await _sqlite_ensure_column(
+        conn,
+        "user_facts",
+        "revision",
+        "revision INTEGER NOT NULL DEFAULT 1",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "user_facts",
+        "source_thread_id",
+        "source_thread_id BIGINT",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "user_facts",
+        "corrected_by",
+        "corrected_by BIGINT",
+    )
+    changed |= await _sqlite_ensure_column(
+        conn,
+        "user_facts",
+        "corrected_at",
+        "corrected_at DATETIME",
+    )
+    await conn.execute(
+        text("UPDATE user_facts SET revision = 1 WHERE revision IS NULL")
+    )
+    return changed
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
     *,
@@ -2056,6 +2438,34 @@ async def init_db(
             if await _sqlite_table_exists(conn, "telegram_delete_jobs"):
                 await _sqlite_migrate_telegram_delete_jobs(conn)
         await conn.run_sync(Base.metadata.create_all)
+        if is_sqlite:
+            # B13a 返工 R1：运营 run 的「预览目标快照」列。新库由 create_all 直接建，
+            # 老库靠这里补；``operations_business_receipts`` 是**新表**，create_all
+            # 已经建好，重复执行是空操作。
+            await _sqlite_ensure_column(
+                conn, "operations_runs", "target_keys", "target_keys JSON"
+            )
+            # B13b：确认那一刻的按群策略版本（来源切换 / 周期计划改动后旧确认
+            # 必须在真实不可逆准入被挡住）。老库补列，新库由 create_all 建好。
+            await _sqlite_ensure_column(
+                conn, "operations_runs", "policy_revision", "policy_revision INTEGER NOT NULL DEFAULT 0"
+            )
+        if is_sqlite:
+            # B13b：按群执行来源/周期计划是**新表**（create_all 建），但已存在的库
+            # 上 create_all 不补索引，唯一键必须显式建（同其它显式索引的做法）。
+            await _sqlite_ensure_group_task_policy_unique_key(conn)
+        if is_sqlite:
+            # C3：长期事实的修订号 / 可信 thread / 人工纠错标记。老库靠这里补列，
+            # 新库由 create_all 直接建好；重复执行是空操作。
+            await _sqlite_migrate_user_fact_revisions(conn)
+        if is_sqlite:
+            # 配置变更历史：表由 create_all 建，索引必须显式补（create_all 对
+            # 已存在的表不补索引）。
+            await _sqlite_ensure_runtime_config_history_indexes(conn)
+        if is_sqlite:
+            # 永久备忘的 (group_id, content) 唯一键：同 create_all 的其它索引，
+            # 已存在的表不会被补，必须显式建。
+            await _sqlite_ensure_group_permanent_memory_unique_key(conn)
         if is_sqlite:
             # B-27：老库的 checkin_reminder_posts 补 delivered_at（可空）。
             # NULL = "这条占位从没确认送达"，与「刚 claim 正在发」同义，靠
@@ -2239,6 +2649,41 @@ async def init_db(
             await _sqlite_cleanup_orphan_vote_ban_votes(conn)
             await _sqlite_repair_missing_group_parents(conn)
             await _sqlite_migrate_violation_rule_fk(conn)
+            await _sqlite_migrate_moderation_replay(conn)
+            # 预算预留行新增完整价格快照列（老库平滑升级）。
+            await _sqlite_ensure_column(
+                conn,
+                "group_budget_reservations",
+                "price_snapshot",
+                "price_snapshot JSON",
+            )
+            # 告警事件新增「已开始发送」列：租约恢复据此区分可重发与 unknown。
+            await _sqlite_ensure_column(
+                conn,
+                "budget_alert_events",
+                "dispatch_started",
+                "dispatch_started BOOLEAN NOT NULL DEFAULT 0",
+            )
+            # operation 额度按 feature 分别报 -> 唯一键必须含 feature。
+            # 老库上的旧索引只有 (群,日,类型,档)：不重建的话 tts 与 search 会
+            # 互吞掉对方的一条告警。只改 ORM metadata 不会碰老库的索引。
+            #
+            # DDL 必须走 exec_driver_sql：conn.execute 会把裸字符串当成语句对象
+            # 处理（'str' object has no attribute '_execute_on_connection'）。
+            await _sqlite_ensure_column(
+                conn,
+                "budget_alert_events",
+                "feature",
+                "feature TEXT NOT NULL DEFAULT ''",
+            )
+            await conn.exec_driver_sql(
+                "DROP INDEX IF EXISTS ux_budget_alert_daily_threshold"
+            )
+            await conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_budget_alert_daily_threshold "
+                "ON budget_alert_events "
+                "(group_id, budget_date, limit_kind, feature, threshold_kind)"
+            )
             await _sqlite_ensure_column(
                 conn,
                 "group_members",
@@ -2323,6 +2768,23 @@ async def init_db(
                 # 时每次都全表扫。和 F-030 同理，create_all 不会给已存在的表补索引。
                 "CREATE INDEX IF NOT EXISTS ix_violations_group_created_at "
                 "ON violations (group_id, created_at)",
+                # 按群成本明细台账：表由 create_all 建，索引按惯例在这里幂等补齐
+                # （半发版可能出现"有表没索引"）。
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_llm_cost_daily_key "
+                "ON llm_cost_daily (usage_date, scope, group_id, purpose, "
+                "stage, provider, model)",
+                "CREATE INDEX IF NOT EXISTS ix_llm_cost_daily_group_day "
+                "ON llm_cost_daily (group_id, usage_date)",
+                # 接入申请：单群仅一条有效 pending。部分唯一索引 create_all 会建，
+                # 这里再声明一次是为了让"老库里已经建过同名表"的半发版也能补上。
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_group_onboarding_open_request "
+                "ON group_onboarding_requests (group_id) WHERE status = 'pending'",
+                "CREATE INDEX IF NOT EXISTS ix_group_onboarding_group_created "
+                "ON group_onboarding_requests (group_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS ix_group_onboarding_applicant_created "
+                "ON group_onboarding_requests (applicant_id, created_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_group_onboarding_request_id "
+                "ON group_onboarding_requests (request_id)",
             ):
                 await conn.execute(text(index_sql))
             # 审核规则的扫描范围：列存在性 + 老数据默认值 + 生产规则的一次性升级。

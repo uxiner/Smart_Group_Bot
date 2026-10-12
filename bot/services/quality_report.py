@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Sequence
+from typing import Any, Sequence
 
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +77,29 @@ def _local_since_date(days: int) -> str:
     return (local_today() - timedelta(days=max(1, int(days)))).isoformat()
 
 
+def _until(column: Any, until: datetime | None) -> tuple[Any, ...]:
+    """``[since, until)`` 的上界谓词；``until`` 为 None（滚动窗口）时返回空元组。
+
+    R4（返工 v2）：周报的主统计必须是**上一完整业务周**的精确边界，不能再拿
+    "近 N 天"的滚动窗口冒充。调用方给出窗口时，这里补上严格上界。
+    """
+
+    if until is None:
+        return ()
+    return (column < until,)
+
+
+def business_week_window(
+    week_start: date, week_end: date
+) -> tuple[datetime, datetime, str]:
+    """业务周 ``[start 00:00, end+1 天 00:00)`` 的本地（上海 naive）边界与标签。"""
+
+    start = datetime.combine(week_start, datetime.min.time())
+    end = datetime.combine(week_end, datetime.min.time()) + timedelta(days=1)
+    label = f"{week_start.isoformat()}~{week_end.isoformat()}"
+    return start, end, label
+
+
 @dataclass(frozen=True, slots=True)
 class ModerationQuality:
     days: int
@@ -99,6 +122,8 @@ class ModerationQuality:
     # 落在 moderation.high_confidence_threshold 之上的命中数（默认 0.9）
     high_confidence_hits: int = 0
     high_confidence_threshold: float = MARGINAL_CONFIDENCE
+    #: 精确业务周窗口的展示标签（``2026-10-05~2026-10-11``）；空＝按"近 N 天"。
+    window_label: str = ""
 
     @property
     def cleared(self) -> int:
@@ -134,6 +159,8 @@ class ActivitySummary:
     checkin_members: int = 0
     points_awarded: int = 0
     top_members: list[tuple[str, int]] = field(default_factory=list)
+    #: 同 ModerationQuality.window_label。
+    window_label: str = ""
 
 
 async def _rule_labels(session: AsyncSession, group_id: int) -> dict[int, str]:
@@ -155,11 +182,16 @@ async def collect_quality(
     group_id: int,
     days: int = 7,
     high_threshold: float | None = None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    window_label: str = "",
 ) -> ModerationQuality:
     """窗口内的审核质量：命中构成、边缘判定、放行（误伤）数。
 
     ``high_threshold`` 是运行时配置的 ``moderation.high_confidence_threshold``；
     不传就按默认 0.9 统计"高置信占比"。
+    ``window_start``/``window_end`` 给出**精确业务周**边界（本地上海 naive，左闭右开），
+    给了就不用滚动的"近 N 天"。
     """
 
     gid = int(group_id)
@@ -167,19 +199,32 @@ async def collect_quality(
     confidence_threshold = (
         MARGINAL_CONFIDENCE if high_threshold is None else float(high_threshold)
     )
-    utc_since = _utc_since(window)
+    utc_since = (
+        window_start - timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
+        if window_start is not None
+        else _utc_since(window)
+    )
+    utc_until = (
+        window_end - timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
+        if window_end is not None
+        else None
+    )
 
     total = (
         await session.execute(
             select(func.count())
             .select_from(Violation)
-            .where(Violation.group_id == gid, Violation.created_at >= utc_since)
+            .where(
+                Violation.group_id == gid,
+                Violation.created_at >= utc_since,
+                *_until(Violation.created_at, utc_until),
+            )
         )
     ).scalar() or 0
 
     action_rows = await session.execute(
         select(Violation.action_taken, func.count())
-        .where(Violation.group_id == gid, Violation.created_at >= utc_since)
+        .where(Violation.group_id == gid, Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until))
         .group_by(Violation.action_taken)
     )
     by_action = {str(action or "?"): int(count) for action, count in action_rows.all()}
@@ -187,7 +232,7 @@ async def collect_quality(
     members = (
         await session.execute(
             select(func.count(func.distinct(Violation.user_id))).where(
-                Violation.group_id == gid, Violation.created_at >= utc_since
+                Violation.group_id == gid, Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until)
             )
         )
     ).scalar() or 0
@@ -237,7 +282,7 @@ async def collect_quality(
                     )
                 ),
             ).where(
-                Violation.group_id == gid, Violation.created_at >= utc_since
+                Violation.group_id == gid, Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until)
             )
         )
     ).one()
@@ -253,7 +298,7 @@ async def collect_quality(
         band_rows = await session.execute(
             select(Violation.confidence).where(
                 Violation.group_id == gid,
-                Violation.created_at >= utc_since,
+                Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until),
                 Violation.confidence.isnot(None),
             )
         )
@@ -263,7 +308,7 @@ async def collect_quality(
     labels = await _rule_labels(session, gid)
     rule_rows = await session.execute(
         select(Violation.rule_id, func.count())
-        .where(Violation.group_id == gid, Violation.created_at >= utc_since)
+        .where(Violation.group_id == gid, Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until))
         .group_by(Violation.rule_id)
         .order_by(func.count().desc())
         .limit(4)
@@ -285,7 +330,7 @@ async def collect_quality(
                         select(Violation.user_id)
                         .where(
                             Violation.group_id == gid,
-                            Violation.created_at >= utc_since,
+                            Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until),
                         )
                         .group_by(Violation.user_id)
                         .having(func.count() > 1)
@@ -300,7 +345,7 @@ async def collect_quality(
         select(Violation.verdict_reason, func.count())
         .where(
             Violation.group_id == gid,
-            Violation.created_at >= utc_since,
+            Violation.created_at >= utc_since, *_until(Violation.created_at, utc_until),
             Violation.verdict_reason != "",
         )
         .group_by(Violation.verdict_reason)
@@ -314,7 +359,7 @@ async def collect_quality(
         .where(
             BanAuditEvent.group_id == gid,
             BanAuditEvent.action == "clear",
-            BanAuditEvent.created_at >= utc_since,
+            BanAuditEvent.created_at >= utc_since, *_until(BanAuditEvent.created_at, utc_until),
         )
         .group_by(BanAuditEvent.source)
     )
@@ -325,7 +370,7 @@ async def collect_quality(
         .where(
             BanAuditEvent.group_id == gid,
             BanAuditEvent.action == "ban",
-            BanAuditEvent.created_at >= utc_since,
+            BanAuditEvent.created_at >= utc_since, *_until(BanAuditEvent.created_at, utc_until),
         )
         .group_by(BanAuditEvent.source)
     )
@@ -363,18 +408,30 @@ async def collect_quality(
         confidence_bands=bands,
         high_confidence_hits=int(high_hits),
         high_confidence_threshold=confidence_threshold,
+        window_label=window_label,
     )
 
 
 async def collect_activity(
-    session: AsyncSession, *, group_id: int, days: int = 7
+    session: AsyncSession,
+    *,
+    group_id: int,
+    days: int = 7,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    window_label: str = "",
 ) -> ActivitySummary:
     """窗口内的活跃度：消息量、发言人数、签到与积分。"""
 
     gid = int(group_id)
     window = max(1, int(days))
-    local_since = _local_since(window)
-    since_date = _local_since_date(window)
+    local_since = window_start if window_start is not None else _local_since(window)
+    since_date = (
+        window_start.date().isoformat()
+        if window_start is not None
+        else _local_since_date(window)
+    )
+    until_date = window_end.date().isoformat() if window_end is not None else None
 
     messages = (
         await session.execute(
@@ -383,6 +440,7 @@ async def collect_activity(
             .where(
                 GroupMessageArchive.group_id == gid,
                 GroupMessageArchive.sent_at >= local_since,
+                *_until(GroupMessageArchive.sent_at, window_end),
             )
         )
     ).scalar() or 0
@@ -391,6 +449,7 @@ async def collect_activity(
             select(func.count(func.distinct(GroupMessageArchive.sender_id))).where(
                 GroupMessageArchive.group_id == gid,
                 GroupMessageArchive.sent_at >= local_since,
+                *_until(GroupMessageArchive.sent_at, window_end),
             )
         )
     ).scalar() or 0
@@ -405,6 +464,11 @@ async def collect_activity(
         .where(
             MemberCheckin.group_id == gid,
             MemberCheckin.checkin_date >= since_date,
+            *(
+                (MemberCheckin.checkin_date <= until_date,)
+                if until_date is not None
+                else ()
+            ),
         )
     )
     checkin_count, checkin_members, points_awarded = checkin_rows.one()
@@ -417,6 +481,11 @@ async def collect_activity(
         .where(
             MemberCheckin.group_id == gid,
             MemberCheckin.checkin_date >= since_date,
+            *(
+                (MemberCheckin.checkin_date <= until_date,)
+                if until_date is not None
+                else ()
+            ),
         )
         .group_by(MemberCheckin.user_id)
         .subquery()
@@ -459,6 +528,7 @@ async def collect_activity(
         checkin_members=int(checkin_members or 0),
         points_awarded=int(points_awarded or 0),
         top_members=top_members,
+        window_label=window_label,
     )
 
 
@@ -492,7 +562,11 @@ def render_quality_report(
     这里只负责排版，不重复统计也不发奖。
     """
 
-    title = f"审核质量 · 近 {quality.days} 天"
+    title = (
+        f"审核质量 · {quality.window_label}"
+        if quality.window_label
+        else f"审核质量 · 近 {quality.days} 天"
+    )
     lines: list[str] = []
     if quality.total <= 0:
         lines.append("本期没有任何审核命中。")
@@ -555,7 +629,10 @@ def render_quality_report(
         lines.append(f"{ban_text}｜待完成质询 {quality.pending_challenges} 个")
     if activity is not None:
         lines.append("")
-        lines.append(f"【群活跃 · 近 {activity.days} 天】")
+        if activity.window_label:
+            lines.append(f"【群活跃 · {activity.window_label}】")
+        else:
+            lines.append(f"【群活跃 · 近 {activity.days} 天】")
         lines.append(
             f"消息 <b>{activity.messages}</b> 条｜发言成员 <b>{activity.senders}</b> 人"
         )
@@ -583,16 +660,40 @@ async def render_group_quality(
     days: int = 7,
     activity_lines: Sequence[str] | None = None,
     high_threshold: float | None = None,
+    week_start: date | None = None,
+    week_end: date | None = None,
 ) -> str:
-    """一次取齐并渲染（命令与周报共用）。"""
+    """一次取齐并渲染（命令与周报共用）。
 
+    ``week_start``/``week_end``（含首尾日期）给出**上一完整业务周**时，主统计就按
+    这个精确边界统计，标题也换成真实日期范围——周报不再拿"近 N 天"滚动窗口冒充
+    完整周；``days`` 只在没有给业务周时（命令/管理面板的临时查看）生效。
+    """
+
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    window_label = ""
+    if week_start is not None and week_end is not None:
+        window_start, window_end, window_label = business_week_window(
+            week_start, week_end
+        )
     quality = await collect_quality(
         session,
         group_id=group_id,
         days=days,
         high_threshold=high_threshold,
+        window_start=window_start,
+        window_end=window_end,
+        window_label=window_label,
     )
-    activity = await collect_activity(session, group_id=group_id, days=days)
+    activity = await collect_activity(
+        session,
+        group_id=group_id,
+        days=days,
+        window_start=window_start,
+        window_end=window_end,
+        window_label=window_label,
+    )
     return render_quality_report(quality, activity, activity_lines=activity_lines)
 
 

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import func, select
 from sqlalchemy import create_engine, inspect
 
@@ -1839,7 +1839,14 @@ class ExpirySweepTests(_DbTestCase):
         await self._seed_entitlement(
             kind=KIND_TAG, payload="摸鱼冠军", expires_at=_day(-1)
         )
-        bot = FakeBot(private_error=RuntimeError("bot was blocked by the user"))
+        # 真实 aiogram 明确拒收类型：普通 RuntimeError 里带拒绝文本已经不再被
+        # 当作明确拒收（返工 v3 的 R1 收紧），只修 fixture 真实性，断言不变。
+        bot = FakeBot(
+            private_error=TelegramForbiddenError(
+                method=SimpleNamespace(chat_id=7, text="x"),
+                message="Forbidden: bot was blocked by the user",
+            )
+        )
 
         await self._sweep(bot)
 

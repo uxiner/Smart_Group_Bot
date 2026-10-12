@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.utils.timezone import now_shanghai_naive
+from bot.utils.message_links import MEMBER_ONLY_LINK_KIND, message_link
 from bot.db.models import Admin, AuthorizedGroup, Group, GroupMember
 from bot.services.moderation_context import build_moderation_context
 from bot.services.authz import (
@@ -43,13 +44,43 @@ from bot.services.authz import (
 from bot.services import memory_holder
 # 第 4 期：长期记忆（/memory 命令的读写都走这个服务，命令层只做渲染与权限）
 from bot.services.long_term_memory import (
+    CONFLICT_DUPLICATE,
+    CONFLICT_EXPIRED,
+    CONFLICT_GONE,
+    CONFLICT_NOT_VISIBLE,
+    CONFLICT_OPTOUT,
+    CONFLICT_REVISION,
+    CONFLICT_TOMBSTONE,
+    CORRECTION_CONFLICT,
+    CORRECTION_CORRECTED,
+    CORRECTION_OPERATOR_SELF,
+    CORRECTION_UNCHANGED,
+    CORRECTION_UNCONFIRMED,
+    REASON_BAD_ARGUMENT,
+    REASON_EMPTY,
+    REASON_SENSITIVE,
+    REASON_TOO_LONG,
+    SOURCE_PASSIVE,
+    SOURCE_TOOL,
+    MemorySessionCleanupUnsafeError,
     clear_optout,
+    clear_optout_outcome,
+    correct_fact,
     list_facts_about_user_in_group,
     list_facts_for_user,
     list_group_facts,
     memory_facts_enabled,
     set_optout,
-    soft_delete_fact,
+    set_optout_outcome,
+    soft_delete_fact_outcome,
+)
+# C3：来源回链只认「本群现存归档」——归档核验与原文展开共用同一个现读实现
+from bot.services.memory_source import archive_threads
+# B2：删除证据核对与审核线共用同一实现（只读、有界，不会为了「零新增查询」放弃删除保护）
+from bot.services.memory import (
+    PM_DELETE_DELETED,
+    PM_DELETE_NO_CHANGE,
+    disposed_message_ids,
 )
 from bot.services.checkin import (
     challenge_skip_cost,
@@ -2219,28 +2250,69 @@ async def on_memory_delete(
         await callback.answer("参数错误", show_alert=True)
         return
 
-    deleted = await memory_holder.get().delete_permanent_memory(msg.chat.id, f"#{memory_id}")
-    if not deleted:
-        await callback.answer("记忆不存在或已删除", show_alert=True)
-        return
-
-    items = await memory_holder.get().list_permanent_memories(msg.chat.id, limit=200)
-    if not items:
-        await msg.edit_text(
-            render_data_brief("永久记忆", empty="当前没有保存的永久记忆。"),
-            reply_markup=None,
-        )
-        await callback.answer(f"已删除记忆 #{memory_id}")
-        return
-
-    total_pages = max(1, (len(items) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
-    page = min(max(page_hint, 0), total_pages - 1)
-    text, keyboard = _build_memory_list_page(items, page=page)
     try:
-        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
-    except Exception:
-        await callback.answer("删除成功，但列表刷新失败，请重试 /lm", show_alert=True)
+        outcome = await memory_holder.get().delete_permanent_memory_outcome(
+            msg.chat.id, memory_id
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning(
+            "[%s] /lm 删除未确认 | memory_id=%s | reason=%s",
+            msg.chat.id,
+            memory_id,
+            type(exc).__name__,
+        )
+        await callback.answer(MEMORY_DELETE_UNCONFIRMED_TEXT, show_alert=True)
         return
+
+    # 三态必须分开：未确认 ≠ 确认零变更 ≠ 确认已删除。非法/异常形状一律保守按未确认；
+    # 绝不用「不是已确认删除 ⇒ 不存在」这种推断，也不靠真值属性组合猜结局。
+    try:
+        verdict = _classify_memory_delete_outcome(outcome)
+    except Exception:  # pragma: no cover - 分类函数自身故障也必须回一条未确认
+        verdict = None
+    if verdict is None:
+        log.warning(
+            "[%s] /lm 删除未确认 | memory_id=%s | reason=%s",
+            msg.chat.id,
+            memory_id,
+            _memory_delete_outcome_reason(outcome),
+        )
+        await callback.answer(MEMORY_DELETE_UNCONFIRMED_TEXT, show_alert=True)
+        return
+
+    if verdict == "no_change":
+        await callback.answer(MEMORY_DELETE_NO_CHANGE_TEXT, show_alert=True)
+        return
+
+    try:
+        items = await memory_holder.get().list_permanent_memories(msg.chat.id, limit=200)
+        if not items:
+            await msg.edit_text(
+                render_data_brief("永久记忆", empty="当前没有保存的永久记忆。"),
+                reply_markup=None,
+            )
+        else:
+            total_pages = max(1, (len(items) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+            page = min(max(page_hint, 0), total_pages - 1)
+            text, keyboard = _build_memory_list_page(items, page=page)
+            await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning(
+            "[%s] /lm 列表刷新失败 | memory_id=%s | reason=%s",
+            msg.chat.id,
+            memory_id,
+            type(exc).__name__,
+        )
+        await callback.answer(
+            MEMORY_DELETE_REFRESH_FAILED_TEXT.format(memory_id=memory_id),
+            show_alert=True,
+        )
+        return
+
     await callback.answer(f"已删除记忆 #{memory_id}")
 
 
@@ -3279,6 +3351,75 @@ async def cmd_me(
     await _answer(message, settings, _render_member_profile(profile))
 
 
+@dataclass(frozen=True)
+class _SourceLinkCheck:
+    """来源回链核验结果：已核实删除的消息 + 这一次核验是否可用。
+
+    ``deleted`` 只放**已有真实处置证据**的消息 id；``verified`` 为 False 表示这一
+    次没能查动证据（未知，不是"已删除"）。两者必须分开，否则回执会把"查不出来"
+    谎报成"已被审核删除"。
+    """
+
+    deleted: frozenset[int] = frozenset()
+    verified: bool = True
+
+
+async def _check_source_links(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    message_ids: set[int],
+) -> _SourceLinkCheck:
+    """这批来源消息里哪些**不能**给回链，以及这一次核验到底可不可用。
+
+    只有查得到"这条来源已被审核删除"的真实证据时才认定已删除；查不到／查不动证据
+    时按"不可链接"处理（fail closed）——链接不是删除过滤的豁免，宁可少给一条链接，
+    也不给一条指向已被删除内容的链接。但"核验失败"只是未知：它**不能**被说成
+    "已被审核删除"，也不做任何真实 Telegram 存活探测。
+    """
+
+    wanted = {int(value) for value in message_ids if int(value or 0) > 0}
+    if not wanted:
+        return _SourceLinkCheck()
+    try:
+        removed = await disposed_message_ids(
+            session, group_id=int(group_id), telegram_message_ids=wanted
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning(
+            "[%s] 来源状态核验失败，本次不提供链接 | count=%d",
+            group_id,
+            len(wanted),
+            exc_info=True,
+        )
+        return _SourceLinkCheck(deleted=frozenset(), verified=False)
+    return _SourceLinkCheck(
+        deleted=frozenset(
+            int(value) for value in removed if int(value or 0) > 0
+        )
+    )
+
+
+def _row_belongs_to_current_group(row: object, group_id: int) -> bool:
+    """召回文档必须**显式**声明它属于当前群，才允许继续谈回链。
+
+    C3：``/find`` 的链接依据不再来自召回缓存里的 ``message_thread_id`` 快照，而是
+    由 :func:`archive_threads` 现读本群归档行。因此这一行必须先证明"身份就是本群"：
+    ``group_id`` 缺失（旧文档/替身）或指向别的群，都**不算**本群证据，一律不给链接；
+    跨群时不区分"缺群身份"和"是他群"，避免泄露他群信息。
+    """
+
+    raw = row.get("group_id") if isinstance(row, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        return int(raw) == int(group_id)
+    except (TypeError, ValueError):
+        return False
+
+
 @router.message(Command("find"))
 async def cmd_find(
     message: Message,
@@ -3347,6 +3488,31 @@ async def cmd_find(
         )
         return
 
+    # B2-1 + C3：来源回链只给「当前群 + 能证明还看得到」的命中。链接不是删除过滤的
+    # 豁免：--all 会把已删除正文照旧显示，但那些命中不给链接。
+    # 双重现读：① 真实处置证据（是否已被审核删除）；② 本群现存归档行（消息是否还在，
+    # 以及可信 thread）。召回文档里的 message_thread_id 只是写入/召回时的快照，**不**
+    # 作为链接依据；thread 只取现读归档行。任一核验失败都 fail-closed。
+    current_group_id = int(message.chat.id)
+    link_candidates: set[int] = set()
+    for row in hits:
+        if not _row_belongs_to_current_group(row, current_group_id):
+            continue
+        candidate = int(row.get("telegram_message_id") or 0)
+        if candidate > 0:
+            link_candidates.add(candidate)
+    link_check = await _check_source_links(
+        session, group_id=current_group_id, message_ids=link_candidates
+    )
+    archive = await archive_threads(
+        session, group_id=current_group_id, message_ids=link_candidates
+    )
+    member_only_link = False
+    missing_link = False
+    missing_archive_link = False
+    suppressed_link = False
+    unverified_link = False
+    foreign_link = False
     lines = [f"<b>群内搜索</b> · 「{html.escape(query)}」"]
     for index, row in enumerate(hits, start=1):
         content = " ".join(
@@ -3364,16 +3530,66 @@ async def cmd_find(
             or row.get("sender_username")
             or "未知"
         )
-        lines.append(f"{index}. <code>{when}</code> {html.escape(who)}：{html.escape(body)}")
-    lines.append(
+        message_id = int(row.get("telegram_message_id") or 0)
+        # C3：先证明这一行就是本群，再用现读归档行取 thread；缺失/跨群一律不给链接。
+        belongs = _row_belongs_to_current_group(row, current_group_id)
+        url, kind = "", ""
+        if belongs and message_id > 0:
+            if message_id in link_check.deleted:
+                suppressed_link = True
+            elif archive is None:
+                # 现读归档失败 = 未知，不能说成"已被删除"，也不能给链接
+                unverified_link = True
+            elif message_id not in archive:
+                missing_archive_link = True
+            elif not link_check.verified:
+                # 核验失败只是"未知"：不发链接，但也不说它已被删除
+                unverified_link = True
+            else:
+                url, kind = message_link(
+                    message.chat, message_id, archive.get(message_id)
+                )
+                if not url:
+                    # 基础群没有公开回链形状（消息 id 与归档都正常）
+                    missing_link = True
+        elif row.get("group_id") is None or isinstance(row.get("group_id"), bool):
+            # 缺群身份：无法证明是本群，按"无法核验"处理（不泄露任何群信息）
+            unverified_link = True
+        elif not belongs:
+            foreign_link = True
+        else:
+            missing_link = True
+        suffix = ""
+        if url:
+            suffix = f' · <a href="{html.escape(url, quote=True)}">查看原消息</a>'
+            if kind == MEMBER_ONLY_LINK_KIND:
+                member_only_link = True
+                suffix += "（仅群成员可用）"
+        lines.append(
+            f"{index}. <code>{when}</code> {html.escape(who)}：{html.escape(body)}{suffix}"
+        )
+    footer = [
         "\n<i>最多列出 5 条，按相关度排序。"
         + (
             "已包含被审核删除的消息（管理员审计口径）。"
             if include_disposed
             else "已排除被审核删除的消息。"
         )
-        + "</i>"
-    )
+    ]
+    if suppressed_link:
+        footer.append("已被审核删除的来源不提供链接。")
+    if unverified_link:
+        footer.append("来源状态暂无法核验，本次不提供链接。")
+    if missing_archive_link:
+        footer.append("来源消息已不在本群归档中，不提供链接。")
+    if foreign_link:
+        footer.append("来源归档不属于当前群，本次不提供链接。")
+    if member_only_link:
+        footer.append("私有超级群的 t.me/c 链接仅群成员可用。")
+    if missing_link:
+        footer.append("部分条目没有链接：普通群没有公开回链，或该条缺少消息 id。")
+    footer.append("</i>")
+    lines.append("".join(footer))
     await _answer(message, settings, "\n".join(lines), disable_web_page_preview=True)
 
 
@@ -3394,6 +3610,162 @@ _MEMORY_CATEGORY_LABELS = {
 }
 
 _MEMORY_SCOPE_LABELS = {"group": "群内", "private": "私聊"}
+#: 事实的写入方式（B2-2）；未知取值不会被硬塞进这两个标签里。
+_MEMORY_SOURCE_KIND_LABELS = {
+    SOURCE_PASSIVE: "自动提炼",
+    SOURCE_TOOL: "模型写入",
+}
+
+#: B4：写失败时的回执（**未确认成功** ≠ 没有生效）。
+#: 契约：`*_outcome(...).committed` 为假只说明「这次没能确认成功」，绝不断言
+#: 「没有发生持久化变化」—— commit 可能已经真的成功、随后才抛错/被取消。
+#: 文案不回显异常、SQL、个人或群标识、事实正文，也不自动重试。
+MEMORY_OFF_UNCONFIRMED_TEXT = (
+    "<b>未能确认关闭长期记忆</b>\n"
+    "这次操作未能确认成功，请稍后重试 /memory off；如果持续失败，请联系机器人维护者。"
+)
+MEMORY_ON_UNCONFIRMED_TEXT = (
+    "<b>未能确认重新打开长期记忆</b>\n"
+    "这次操作未能确认成功，请稍后重试 /memory on；如果持续失败，请联系机器人维护者。"
+)
+
+#: B5：``/memory forget`` 的三条确定文案（单条删除另有软删/no-op 语义）。
+#: * 未确认成功——commit 可能**已经落库**再抛错，所以只说「未能确认」，
+#:   绝不断言「没有生效 / 没有被删除」；不自动重试，指引重新查看列表。
+#: * 已确认成功且有变更——单条删除是**软删**，不说「彻底删除 / 无残留 / 永不再记」。
+#: * 已确认成功但零命中——零命中可能是已经删过、行不存在或已被并发删除，
+#:   本层不做额外查询去区分，因此只给统一的安全 no-op 文案。
+MEMORY_FORGET_UNCONFIRMED_TEXT = (
+    "<b>未能确认这条长期记忆是否已标记删除</b>\n"
+    "这次操作未能确认成功，请使用 /memory 重新查看；如果持续失败，请联系机器人维护者。"
+)
+MEMORY_FORGET_FORGOTTEN_TEXT = "已标记删除这条长期记忆。"
+MEMORY_FORGET_UNCHANGED_TEXT = (
+    "未改动这条长期记忆；记录可能已删除或已不可用。请使用 /memory 重新查看。"
+)
+
+#: C3：``/memory fix <ID> <新内容>`` 的确定文案。
+#: * 单条回执**只给稳定 ID / 修订号与结论**，不回显正文，也不广播来源原文或他人信息；
+#: * 冲突（并发改过 / 墓碑 / 同文重名）不自动重试、不静默合并，指引重新查看；
+#: * 未确认成功——commit 可能**已经落库**再抛错，所以只说「未能确认」，绝不断言"没有生效"。
+MEMORY_FIX_USAGE_TEXT = (
+    "用法：<code>/memory fix &lt;ID&gt; &lt;新内容&gt;</code>\n"
+    "ID 是 /memory 列表里每条后面的稳定 ID（不是 #编号）。"
+    "只改这条记忆的正文；聊天原文与来源关系保持不动。"
+)
+MEMORY_FIX_UNCONFIRMED_TEXT = (
+    "<b>未能确认这次修改是否已生效</b>\n"
+    "这次操作未能确认成功，请使用 /memory 重新查看这条记忆的最新内容；"
+    "不要重复提交，如果持续失败请联系机器人维护者。"
+)
+MEMORY_FIX_CONFLICT_TEXT = (
+    "<b>这次修改没有生效</b>\n"
+    "这条记忆在你查看之后又变了（可能已被再次确认、纠错、删除或到期）。"
+    "请使用 /memory 重新查看最新内容后再改；草稿请自行保留。"
+)
+MEMORY_FIX_TOMBSTONE_TEXT = (
+    "<b>这次修改没有生效</b>\n"
+    "同样的内容已经有一条被删除/被替换的记录，不能靠修改把它复活。"
+    "请换一个说法，或先 /memory 查看现状。"
+)
+MEMORY_FIX_DUPLICATE_TEXT = (
+    "<b>这次修改没有生效</b>\n"
+    "已经有一条内容相同的记忆了，本次不合并、不新建。请 /memory 查看现状。"
+)
+MEMORY_FIX_DENIED_TEXT = (
+    "没有找到这个 ID，或者你没有权限修改这条"
+    "（只能改关于你本人的；群管理员请在本群管理面板里改）。"
+)
+MEMORY_FIX_CORRECTED_TEXT = (
+    "已按你的修改更新这条长期记忆（新 ID {fact_id} · 修订 {revision}）。\n"
+    "<i>旧版本已标记为被替换并保留审计记录；聊天原文与来源关系没有被改动，"
+    "这条新正文标为人工纠错，不代表来源原话。</i>"
+)
+MEMORY_FIX_UNCHANGED_TEXT = "内容没有变化，这次没有改动任何记忆。"
+_MEMORY_FIX_INVALID_TEXTS = {
+    REASON_EMPTY: "新内容不能是空的。",
+    REASON_TOO_LONG: "新内容太长了（一条长期记忆最多 200 个字）。",
+    REASON_SENSITIVE: (
+        "新内容里含有敏感信息（密码、证件号、银行卡、长数字串等），"
+        "不能写进长期记忆。"
+    ),
+    REASON_BAD_ARGUMENT: MEMORY_FIX_USAGE_TEXT,
+}
+
+
+def _strict_memory_id(value: object) -> int | None:
+    """``/memory fix`` 的 ID 解析：只接受十进制正整数串（``01``/``+1``/``1.0`` 都不算）。
+
+    命令参数是文本，所以这里按**字面**校验（不走 ``int()`` 的宽松转换），避免
+    ``bool``/``float``/空白/全角数字被静默截断成某个 ID。
+    """
+
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        return None
+    return int(raw)
+
+#: B6：``/lm`` 单条群永久备忘删除按钮的三条确定文案。
+#: * 未确认成功——``commit`` wrapper 可能**已经真的落库**再抛错，所以只说「未能确认」，
+#:   绝不断言「没有生效 / 未删除」；不自动重试，也不刷新列表，指引重新查看。
+#: * 已确认零变更——零命中可能是本来就不存在、已经删过、或属于别的群；
+#:   本层不做额外查询去区分，保持既有文案以免跨群泄漏存在性。
+#: * 已确认删除但列表刷新失败——删除**已经持久生效**，所以先如实说已删除，
+#:   再说刷新失败、请重新查看；不能说成「删除成功，请重试」。
+MEMORY_DELETE_UNCONFIRMED_TEXT = "未能确认这条群永久备忘是否已删除。请重新 /lm 查看。"
+MEMORY_DELETE_NO_CHANGE_TEXT = "记忆不存在或已删除"
+MEMORY_DELETE_REFRESH_FAILED_TEXT = (
+    "记忆 #{memory_id} 已删除，但列表刷新失败，请重新 /lm 查看。"
+)
+
+
+#: 日志只允许这几类固定原因码；绝不把 outcome.detail 里的任意原文写进日志。
+_MEMORY_DELETE_OUTCOME_REASONS = frozenset(
+    {
+        "invalid_target",
+        "execute_failed",
+        "commit_failed",
+        "rowcount_unknown",
+        "cleanup_failed",
+    }
+)
+
+
+def _memory_delete_outcome_reason(outcome: object) -> str:
+    """把任意形状的结果压成一个**固定**原因码，绝不输出原始 ``detail`` 文本。"""
+
+    if outcome is None:
+        return "missing_outcome"
+    try:
+        detail = getattr(outcome, "detail", "")
+    except Exception:  # pragma: no cover - 属性抛错的替身
+        return "unexpected_outcome"
+    if isinstance(detail, str) and detail in _MEMORY_DELETE_OUTCOME_REASONS:
+        return detail
+    return "unexpected_outcome"
+
+
+def _classify_memory_delete_outcome(outcome: object) -> str | None:
+    """把服务返回的删除结果严格归类；任何不符形状一律返回 ``None``（未确认）。
+
+    只认**字段相容性**，不靠 ``confirmed_deleted`` / ``confirmed_no_change`` 这类真值
+    属性猜结局：父代理已证明 ``DTO('deleted', 0)`` 与 ``DTO('no_change', 1)`` 会被属性
+    组合误认成「已确认」。未知对象、缺字段、属性读取抛错、矛盾取值、``bool`` 或浮点计数
+    一律按未确认处理，且本函数自身绝不抛错——它抛错也要变成「一次未确认回执」。
+    """
+
+    try:
+        status = getattr(outcome, "status", None)
+        changed_rows = getattr(outcome, "changed_rows", None)
+    except Exception:  # pragma: no cover - 属性抛错的替身
+        return None
+    if isinstance(changed_rows, bool) or not isinstance(changed_rows, int):
+        return None
+    if status == PM_DELETE_DELETED:
+        return "deleted" if changed_rows == 1 else None
+    if status == PM_DELETE_NO_CHANGE:
+        return "no_change" if changed_rows == 0 else None
+    return None
 
 
 async def _schedule_memory_command_cleanup(message: Message, group_id: int) -> None:
@@ -3416,13 +3788,117 @@ async def _schedule_memory_command_cleanup(message: Message, group_id: int) -> N
         )
 
 
+@dataclass(frozen=True)
+class _MemoryLinkContext:
+    """``/memory`` 渲染「最近确认 / 写入方式 / 来源」所需的只读上下文。
+
+    ``chat`` 是**当前群的 chat 对象**（不额外 get_chat、不解析其它群的用户名）；
+    ``unlinkable`` 是已核验「已被审核删除、不能给链接」的来源 message id；
+    ``verified`` 为 False 表示这一次核验没能查动证据（未知，不是已删除）。
+    ``archive`` 是本次**现读**本群归档的结果：``{message_id: 可信 thread or None}``；
+    ``None`` 表示归档核验失败（未知，同样不给链接）。只有 ``message_id in archive``
+    才证明来源消息**现在**还在本群归档里；写入时存下的 ``source_thread_id`` 不算证据。
+    """
+
+    chat: object
+    group_id: int
+    unlinkable: frozenset[int]
+    verified: bool = True
+    archive: dict[int, int | None] | None = None
+
+    def entry_notes(self, record: dict) -> list[str]:
+        """一条事实的补充说明；给不出链接时说明原因，不猜。
+
+        只对**当前群**的 group 事实生效：其它 scope（私聊、别的群）保持原有列表
+        显示，不在当前群新增来源链接或来源元数据。
+        """
+
+        scope = str(record.get("scope") or "group")
+        scope_id = int(record.get("scope_id") or 0)
+        if scope != "group" or scope_id != int(self.group_id):
+            return []
+        parts: list[str] = []
+        last_confirmed = record.get("last_confirmed_at")
+        if last_confirmed is not None:
+            parts.append(f"最近确认 {last_confirmed.strftime('%Y-%m-%d')}")
+        source_kind = str(record.get("source_kind") or "").strip().lower()
+        kind_label = _MEMORY_SOURCE_KIND_LABELS.get(source_kind)
+        if kind_label:
+            parts.append(f"写入方式 {kind_label}")
+        elif source_kind:
+            # 未知取值：如实标出原始类型，但只作为**文本**（转义后）显示，
+            # 绝不让库里的任意字符串变成可点击 HTML 或任意 URL。
+            parts.append(f"来源类型 {html.escape(source_kind)}")
+        source_message_id = int(record.get("source_message_id") or 0)
+        if source_message_id <= 0:
+            parts.append("来源消息未记录，不提供链接")
+            return parts
+        if self.archive is None:
+            # 归档核验失败只是"未知"：不给链接，也不能说它已被删除或不存在。
+            parts.append("来源归档状态暂无法核验，本次不提供链接")
+            return parts
+        if source_message_id in self.unlinkable:
+            parts.append("来源消息已被审核删除，不提供链接")
+            return parts
+        if source_message_id not in self.archive:
+            parts.append("来源消息已不在本群归档中，不提供链接")
+            return parts
+        if not self.verified:
+            # 核验失败只是"未知"：不给链接，但不能说它已被删除
+            parts.append("来源状态暂无法核验，本次不提供链接")
+            return parts
+        # thread 只取**这条现存归档行**里的可信值；旧行里的 stored thread 不作数。
+        url, kind = message_link(
+            self.chat, source_message_id, self.archive.get(source_message_id)
+        )
+        if not url:
+            parts.append("本群没有可用的消息回链")
+            return parts
+        suffix = "（仅群成员可用）" if kind == MEMBER_ONLY_LINK_KIND else ""
+        parts.append(
+            f'<a href="{html.escape(url, quote=True)}">查看来源消息</a>{suffix}'
+        )
+        return parts
+
+
+async def _memory_link_context(
+    message: Message,
+    session: AsyncSession,
+    records: list[dict],
+) -> _MemoryLinkContext:
+    """核验当前群 group 事实的来源：现存归档 + 删除证据（有界、只读、不跨群）。"""
+
+    group_id = int(message.chat.id)
+    source_ids = {
+        int(record.get("source_message_id") or 0)
+        for record in records
+        if str(record.get("scope") or "group") == "group"
+        and int(record.get("scope_id") or 0) == group_id
+    }
+    source_ids.discard(0)
+    link_check = await _check_source_links(
+        session, group_id=group_id, message_ids=source_ids
+    )
+    archive = await archive_threads(
+        session, group_id=group_id, message_ids=source_ids
+    )
+    return _MemoryLinkContext(
+        chat=message.chat,
+        group_id=group_id,
+        unlinkable=frozenset(int(value) for value in link_check.deleted),
+        verified=link_check.verified,
+        archive=archive,
+    )
+
+
 def _memory_record_lines(
     records: list[dict],
     *,
     start_index: int,
     titles: dict[int, str] | None = None,
+    link_context: _MemoryLinkContext | None = None,
 ) -> list[str]:
-    """把若干条事实渲染成「编号 + 类别 + 时间 + 确认次数 + 正文」。"""
+    """把若干条事实渲染成「编号 + 类别 + 时间 + 确认次数 + 正文（+ 来源行）」。"""
 
     lines: list[str] = []
     label_map = titles or {}
@@ -3440,10 +3916,22 @@ def _memory_record_lines(
         first_seen = record.get("first_seen_at")
         when = first_seen.strftime("%Y-%m-%d") if first_seen is not None else "时间未知"
         body = str(record.get("fact_text") or "")
+        detail = f"　　{html.escape(body)}"
+        if bool(record.get("corrected")):
+            # C3：人工纠错过的正文必须自己说出来，不能让人误以为是来源原话。
+            detail = f"{detail}\n　　<i>（人工纠错：这条正文由人工修改，非来源消息原文）</i>"
+        if link_context is not None:
+            notes = link_context.entry_notes(record)
+            if notes:
+                detail = f"{detail}\n　　{' · '.join(notes)}"
+        # C3：列表同时给出**稳定 ID**（改这条要用它，而不是会变动的 #编号）。
+        stable_id = int(record.get("id") or 0)
+        revision = int(record.get("revision") or 1)
         lines.append(
-            f"<b>#{number}</b> · {html.escape(category)} · {html.escape(where)} · "
+            f"<b>#{number}</b>（ID {stable_id} · 修订 {revision}） · "
+            f"{html.escape(category)} · {html.escape(where)} · "
             f"{html.escape(when)} · 已确认 {int(record.get('confirm_count') or 1)} 次\n"
-            f"　　{html.escape(body)}"
+            f"{detail}"
         )
     return lines
 
@@ -3455,6 +3943,7 @@ def _render_memory_receipt(
     page_size: int = MEMORY_PAGE_SIZE,
     header: str = "机器人记得我的事",
     group_titles: dict[int, str] | None = None,
+    link_context: _MemoryLinkContext | None = None,
 ) -> str:
     """``/memory`` 的回执（分页；编号是**全局序号**，跟 /memory forget 对齐）。"""
 
@@ -3471,9 +3960,18 @@ def _render_memory_receipt(
         )
     lines = [
         f"<b>{html.escape(header)}</b>（第 {current}/{pages} 页，共 {total} 条）",
-        *_memory_record_lines(chunk, start_index=start + 1, titles=group_titles),
+        *_memory_record_lines(
+            chunk,
+            start_index=start + 1,
+            titles=group_titles,
+            link_context=link_context,
+        ),
         "",
         "<i>/memory forget &lt;编号&gt; 删除一条；/memory off 关掉长期记忆。</i>",
+        "<i>编号是列表里的全局序号（跨页连续，跟 forget 对齐）：只能删关于你本人的，"
+        "群管理员可以删本群任意一条。编号不存在或无权操作时，回执口径相同。</i>",
+        "<i>改一条：/memory fix &lt;ID&gt; &lt;新内容&gt;（用列表里的稳定 ID，不是 #编号）。"
+        "修改只影响这条记忆的正文，聊天原文与来源关系保持不动。</i>",
     ]
     if pages > 1:
         lines.append(
@@ -3568,34 +4066,116 @@ async def cmd_memory(
     if action in ("off", "on"):
         await _schedule_memory_command_cleanup(message, group_id)
         if action == "off":
-            removed = await set_optout(session, user_id, reason="/memory off")
+            # B4：只有**确认 commit 成功**才发成功回执。`committed` 为假时
+            # 不断言「没有生效」（commit 可能已成功、随后才抛错/被取消）。
+            try:
+                outcome = await set_optout_outcome(
+                    session, user_id, reason="/memory off"
+                )
+            except MemorySessionCleanupUnsafeError:
+                # 事务没能提交，而且服务无法证明残留已被丢弃。正常 return 会让
+                # DbSessionMiddleware 在 handler 返回后补一次 commit，把残留真的写进
+                # 库。所以：先发固定失败回执（不含异常文本），再**原样上抛**，让
+                # 中间件跳过补偿 commit。
+                log.warning(
+                    "[%s] /memory off | user=%s | cleanup_unsafe=true", group_id, user_id
+                )
+                await _answer(
+                    message,
+                    settings,
+                    MEMORY_OFF_UNCONFIRMED_TEXT,
+                    auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+                )
+                raise
             log.info(
-                "[%s] /memory off | user=%s | soft_deleted=%d",
+                "[%s] /memory off | user=%s | committed=%s | switch_changed=%s"
+                " | facts_soft_deleted=%d",
                 group_id,
                 user_id,
-                removed,
+                outcome.committed,
+                outcome.switch_changed,
+                outcome.facts_soft_deleted,
+            )
+            if not outcome.committed:
+                await _answer(
+                    message,
+                    settings,
+                    MEMORY_OFF_UNCONFIRMED_TEXT,
+                    auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+                )
+                return
+            if outcome.changed:
+                # 条数只算「被软删的事实」，**不含**开关行本身的新建/更新。
+                body = (
+                    "<b>已关闭长期记忆</b>\n"
+                    f"关于你在所有群与私聊里的 "
+                    f"{outcome.facts_soft_deleted} 条长期事实已标记删除。\n"
+                    "这个开关是全局的；不删除聊天原文归档、群摘要、联网检索留档"
+                    "或群永久备忘。\n"
+                    "<i>想重新打开用 /memory on（已标记删除的事实不会恢复）。</i>"
+                )
+            else:
+                # 幂等重试 / 本来就没有记录：确认成功，但**不声称**新增了删除。
+                body = (
+                    "<b>已关闭长期记忆</b>\n"
+                    "这次没有新的记录被删除（此前已经关闭过，或者本来就没有"
+                    "关于你的记录）。\n"
+                    "这个开关是全局的；不删除聊天原文归档、群摘要、联网检索留档"
+                    "或群永久备忘。\n"
+                    "<i>想重新打开用 /memory on（已标记删除的事实不会恢复）。</i>"
+                )
+            await _answer(
+                message,
+                settings,
+                body,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        try:
+            on_outcome = await clear_optout_outcome(session, user_id)
+        except MemorySessionCleanupUnsafeError:
+            # 同 off 分支：先发固定失败回执，再原样上抛，阻断中间件的补偿 commit。
+            log.warning(
+                "[%s] /memory on | user=%s | cleanup_unsafe=true", group_id, user_id
             )
             await _answer(
                 message,
                 settings,
-                "<b>已关闭长期记忆</b>\n"
-                f"关于你的 {removed} 条记录已经删除，以后也不会再从你的消息里提炼。\n"
-                "<i>想重新打开用 /memory on（已经删掉的不会恢复）。</i>",
+                MEMORY_ON_UNCONFIRMED_TEXT,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            raise
+        log.info(
+            "[%s] /memory on | user=%s | committed=%s | switch_changed=%s",
+            group_id,
+            user_id,
+            on_outcome.committed,
+            on_outcome.switch_changed,
+        )
+        if not on_outcome.committed:
+            await _answer(
+                message,
+                settings,
+                MEMORY_ON_UNCONFIRMED_TEXT,
                 auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
             )
             return
-        restored = await clear_optout(session, user_id)
-        log.info(
-            "[%s] /memory on | user=%s | had_optout=%s",
-            group_id,
-            user_id,
-            restored,
-        )
+        if on_outcome.switch_changed:
+            on_body = (
+                "<b>已重新打开长期记忆</b>\n"
+                "以后会重新从你的消息里提炼（之前删掉的事实不会恢复）。"
+            )
+        else:
+            # 个人表里本来就没有关闭标记：**不得**据此宣称全局总开关是开的。
+            on_body = (
+                "<b>已重新打开长期记忆</b>\n"
+                "你的个人记忆关闭标记已清除（此前也没有关闭标记）。\n"
+                "是否提炼仍取决于机器人设置；之前删掉的事实不会恢复。"
+            )
         await _answer(
             message,
             settings,
-            "<b>已重新打开长期记忆</b>\n"
-            "以后会重新从你的消息里提炼（之前删掉的事实不会恢复）。",
+            on_body,
             auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
         )
         return
@@ -3630,22 +4210,149 @@ async def cmd_memory(
             await _answer(
                 message,
                 settings,
-                "没有找到这个编号（只能删关于你本人的；群管理员可以删本群任意一条）。",
+                "没有找到这个编号，或者你没有权限删这条"
+                "（只能删关于你本人的；群管理员可以删本群任意一条）。"
+                "编号是 /memory 列表里的全局序号，跨页连续。",
                 auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
             )
             return
-        deleted = await soft_delete_fact(session, int(target["id"]))
+        try:
+            outcome = await soft_delete_fact_outcome(session, int(target["id"]))
+        except MemorySessionCleanupUnsafeError:
+            # 清理失败 ⇒ 残留 DML 仍挂在会话上。先发固定失败回执，再**原样上抛**，
+            # 让 DbSessionMiddleware 不进入补偿 commit（正常 return 会把残留补写）。
+            log.warning(
+                "[%s] /memory forget | user=%s | cleanup_unsafe=true", group_id, user_id
+            )
+            await _answer(
+                message,
+                settings,
+                MEMORY_FORGET_UNCONFIRMED_TEXT,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            raise
         log.info(
-            "[%s] /memory forget | user=%s | fact_id=%s | deleted=%s",
+            "[%s] /memory forget | user=%s | fact_id=%s | committed=%s | facts_soft_deleted=%s",
             group_id,
             user_id,
             target["id"],
-            deleted,
+            outcome.committed,
+            outcome.facts_soft_deleted,
         )
+        if not outcome.committed:
+            body = MEMORY_FORGET_UNCONFIRMED_TEXT
+        elif outcome.facts_soft_deleted > 0:
+            body = MEMORY_FORGET_FORGOTTEN_TEXT
+        else:
+            body = MEMORY_FORGET_UNCHANGED_TEXT
         await _answer(
             message,
             settings,
-            "已删除这条长期记忆。" if deleted else "这条记录已经删过了。",
+            body,
+            auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+        )
+        return
+
+    if action == "fix":
+        # C3：本人自助纠错。命令用**稳定 ID**（不是会变动的 #编号），并且只允许改
+        # 「既有个人权限内、subject 就是本人」的事实——不新增任何跨用户权限。
+        await _schedule_memory_command_cleanup(message, group_id)
+        id_token, _, new_text = rest.partition(" ")
+        fact_id = _strict_memory_id(id_token)
+        new_text = new_text.strip()
+        if fact_id is None or not new_text:
+            await _answer(
+                message,
+                settings,
+                MEMORY_FIX_USAGE_TEXT,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        mine = await list_facts_for_user(session, user_id=user_id)
+        target = next(
+            (record for record in mine if int(record.get("id") or 0) == fact_id), None
+        )
+        if target is None:
+            # 不存在与无权操作给**同一条**回执，不区分、不泄漏他人事实是否存在。
+            await _answer(
+                message,
+                settings,
+                MEMORY_FIX_DENIED_TEXT,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            return
+        try:
+            outcome = await correct_fact(
+                session,
+                scope=str(target.get("scope") or "group"),
+                scope_id=int(target.get("scope_id") or 0),
+                subject_user_id=user_id,
+                fact_id=fact_id,
+                expected_revision=int(target.get("revision") or 1),
+                new_text=new_text,
+                operator_user_id=user_id,
+                operator_kind=CORRECTION_OPERATOR_SELF,
+            )
+        except MemorySessionCleanupUnsafeError:
+            # 清理失败 ⇒ 残留 DML 可能还挂在会话上。先发固定失败回执，再**原样上抛**，
+            # 让 DbSessionMiddleware 不进入补偿 commit（正常 return 会把残留补写）。
+            log.warning(
+                "[%s] /memory fix | user=%s | cleanup_unsafe=true", group_id, user_id
+            )
+            await _answer(
+                message,
+                settings,
+                MEMORY_FIX_UNCONFIRMED_TEXT,
+                auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
+            )
+            raise
+        log.info(
+            "[%s] /memory fix | user=%s | fact_id=%s | status=%s | committed=%s"
+            " | confirmed=%s | conflict=%s | reason=%s",
+            group_id,
+            user_id,
+            fact_id,
+            outcome.status,
+            outcome.committed,
+            outcome.confirmed,
+            outcome.conflict or "-",
+            outcome.reason or "-",
+        )
+        if outcome.status == CORRECTION_CORRECTED:
+            if outcome.confirmed:
+                body = MEMORY_FIX_CORRECTED_TEXT.format(
+                    fact_id=outcome.fact_id, revision=outcome.revision
+                )
+            else:
+                # commit 已经返回但读回确认失败：可能是 durable 的，绝不说"没有生效"。
+                body = MEMORY_FIX_UNCONFIRMED_TEXT
+        elif outcome.status == CORRECTION_UNCHANGED:
+            body = MEMORY_FIX_UNCHANGED_TEXT
+        elif outcome.status == CORRECTION_UNCONFIRMED:
+            body = MEMORY_FIX_UNCONFIRMED_TEXT
+        elif outcome.status == CORRECTION_CONFLICT:
+            if outcome.conflict == CONFLICT_DUPLICATE:
+                body = MEMORY_FIX_DUPLICATE_TEXT
+            elif outcome.conflict == CONFLICT_TOMBSTONE:
+                body = MEMORY_FIX_TOMBSTONE_TEXT
+            elif outcome.conflict in (
+                CONFLICT_REVISION,
+                CONFLICT_GONE,
+                CONFLICT_NOT_VISIBLE,
+                CONFLICT_EXPIRED,
+                CONFLICT_OPTOUT,
+            ):
+                body = MEMORY_FIX_CONFLICT_TEXT
+            else:
+                body = MEMORY_FIX_CONFLICT_TEXT
+        else:
+            body = _MEMORY_FIX_INVALID_TEXTS.get(
+                outcome.reason, MEMORY_FIX_USAGE_TEXT
+            )
+        await _answer(
+            message,
+            settings,
+            body,
             auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
         )
         return
@@ -3674,6 +4381,7 @@ async def cmd_memory(
         records = await list_facts_about_user_in_group(
             session, group_id=group_id, subject_user_id=target_id
         )
+        link_context = await _memory_link_context(message, session, records)
         await _schedule_memory_command_cleanup(message, group_id)
         await _answer(
             message,
@@ -3682,6 +4390,7 @@ async def cmd_memory(
                 records,
                 page=1,
                 header=f"本群关于 {target_name or target_id} 的记忆",
+                link_context=link_context,
             ),
             auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
         )
@@ -3717,11 +4426,16 @@ async def cmd_memory(
         except Exception:
             titles = {}
     await _schedule_memory_command_cleanup(message, group_id)
+    link_context = await _memory_link_context(message, session, records)
     await _answer(
         message,
         settings,
         _render_memory_receipt(
-            records, page=page, group_titles=titles, header="机器人记得我的事"
+            records,
+            page=page,
+            group_titles=titles,
+            header="机器人记得我的事",
+            link_context=link_context,
         ),
         auto_delete_seconds=MEMORY_RECEIPT_SECONDS,
     )

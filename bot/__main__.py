@@ -24,8 +24,9 @@ from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
+from bot.middlewares.usage_scope import UsageScopeMiddleware
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
-from bot.services import llm_metrics, memory_holder, model_limits
+from bot.services import group_costs, llm_metrics, memory_holder, model_limits
 from bot.services.archive_vector import SQLiteArchiveVectorRecallProvider
 from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
@@ -49,6 +50,7 @@ from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_ta
 from bot.services.memory import MemoryService
 from bot.services.ops_alert import alert_super_admin
 from bot.services.patrol import PatrolService, init_patrol_service
+from bot.services.periodic_tasks import CheckinInternalRunner, WeeklyPlanRunner
 from bot.services.point_shop import ShopExpiryService
 from bot.services.private_chat import (
     private_history_retention_days,
@@ -458,9 +460,158 @@ async def _initialize_runtime_services(
     session_factory: Any,
     on_late_model_refresh: Callable[[], None] | None = None,
 ) -> tuple[RuntimeConfigManager, LLMService, MemoryService]:
+    """启动装配的**薄包装器**：失败时只清理由本次调用新建的东西。
+
+    真正的初始化在 ``_initialize_runtime_services_inner``（原函数体逐字未动）。
+    包装器存在的一理由：预算消费者在初始化**之前**就装配并 ``start`` 了，
+    后面任何一步抛异常时那次启动其实是失败的 —— 但消费者已经进了全局 holder
+    且后台任务还在跑。不清就是进程带着一个已废弃的消费者继续跑，重启还会越积
+    越多（父探针：retained_consumers=1, live_consumer_tasks=1）。
+
+    这里**只认本次新增的对象**：进入时已存在的消费者与登记钩子一律保留 ——
+    一次失败的重启不该把别的、跑得好好的实例顺手停掉。
+    """
+
+    from bot.services import group_budget as budget_module
+    from bot.services.llm import cost_guard_factory
+
+    holder_before = list(budget_alert_consumer_holder)
+    hook_before = _alert_enqueuer_readonly(budget_module)
+    _STARTUP_ALERT_BASELINE[0] = (holder_before, hook_before)
+    # 记下进入时的进程级护栏。装配成功后它一直留在原地，等关停/失败清理还原；
+    # 装配失败时**立即**还原，别让一次没起来的重启把上一个实例的护栏顶掉。
+    _COST_GUARD_BASELINE[0] = cost_guard_factory()
+    try:
+        return await _initialize_runtime_services_inner(
+            settings=settings,
+            session_factory=session_factory,
+            on_late_model_refresh=on_late_model_refresh,
+        )
+    except BaseException:
+        _STARTUP_ALERT_BASELINE[0] = None
+        await _abandon_new_alerts(holder_before, hook_before)
+        _restore_cost_guard_baseline()
+        raise
+    finally:
+        _STARTUP_ALERT_BASELINE[0] = None
+
+
+async def _abandon_new_alerts(
+    holder_before: "list[Any]", hook_before: Any
+) -> None:
+    """停掉并摘除**本次**新建的消费者；把登记钩子还原成进入时的那个。"""
+
+    from bot.services import group_budget as budget_module
+
+    # 只有真的摘掉过东西才还原钩子：没摘过就说明本次压根没建消费者，
+    # 这时把钩子写回去反而会盖掉别人刚装好的那个。
+    if await _stop_new_alerts(holder_before):
+        budget_module.configure_alert_enqueuer(hook_before)
+
+
+async def _stop_new_alerts(holder_before: "list[Any]") -> int:
+    """停掉 holder 里进入时不存在的消费者（有界），既有实例一律不动。
+
+    返回摘除的条数（调用方据此判断要不要还原登记钩子）。
+    """
+
+    fresh = [
+        consumer
+        for consumer in list(budget_alert_consumer_holder)
+        if consumer not in holder_before
+    ]
+    removed = 0
+    for consumer in fresh:
+        try:
+            await asyncio.wait_for(consumer.stop(), 5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:  # noqa: BLE001 - 清理不追究原因
+            log.warning("budget alert consumer abandon failed", exc_info=True)
+        if consumer in budget_alert_consumer_holder:
+            budget_alert_consumer_holder.remove(consumer)
+            removed += 1
+    return removed
+
+
+async def _initialize_runtime_services_inner(
+    *,
+    settings: Any,
+    session_factory: Any,
+    on_late_model_refresh: Callable[[], None] | None = None,
+) -> tuple[RuntimeConfigManager, LLMService, MemoryService]:
     # 成本看板的记数器只累加在内存里，这里给它会话工厂，
     # 由它自己按 60 秒的节奏落盘（回复路径上不做任何数据库写入）。
     llm_metrics.configure(session_factory)
+    # 按群明细台账与上面的看板计数器同构：同样只在内存里加整数、同样按
+    # 60 秒惰性落盘，回复路径上不引入任何数据库写入。
+    group_costs.configure(session_factory)
+    # 进程级预算护栏：装配之后所有 LLM 入口自动带上，无需逐个调用方传参。
+    try:
+        from bot.services import group_budget as budget_module
+        from bot.services.llm import configure_cost_guard
+        from bot.web.settings_api import (
+            configure_price_store,
+            price_catalog_provider,
+            restore_price_catalog,
+        )
+
+        # 价格目录必须在 guard 与 HTTP 都可用**之前**恢复：否则重启后目录是空的，
+        # 一个已经启用的金额上限立刻失去计价依据，而且后续写入会撞版本冲突。
+        configure_price_store(session_factory)
+        await restore_price_catalog()
+        # 共享实例：启动装配与 HTTP 接口必须是**同一个** service，否则这里保存的
+        # 预算既不会让 HTTP 侧的缓存失效，两边的"有没有预算"也会各说各话。
+        from bot.services import budget_alerts
+
+        # 预算告警闭环：阈值登记钩子 + 后台消费者 + 崩溃租约恢复。
+        budget_module.configure_alert_enqueuer(
+            budget_alerts.enqueue_threshold_events
+        )
+        _budget_alert_consumer = budget_alerts.BudgetAlertConsumer(
+            session_factory,
+            sender=_budget_alert_sender(settings),
+            # 收件人**显式**来自部署自身的配置。之前这里没传、而
+            # _recipient() 又固定返回空串，真实装配下永远发不出去。
+            # 注意：``str(int(0))`` 是 ``"0"``，而它**是 truthy 的** ——
+            # 未配置超管时若直接这么传，"无收件人"检测会放行，然后把消息发给 0 号
+            # 用户。必须在这里就折成空串。
+            recipient=(
+                str(int(admin_id))
+                if (admin_id := int(getattr(settings, "super_admin_id", 0) or 0)) > 0
+                else ""
+            ),
+        )
+        budget_alert_consumer_holder.append(_budget_alert_consumer)
+        # 崩溃恢复：**必须 await**，否则是个没跑过的协程对象。
+        await _budget_alert_consumer.recover_expired_leases()
+        await _budget_alert_consumer.mark_uncertain_dispatches()
+        _budget_alert_consumer.start()
+
+        guard_service = budget_module.shared_service(
+            session_factory, price_catalog_provider
+        )
+        configure_cost_guard(
+            budget_module.llm_budget_guard(guard_service)("", "")
+        )
+    except Exception as exc:  # noqa: BLE001 - 装配失败不得挡住启动
+        # 装配失败 = **不确定有没有在保护**，不是"确定没保护"：可选功能拒绝、
+        # 安全调用照常。留成 None 等于把"数据库里有 cap=0"当成没有护栏。
+        log.warning("按群预算护栏装配失败；可选功能将被拒绝", exc_info=True)
+        # 这条 except 会**吞掉**异常并继续往下走，所以外层包装器看不到失败 ——
+        # 但消费者已经在上面装配并 start 了。预算不可用时它同样不该留着：
+        # 一张没有 guard 写入方的事务日志没人消费。
+        # 只清本次创建的，并把登记钩子还原成进入时的那个；既有实例不动。
+        baseline = _STARTUP_ALERT_BASELINE[0]
+        if baseline is not None:
+            await _abandon_new_alerts(baseline[0], baseline[1])
+        try:
+            from bot.services.group_budget import UnavailableCostGuard
+            from bot.services.llm import configure_cost_guard
+
+            configure_cost_guard(UnavailableCostGuard(str(exc)))
+        except Exception:  # pragma: no cover - 连兜底都装不上时不再折腾
+            log.error("预算护栏兜底装配也失败", exc_info=True)
 
     runtime_config = RuntimeConfigManager(
         session_factory=session_factory,
@@ -579,12 +730,87 @@ def _build_group_summary_scheduler(
     )
 
 
+#: 启动时装配的告警消费者（关闭清理时要用）。
+budget_alert_consumer_holder: "list[Any]" = []
+
+#: 本次启动进入时的 (holder 快照, 登记钩子)。内层装配失败**被吞掉**时用它清理；
+#: 外层异常路径已经处理完时它是 None。
+_STARTUP_ALERT_BASELINE: "list[Any]" = [None]
+
+#: "本次启动之前"的进程级成本护栏。``configure_cost_guard`` 是模块级单例，
+#: 启动时把它指到本次的预算服务上，**关停/失败清理时必须还原** —— 否则这个进程
+#: 里后续任何 LLM 调用都还会拿着已经 dispose 的引擎去查预算，报
+#: ``sqlite unable to open database file`` 而不是"没有护栏"。
+_GUARD_UNSET = object()
+_COST_GUARD_BASELINE: "list[Any]" = [_GUARD_UNSET]
+
+
+def _restore_cost_guard_baseline() -> bool:
+    """还原进程级成本护栏；返回是否真的还原过（没启动过就什么都不做）。"""
+
+    from bot.services.llm import configure_cost_guard
+
+    baseline = _COST_GUARD_BASELINE[0]
+    if baseline is _GUARD_UNSET:
+        return False
+    _COST_GUARD_BASELINE[0] = _GUARD_UNSET
+    configure_cost_guard(None if baseline is _GUARD_UNSET else baseline)
+    return True
+
+
+def _alert_enqueuer_readonly(module: Any) -> Any:
+    """读登记钩子。兼容没有 ``alert_enqueuer()`` 的旧树（回退读模块全局）。"""
+
+    getter = getattr(module, "alert_enqueuer", None)
+    if callable(getter):
+        return getter()
+    return getattr(module, "_ALERT_ENQUEUER", None)
+
+
+def _budget_alert_sender(settings: Any):
+    """把告警**私发**给部署自己配置的最高管理员。
+
+    收件人只来自 ``settings.super_admin_id``，不硬编码任何用户/群 ID；没配置
+    收件人时消费者会把事件留在表里可见，不会假装送达。
+    """
+
+    admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
+
+    async def send(text: str, event: dict[str, Any]) -> bool:
+        if admin_id <= 0:
+            return False
+        bot_obj = _BUDGET_ALERT_BOT[0]
+        send_message = getattr(bot_obj, "send_message", None)
+        if not callable(send_message):
+            return False
+        # 刻意**不走** ops_alert.alert_super_admin：它按 kind 做 300s 内存
+        # cooldown，而预算告警的 kind 只有一个，跨群/跨档的连续事件会互相吞
+        # （父探针：两事件得到 [True, False]，只真发出一条）。日级幂等由 outbox
+        # 唯一键负责，这里做一次性的结构化投递。
+        try:
+            result = await asyncio.wait_for(
+                send_message(admin_id, text, parse_mode="HTML"), 20.0
+            )
+        except Exception:  # noqa: BLE001 - 失败必须由消费者看到并重试
+            raise
+        return result is not None
+
+    return send
+
+
+#: 供 sender 闭包取到运行期 bot 实例（装配发生在 bot 创建之后）。
+_BUDGET_ALERT_BOT: "list[Any]" = [None]
+
+
 def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
     """Install middleware on every update observer that needs its services."""
 
     dispatcher.update.outer_middleware(
         DurableInboxUpdateDedupMiddleware(session_factory)
     )
+    # 用量归属必须**最外层**绑定：任何 handler 里的模型调用都要落在正确的群上，
+    # 漏绑一个 observer 就等于让那一类 update 的成本凭空消失。
+    dispatcher.update.outer_middleware(UsageScopeMiddleware())
     dispatcher.message.outer_middleware(
         GlobalBanEnforcementMiddleware(session_factory)
     )
@@ -667,6 +893,26 @@ async def main() -> None:
     # MemoryService 的预算是构造时的快照：启动预取超时转后台、周期刷新带来新窗口，
     # 都必须走这一条线才算真的生效。
     window_sync = _MemoryContextWindowSync(settings=settings)
+    # **在调用 initializer 之前**拍基线。之前我是在 create_bot 前才拍，那时消费者
+    # 已经被创建并 start 了，快照把它们算成"既有" → fresh 为空 → 什么都没停。
+    # 这里记的是本次 main 进入时的 holder 身份、登记钩子与 bot 引用。
+    _main_alert_baseline = list(budget_alert_consumer_holder)
+    _main_alert_hook = _alert_enqueuer_readonly(
+        __import__("bot.services.group_budget", fromlist=["x"])
+    )
+    _main_bot_baseline = _BUDGET_ALERT_BOT[0]
+    # 本次 main 拥有的这一批消费者：initializer 之后**任何**一步失败都必须清掉
+    # （warm cache、router 注册、create_bot、身份 bootstrap……）。定义在使用
+    # **之前**，并真的把那段代码包起来 —— 只定义一个收口函数而没接线等于没做。
+    async def _fail_main_startup(reason: str) -> None:
+        await _abandon_new_alerts(_main_alert_baseline, _main_alert_hook)
+        # 只在**本次**绑定过 bot 引用时才还原；既有 bot 不动。
+        if _BUDGET_ALERT_BOT[0] is not _main_bot_baseline:
+            _BUDGET_ALERT_BOT[0] = _main_bot_baseline
+        # 本次没起来的启动不能把进程级护栏留在自己的服务上。
+        _restore_cost_guard_baseline()
+        await _await_cleanup_bounded(engine.dispose(), label=reason)
+
     try:
         runtime_config, llm, memory = await _initialize_runtime_services(
             settings=settings,
@@ -679,42 +925,49 @@ async def main() -> None:
             label="database engine after runtime bootstrap failure",
         )
         raise
-    window_sync.bind(llm=llm, memory=memory)
+    try:
+        window_sync.bind(llm=llm, memory=memory)
 
-    # 第②项：后台群摘要调度器（进程级单例）。前台只登记、只读已发布摘要；
-    # 真正的模型调用走 BACKGROUND 优先级与独立容量（≤2、与回复共享 normal=4）。
-    summary_scheduler = _build_group_summary_scheduler(
-        llm=llm, memory=memory, settings=settings
-    )
+        # 第②项：后台群摘要调度器（进程级单例）。前台只登记、只读已发布摘要；
+        # 真正的模型调用走 BACKGROUND 优先级与独立容量（≤2、与回复共享 normal=4）。
+        summary_scheduler = _build_group_summary_scheduler(
+            llm=llm, memory=memory, settings=settings
+        )
 
-    dp["settings"] = settings
-    # C3-01：把实际运行身份写进启动日志（root 时 WARNING）。
-    log_process_identity()
-    # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
-    # 状态写进启动日志（opt-in 默认关闭；只要有开启就 WARNING 列出）。
-    log_enforcement_switch_state(settings)
-    dp["session_factory"] = session_factory
-    dp["runtime_config"] = runtime_config
-    warmed_operators = await warm_privileged_operator_cache(session_factory)
-    if warmed_operators:
-        log.info("Preloaded %d delegated privileged operator scope(s)", warmed_operators)
+        dp["settings"] = settings
+        # C3-01：把实际运行身份写进启动日志（root 时 WARNING）。
+        log_process_identity()
+        # F-024：运行时配置已经套用到 settings，这里把"对用户可见的执法开关"的生效
+        # 状态写进启动日志（opt-in 默认关闭；只要有开启就 WARNING 列出）。
+        log_enforcement_switch_state(settings)
+        dp["session_factory"] = session_factory
+        dp["runtime_config"] = runtime_config
+        warmed_operators = await warm_privileged_operator_cache(session_factory)
+        if warmed_operators:
+            log.info("Preloaded %d delegated privileged operator scope(s)", warmed_operators)
 
-    _register_update_middlewares(dp, session_factory)
+        _register_update_middlewares(dp, session_factory)
 
-    dp.include_router(commands.router)
-    dp.include_router(admin.router)
-    dp.include_router(membership.router)
-    # 私聊 router 必须排在 group 之前：群处理器用的是宽泛过滤（F.text|F.photo|…）
-    # 并在函数体里 is_group() 早退，谁先注册谁先吃消息，排后面就永远收不到私聊。
-    dp.include_router(private_chat.router)
-    dp.include_router(group.router)
+        dp.include_router(commands.router)
+        dp.include_router(admin.router)
+        dp.include_router(membership.router)
+        # 私聊 router 必须排在 group 之前：群处理器用的是宽泛过滤（F.text|F.photo|…）
+        # 并在函数体里 is_group() 早退，谁先注册谁先吃消息，排后面就永远收不到私聊。
+        dp.include_router(private_chat.router)
+        dp.include_router(group.router)
+    except BaseException:
+        await _fail_main_startup(
+            "database engine after post-runtime startup failure"
+        )
+        raise
 
     try:
         bot = create_bot(settings)
+        # 告警消费者在装配时还没有 bot 实例，这里补上（sender 是惰性取用的）。
+        _BUDGET_ALERT_BOT[0] = bot
     except BaseException:
-        await _await_cleanup_bounded(
-            engine.dispose(),
-            label="database engine after Bot construction failure",
+        await _fail_main_startup(
+            "database engine after Bot construction failure"
         )
         raise
     telegram_cleanup: TelegramCleanupScheduler | None = None
@@ -750,6 +1003,14 @@ async def main() -> None:
                 telegram_cleanup.stop(),
                 label="Telegram cleanup after identity/bootstrap failure",
             )
+        # 消费者先停：它还会用这个 bot 发消息，而 bot HTTP 马上要关、
+        # engine 马上要 dispose —— 顺序反了就是对着已关的连接发消息。
+        # 走 _abandon_new_alerts（含 hook 还原），不只是 _stop_new_alerts。
+        await _abandon_new_alerts(_main_alert_baseline, _main_alert_hook)
+        if _BUDGET_ALERT_BOT[0] is not _main_bot_baseline:
+            _BUDGET_ALERT_BOT[0] = _main_bot_baseline
+        # 护栏也摘掉：本次启动没成功，不能把进程级护栏留在自己的服务上。
+        _restore_cost_guard_baseline()
         await _await_cleanup_bounded(
             bot.session.close(),
             label="Bot HTTP session after identity/bootstrap failure",
@@ -795,6 +1056,21 @@ async def main() -> None:
         shop_expiry = ShopExpiryService(
             bot=bot,
             session_factory=session_factory,
+        )
+        # B13b/C4：按群执行来源下的两个内部 runner。
+        # - 签到提醒默认来源是 external（现场 cron），所以这个 runner **默认什么都不
+        #   做**；管理员把某个群预览确认切到 internal 之后，下一个 tick 起由它负责。
+        # - 周报周期计划默认 off，且锚点是严格未来：开启/发布都不会立刻补上一周。
+        # 两者每轮现读持久策略（切换即时生效，不需要重启），随进程一起关停。
+        checkin_runner = CheckinInternalRunner(
+            bot=bot,
+            session_factory=session_factory,
+        )
+        weekly_plan_runner = WeeklyPlanRunner(
+            bot=bot,
+            settings=settings,
+            session_factory=session_factory,
+            manager=runtime_config,
         )
         # Event-driven (no background loop): joins feed the detector from the
         # membership handler; challenge deadlines ride the shared sweeper.
@@ -902,6 +1178,14 @@ async def main() -> None:
     except BaseException:
         # No runner has been scheduled yet, so construction failure cleanup is
         # limited to the shared resources that are already live.
+        # 告警消费者是其中之一：它还在用这个 bot 发消息，而 bot HTTP 马上要关。
+        # 走 _abandon_new_alerts（含 hook 还原），不只是 _stop_new_alerts ——
+        # 身份失败那条已经是这么做的，别重复同样的错。
+        await _abandon_new_alerts(_main_alert_baseline, _main_alert_hook)
+        if _BUDGET_ALERT_BOT[0] is not _main_bot_baseline:
+            _BUDGET_ALERT_BOT[0] = _main_bot_baseline
+        # 同上：构造失败也要把进程级护栏还回进入时那个。
+        _restore_cost_guard_baseline()
         configure_telegram_cleanup_scheduler(None)
         await _await_cleanup_bounded(
             telegram_cleanup.stop(),
@@ -987,6 +1271,14 @@ async def main() -> None:
             asyncio.create_task(
                 shop_expiry.run_forever(),
                 name="shop-expiry-runner",
+            ),
+            asyncio.create_task(
+                checkin_runner.run_forever(),
+                name="checkin-reminder-internal-runner",
+            ),
+            asyncio.create_task(
+                weekly_plan_runner.run_forever(),
+                name="weekly-report-plan-runner",
             ),
             asyncio.create_task(
                 run_resource_watchdog(),
@@ -1197,6 +1489,18 @@ async def main() -> None:
             flush_telegram_background_tasks(),
             label="Telegram delayed cleanup tasks",
         )
+        # 告警消费者**先停**：它还在用这个 bot 发消息，而 bot HTTP 马上要关、
+        # engine 马上要 dispose —— 顺序反了就是对着已关的连接发消息。
+        # 只停本次 main 拥有的那一批并还原 hook/bot 引用；此前成功启动留下的
+        # keeper 不误停（不再用 stop-all + holder.clear，那会把 keeper 一起杀掉）。
+        await _abandon_new_alerts(_main_alert_baseline, _main_alert_hook)
+        if _BUDGET_ALERT_BOT[0] is not _main_bot_baseline:
+            _BUDGET_ALERT_BOT[0] = _main_bot_baseline
+        # 进程级预算护栏同理：它握着本次的会话工厂，engine 马上要 dispose，
+        # 必须在这里摘掉并还原成进入时那个（没有就清成 None）。留着它，这个
+        # 进程里任何后续 LLM 调用都会对着已关的库查预算 —— 测试里就是上一套件
+        # 删掉的临时库，报 "unable to open database file"。
+        _restore_cost_guard_baseline()
         await _await_cleanup_bounded(
             bot.session.close(),
             label="Bot HTTP session",
@@ -1206,6 +1510,11 @@ async def main() -> None:
         await _await_cleanup_bounded(
             llm_metrics.flush(force=True),
             label="llm usage counters",
+        )
+        # 明细台账同理：flush 幂等，必须排在 engine.dispose() 之前。
+        await _await_cleanup_bounded(
+            group_costs.flush(force=True),
+            label="llm per-group cost counters",
         )
         await _await_cleanup_bounded(
             engine.dispose(),

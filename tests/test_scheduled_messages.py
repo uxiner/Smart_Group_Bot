@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
@@ -108,12 +109,25 @@ class _FakeSession:
         self._authorized = authorized
         self._updated = updated_rows if updated_rows is not None else {}
         self.commit = AsyncMock()
+        # B13a 返工 R1：出站证据（``operations_business_receipts``）在这套内存替身里
+        # 用一张极简表模拟。``scalar`` 只被 receipt 读取使用，不必区分实体；真实的
+        # 多键作用域由 init_db + 签名 HTTP 的正式回归覆盖。
+        self._receipts: list[Any] = []
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
         return False
+
+    async def scalar(self, _stmt):
+        return self._receipts[0] if self._receipts else None
+
+    def add(self, obj):
+        self._receipts.append(obj)
+
+    async def flush(self):
+        return None
 
     async def scalars(self, _stmt):
         return SimpleNamespace(all=lambda: list(self._rows))
@@ -172,7 +186,7 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
                 entry=entry,
             )
 
-        async def complete_occurrence(claimed, *, completed_at):
+        async def complete_occurrence(claimed, *, completed_at, outbound=None):
             claimed.entry.last_run_at = completed_at
             await session.commit()
             return True

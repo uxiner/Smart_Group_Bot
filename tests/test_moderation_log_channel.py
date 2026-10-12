@@ -905,5 +905,44 @@ class ReviewCallbackTests(unittest.IsolatedAsyncioTestCase):
         session.get.assert_not_awaited()
 
 
+class ReviewKeyboardPreservedTests(unittest.IsolatedAsyncioTestCase):
+    """第一下（待确认）编辑频道卡片时**必须带上 reply_markup**：editMessageText 不带它时
+    Telegram 会删掉这条频道消息的 inline 键盘（2026-10-06 线上实测：点一下按钮就没了，
+    第二下没法点）。这个用例把「按钮必须仍在」钉死。"""
+
+    async def test_arm_edit_re_attaches_review_buttons(self) -> None:
+        violation = _violation(review_state="none")
+        session = _review_session(violation)
+        callback = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
+
+        await group.on_review_action(callback, _settings(), session=session)
+
+        edit = callback.bot.edit_message_text
+        edit.assert_awaited()
+        markup = edit.await_args.kwargs.get("reply_markup")
+        self.assertIsNotNone(
+            markup, "arm 时必须带上 reply_markup，否则按钮会被 Telegram 删掉"
+        )
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertEqual(payloads, ["mrev:rel:99", "mrev:ban:99"])
+
+    async def test_execute_edit_drops_the_buttons(self) -> None:
+        """第二下执行完（放行已落地）后按钮必须消失：空键盘才是「点不了了」。"""
+
+        violation = _violation(
+            review_state="none", pending_action="rel", pending_at=now_shanghai_naive()
+        )
+        session = _review_session(violation)
+        callback = _callback(data="mrev:rel:99", operator_id=SUPER_ADMIN_ID)
+
+        await group.on_review_action(callback, _settings(), session=session)
+
+        self.assertIn("已放行", callback.answered[-1][0], "第二下应当执行放行")
+        markup = callback.bot.edit_message_text.await_args.kwargs.get("reply_markup")
+        self.assertIsNotNone(markup, "终态也要显式带上键盘（带空键盘才会移除按钮）")
+        rows = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertEqual(rows, [], "终态必须清空按钮")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

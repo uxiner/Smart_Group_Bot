@@ -13,6 +13,14 @@
 ``--dry-run`` 只打印"打算做什么"，既不调 Telegram 也不改数据库，用来运维自检。
 机器人进程内还有一个常驻的 ``ShopExpiryService`` 跑同一套逻辑（默认 5 分钟一轮），
 所以这个 CLI 主要是给"想立刻看一眼/补一次"的场景用的。
+
+**B13b/C4 按群执行来源**：商店到期处理的默认来源是 ``internal``（进程内常驻服务），
+所以**默认配置下这个外部入口是 no-op**——它只处理被管理员显式切到 ``external``
+的群（``group_task_policies`` 里 ``task_id='shop_expire'`` 且 ``source='external'``），
+没有这样的群就直接退出 0，不会替内部服务重复做一遍。内部服务的 5 分钟节奏不变。
+**准入不是一次预检查**：本 CLI 用读来源那一刻的策略版本构造每群守卫，撤销前的准入
+写与 DELETE 都带这份谓词；管理员在"读了来源"与"真正撤销"之间切换来源时，旧来源
+一条都不会撤、也不会发通知（见 ``bot/services/operations_guard.py``）。
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ import sys
 from bot.config import load_bootstrap_settings
 from bot.db.engine import init_db
 from bot.loader import create_bot
-from bot.services.point_shop import expire_due_entitlements
+from bot.services.point_shop import expire_due_entitlements, shop_source_plan
 
 log = logging.getLogger(__name__)
 
@@ -58,15 +66,37 @@ async def _expire(*, dry_run: bool, notify: bool, limit: int) -> int:
     engine, session_factory = await init_db(settings.database_url)
     bot = None
     try:
-        if not dry_run:
-            bot = create_bot(settings)
         async with session_factory() as session:
+            plan = await shop_source_plan(session)
+            external = plan.external
+            if not external:
+                print(
+                    "本部署没有任何群把商店到期处理交给外部执行（默认 internal）："
+                    "这个入口什么都不做。需要外部 cron 时先在 Mini App 里预览并确认来源切换。"
+                )
+                return 0
+            if not dry_run:
+                bot = create_bot(settings)
+            print(
+                "外部执行来源的群：" + "、".join(str(group) for group in external)
+            )
             outcomes = await expire_due_entitlements(
                 session,
                 bot=bot,
                 dry_run=dry_run,
                 notify=notify,
                 limit=limit,
+                group_ids=external,
+                session_factory=session_factory,
+                # R-B1：守卫来自这次来源判定所依据的同一份策略快照，并被编进真实
+                # 撤销前准入写与 DELETE 的 WHERE。管理员在"读了来源"与"真正撤销"
+                # 之间把这些群切回 internal 时，这里一条都不会撤、也不会发通知。
+                guards=plan.guards,
+                # v3（父 v5）：缺守卫时按**群**判定——已治理群一律 fail-closed；
+                # 既没有身份也没有策略的纯历史群从来不归外部入口（改造前也不归），
+                # 这里显式禁止，免得它们被当成"无约束 legacy"顺手撤掉。
+                governed_groups=plan.governed,
+                allow_unmanaged_legacy=False,
             )
     except Exception as exc:
         log.warning("shop expiry run failed | %s", exc, exc_info=True)

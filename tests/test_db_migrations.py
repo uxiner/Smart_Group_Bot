@@ -1363,5 +1363,377 @@ class DurableQueueMigrationTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
 
+class RuntimeConfigHistoryMigrationTests(unittest.IsolatedAsyncioTestCase):
+    """配置变更历史表必须走**真实** ``init_db`` 路径建出来（不许只在测试里 create_all）。
+
+    两种部署形状都要覆盖：
+
+    1. 老库（只有 ``runtime_config``，没有历史表）→ ``create_all`` 建表 + 建索引；
+    2. 半发版留下的"有表没索引"（``create_all`` 对已存在的表**不会**补索引）→
+       启动路径必须把唯一索引与时间索引补齐，否则 revision 乐观锁的历史记录
+       可以被重复插入，审计链就断了。
+    """
+
+    LEGACY_RUNTIME_CONFIG = (
+        "CREATE TABLE runtime_config ("
+        "id INTEGER NOT NULL PRIMARY KEY, "
+        "schema_version INTEGER NOT NULL DEFAULT 1, "
+        "revision INTEGER NOT NULL DEFAULT 1, "
+        "payload JSON NOT NULL DEFAULT '{}', "
+        "updated_by BIGINT NOT NULL DEFAULT 0, "
+        "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    )
+
+    async def _indexes(self, session_factory, table: str) -> dict[str, bool]:
+        async with session_factory() as session:
+            return {
+                str(row[1]): bool(row[2])
+                for row in (
+                    await session.execute(text(f"PRAGMA index_list({table})"))
+                ).all()
+            }
+
+    async def _columns(self, session_factory, table: str) -> set[str]:
+        async with session_factory() as session:
+            return {
+                str(row[1])
+                for row in (
+                    await session.execute(text(f"PRAGMA table_info({table})"))
+                ).all()
+            }
+
+    async def test_legacy_database_gains_the_history_table_and_indexes(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            connection = sqlite3.connect(path)
+            connection.execute(self.LEGACY_RUNTIME_CONFIG)
+            connection.execute(
+                "INSERT INTO runtime_config (id, revision, payload) "
+                "VALUES (1, 1, '{}')"
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            self.assertTrue(
+                {
+                    "revision",
+                    "parent_revision",
+                    "payload_redacted",
+                    "secret_paths_changed",
+                    "updated_by",
+                    "updated_at",
+                    "operation",
+                    "summary",
+                    "restore_source_revision",
+                }
+                <= await self._columns(session_factory, "runtime_config_history")
+            )
+            indexes = await self._indexes(session_factory, "runtime_config_history")
+            self.assertTrue(indexes.get("ix_runtime_config_history_revision"))
+            self.assertIn("ix_runtime_config_history_updated_at", indexes)
+            # 幂等：再跑一次不会炸。
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            indexes = await self._indexes(session_factory, "runtime_config_history")
+            self.assertTrue(indexes.get("ix_runtime_config_history_revision"))
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_table_without_indexes_is_repaired_on_startup(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            connection = sqlite3.connect(path)
+            connection.execute(self.LEGACY_RUNTIME_CONFIG)
+            # 半发版：表在，索引没建。
+            connection.execute(
+                "CREATE TABLE runtime_config_history ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "revision INTEGER NOT NULL, "
+                "parent_revision INTEGER NOT NULL, "
+                "payload_redacted JSON, "
+                "secret_paths_changed JSON, "
+                "updated_by BIGINT NOT NULL DEFAULT 0, "
+                "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+                "operation VARCHAR(16) NOT NULL DEFAULT 'save', "
+                "summary TEXT NOT NULL DEFAULT '', "
+                "restore_source_revision INTEGER)"
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            indexes = await self._indexes(session_factory, "runtime_config_history")
+            self.assertTrue(
+                indexes.get("ix_runtime_config_history_revision"),
+                "有表没索引的老库必须补上 revision 唯一索引",
+            )
+            self.assertIn("ix_runtime_config_history_updated_at", indexes)
+
+            # 唯一索引真的生效：同一个 revision 不许插两次。
+            async with session_factory() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO runtime_config_history "
+                        "(revision, parent_revision, payload_redacted) "
+                        "VALUES (2, 1, '{}')"
+                    )
+                )
+                await session.commit()
+            with self.assertRaises(Exception):
+                async with session_factory() as session:
+                    await session.execute(
+                        text(
+                            "INSERT INTO runtime_config_history "
+                            "(revision, parent_revision, payload_redacted) "
+                            "VALUES (2, 1, '{}')"
+                        )
+                    )
+                    await session.commit()
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+
+    async def test_duplicate_revisions_are_repaired_before_the_unique_index(self) -> None:
+        """半发版可能已经写进重复 revision：先收敛到"最早那条"再建唯一索引。
+
+        收敛是**有意的**：唯一索引建不出来 = 之后的每一次保存都会在事务里炸掉，
+        配置根本改不动。重复行本身是 bug 产物，审计上以最早那条为准并打告警。
+        """
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            connection = sqlite3.connect(path)
+            connection.execute(self.LEGACY_RUNTIME_CONFIG)
+            connection.execute(
+                "CREATE TABLE runtime_config_history ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "revision INTEGER NOT NULL, "
+                "parent_revision INTEGER NOT NULL, "
+                "payload_redacted JSON, "
+                "secret_paths_changed JSON, "
+                "updated_by BIGINT NOT NULL DEFAULT 0, "
+                "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+                "operation VARCHAR(16) NOT NULL DEFAULT 'save', "
+                "summary TEXT NOT NULL DEFAULT '', "
+                "restore_source_revision INTEGER)"
+            )
+            connection.executemany(
+                "INSERT INTO runtime_config_history "
+                "(id, revision, parent_revision, payload_redacted, summary) "
+                "VALUES (?, ?, 1, '{}', ?)",
+                [(1, 2, "first"), (2, 2, "duplicate"), (3, 3, "second")],
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            async with session_factory() as session:
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT revision, summary FROM runtime_config_history "
+                            "ORDER BY revision"
+                        )
+                    )
+                ).all()
+            self.assertEqual(rows, [(2, "first"), (3, "second")])
+            indexes = await self._indexes(session_factory, "runtime_config_history")
+            self.assertTrue(indexes.get("ix_runtime_config_history_revision"))
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+
+class GroupOnboardingSchemaTests(unittest.IsolatedAsyncioTestCase):
+    """接入申请表 + 预算/成本表的 schema 形状（``create_all`` 路径 + 索引补齐）。
+
+    这里只断言**结构合同**：表在、列在、部分唯一索引真的 ``UNIQUE``。状态机的
+    行为在 ``tests/test_group_onboarding.py``。
+    """
+
+    ONBOARDING_TABLE = "group_onboarding_requests"
+
+    async def _tables(self, session_factory) -> set[str]:
+        async with session_factory() as session:
+            result = await session.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+            return {str(row[0]) for row in result.all()}
+
+    async def _index_ddl(self, session_factory, name: str) -> str:
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    text("SELECT sql FROM sqlite_master WHERE type='index' AND name=:n"),
+                    {"n": name},
+                )
+            ).first()
+        self.assertIsNotNone(row, f"缺少索引 {name}")
+        return str(row[0])
+
+    async def test_fresh_database_has_the_onboarding_table(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            tables = await self._tables(session_factory)
+            self.assertIn(self.ONBOARDING_TABLE, tables)
+            async with session_factory() as session:
+                columns = {
+                    str(row[1])
+                    for row in (
+                        await session.execute(
+                            text(f"PRAGMA table_info({self.ONBOARDING_TABLE})")
+                        )
+                    ).all()
+                }
+            self.assertLessEqual(
+                {
+                    "request_id",
+                    "group_id",
+                    "applicant_id",
+                    "requested_features",
+                    "preset_id",
+                    "status",
+                    "revision",
+                    "created_at",
+                    "reviewed_at",
+                    "reviewed_by",
+                    "reason",
+                    "granted_group_authorization",
+                },
+                columns,
+            )
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_pending_unique_index_is_partial_and_unique(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            ddl = await self._index_ddl(
+                session_factory, "ux_group_onboarding_open_request"
+            )
+            self.assertIn("UNIQUE", ddl.upper())
+            self.assertIn("pending", ddl)
+            self.assertIn("group_id", ddl)
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_legacy_database_without_the_new_tables_upgrades_cleanly(self) -> None:
+        """老库（早于本轮）没有任何新表：启动必须补齐，且不得破坏既有数据。"""
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE authorized_groups ("
+                "group_id BIGINT NOT NULL PRIMARY KEY, "
+                "authorized_by BIGINT)"
+            )
+            connection.execute(
+                "INSERT INTO authorized_groups (group_id, authorized_by) "
+                "VALUES (-100111, 42)"
+            )
+            connection.execute(
+                "CREATE TABLE groups (id BIGINT NOT NULL PRIMARY KEY, "
+                "title VARCHAR(255), settings JSON)"
+            )
+            connection.execute(
+                "INSERT INTO groups (id, title, settings) VALUES (-100111, '旧群', '{}')"
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            tables = await self._tables(session_factory)
+            self.assertIn(self.ONBOARDING_TABLE, tables)
+            async with session_factory() as session:
+                authorized = (
+                    await session.execute(
+                        text(
+                            "SELECT authorized_by FROM authorized_groups "
+                            "WHERE group_id = -100111"
+                        )
+                    )
+                ).first()
+                group_title = (
+                    await session.execute(
+                        text("SELECT title FROM groups WHERE id = -100111")
+                    )
+                ).first()
+            self.assertEqual(int(authorized[0]), 42)
+            self.assertEqual(str(group_title[0]), "旧群")
+            await self._index_ddl(session_factory, "ux_group_onboarding_open_request")
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_restart_is_idempotent_for_the_new_schema(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            await engine.dispose()
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            tables = await self._tables(session_factory)
+            self.assertIn(self.ONBOARDING_TABLE, tables)
+            await self._index_ddl(session_factory, "ux_group_onboarding_open_request")
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

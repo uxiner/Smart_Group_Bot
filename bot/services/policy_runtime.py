@@ -755,6 +755,9 @@ CONSUMER_REGISTRY: dict[str, tuple[str, ...]] = {
     "admin_ops.privileged_group_concurrency": ("bot/handlers/admin.py:admin_ops",),
     "admin_ops.privileged_group_deadline_seconds": ("bot/handlers/admin.py:admin_ops",),
     "admin_ops.privileged_job_deadline_seconds": ("bot/handlers/admin.py:admin_ops",),
+    "admin_ops.operations_preview_ttl_seconds": (
+        "bot/services/operations_runs.py:preview_ttl_seconds",
+    ),
     # --- 群内视觉 / 活跃度 --------------------------------------------------
     "group_ops.vision_image_max_bytes": ("bot/handlers/group.py:group_ops",),
     "group_ops.vision_download_timeout_seconds": ("bot/handlers/group.py:group_ops",),

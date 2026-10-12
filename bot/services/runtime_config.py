@@ -9,12 +9,20 @@ import logging
 import os
 import re
 import tomllib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -42,7 +50,11 @@ from bot.config import (
     _parse_fallbacks,
     _resolve_provider_profile,
 )
-from bot.db.models import RuntimeConfigRecord, RuntimeConfigSecret
+from bot.db.models import (
+    RuntimeConfigHistory,
+    RuntimeConfigRecord,
+    RuntimeConfigSecret,
+)
 from bot.utils.budget import (
     BUSINESS_CONTEXT_TOKENS_MAX,
     BUSINESS_CONTEXT_TOKENS_MIN,
@@ -55,6 +67,23 @@ from bot.utils.budget import (
     validate_group_history_max_messages,
 )
 from bot.services import policy_runtime
+from bot.services.runtime_config_history import (
+    RuntimeConfigHistoryNotFoundError,
+    RuntimeConfigHistoryNotRestorableError,
+    build_diff,
+    build_summary,
+    configured_secret_paths,
+    discover_secret_paths,
+    ensure_snapshot_within_limit,
+    redact_opaque_leaves,
+    redact_payload,
+    resolve_secret_changes,
+    restore_opaque_values,
+    secret_status_change,
+    secret_status_metadata,
+    snapshot_limit,
+    strip_redaction_markers,
+)
 from bot.utils.prompts import load_prompt_defaults, set_runtime_prompts
 
 log = logging.getLogger(__name__)
@@ -63,6 +92,16 @@ log = logging.getLogger(__name__)
 #: 一次性提示词迁移需要一个只执行一次的标记，而这个版本号正好是持久化文档里现成
 #: 的字段，不必新增列。
 CONFIG_SCHEMA_VERSION = 2
+
+#: ``GET /api/v1/settings/history`` 的分页契约。
+#:
+#: 为什么要有：历史表**只增不删**（没有 TTL、没有条数上限，见
+#: ``docs/configuration-reference.md`` 的"历史保留/清理"），所以"返回全部行"等价
+#: 于一条随部署年龄线性增长的读取路径——而且它把每一行的两个 JSON 列都反序列化、
+#: 在全局锁里逐行重建候选配置。一条几 MB 的提示词就能让这个接口与保存路径一起
+#: 卡住。
+HISTORY_PAGE_LIMIT = 20
+HISTORY_PAGE_MAX_LIMIT = 100
 
 #: 第②项后台摘要的全部运行时字段名（apply / legacy 导入 / 顶层同步共用一份清单）。
 _GROUP_SUMMARY_FIELD_NAMES: tuple[str, ...] = (
@@ -1482,6 +1521,9 @@ class AdminOpsSettingsConfig(StrictModel):
     privileged_job_deadline_seconds: float = Field(
         default=300.0, ge=30.0, le=900.0, allow_inf_nan=False
     )
+    #: 运营任务中心的预览令牌有效期（秒）：预览到确认必须在这个窗口内完成，
+    #: 过期即拒绝确认，没有"自动续期"。
+    operations_preview_ttl_seconds: int = Field(default=120, ge=30, le=600)
 
     @model_validator(mode="after")
     def _validate_deadlines(self) -> "AdminOpsSettingsConfig":
@@ -1749,7 +1791,20 @@ class RuntimeConfig(StrictModel):
         return clone.model_dump(mode="json")
 
     def public_payload(self) -> dict[str, Any]:
-        return self.storage_payload()
+        """给 ``GET /api/v1/settings`` 的**编辑表单**。
+
+        与 :meth:`storage_payload` 的区别只在"自由 JSON / URL 里的凭据"：
+        ``request_params.extra_headers`` 与带凭据的 ``api_base`` 是运营刚填进去
+        的明文，逐字回显等于把它写进浏览器历史、devtools 与任何一次抓包，所以
+        换成 ``<redacted:current>`` / ``<redacted:url-query>`` 标记。登记在册的
+        密钥路径本来就是空的，不受影响。
+
+        配套：``save`` / ``preview`` 在校验之前用
+        :func:`restore_opaque_values` 把这些标记换回**当前**值，所以"把这份
+        文档原样回传"是无损的（见 ``docs/configuration-reference.md``）。
+        """
+
+        return redact_opaque_leaves(self.storage_payload())
 
     @staticmethod
     def _fallback_spec(items: list[ModelFallbackConfig]) -> str:
@@ -1772,6 +1827,7 @@ class RuntimeConfig(StrictModel):
             )
             profiles[item.name] = ProviderProfile(
                 provider=provider,
+                slot=item.name,
                 api_key=item.api_key or None,
                 api_base=api_base,
                 stream=item.stream,
@@ -2155,6 +2211,22 @@ class RuntimeConfigEncryptionError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _PreparedRevision:
+    """"这一版保存下去会长什么样"——**预览与保存拿到的是同一个对象**。
+
+    刻意做成一个不可变值对象而不是各算一遍：以前预览算自己的差异（还没接
+    ``changed_secret_paths``、还没过体积上限），于是两边可以给出不同的结论。
+    """
+
+    payload_redacted: dict[str, Any]
+    secret_paths: set[str]
+    size_bytes: int
+    entries: list[dict[str, Any]]
+    summary: str
+    changed_secret_paths: list[str]
+
+
 class SecretCipher:
     def __init__(self, master_key: str) -> None:
         raw = str(master_key or "").strip()
@@ -2458,6 +2530,55 @@ def _normalize_deprecated_runtime_payload(
     return (normalized, True) if changed else (payload, False)
 
 
+async def _history_metadata_only(
+    session: AsyncSession,
+    *,
+    limit: int | None = None,
+    before: int | None = None,
+) -> list[RuntimeConfigHistory]:
+    """只读历史元数据（跳过两个 JSON 列）的降级查询。
+
+    存在的意义：``payload_redacted`` / ``secret_paths_changed`` 是 JSON 列，SQLAlchemy
+    在**读结果**时就把它们反序列化了——任何一行内容损坏（人工改库、半截导入），
+    整批历史就都读不出来。历史列表因此必须有一条不碰 JSON 列的退路：元数据仍然
+    可用，"这一版存在，只是内容坏了"是运维真正需要看到的信息。
+
+    同样带上限：降级路径也不能变成"把所有行读一遍"。
+    """
+
+    statement = select(
+        RuntimeConfigHistory.revision,
+        RuntimeConfigHistory.parent_revision,
+        RuntimeConfigHistory.operation,
+        RuntimeConfigHistory.summary,
+        RuntimeConfigHistory.updated_by,
+        RuntimeConfigHistory.updated_at,
+        RuntimeConfigHistory.restore_source_revision,
+    )
+    if before is not None:
+        statement = statement.where(RuntimeConfigHistory.revision < int(before))
+    statement = statement.order_by(RuntimeConfigHistory.revision.desc())
+    if limit is not None:
+        statement = statement.limit(int(limit))
+    result = await session.execute(statement)
+    return [
+        RuntimeConfigHistory(
+            revision=int(row.revision),
+            parent_revision=int(row.parent_revision),
+            operation=str(row.operation or "save"),
+            summary=str(row.summary or ""),
+            updated_by=int(row.updated_by or 0),
+            updated_at=row.updated_at,
+            restore_source_revision=(
+                int(row.restore_source_revision)
+                if row.restore_source_revision is not None
+                else None
+            ),
+        )
+        for row in result.all()
+    ]
+
+
 class RuntimeConfigManager:
     def __init__(
         self,
@@ -2509,12 +2630,24 @@ class RuntimeConfigManager:
         secrets: dict[str, str],
         *,
         updated_by: int,
+        delete_paths: Iterable[str] = (),
     ) -> None:
+        """写密钥表。**只删 ``delete_paths`` 里的行**，其余一律保留。
+
+        保留策略（见 ``docs/configuration-reference.md``）：一张密钥行只有在它的
+        **槽位仍然存在于配置里**、并且这次被明确清空时才允许删除。供应商被从配置
+        里删掉时 ``providers.<name>.api_key`` 不再是任何候选配置的合法槽位，于是它
+        的密文**留在库里**：运行时看不见它，但它也没被销毁。原来这里是把"不在
+        ``secrets`` 里"直接当成删除指令，于是"回滚到一个供应商更少的旧版本 →
+        再随便保存一次"会把那把 API Key 真的删掉——配置看着回滚成功，凭据没了。
+        """
+
+        deletes = {str(path) for path in delete_paths}
         result = await session.execute(select(RuntimeConfigSecret))
         existing = {row.name: row for row in result.scalars().all()}
-        for name, row in existing.items():
-            if name not in secrets:
-                await session.delete(row)
+        for name in sorted(existing):
+            if name in deletes:
+                await session.delete(existing[name])
         for name, value in secrets.items():
             row = existing.get(name)
             ciphertext = self._cipher.encrypt(value)
@@ -2529,6 +2662,29 @@ class RuntimeConfigManager:
             else:
                 row.ciphertext = ciphertext
                 row.updated_by = updated_by
+
+    async def _stored_secret_names(self) -> set[str]:
+        """密钥表里**有哪些路径**（只读名字，不解密）。
+
+        不解密是有意的：保留策略的判断不该依赖 CONFIG_MASTER_KEY 可用，历史列表
+        更不该因为主密钥缺失就整个打不开。
+        """
+
+        async with self.session_factory() as session:
+            result = await session.execute(select(RuntimeConfigSecret.name))
+            return {str(name) for name in result.scalars().all()}
+
+    async def retained_secret_paths(self) -> list[str]:
+        """密钥表里有、当前配置里**没有对应槽位**的密钥（保留，未删除）。
+
+        这就是"供应商被删掉 / 回滚到供应商更少的旧版本"之后的状态：它们不再被
+        运行时使用，但密文还在。UI 要能把它们显示出来——"保留"如果不可见，运维
+        会以为配置里没有这把 Key 了，重新填一遍。
+        """
+
+        stored = await self._stored_secret_names()
+        live = configured_secret_paths(self.config.extract_secrets())
+        return sorted(stored - live)
 
     async def initialize(self) -> RuntimeConfig:
         async with self._lock:
@@ -2611,89 +2767,173 @@ class RuntimeConfigManager:
             # component-specific refresh is logged for operator action.
             log.exception("runtime config post-apply callback failed")
 
-    async def save(
+    def _validate_candidate_secrets(self, candidate: RuntimeConfig) -> None:
+        """Turnstile / hCaptcha 的 Site-Secret 配对检查（save 与 restore 共用）。
+
+        "已存在的同值配置"照旧放行：老库里 site == secret 是既成事实，一次无关的
+        保存不该把它变成永远保存不了的死配置。
+        """
+
+        current = self.config
+        turnstile_issue = turnstile_key_configuration_issue(
+            candidate.verification.turnstile_site_key,
+            candidate.verification.turnstile_secret_key,
+        )
+        current_turnstile_issue = turnstile_key_configuration_issue(
+            current.verification.turnstile_site_key,
+            current.verification.turnstile_secret_key,
+        )
+        unchanged_legacy_issue = bool(
+            current_turnstile_issue
+            and turnstile_issue
+            and candidate.verification.turnstile_site_key
+            == current.verification.turnstile_site_key
+            and candidate.verification.turnstile_secret_key
+            == current.verification.turnstile_secret_key
+        )
+        if turnstile_issue and not unchanged_legacy_issue:
+            raise ValueError(turnstile_issue)
+        hcaptcha_issue = hcaptcha_key_configuration_issue(
+            candidate.verification.hcaptcha_site_key,
+            candidate.verification.hcaptcha_secret_key,
+        )
+        current_hcaptcha_issue = hcaptcha_key_configuration_issue(
+            current.verification.hcaptcha_site_key,
+            current.verification.hcaptcha_secret_key,
+        )
+        unchanged_hcaptcha_issue = bool(
+            current_hcaptcha_issue
+            and hcaptcha_issue
+            and candidate.verification.hcaptcha_site_key
+            == current.verification.hcaptcha_site_key
+            and candidate.verification.hcaptcha_secret_key
+            == current.verification.hcaptcha_secret_key
+        )
+        if hcaptcha_issue and not unchanged_hcaptcha_issue:
+            raise ValueError(hcaptcha_issue)
+
+    def _build_candidate(
         self,
         payload: dict[str, Any],
         *,
+        secrets: dict[str, str],
+    ) -> RuntimeConfig:
+        """把一份 payload + 一份密钥表合成"待落库的候选配置"。
+
+        ``save()`` / ``restore()`` / ``preview()`` / 历史列表共用这一条：落库前把
+        **所有**会拒绝这次变更的原因都算完（严格 schema、密钥白名单、Site-Secret
+        配对、``apply_to_settings`` 能不能跑通），任何一条不过数据库一个字节都
+        不会动。共用是刻意的——"保存能过、回滚不能过"的分叉行为比多一次校验贵
+        得多。
+        """
+
+        normalized_payload, _ = _normalize_deprecated_runtime_payload(payload)
+        return self._finalize_candidate(
+            RuntimeConfig.model_validate(normalized_payload),
+            secrets=secrets,
+        )
+
+    def _finalize_candidate(
+        self,
+        candidate: RuntimeConfig,
+        *,
+        secrets: dict[str, str],
+    ) -> RuntimeConfig:
+        """合并密钥 + 配对校验 + 干跑 ``apply_to_settings``（只作用于 settings 副本）。"""
+
+        allowed_paths = candidate.secret_paths()
+        merged = {
+            path: value
+            for path, value in secrets.items()
+            if path in allowed_paths and str(value or "").strip()
+        }
+        candidate = candidate.with_secrets(merged)
+        self._validate_candidate_secrets(candidate)
+        candidate.apply_to_settings(
+            self.settings.model_copy(deep=True),
+            apply_prompts=False,
+        )
+        return candidate
+
+    def _redacted_current(self) -> dict[str, Any]:
+        """当前配置的脱敏快照（差异的基准侧）。"""
+
+        return redact_payload(
+            self.config.model_dump(mode="json"), self.config.secret_paths()
+        )
+
+    def _prepare_revision(
+        self,
+        candidate: RuntimeConfig,
+        *,
+        changed_secret_paths: list[str] | None,
+    ) -> _PreparedRevision:
+        """**预览与保存共用的那一次判断**：脱敏 → 量快照 → 算差异 → 写摘要。
+
+        放在这里而不是各写一份，是因为"预览说能存、保存说存不下"是一次真实的
+        事故：``preview`` 曾经完全跳过 :func:`ensure_snapshot_within_limit`，
+        于是管理员点"预览"看到一切正常，点"保存"拿到 400。
+
+        顺序刻意是"先量后开会话"：超限时数据库一个字节都不写，连乐观锁的 UPDATE
+        都不该发出去。这里绝不能"截断后照存"或"跳过历史照存主表"——那正是
+        "配置改了却查不到谁改的"这条不变量要防的事。正常配置离上限有两个数量级
+        （默认脱敏后约 80 KB / 上限 1 MiB），超限即说明有人提交了病态大小的
+        提示词，而不是"今天恰好配置变大了"。
+        """
+
+        secret_paths = candidate.secret_paths()
+        payload_redacted = redact_payload(
+            candidate.model_dump(mode="json"), secret_paths
+        )
+        size_bytes = ensure_snapshot_within_limit(payload_redacted)
+        entries = build_diff(
+            self._redacted_current(),
+            payload_redacted,
+            secret_paths,
+            changed_secret_paths=changed_secret_paths,
+        )
+        return _PreparedRevision(
+            payload_redacted=payload_redacted,
+            secret_paths=secret_paths,
+            size_bytes=size_bytes,
+            entries=entries,
+            summary=build_summary(entries, changed_secret_paths),
+            changed_secret_paths=list(changed_secret_paths or ()),
+        )
+
+    async def _commit_revision(
+        self,
+        *,
+        candidate: RuntimeConfig,
+        secrets: dict[str, str] | None,
+        delete_secret_paths: Iterable[str] = (),
         expected_revision: int,
         updated_by: int,
-        secret_changes: dict[str, dict[str, str]] | None = None,
-    ) -> RuntimeConfig:
-        async with self._lock:
-            current = self.config
-            normalized_payload, _ = _normalize_deprecated_runtime_payload(payload)
-            candidate = RuntimeConfig.model_validate(normalized_payload)
-            allowed_paths = candidate.secret_paths()
-            secrets = current.extract_secrets()
+        operation: str,
+        restore_source_revision: int | None = None,
+        changed_secret_paths: list[str] | None = None,
+    ) -> int:
+        """乐观锁更新 + 密钥表 + 历史行，**同一个事务**。
 
-            # Non-empty secret fields are accepted for non-browser callers, but
-            # the Mini App normally uses the explicit replace/clear protocol.
-            secrets.update(candidate.extract_secrets())
-            for path, change in (secret_changes or {}).items():
-                if path not in allowed_paths:
-                    raise ValueError(f"unknown secret setting: {path}")
-                action = str((change or {}).get("action") or "").strip().lower()
-                if action == "keep":
-                    continue
-                if action == "clear":
-                    secrets.pop(path, None)
-                    continue
-                if action == "replace":
-                    value = str((change or {}).get("value") or "").strip()
-                    if not value:
-                        raise ValueError(f"replacement secret is empty: {path}")
-                    secrets[path] = value
-                    continue
-                raise ValueError(f"invalid secret action for {path}")
-            secrets = {
-                path: value
-                for path, value in secrets.items()
-                if path in allowed_paths and value
-            }
-            candidate = candidate.with_secrets(secrets)
-            turnstile_issue = turnstile_key_configuration_issue(
-                candidate.verification.turnstile_site_key,
-                candidate.verification.turnstile_secret_key,
-            )
-            current_turnstile_issue = turnstile_key_configuration_issue(
-                current.verification.turnstile_site_key,
-                current.verification.turnstile_secret_key,
-            )
-            unchanged_legacy_issue = bool(
-                current_turnstile_issue
-                and turnstile_issue
-                and candidate.verification.turnstile_site_key
-                == current.verification.turnstile_site_key
-                and candidate.verification.turnstile_secret_key
-                == current.verification.turnstile_secret_key
-            )
-            if turnstile_issue and not unchanged_legacy_issue:
-                raise ValueError(turnstile_issue)
-            hcaptcha_issue = hcaptcha_key_configuration_issue(
-                candidate.verification.hcaptcha_site_key,
-                candidate.verification.hcaptcha_secret_key,
-            )
-            current_hcaptcha_issue = hcaptcha_key_configuration_issue(
-                current.verification.hcaptcha_site_key,
-                current.verification.hcaptcha_secret_key,
-            )
-            unchanged_hcaptcha_issue = bool(
-                current_hcaptcha_issue
-                and hcaptcha_issue
-                and candidate.verification.hcaptcha_site_key
-                == current.verification.hcaptcha_site_key
-                and candidate.verification.hcaptcha_secret_key
-                == current.verification.hcaptcha_secret_key
-            )
-            if hcaptcha_issue and not unchanged_hcaptcha_issue:
-                raise ValueError(hcaptcha_issue)
-            candidate.apply_to_settings(
-                self.settings.model_copy(deep=True),
-                apply_prompts=False,
-            )
+        历史行必须和主表同生共死：只写主表不写历史，等于"配置改了但查不到是谁改
+        的"，审计链从这里断掉。所以历史 INSERT 放在 ``session.flush()``（commit
+        之前）里，任何一步抛错都整笔回滚——绝不允许出现"主表已经变了、历史没有"
+        的中间态。``revision`` 上的唯一索引是第二道保险：真出现重复 revision 时
+        让事务炸掉，而不是悄悄记两遍。
 
-            async with self.session_factory() as session:
-                expected = int(expected_revision)
+        ``secrets is None`` 表示"这次不动密钥表"（回滚路径就是如此：回滚永远保留
+        当前密钥，不重写也不删除）。
+
+        脱敏、体积上限、差异、摘要全部由 :meth:`_prepare_revision` 算——**保存
+        预览调的是同一个方法**，所以两者不可能给出不同的判断。
+        """
+
+        expected = int(expected_revision)
+        prepared = self._prepare_revision(
+            candidate, changed_secret_paths=changed_secret_paths
+        )
+        async with self.session_factory() as session:
+            try:
                 result = await session.execute(
                     update(RuntimeConfigRecord)
                     .where(
@@ -2717,19 +2957,490 @@ class RuntimeConfigManager:
                     raise RuntimeConfigConflictError(
                         f"runtime config revision changed: expected {expected}, got {int(actual or 0)}"
                     )
-                await self._write_secret_map(session, secrets, updated_by=int(updated_by))
+                if secrets is not None:
+                    await self._write_secret_map(
+                        session,
+                        secrets,
+                        updated_by=int(updated_by),
+                        delete_paths=delete_secret_paths,
+                    )
+                session.add(
+                    RuntimeConfigHistory(
+                        revision=expected + 1,
+                        parent_revision=expected,
+                        payload_redacted=prepared.payload_redacted,
+                        secret_paths_changed=prepared.changed_secret_paths,
+                        updated_by=int(updated_by),
+                        operation=operation,
+                        summary=prepared.summary,
+                        restore_source_revision=restore_source_revision,
+                    )
+                )
+                await session.flush()
                 await session.commit()
-                revision = expected + 1
+            except BaseException:
+                # 显式回滚：历史写入失败时主表必须逐字不变（乐观锁的 UPDATE 已经
+                # 发出去了，不回滚就等于"配置改了、历史没写"）。
+                await session.rollback()
+                raise
+        return expected + 1
 
-            candidate.apply_to_settings(self.settings)
-            policy_runtime.bind(self.settings)
-            self._restart_pending = candidate.restart_pending_paths(
-                self._applied_restart or applied_restart_values()
+    def _publish_applied(self, candidate: RuntimeConfig, revision: int) -> None:
+        """提交之后把新配置热更到进程内（save / restore 共用）。"""
+
+        candidate.apply_to_settings(self.settings)
+        policy_runtime.bind(self.settings)
+        self._restart_pending = candidate.restart_pending_paths(
+            self._applied_restart or applied_restart_values()
+        )
+        self._config = candidate
+        self._revision = revision
+
+    def _prepare_candidate(
+        self,
+        payload: dict[str, Any],
+        *,
+        secret_changes: dict[str, dict[str, str]] | None,
+    ) -> tuple[RuntimeConfig, dict[str, str], list[str]]:
+        """"这次保存长什么样"：**预览与保存唯一的一条解析路径**。
+
+        返回 ``(candidate, secrets, changed_secret_paths)``。三件事在这里做，而且
+        只在这里做：
+
+        1. ``secret_changes`` 交给 :func:`resolve_secret_changes` —— 未知路径、
+           未知动作、空的 replace 都会被拒。预览以前自己抄了一份只认 replace/clear
+           的解析器，于是这些请求"预览通过、保存报错"。
+        2. ``_finalize_candidate`` —— 严格 schema、密钥白名单、Site-Secret 配对、
+           ``apply_to_settings`` 干跑。
+        3. ``changed_secret_paths`` —— 只有 ``save()`` 会把它写进历史，预览用它算
+           差异，于是两边看到的差异逐字一致。
+        """
+
+        current = self.config
+        # ``GET /api/v1/settings`` 回的是带 ``<redacted:current>`` 标记的编辑
+        # 表单；把它原样回传是**无损**的——这些标记先被换回当前值，再进校验。
+        # 少了这一步，一次"什么都没改"的保存会把标记本身写进配置。
+        resolved_payload = restore_opaque_values(
+            payload, current.model_dump(mode="json")
+        )
+        normalized_payload, _ = _normalize_deprecated_runtime_payload(resolved_payload)
+        proposed = RuntimeConfig.model_validate(normalized_payload)
+        # 改之前的密钥表：既作为默认值，也是判断"这次哪些密钥状态变了"的基准。
+        previous_secrets = current.extract_secrets()
+        secrets, replaced_paths = resolve_secret_changes(
+            secret_changes,
+            allowed_paths=proposed.secret_paths(),
+            current_secrets=previous_secrets,
+            # Non-empty secret fields are accepted for non-browser callers, but
+            # the Mini App normally uses the explicit replace/clear protocol.
+            proposed_secrets=proposed.extract_secrets(),
+        )
+        # 脱敏快照里只有"配没配"，看不出**换了新值**；这一步由 keep/clear/replace
+        # 协议补上，历史里才有一条"该密钥被替换过"的记录（仍然只有路径名）。
+        changed_secrets = sorted(
+            set(secret_status_change(previous_secrets, secrets)) | replaced_paths
+        )
+        candidate = self._finalize_candidate(proposed, secrets=secrets)
+        return candidate, secrets, changed_secrets
+
+    @staticmethod
+    def _deleted_secret_paths(
+        previous_secrets: dict[str, str],
+        secrets: dict[str, str],
+        allowed_paths: set[str],
+    ) -> list[str]:
+        """这次保存允许删掉哪些密钥行。
+
+        **只有仍然存在于候选配置里的槽位才可能被删**：供应商被从配置里删掉时，
+        ``providers.<name>.api_key`` 已经不是合法槽位，它的密文必须**保留**。
+        这条保留策略是"回滚 → 再保存"这条链上唯一会让密钥真的消失的地方。
+        """
+
+        return sorted(
+            path
+            for path in set(previous_secrets) - set(secrets)
+            if path in allowed_paths
+        )
+
+    async def save(
+        self,
+        payload: dict[str, Any],
+        *,
+        expected_revision: int,
+        updated_by: int,
+        secret_changes: dict[str, dict[str, str]] | None = None,
+    ) -> RuntimeConfig:
+        async with self._lock:
+            # 保存**之前**的密钥表：决定"这次哪些行允许被删"的基准。必须在
+            # ``_prepare_candidate`` 之前取——它返回的候选还没发布，此时
+            # ``self.config`` 仍然是旧值，两边取到的是同一份。
+            previous_secrets = self.config.extract_secrets()
+            candidate, secrets, changed_secrets = self._prepare_candidate(
+                payload, secret_changes=secret_changes
             )
-            self._config = candidate
-            self._revision = revision
+            revision = await self._commit_revision(
+                candidate=candidate,
+                secrets=secrets,
+                delete_secret_paths=self._deleted_secret_paths(
+                    previous_secrets, secrets, candidate.secret_paths()
+                ),
+                expected_revision=expected_revision,
+                updated_by=updated_by,
+                operation="save",
+                changed_secret_paths=changed_secrets,
+            )
+            self._publish_applied(candidate, revision)
             await self._notify_applied(candidate)
             return candidate
+
+    def _restore_candidate(
+        self,
+        row: RuntimeConfigHistory,
+        *,
+        secrets: dict[str, str],
+    ) -> RuntimeConfig:
+        """历史那一版 → 管理员**真正会拿到**的配置。
+
+        两步合并，顺序不能换：
+
+        1. ``restore_opaque_values``：把 ``<redacted:current>`` 与就地抹掉凭据的
+           URL 换成**当前**值；当前也没有就明确抛
+           :class:`RuntimeConfigHistoryNotRestorableError`，绝不悄悄清空。
+        2. ``strip_redaction_markers``：登记在册的密钥变成空串，随后由
+           ``secrets`` 合并回来（回滚永远保留当前密钥）。
+        """
+
+        merged = restore_opaque_values(
+            row.payload_redacted, self.config.model_dump(mode="json")
+        )
+        return self._build_candidate(
+            strip_redaction_markers(merged),
+            secrets=secrets,
+        )
+
+    async def _restore_candidate_for_revision(
+        self,
+        revision: int,
+    ) -> tuple[int, RuntimeConfig, dict[str, str]]:
+        row = await self.history_row(revision)
+        # 密钥从**库里**读而不是从内存快照读：库才是"当前密钥"的权威，也
+        # 让"密钥服务不可用"在回滚路径上同样报得出稳定的 400，而不是静默
+        # 回滚成"密钥全空"。
+        async with self.session_factory() as session:
+            secrets = await self._load_secret_map(session)
+        return int(row.revision), self._restore_candidate(row, secrets=secrets), secrets
+
+    async def restore(
+        self,
+        revision: int,
+        *,
+        expected_revision: int,
+        updated_by: int,
+    ) -> RuntimeConfig:
+        """把非密钥字段回滚到某个历史 revision。
+
+        语义（四条，写在方法上是因为每一条都对应一个真实事故）：
+
+        * **密钥一个都不动。** 历史里根本没有密钥（只有状态标记），回滚时把
+          **当前**密钥表合并回来；``secrets=None`` 让 ``_write_secret_map`` 根本
+          不被调用，密文与 ``updated_by`` 保持原样。密钥是独立资产，回滚配置
+          绝不能顺手把 API Key 清掉。
+        * **候选与真正回滚逐字同一份**（:meth:`_restore_candidate` + 预览走同一个
+          方法）："我以为回滚会得到 X，结果得到 Y"比回滚失败更难查。
+        * **永远前向产生新 revision。** 回滚当前 revision 也会写一条
+          ``operation="restore"`` 的新历史，历史是**追加**的、绝不倒写——否则审计
+          链的时间顺序就没了。
+        * **与 save 走同一条校验与落库路径**（``_build_candidate`` +
+          ``_prepare_revision`` + ``_commit_revision``）：回滚后的配置同样要过严格
+          schema、快照上限和 ``apply_to_settings``，过不了就整笔回滚，不会把进程
+          改成一个跑不起来的状态。
+        """
+
+        async with self._lock:
+            target, candidate, _secrets = await self._restore_candidate_for_revision(
+                revision
+            )
+            revision_value = await self._commit_revision(
+                candidate=candidate,
+                secrets=None,
+                expected_revision=expected_revision,
+                updated_by=updated_by,
+                operation="restore",
+                restore_source_revision=target,
+                changed_secret_paths=[],
+            )
+            self._publish_applied(candidate, revision_value)
+            await self._notify_applied(candidate)
+            return candidate
+
+    async def preview_restore(self, revision: int) -> dict[str, Any]:
+        """"回滚到这一版会发生什么"——**当前配置 → 真正的回滚候选**。
+
+        刻意不是"两个历史版本之间的差异"：管理员点回滚时拿到的是
+        ``目标版本非密钥字段 + 当前密钥 + 当前不透明值``，他需要看的正是
+        **当前**到那一份的差异。多读一条当前密钥，与 :meth:`restore` 共用
+        :meth:`_restore_candidate`，所以"预览说会这样、回滚却不是这样"不可能发生。
+        """
+
+        async with self._lock:
+            target, candidate, _secrets = await self._restore_candidate_for_revision(
+                revision
+            )
+            prepared = self._prepare_revision(candidate, changed_secret_paths=[])
+            return {
+                "revision": target,
+                "current_revision": self.revision,
+                "diff": prepared.entries,
+                "summary": prepared.summary,
+                "snapshot_bytes": prepared.size_bytes,
+                "restart_pending": candidate.restart_pending_paths(
+                    self._applied_restart or applied_restart_values()
+                ),
+                "retained_secrets": await self.retained_secret_paths(),
+            }
+
+    async def preview(
+        self,
+        payload: dict[str, Any],
+        *,
+        secret_changes: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """"这次保存会把配置改成什么样"——**只读**，一个字都不写。
+
+        与 :meth:`save` 共用 :meth:`_prepare_candidate` + :meth:`_prepare_revision`：
+        同一份请求体在预览与真保存下得到**逐字相同**的候选、**逐字相同**的差异、
+        **同一个**体积上限判断，以及失败时**同一个**异常类型（于是同一个稳定错误
+        码）。以前预览是另抄的一份解析器，还完全跳过了体积上限，于是"预览接受 /
+        保存拒绝"。
+
+        这里**不做**乐观锁检查：预览没有写入语义，过期 revision 由调用方对比返回
+        的 ``revision`` 自行提示。
+        """
+
+        async with self._lock:
+            candidate, _secrets, changed_secrets = self._prepare_candidate(
+                payload, secret_changes=secret_changes
+            )
+            prepared = self._prepare_revision(
+                candidate, changed_secret_paths=changed_secrets
+            )
+            return {
+                "revision": self.revision,
+                "diff": prepared.entries,
+                "summary": prepared.summary,
+                "changed_secret_paths": prepared.changed_secret_paths,
+                "snapshot_bytes": prepared.size_bytes,
+                "snapshot_limit_bytes": snapshot_limit(),
+                "restart_pending": candidate.restart_pending_paths(
+                    self._applied_restart or applied_restart_values()
+                ),
+            }
+
+    async def _history_page(
+        self,
+        *,
+        limit: int,
+        before: int | None,
+    ) -> tuple[list[RuntimeConfigHistory], bool]:
+        """取**至多** ``limit`` 行（按 revision 升序），外加"还有没有更早的"。
+
+        多读一行来判断 ``has_more``，所以翻页契约不会因为"最后一页恰好等于
+        limit"而多翻一次空页。JSON 列只在这 ``limit + 1`` 行上反序列化。
+        """
+
+        async with self.session_factory() as session:
+            try:
+                statement = select(RuntimeConfigHistory)
+                if before is not None:
+                    statement = statement.where(
+                        RuntimeConfigHistory.revision < int(before)
+                    )
+                result = await session.execute(
+                    statement.order_by(RuntimeConfigHistory.revision.desc()).limit(
+                        int(limit) + 1
+                    )
+                )
+                rows = list(result.scalars().all())
+            except (ValueError, TypeError):
+                # 某一行的 payload_redacted 不是合法 JSON（人工改库、半截导入）：
+                # SQLAlchemy 是在**结果反序列化**时抛的错，整批都读不出来。退化成
+                # 只读元数据——历史列表必须还能看见"这一版存在，只是内容坏了"，
+                # 只有读详情/回滚才应该拒绝。
+                await session.rollback()
+                rows = await _history_metadata_only(
+                    session, limit=int(limit) + 1, before=before
+                )
+        has_more = len(rows) > int(limit)
+        page = rows[: int(limit)]
+        page.reverse()
+        return page, has_more
+
+    async def history_rows(
+        self,
+        *,
+        limit: int = HISTORY_PAGE_LIMIT,
+        before: int | None = None,
+    ) -> list[RuntimeConfigHistory]:
+        """按 revision 升序返回历史行（``payload_redacted`` 已脱敏）。
+
+        **有上限**：默认 :data:`HISTORY_PAGE_LIMIT` 行，最多
+        :data:`HISTORY_PAGE_MAX_LIMIT` 行。以前这里是"返回全部行"，于是一条
+        无界的读取接口能把整个历史表拉进内存、在全局锁里把所有 JSON 重新反序列化
+        并逐行重建候选配置——一个足够大的提示词就能把保存路径一起堵死。
+        """
+
+        if limit is None or int(limit) <= 0:
+            raise ValueError("history page limit must be a positive integer")
+        if int(limit) > HISTORY_PAGE_MAX_LIMIT:
+            raise ValueError(
+                f"history page limit exceeds {HISTORY_PAGE_MAX_LIMIT}"
+            )
+        rows, _has_more = await self._history_page(limit=int(limit), before=before)
+        return rows
+
+    async def history_row(self, revision: int) -> RuntimeConfigHistory:
+        """取一行历史；缺失**或**损坏都走同一个稳定异常（调用方只需知道回滚不到）。"""
+
+        target = int(revision)
+        async with self.session_factory() as session:
+            try:
+                row = await session.scalar(
+                    select(RuntimeConfigHistory).where(
+                        RuntimeConfigHistory.revision == target
+                    )
+                )
+            except (ValueError, TypeError) as exc:
+                # JSON 损坏：这一版就是回滚不了，对外与"不存在"同码。
+                raise RuntimeConfigHistoryNotFoundError(
+                    f"runtime config history revision {target} is unavailable"
+                ) from exc
+        stored = row.payload_redacted if row is not None else None
+        if row is None or not isinstance(stored, dict) or not stored:
+            raise RuntimeConfigHistoryNotFoundError(
+                f"runtime config history revision {target} is unavailable"
+            )
+        return row
+
+    def _history_secret_paths(self, row: RuntimeConfigHistory) -> set[str]:
+        """某一版历史涉及的 secret 路径（该版 payload 里的 ∪ 当前配置的）。
+
+        当前配置那一半是为了让"新增/删除一个供应商"这种变更也显示密钥状态，否则
+        历史详情里会凭空少一条"这个供应商当时没有密钥"。
+        """
+
+        stored = row.payload_redacted if isinstance(row.payload_redacted, dict) else {}
+        return discover_secret_paths(stored, self.config.secret_paths())
+
+    def history_secret_metadata(
+        self,
+        row: RuntimeConfigHistory,
+    ) -> list[dict[str, str]]:
+        """历史详情里的密钥**状态**元数据（配没配），永远没有值。"""
+
+        if not isinstance(row.payload_redacted, dict):
+            return []
+        return secret_status_metadata(
+            row.payload_redacted,
+            self._history_secret_paths(row),
+        )
+
+    async def _entries_for_rows(
+        self,
+        rows: list[RuntimeConfigHistory],
+    ) -> list[dict[str, Any]]:
+        """把历史行摊成列表条目（只含元数据，**任何配置值都不出现**）。
+
+        ``restart_pending`` 需要把每一版真的重建一遍候选配置，所以这里逐行调用与
+        :meth:`_restore_candidate` **完全相同**的合并逻辑——不是另一份"能跑就行"
+        的近似（``<redacted:current>`` 若不被解析，会让每一版都被误判成"不可
+        回滚"，重启字段一栏永远为空）。
+
+        调用方必须已经取好**有上限**的行集合，见 :meth:`_history_page`。
+        """
+
+        baseline = self._applied_restart or applied_restart_values()
+        secrets = self.config.extract_secrets()
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            pending: list[str] = []
+            try:
+                config = self._restore_candidate(row, secrets=secrets)
+            except (ValueError, ValidationError):
+                # 某一版历史在当前 schema 下已经不可用（比如老字段退役），或者它
+                # 的不透明槽位在当前配置里取不到值：这一行**仍然要显示**，只是
+                # "重启字段"一栏为空——历史不是无效的，只是不能直接回滚。
+                config = None
+            if config is not None:
+                pending = config.restart_pending_paths(baseline)
+            entries.append(
+                {
+                    "revision": int(row.revision),
+                    "parent_revision": int(row.parent_revision),
+                    "operation": str(row.operation),
+                    "summary": str(row.summary),
+                    "updated_by": int(row.updated_by or 0),
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+                    "restore_source_revision": (
+                        int(row.restore_source_revision)
+                        if row.restore_source_revision is not None
+                        else None
+                    ),
+                    "restart_pending": pending,
+                }
+            )
+        return entries
+
+    async def history_entries(
+        self,
+        *,
+        limit: int = HISTORY_PAGE_LIMIT,
+        before: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """历史列表（一页），只含元数据，**任何配置值都不出现**。"""
+
+        async with self._lock:
+            rows, _has_more = await self._history_page(limit=int(limit), before=before)
+            return await self._entries_for_rows(rows)
+
+    async def history_page(
+        self,
+        *,
+        limit: int = HISTORY_PAGE_LIMIT,
+        before: int | None = None,
+    ) -> dict[str, Any]:
+        """分页历史列表 + 稳定的翻页契约。
+
+        响应形状::
+
+            {"history": [...], "page": {"limit", "before", "count",
+                                        "has_more", "next_before"}}
+
+        ``history`` 按 revision **升序**（最旧 → 最新）。第一页取**最新**的
+        ``limit`` 行；``next_before`` 是这一页里**最小**的 revision，把它作为下
+        一页的 ``before`` 就能继续往更早翻，直到 ``has_more`` 为 false。整条链走
+        到头恰好覆盖全部行，不重不漏。
+        """
+
+        page_size = int(limit)
+        if page_size <= 0 or page_size > HISTORY_PAGE_MAX_LIMIT:
+            raise ValueError(
+                f"history page limit must be between 1 and {HISTORY_PAGE_MAX_LIMIT}"
+            )
+        async with self._lock:
+            rows, has_more = await self._history_page(limit=page_size, before=before)
+            entries = await self._entries_for_rows(rows)
+        return {
+            "history": entries,
+            "page": {
+                "limit": page_size,
+                "before": int(before) if before is not None else None,
+                "count": len(entries),
+                "has_more": bool(has_more),
+                "next_before": (
+                    min(int(row.revision) for row in rows) if has_more and rows else None
+                ),
+            },
+        }
 
     def api_document(self) -> dict[str, Any]:
         config = self.config

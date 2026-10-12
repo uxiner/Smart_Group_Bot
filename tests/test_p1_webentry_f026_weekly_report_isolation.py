@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot.tools import weekly_report
 
@@ -54,7 +54,9 @@ class WeeklyReportPerGroupIsolationTests(unittest.IsolatedAsyncioTestCase):
             sent_to.append(int(chat_id))
             return SimpleNamespace(message_id=1)
 
-        async def render_group_quality(_session, *, group_id, days, activity_lines):
+        async def render_group_quality(
+            _session, *, group_id, days, activity_lines, **_kwargs
+        ):
             if group_id == broken_group:
                 raise RuntimeError("boom: 这个群的报表炸了")
             return f"群 {group_id} 的周报"
@@ -69,9 +71,16 @@ class WeeklyReportPerGroupIsolationTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.commit = AsyncMock()
                 self.rollback = AsyncMock()
+                self.add = MagicMock()
+                self.flush = AsyncMock()
 
             async def execute(self, *_args, **_kwargs):
                 return SimpleNamespace(scalar_one_or_none=lambda: (1,))
+
+            async def scalar(self, *_args, **_kwargs):
+                # 出站证据查询：这个替身代表"没有任何 receipt"的场景，仍按
+                # 原来的占位/发送路径走（断言与场景不变）。
+                return None
 
         class _Ctx:
             async def __aenter__(self):

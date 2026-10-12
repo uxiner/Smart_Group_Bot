@@ -12,7 +12,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from inspect import isawaitable
 from types import SimpleNamespace
 from typing import Any
@@ -26,7 +26,7 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
-from bot.services import llm_metrics
+from bot.services import group_costs, llm_metrics, usage_scope
 from bot.services import model_limits as model_limits_module
 from bot.services.model_limits import (
     CONTEXT_MODE_FIXED,
@@ -49,6 +49,101 @@ from bot.services.request_priority import (
 from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
+
+#: 进程级预算护栏。启动时装配一次，之后**每个** LLM 调用点自动带上它 ——
+#: 不依赖每个调用方记得传 ``cost_guard``（漏一个就等于那个入口完全不受限）。
+#: 未装配时为 None，等价于「本部署没有启用按群预算」。
+_PROCESS_COST_GUARD: Any = None
+
+
+def configure_cost_guard(guard: Any | None) -> None:
+    """启动时注入（测试可临时替换）。"""
+
+    global _PROCESS_COST_GUARD
+    _PROCESS_COST_GUARD = guard
+
+
+def cost_guard_factory() -> Any | None:
+    return _PROCESS_COST_GUARD
+
+
+async def _release_reservation(cost_guard: Any, reservation_id: int | None) -> None:
+    """请求**没发出去**（排队取消 / 许可超时）时退还预留。幂等，绝不冒泡。"""
+
+    if cost_guard is None or reservation_id is None:
+        return
+    try:
+        await cost_guard.release(reservation_id)
+    except Exception:  # pragma: no cover - 记账绝不拖垮请求
+        log.debug("budget reservation release failed", exc_info=True)
+
+
+async def _settle_reservation(
+    cost_guard: Any,
+    reservation_id: int | None,
+    response: Any,
+    *,
+    unknown: bool = False,
+) -> None:
+    # 结算一次预留。任何异常都不冒泡：护栏记账失败不该让一条正常回复失败。
+    if cost_guard is None or reservation_id is None:
+        return
+    try:
+        await cost_guard.settle(
+            reservation_id,
+            usage=None if response is None else getattr(response, "usage", None),
+            unknown=unknown,
+        )
+    except Exception:  # pragma: no cover - 记账绝不拖垮主链路
+        log.debug("budget reservation settle failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# 用量归属（每次**真正发出**供应商请求都记一条）
+# ---------------------------------------------------------------------------
+#: 拿不到任何配置槽身份时的显式标记。宁可标"未知"，也不要拿协议名冒充：
+#: 协议名会让两个不同网关被算成同一家，于是按其中一家的价格给另一家出账。
+COST_IDENTITY_UNKNOWN = "unknown-slot"
+
+
+def cost_provider_key(cfg: Any) -> str:
+    """台账里的「实际供应商」标识 = **逻辑配置槽名**。
+
+    取值顺序：显式 ``slot`` → ``provider``（运行时配置里它就是槽名）→ 未知。
+
+    刻意**不**用 model 的 ``vendor/`` 前缀，也不把 ``api_base`` 写进账：
+    前者会把两个不同网关合并，后者会把鉴权参数泄漏到成本报表。
+    """
+
+    slot = str(getattr(cfg, "slot", "") or "").strip().lower()
+    if slot:
+        return slot[:48]
+    provider = str(getattr(cfg, "provider", "") or "").strip().lower()
+    # ``provider`` 在运行时配置里存的就是槽名；只有当它恰好是本项目认识的
+    # **协议名**时，才说明这里没有槽身份 —— 那时候标未知，而不是拿协议名
+    # 冒充一家供应商（两个不同网关会因此被算成同一家）。
+    if provider and provider not in _KNOWN_PROTOCOL_NAMES:
+        return provider[:48]
+    return COST_IDENTITY_UNKNOWN
+
+
+def cost_model_key(cfg: Any) -> str:
+    return str(getattr(cfg, "model", "") or "")[:128]
+
+
+@contextmanager
+def cost_purpose_scope(purpose: str | None):
+    """临时把这一次调用的用途钉住（如审核取证视觉 vs 娱乐看图）。"""
+
+    if not purpose:
+        yield
+        return
+    current = usage_scope.current_usage_scope()
+    token = usage_scope.set_current(usage_scope.with_purpose(current, purpose))
+    try:
+        yield
+    finally:
+        usage_scope.reset_current(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +178,16 @@ _LLM_PRIORITY_GATE = ReservedCapacityGate(
 # reply slots).  Ordinary replies keep the default NORMAL priority and can
 # no longer push an audit past its stage deadline during a burst.
 _MODERATION_EXECUTION_PRIORITY = ExecutionPriority.HIGH
+# 审核的**离线**变体（离线回放/dry-run）必须显式走 BACKGROUND：它占的是
+# `_LLM_PRIORITY_GATE` 的背景名额（≤2、与普通回复共享 normal 上限），一次都碰不到
+# 为活链路审核/权限变更保留的 HIGH/CRITICAL 额度。
+#
+# 为什么需要一个**显式参数**而不是靠外层 contextvar：`chat(use_moderation=True)`
+# 下方无条件套一个 HIGH 的 scope，外层调用方（`run_replay`）设的 BACKGROUND 会被
+# 它整个盖掉 —— 那正是"回放不吃活链路预算"这句话曾经为假的根因。降级必须由
+# 调用方在**这一层**说出来，并且只对这一次调用生效（默认仍然是 HIGH，绝不全局
+# 降级活链路审核）。
+_MODERATION_BACKGROUND_EXECUTION_PRIORITY = ExecutionPriority.BACKGROUND
 _LLM_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
 _LLM_ORPHAN_STARTED: dict[asyncio.Future[Any], float] = {}
 _LLM_CLEANUP_TASKS: set[asyncio.Future[Any]] = set()
@@ -463,6 +568,26 @@ _PROVIDER_CREDENTIAL_ENV_KEYS = {
     "mistral": ("MISTRAL_API_KEY",),
     "groq": ("GROQ_API_KEY",),
 }
+#: 本项目认识的协议名集合（来源：``_PROVIDER_CREDENTIAL_ENV_KEYS`` 的键 + 几个
+#: 传输层协议）。出现在这里就说明那是**协议**而不是配置槽。
+_KNOWN_PROTOCOL_NAMES: frozenset[str] = frozenset(
+    set(_PROVIDER_CREDENTIAL_ENV_KEYS)
+    | {
+        "azure",
+        "azure_ai",
+        "bedrock",
+        "vertex_ai",
+        "vertexai",
+        "ollama",
+        "together_ai",
+        "palm",
+        "claude",
+        "codestral",
+        "openai_compatible",
+        "custom",
+    }
+)
+
 _PROVIDER_OFFICIAL_HOSTS = {
     "gemini": {"generativelanguage.googleapis.com"},
     "openai": {"api.openai.com"},
@@ -832,6 +957,7 @@ class LLMService:
             ChatEndpointConfig(
                 model=cfg.model,
                 provider=getattr(cfg, "provider", ""),
+                slot=getattr(cfg, "slot", "") or "",
                 api_key=cfg.api_key,
                 api_base=cfg.api_base,
                 stream=cfg.stream,
@@ -856,6 +982,7 @@ class LLMService:
             EmbedEndpointConfig(
                 model=cfg.model,
                 provider=getattr(cfg, "provider", ""),
+                slot=getattr(cfg, "slot", "") or "",
                 api_key=cfg.api_key,
                 api_base=cfg.api_base,
                 endpoint_path=getattr(cfg, "endpoint_path", "/v1beta/models"),
@@ -1314,6 +1441,63 @@ class LLMService:
             usage=usage,
         )
 
+    @staticmethod
+    def _describe_response(normalized: Any) -> dict[str, Any]:
+        """从**已归一化**的响应里提取台账需要的判定（不抛异常）。
+
+        用 ``getattr`` 链而不是索引访问：choices 为空、message 缺字段这些形状
+        必须在这里安静地变成 "parse_failed"，而不是把整个归一化过程炸掉 ——
+        炸掉的话这条尝试就永远停在在飞表里。
+        """
+
+        out: dict[str, Any] = {}
+        choices = getattr(normalized, "choices", None)
+        if not choices:
+            out["parse_failed"] = True
+            return out
+        try:
+            message = choices[0].message
+            content = str(getattr(message, "content", "") or "").strip()
+            tool_calls = getattr(message, "tool_calls", None)
+        except Exception:  # noqa: BLE001 - 形状异常即视为解析失败
+            out["parse_failed"] = True
+            return out
+        out["empty"] = not content and not tool_calls
+        return out
+
+    @classmethod
+    def _settle_attempt(
+        cls,
+        attempt_id: str,
+        settled: dict[str, Any],
+        *,
+        failed: bool = False,
+        timed_out: bool = False,
+        parse_error: bool = False,
+    ) -> None:
+        """按已知信息结算一次尝试（幂等：重复调用只有第一次生效）。"""
+
+        if not attempt_id:
+            return
+        usage = settled.get("usage")
+        # 形状异常（choices 为空 / 字段缺失）就是**这一次尝试**的失败：
+        # 上游已经收了钱、也报了 usage，但这次调用对产品没有产出。把它记成
+        # 成功会让成本报表看不出这些"花了钱却什么都没拿到"的调用。
+        unparsable = bool(settled.get("parse_failed")) or parse_error
+        failed = failed or unparsable
+        try:
+            group_costs.record_result(
+                attempt_id=attempt_id,
+                usage=usage,
+                success=not (failed or timed_out),
+                failed=failed,
+                timed_out=timed_out,
+                empty=bool(settled.get("empty")) and not failed,
+                parse_error=unparsable,
+            )
+        except Exception:  # pragma: no cover - 记账绝不拖垮请求
+            log.debug("LLM attempt settlement failed", exc_info=True)
+
     @classmethod
     def _normalize_response_object(cls, resp: Any) -> Any:
         usage = cls._coerce_usage(cls._get_value(resp, "usage"))
@@ -1381,7 +1565,9 @@ class LLMService:
                 return param
         return ""
 
-    async def _consume_chat_stream(self, stream_resp: Any) -> Any:
+    async def _consume_chat_stream(
+        self, stream_resp: Any, observed: dict[str, Any] | None = None
+    ) -> Any:
         content_parts: dict[tuple[int, int], list[str]] = {}
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
@@ -1399,6 +1585,16 @@ class LLMService:
                 chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
                 if chunk_usage is not None:
                     usage = chunk_usage
+                    if observed is not None:
+                        # 边读边存：流读到一半抛异常时，已经观察到的 usage
+                        # 仍然要能进账 —— 上游已经收了钱。之前 usage 只在局部
+                        # 变量里，异常一抛就跟着丢了。
+                        observed["usage"] = chunk_usage
+                    if observed is not None:
+                        # 边读边存：流读到一半抛异常时，已经观察到的 usage
+                        # 仍然要能进账 —— 上游已经收了钱。之前 usage 只在
+                        # 局部变量里，异常一抛就跟着丢了。
+                        observed["usage"] = chunk_usage
 
                 if event_type in {"response.output_text.delta", "response.refusal.delta"}:
                     self._merge_stream_content_slot(
@@ -2391,7 +2587,12 @@ class LLMService:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
         permit: Any | None = None,
+        cost_guard: Any | None = None,
     ) -> Any | None:
+        # 调用方没显式给就用进程级那个：护栏必须覆盖**所有**入口，而不是
+        # 「谁记得传谁才受管」。
+        if cost_guard is None:
+            cost_guard = _PROCESS_COST_GUARD
         label_cn = self._label_cn(label)
         total_attempts = self._retry_attempts(cfg)
         limits = self.endpoint_limits(cfg)
@@ -2503,6 +2704,37 @@ class LLMService:
                 timeout_sec,
                 stream,
             )
+            # 预算准入：**每一次**尝试（含重试）都各自预留。放在重试循环里而不是
+            # 函数入口，是因为重试与回退各自都是一次真实请求；只在入口判一次
+            # 等于把额度放大了 (attempts × fallbacks) 倍。
+            reservation_id = None
+            if cost_guard is not None:
+                admitted = await cost_guard.admit(
+                    stage=label,
+                    prompt_tokens=prompt_tokens,
+                    max_output_tokens=int(getattr(cfg, "max_tokens", 0) or 0),
+                    # 每次尝试按**它自己**的候选计价：回退候选与主候选可能同协议
+                    # 同模型、不同网关，用固定的 guard 身份会把回退按主模型出账。
+                    provider=cost_provider_key(cfg),
+                    model=cost_model_key(cfg),
+                )
+                if not admitted.admitted:
+                    log.info(
+                        "LLM optional call denied by budget | stage=%s | model=%s | reason=%s",
+                        label_cn,
+                        cfg.model,
+                        admitted.reason,
+                    )
+                    group_costs.cancel_before_send(
+                        stage=label,
+                        provider=cost_provider_key(cfg),
+                        model=cost_model_key(cfg),
+                    )
+                    return None
+                reservation_id = admitted.reservation_id
+            # 「是否已把请求交给上游」由外层持有：内层只负责置位，
+            # 外层的 except 才能区分"没发出去"与"发出去了"。
+            sent = {"value": False}
             try:
                 async def _perform_attempt() -> Any:
                     # Keep the permit owned by the actual request task. If an
@@ -2556,19 +2788,81 @@ class LLMService:
                                     else:
                                         request = litellm.acompletion(messages=messages, **kwargs)
 
-                                raw_resp = await request
-                                if stream:
-                                    try:
-                                        return await self._consume_chat_stream(raw_resp)
-                                    finally:
-                                        self._close_stream_best_effort(raw_resp)
-                                return self._normalize_response_object(raw_resp)
+                                # 台账的 attempt 在**真正发出前**一刻开：更早
+                                # 记会把「发送前被预算/熔断拒绝」的请求算成花费，
+                                # 更晚记会漏掉「发出后立刻超时」的那次。
+                                attempt_id = group_costs.record_attempt(
+                                    stage=label,
+                                    provider=cost_provider_key(cfg),
+                                    model=cost_model_key(cfg),
+                                )
+                                settled: dict[str, Any] = {"usage": None}
+                                # 「已发出」的判定点就在这里：**协程被真正
+                                # await 的前一刻**。再往前的取消（排队、许可、
+                                # 预算拒绝）都意味着请求根本没交给上游，不该
+                                # 占用预算；再往后的取消才意味着已经发出去了。
+                                sent["value"] = True
+                                try:
+                                    raw_resp = await request
+                                    # 流式的 usage 在**流对象**上（最后一个 chunk
+                                    # 汇总），不是完成响应上；先抓住它，后面哪怕
+                                    # 消费时抛了也不会把已经发生的 token 丢掉。
+                                    settled["usage"] = getattr(raw_resp, "usage", None)
+                                    if stream:
+                                        try:
+                                            streamed = await self._consume_chat_stream(
+                                                raw_resp, settled
+                                            )
+                                        finally:
+                                            self._close_stream_best_effort(raw_resp)
+                                        normalized = self._normalize_response_object(streamed)
+                                    else:
+                                        normalized = self._normalize_response_object(raw_resp)
+                                    settled["usage"] = getattr(normalized, "usage", None) or \
+                                        settled["usage"]
+                                    settled.update(
+                                        self._describe_response(normalized)
+                                    )
+                                    # 预算在**拿到响应的地方**结算，而不是在外层
+                                    # await 之后：上游吞掉取消时，这个返回值会
+                                    # 交给一个已经被放弃的 future，外层根本不会
+                                    # 跑到 —— 结果就是预留永远停在 unknown，
+                                    # 尽管 usage 已经拿到了。
+                                    await _settle_reservation(
+                                        cost_guard, reservation_id, normalized
+                                    )
+                                    return normalized, attempt_id
+                                except asyncio.TimeoutError:
+                                    self._settle_attempt(attempt_id, settled, timed_out=True)
+                                    raise
+                                except BaseException:
+                                    self._settle_attempt(
+                                        attempt_id,
+                                        settled,
+                                        failed=True,
+                                        parse_error=bool(settled.get("parse_failed")),
+                                    )
+                                    # 请求**确实发出**了：把预留标成 unknown，
+                                    # 随后由真正返回 usage 的那条路径对账。
+                                    if sent.get("value"):
+                                        await _settle_reservation(
+                                            cost_guard, reservation_id, None,
+                                            unknown=True,
+                                        )
+                                    raise
+                                finally:
+                                    # 兜底：任何**没有**显式结算过的出口都在这里
+                                    # 结算一次。放在真实请求任务里而不是外层
+                                    # awaiter，是因为外层可能已经被取消/超时退出
+                                    # —— 那样这条尝试会永远留在在飞表里，它的
+                                    # token 花费再也进不了账。
+                                    self._settle_attempt(attempt_id, settled)
                     finally:
                         if owned_permit is not None:
                             # 许可归**实际请求任务**所有；不合作的取消也不会提前释放。
                             owned_permit.release()
 
-                resp = await self._await_with_timeout(
+                resp, attempt_id = await self._await_with_timeout(
                     _perform_attempt(),
                     timeout_sec=timeout_sec,
                 )
@@ -2576,6 +2870,7 @@ class LLMService:
                 message = resp.choices[0].message
                 content = self._normalize_content_text(message.content)
                 tool_calls = getattr(message, "tool_calls", None)
+                await _settle_reservation(cost_guard, reservation_id, resp)
                 if not content.strip() and not tool_calls:
                     if attempt < total_attempts:
                         llm_metrics.record(label, empty_responses=1)
@@ -2618,9 +2913,35 @@ class LLMService:
                 llm_metrics.record_usage(
                     label, usage, prompt_tokens=tokens_in, output_tokens=tokens_out
                 )
+                # 成功 / 空响应 / token 的记账都已经在 _perform_attempt 里
+                # 按「真实请求任务」结算过了；这里再记一次会被去重吞掉，写了
+                # 反而是在暗示"外层也该记"。
                 self._record_circuit_success(cfg, stage=label)
                 return resp
+            except asyncio.CancelledError:
+                # 取消要分两种：还没交给上游 → 退还；已经发出 → 保守占用。
+                # 之前一律按"已发出"处理，于是"排在 admission 队列里被取消"
+                # 也会扣掉本群一整天的 attempt/token/金额 —— 请求压根没发。
+                if sent.get("value"):
+                    await _settle_reservation(
+                        cost_guard, reservation_id, None, unknown=True
+                    )
+                else:
+                    await _release_reservation(cost_guard, reservation_id)
+                raise
             except asyncio.TimeoutError:
+                # 超时也分两种，和取消同一把尺子：**有没有真的把请求交给上游**。
+                # 排队/admission 许可超时时请求还没发出，按 unknown 记会白扣本群
+                # 一整天的 attempt/token/金额（父探针：semaphore=0、provider0、
+                # 却 unknown 且扣了 1 attempt / 2057 tokens）。
+                if sent.get("value"):
+                    # 已发出但结果未知：**不退**。把它当免费等于每次超时都送一次
+                    # 免费额度，而超时往往正是供应商在收钱的时候。
+                    await _settle_reservation(
+                        cost_guard, reservation_id, None, unknown=True
+                    )
+                else:
+                    await _release_reservation(cost_guard, reservation_id)
                 if attempt < total_attempts:
                     llm_metrics.record(label, timeouts=1)
                     log.warning(
@@ -2656,6 +2977,7 @@ class LLMService:
                         dropped_param,
                     )
                     continue
+                await _settle_reservation(cost_guard, reservation_id, None, unknown=True)
                 if attempt < total_attempts:
                     llm_metrics.record(label, failures=1)
                     log.warning(
@@ -2690,6 +3012,7 @@ class LLMService:
         label: str,
         preview_limit: int,
         permit: Any | None = None,
+        cost_guard: Any | None = None,
     ) -> str:
         total = len(candidates)
         loop = asyncio.get_running_loop()
@@ -2724,6 +3047,7 @@ class LLMService:
                         label=label,
                         preview_limit=preview_limit,
                         permit=permit,
+                        cost_guard=cost_guard,
                     )
             except TimeoutError:
                 log.error(
@@ -2877,6 +3201,7 @@ class LLMService:
         label: str = "skill",
         cfg: ModelConfig | None = None,
         preview_limit: int = 80,
+        cost_guard: Any | None = None,
     ) -> Any | None:
         candidates = self._chat_candidates(cfg or self.skill_config)
         loop = asyncio.get_running_loop()
@@ -2923,6 +3248,7 @@ class LLMService:
                         preview_limit=preview_limit,
                         tools=tools,
                         tool_choice="auto",
+                        cost_guard=cost_guard,
                     )
             except TimeoutError:
                 self._tool_incapable[self._tool_endpoint_key(candidate)] = (
@@ -2976,6 +3302,8 @@ class LLMService:
         use_decision: bool = False,
         use_moderation: bool = False,
         stage: str | None = None,
+        background: bool = False,
+        cost_guard: Any | None = None,
     ) -> str:
         """Send chat completion request and return assistant text.
 
@@ -2983,6 +3311,19 @@ class LLMService:
         log lines, and the stage deadline (e.g. ``synopsis`` for the optional
         /av AI overview).  It never changes which model configuration is used,
         so no new provider or endpoint is introduced.
+
+        ``background=True`` marks this call as **offline work** (replay/dry-run,
+        summaries): the whole call — including every retry and every fallback
+        candidate — runs at ``BACKGROUND`` scheduling priority, so it only ever
+        consumes background capacity of ``_LLM_PRIORITY_GATE`` and can never
+        take a slot reserved for live moderation / permission changes.
+
+        It is deliberately a per-call parameter rather than a global downgrade:
+        the default stays ``NORMAL`` for ordinary replies and ``HIGH`` for live
+        moderation (:data:`_MODERATION_EXECUTION_PRIORITY`).  Callers that only
+        wrap the call in ``execution_priority_scope(BACKGROUND)`` do **not** get
+        background admission, because ``use_moderation=True`` below installs its
+        own scope and would silently override theirs.
         """
         if use_moderation:
             cfg = self.moderation_config
@@ -2999,17 +3340,21 @@ class LLMService:
         else:
             preview_limit = 120 if label == "moderation" else 80
 
-        scope = (
-            execution_priority_scope(_MODERATION_EXECUTION_PRIORITY)
-            if use_moderation
-            else nullcontext()
-        )
+        if background:
+            scope = execution_priority_scope(
+                _MODERATION_BACKGROUND_EXECUTION_PRIORITY
+            )
+        elif use_moderation:
+            scope = execution_priority_scope(_MODERATION_EXECUTION_PRIORITY)
+        else:
+            scope = nullcontext()
         with scope:
             return await self._chat_with_fallbacks(
                 messages=messages,
                 candidates=self._chat_candidates(cfg),
                 label=label,
                 preview_limit=preview_limit,
+                cost_guard=cost_guard,
             )
 
     async def background_summary_completion(
@@ -3021,6 +3366,7 @@ class LLMService:
         preview_limit: int = 80,
         max_tokens: int | None = None,
         permit: Any | None = None,
+        cost_guard: Any | None = None,
     ) -> str:
         """后台摘要 / 维护专用的一次性对话调用。
 
@@ -3069,6 +3415,7 @@ class LLMService:
                 label=label,
                 preview_limit=preview_limit,
                 permit=permit,
+                cost_guard=cost_guard,
             )
 
     async def decision(self, system: str, user_text: str) -> str:
@@ -3079,13 +3426,32 @@ class LLMService:
         ]
         return await self.chat(messages, use_decision=True)
 
-    async def moderation(self, system: str, user_text: str) -> str:
-        """Moderation call (uses moderation model)."""
+    async def moderation(
+        self,
+        system: str,
+        user_text: str,
+        *,
+        background: bool = False,
+        cost_guard: Any | None = None,
+    ) -> str:
+        """Moderation call (uses moderation model).
+
+        ``background=True`` is the **offline** moderation path used by
+        ``moderation_replay``: it admits the call (plus its retries and
+        fallbacks) at ``BACKGROUND`` priority instead of ``HIGH``.  Live group
+        moderation keeps calling this without the flag and therefore keeps its
+        reserved capacity.
+        """
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
-        return await self.chat(messages, use_moderation=True)
+        return await self.chat(
+            messages,
+            use_moderation=True,
+            background=background,
+            cost_guard=cost_guard,
+        )
 
     async def generate(self, system: str, user_text: str) -> str:
         """General generation call (uses main model)."""
@@ -3115,8 +3481,22 @@ class LLMService:
             )
         return text
 
-    async def vision_describe(self, image_url: str, prompt: str) -> str:
-        """Image understanding with the dedicated vision model."""
+    async def vision_describe(
+        self,
+        image_url: str,
+        prompt: str,
+        *,
+        purpose: str | None = None,
+        stage: str = "vision",
+    ) -> str:
+        """Image understanding with the dedicated vision model.
+
+        ``purpose`` 必须由调用方按**用途**给出，而不是按「这是个视觉请求」推断：
+        审核取证与执法需要的视觉是安全用途，娱乐看图是可选用途。两者共用一个
+        stage 时，按 stage 判断额度会误停安全取证 —— 那等于让审核因为预算不足
+        而看不见图片证据。
+        """
+
         messages: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -3126,12 +3506,13 @@ class LLMService:
                 ],
             }
         ]
-        return await self._chat_with_fallbacks(
-            messages=messages,
-            candidates=self._chat_candidates(self.vision_config),
-            label="vision",
-            preview_limit=80,
-        )
+        with cost_purpose_scope(purpose):
+            return await self._chat_with_fallbacks(
+                messages=messages,
+                candidates=self._chat_candidates(self.vision_config),
+                label=str(stage or "vision"),
+                preview_limit=80,
+            )
 
     @classmethod
     def embedding_space_id(cls, cfg: EmbedEndpointConfig) -> str:
@@ -3224,13 +3605,40 @@ class LLMService:
                     async def _perform_embedding() -> Any:
                         async with _LLM_PRIORITY_GATE.slot(timeout=timeout_sec):
                             async with _LLM_REQUEST_SEMAPHORE:
-                                return await litellm.aembedding(**kwargs)
+                                # 嵌入也是一次真实供应商请求：同样开一条 attempt，
+                                # 否则「索引很贵」这件事在账上完全看不见。
+                                embed_attempt = group_costs.record_attempt(
+                                    stage="embed",
+                                    provider=cost_provider_key(cfg),
+                                    model=cost_model_key(cfg),
+                                )
+                                embed_state: dict[str, Any] = {"usage": None}
+                                try:
+                                    payload = await litellm.aembedding(**kwargs)
+                                    embed_state["usage"] = getattr(payload, "usage", None)
+                                    # 解析放进**真实请求任务**里：形状异常必须由
+                                    # 这里结算成 failure，外层再解析就会晚一步，
+                                    # 被去重吞掉、最后记成一次"成功"。
+                                    vectors = [item["embedding"] for item in payload.data]
+                                    embed_state["empty"] = not vectors
+                                    return payload, vectors, embed_attempt
+                                except asyncio.TimeoutError:
+                                    self._settle_attempt(
+                                        embed_attempt, embed_state, timed_out=True
+                                    )
+                                    raise
+                                except BaseException:
+                                    self._settle_attempt(
+                                        embed_attempt, embed_state, failed=True
+                                    )
+                                    raise
+                                finally:
+                                    self._settle_attempt(embed_attempt, embed_state)
 
-                    resp = await self._await_with_timeout(
+                    resp, embeddings, embed_attempt = await self._await_with_timeout(
                         _perform_embedding(),
                         timeout_sec=timeout_sec,
                     )
-                    embeddings = [item["embedding"] for item in resp.data]
                     if not embeddings:
                         if attempt < total_attempts:
                             log.warning(
@@ -3250,6 +3658,9 @@ class LLMService:
                         attempt,
                         total_attempts,
                         len(embeddings[0]),
+                    )
+                    self._settle_attempt(
+                        embed_attempt, {"usage": getattr(resp, "usage", None)}
                     )
                     self._record_circuit_success(cfg, stage="embed")
                     return embeddings, cfg

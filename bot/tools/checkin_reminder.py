@@ -35,6 +35,15 @@ cron（VPS 是 UTC，两种任选；``--slot`` 必须按本地时段传，所以
 两个进程同时跑都不会重复发。单个群发送失败只记日志并释放占位（下次重试还能补发），
 不影响其它群。
 
+**B13b/C4 按群执行来源**：签到提醒的默认来源是 ``external``（就是上面的 cron），
+但管理员可以在 Mini App 的运营区把**某个群**预览并确认切到 ``internal``——那之后
+这个群由进程内 runner 负责，本 CLI **不再处理它**（只处理仍是 external 的群；一个
+都没有就直接退出 0）。切换只锚定未来：``active_from`` 之前的时段不会被补发，内外
+两侧共用同一套占位与出站回执，不会各发一条。**准入不是一次预检查**：本 CLI 用读
+来源那一刻的策略版本构造持久守卫，并把它编进真实占位语句（``INSERT ... WHERE``）；
+管理员在"读了来源"与"真正占位"之间切换时，这条语句自己会拒绝，本入口一个字都不发
+（见 ``bot/services/operations_guard.py`` 的 ``for_automatic_entry``）。
+
 **自动删除**：提醒发出后排队 **600 秒**后删除。删除调度器是进程内的，所以本工具
 会自己起一个 ``TelegramCleanupScheduler`` 把任务写进 ``telegram_delete_jobs``
 （持久、重启不丢），真正的删除由常驻机器人进程里的清理 worker 到点执行；本工具
@@ -46,25 +55,30 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import timedelta
 
 from aiogram import Bot
 
 from bot.config import Settings
 from bot.db.engine import init_db
 from bot.services.runtime_config import RuntimeConfigManager
+from bot.services import task_policy
+from bot.services.operations_guard import PersistedGuard
 from bot.services.checkin import local_today
+from bot.services.task_policy import slot_moment
 from bot.services.checkin_reminder import (
-    reminder_auto_delete_seconds,
-    reminder_slots,
+    AUTO_DELETE_BACKFILLED,
+    AUTO_DELETE_UNCONFIRMED,
+    CHECKIN_OUTCOME_ALREADY_DELIVERED,
+    CHECKIN_OUTCOME_MARK_FAILED,
+    CHECKIN_OUTCOME_SEND_FAILED,
+    CHECKIN_OUTCOME_SENT,
     backfill_durable_auto_delete,
-    build_checkin_reminder_keyboard,
-    claim_reminder_slot,
-    mark_reminder_sent,
     normalize_slot,
     reap_stale_reminder_slots,
-    release_reminder_slot,
+    reminder_auto_delete_seconds,
+    reminder_slots,
     render_checkin_reminder,
+    send_checkin_slot,
     shop_start_payload,
     slot_key,
     today_checkin_roster,
@@ -75,7 +89,6 @@ from bot.utils.telegram import (
     configure_telegram_cleanup_scheduler,
     schedule_message_auto_delete_durable,
 )
-from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +116,60 @@ async def _bot_username(bot: object) -> str:
         )
         return ""
     return str(getattr(me, "username", "") or "").strip().lstrip("@")
+
+
+async def external_slot_bindings(
+    session, *, slot: int, day
+) -> tuple[list[PersistedGuard], list[int]]:
+    """B13b/C4：这个时段该由外部入口处理的群，以及**该次判定的准入守卫**。
+
+    返回 ``(应处理的群及其守卫, 因切换生效晚于该时段而跳过的群)``。默认所有群归
+    进程内 runner（``internal``），只有管理员显式切到 ``external`` 的群才归这里；
+    两侧共用同一个 ``active_from`` 与同一套占位/出站回执，谁都不补切换之前的旧时段。
+
+    B13b 返工（R-B1）：守卫**必须由这次判定所依据的同一份策略视图**构造，并且
+    交给 ``send_checkin_slot`` 编进真实占位语句。不能在发送前重新读一次策略来造
+    守卫：管理员刚刚把这个群切回 ``internal`` 时，新读到的 revision 已经 +1，用它
+    造守卫反而会放行，等于旧来源继续执行新效果。
+    """
+
+    group_ids = await authorized_group_ids(session)
+    if not group_ids:
+        return [], []
+    views = await task_policy.load_task_policies(
+        session, task_id="checkin_reminder", group_ids=group_ids
+    )
+    moment = slot_moment(day, slot)
+    guards: list[PersistedGuard] = []
+    skipped: list[int] = []
+    for group_id in group_ids:
+        view = views[group_id]
+        if view.source != task_policy.SOURCE_EXTERNAL:
+            continue
+        if view.active_from is not None and moment < view.active_from:
+            skipped.append(group_id)
+            continue
+        guards.append(
+            PersistedGuard.for_automatic_entry(
+                group_id=group_id,
+                task_id="checkin_reminder",
+                policy_revision=int(view.revision),
+            )
+        )
+    return guards, skipped
+
+
+async def external_slot_scope(
+    session, *, slot: int, day
+) -> tuple[list[int], list[int]]:
+    """只读兼容视图：返回 ``(应处理的群, 跳过的群)``。
+
+    真正的执行入口用 :func:`external_slot_bindings`（要拿守卫）；这里只是群列表的
+    便捷读法，本身不做出站决策。
+    """
+
+    guards, skipped = await external_slot_bindings(session, slot=slot, day=day)
+    return [int(guard.group_id) for guard in guards], skipped
 
 
 async def _post(slot: int, *, dry_run: bool = False) -> int:
@@ -133,10 +200,32 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                     f"{'/'.join(str(s) for s in reminder_slots())}"
                 )
                 return 1
+            # B13b/C4：这个 CLI 就是**外部执行来源**，也是签到提醒的**默认来源**
+            # （`task_policy.DEFAULT_SOURCE["checkin_reminder"] == "external"`，现场
+            # cron 在 UTC 1/4/7/10 = 上海 9/12/15/18 触发它）。只有管理员在 Mini App
+            # 里把某些群显式切到 `internal` 之后，**那些群**才不再由本入口处理。
+            external, skipped_stale = await external_slot_bindings(
+                session, slot=slot, day=local_today()
+            )
+            if not external and not skipped_stale:
+                print(
+                    "本时段没有归外部入口处理的群（签到默认由本 CLI 执行；"
+                    "这些群已被管理员切到进程内 runner）：这个入口什么都不做。"
+                )
+                return 0
+            if skipped_stale:
+                print(
+                    f"已跳过 {len(skipped_stale)} 个刚切到外部执行的群："
+                    f"{slot}:00 这个时段在切换生效之前，不补发。"
+                )
+            if not external:
+                print("没有需要外部执行的群（下一个时段之前无事可做）。")
+                return 0
             key = slot_key(local_today(), slot)
             if dry_run:
                 # 只渲染不发送、不占位：验证文案/目标群时用它，别拿真群当试验场
-                for group_id in group_ids:
+                for guard in external:
+                    group_id = int(guard.group_id)
                     roster = await today_checkin_roster(session, group_id=group_id)
                     print(
                         f"---- dry-run | group={group_id} | slot={slot} | {key} ----"
@@ -189,97 +278,64 @@ async def _post(slot: int, *, dry_run: bool = False) -> int:
                 released = await reap_stale_reminder_slots(session)
                 if released:
                     print(f"已清理 {len(released)} 个未送达的空占位，本轮将补发")
-                for group_id in group_ids:
-                    claimed = False
-                    delivered = False
-                    try:
-                        claimed = await claim_reminder_slot(
-                            session, group_id=group_id, key=key
+                for guard in external:
+                    group_id = int(guard.group_id)
+                    # 发送链（占位 → 发送 → 回填 → 排自动删除）与运营任务中心
+                    # 共用同一个服务原语：任何一侧都不会绕过占位幂等。
+                    outcome = await send_checkin_slot(
+                        session,
+                        bot,
+                        group_id=group_id,
+                        slot=slot,
+                        auto_delete_seconds=reminder_auto_delete_seconds(),
+                        queue_auto_delete=schedule_message_auto_delete_durable,
+                        backfill_auto_delete=backfill_durable_auto_delete,
+                        session_factory=session_factory,
+                        bot_username=bot_username,
+                        # R-B1：把这次判定的准入守卫编进真实占位语句。管理员在
+                        # "本 CLI 读了来源"与"真正占位"之间把这个群切回 internal
+                        # 时，占位语句会拒绝插入 ⇒ 本入口一个字都不发。
+                        guard=guard,
+                    )
+                    if (
+                        outcome.status == CHECKIN_OUTCOME_SEND_FAILED
+                        and str(outcome.reason) == "guard_blocked"
+                    ):
+                        # 来源已被管理员切换/撤权：这一期不归本入口了（进程内
+                        # runner 或下一时段接手）。不算失败，也不重试补发。
+                        print(
+                            f"来源已切换，本群不再由本入口处理 | "
+                            f"group={group_id} | {key}"
                         )
-                        await session.commit()
-                        if not claimed:
-                            print(f"本时段已发过，跳过 | group={group_id} | {key}")
-                            continue
-                        roster = await today_checkin_roster(
-                            session, group_id=group_id
-                        )
-                        sent_message = await bot.send_message(
-                            group_id,
-                            render_checkin_reminder(
-                                slot=slot,
-                                checked_in=roster.count,
-                                names=roster.names,
-                            ),
-                            parse_mode="HTML",
-                            reply_markup=build_checkin_reminder_keyboard(
-                                bot_username=bot_username, group_id=group_id
-                            ),
-                        )
-                        delivered = True
-                        await mark_reminder_sent(
-                            session,
-                            group_id=group_id,
-                            key=key,
-                            message_id=int(getattr(sent_message, "message_id", 0) or 0),
-                        )
-                        await session.commit()
-                        # 10 分钟后自动删除：写 telegram_delete_jobs，重启不丢任务。
-                        # 排不上队只报警，不重发已经发出去的消息。
-                        queued = await schedule_message_auto_delete_durable(
-                            sent_message, reminder_auto_delete_seconds()
-                        )
-                        if not queued:
-                            log.error(
-                                "checkin reminder auto delete not queued | group=%s",
-                                group_id,
+                        continue
+                    if outcome.status == CHECKIN_OUTCOME_ALREADY_DELIVERED:
+                        print(f"本时段已发过，跳过 | group={group_id} | {key}")
+                        continue
+                    if outcome.status == CHECKIN_OUTCOME_SENT:
+                        if outcome.auto_delete == AUTO_DELETE_UNCONFIRMED:
+                            print(
+                                f"提醒已发出但自动删除既没排队也没补写 | group={group_id}"
                             )
-                            # B-27：调度器不健康时那条「10 分钟后自动删除」会留在群里
-                            # 永远不掉。直接往同一张持久表补一行，由常驻进程的清理
-                            # worker 到点执行（绝不重发已经发出去的消息）。
-                            backfilled = await backfill_durable_auto_delete(
-                                session_factory,
-                                chat_id=int(group_id),
-                                message_id=int(
-                                    getattr(sent_message, "message_id", 0) or 0
-                                ),
-                                due_at=now_shanghai_naive()
-                                + timedelta(seconds=reminder_auto_delete_seconds()),
+                        elif outcome.auto_delete == AUTO_DELETE_BACKFILLED:
+                            print(
+                                f"提醒已发出，自动删除已直接补写持久表 | group={group_id}"
                             )
-                            if not backfilled:
-                                print(
-                                    f"提醒已发出但自动删除既没排队也没补写 | group={group_id}"
-                                )
-                            else:
-                                print(
-                                    f"提醒已发出，自动删除已直接补写持久表 | group={group_id}"
-                                )
                         sent += 1
                         print(
                             f"已发送提醒 | group={group_id} | {key}"
-                            f" | 今日已签到 {roster.count} 人"
+                            f" | 今日已签到 {outcome.checked_in} 人"
                         )
-                    except Exception as exc:  # 单群失败不影响其它群
-                        await session.rollback()
-                        if claimed and not delivered:
-                            # 没发出去就不该占着这个时段，撤掉占位让重试能补发
-                            try:
-                                await release_reminder_slot(
-                                    session, group_id=group_id, key=key
-                                )
-                                await session.commit()
-                            except Exception:
-                                await session.rollback()
-                                log.exception(
-                                    "checkin reminder slot release failed | group=%s",
-                                    group_id,
-                                )
-                        failed += 1
-                        log.warning(
-                            "checkin reminder send failed | group=%s | %s",
-                            group_id,
-                            exc,
+                        continue
+                    # send_failed / mark_failed：都算失败（退出码 1）。mark_failed
+                    # 说明消息**已经出站**，只是台账回填失败——绝不重发、也不撤占位。
+                    failed += 1
+                    if outcome.status == CHECKIN_OUTCOME_MARK_FAILED:
+                        print(
+                            f"发送失败 | group={group_id} | 台账回填失败"
+                            f"（消息可能已经发出）| {outcome.error}"
                         )
-                        print(f"发送失败 | group={group_id} | {exc}")
+                    else:
+                        print(f"发送失败 | group={group_id} | {outcome.error}")
             finally:
                 # 进程全局指针必须清掉，别把一个已停止的调度器留给后面的调用方
                 configure_telegram_cleanup_scheduler(None)

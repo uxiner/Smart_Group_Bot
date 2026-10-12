@@ -34,21 +34,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, exists, func, or_, select, text, update
 
-from bot.services import policy_runtime
+from bot.services import policy_runtime, usage_scope
 from bot.db.models import (
     GroupMessageArchive,
     MemoryExtractCursor,
     MemoryOptout,
     PrivateChatMessage,
     UserFact,
+    UserFactCorrection,
 )
 from bot.services.search_memory import (
     SCOPE_GROUP,
@@ -57,7 +60,7 @@ from bot.services.search_memory import (
     normalize_scope,
 )
 from bot.utils.security import wrap_untrusted_multiline
-from bot.utils.timezone import now_shanghai_naive
+from bot.utils.timezone import SHANGHAI_TZ, now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +104,8 @@ STATUSES = (STATUS_ACTIVE, STATUS_SUPERSEDED, STATUS_DELETED)
 FACT_TEXT_MAX_CHARS = 200
 #: 出处片段最多多少字符
 EVIDENCE_EXCERPT_MAX_CHARS = 200
+#: 原文展开 / 片段脱敏时的占位符（命中敏感关键词或 11 位以上数字串）
+SENSITIVE_REDACTION = "［已脱敏］"
 #: 判「互斥」至少要有几个共同关键词（判不准就不标，宁可并存）
 CONFLICT_MIN_SHARED_KEYWORDS = 2
 
@@ -792,6 +797,52 @@ async def _is_opted_out(session: Any, user_id: int) -> bool:
     return found is not None
 
 
+async def _trusted_source_thread(
+    session: Any,
+    *,
+    scope: str,
+    scope_id: int,
+    source_message_id: int | None,
+) -> int | None:
+    """从**一致归档行**核验可信话题(thread) id；核验不到一律 NULL。
+
+    只认 ``group_message_archive`` 里同 ``(group_id, telegram_message_id)`` 的行：
+    正文/模型输出里出现的 thread、用户给的数字都不算。私聊作用域、非法 id、查询
+    失败都返回 NULL —— 没有可信 thread 就不给 Topics 深链（退回普通链），绝不猜。
+    """
+
+    if normalize_scope(scope) != SCOPE_GROUP or source_message_id is None:
+        return None
+    try:
+        message_id = int(source_message_id)
+        group_id = int(scope_id)
+    except (TypeError, ValueError):
+        return None
+    if message_id <= 0 or group_id == 0:
+        return None
+    try:
+        value = (
+            await session.execute(
+                select(GroupMessageArchive.message_thread_id)
+                .where(
+                    GroupMessageArchive.group_id == group_id,
+                    GroupMessageArchive.telegram_message_id == message_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:
+        log.debug(
+            "long-term memory: 可信 thread 核验失败（按没有处理） | error=%s", exc
+        )
+        return None
+    try:
+        thread = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return thread if thread > 0 else None
+
+
 async def record_fact(
     session: Any,
     *,
@@ -896,6 +947,12 @@ async def record_fact(
         )
         expires_at = stamp + timedelta(days=ttl_days)
     conflicting_ids: list[int] = []
+    source_thread_id = await _trusted_source_thread(
+        session,
+        scope=normalized_scope,
+        scope_id=sid,
+        source_message_id=source_message_id,
+    )
 
     try:
         existing = (
@@ -943,6 +1000,9 @@ async def record_fact(
                         func.coalesce(UserFact.confidence, default_confidence)
                         + CONFIRMED_CONFIDENCE_BUMP,
                     ),
+                    # C3：再次确认会改变「最后确认时间/置信度」，属于影响可见性的
+                    # 写入 —— 修订号必须一起前进，否则人工纠错的 CAS 看不见这次更新。
+                    revision=UserFact.revision + 1,
                 )
             )
             await session.commit()
@@ -989,11 +1049,14 @@ async def record_fact(
             source_message_id=(
                 int(source_message_id) if source_message_id is not None else None
             ),
+            # C3：新行写入时就从**一致归档行**核验可信 thread（核验不到保持 NULL）。
+            source_thread_id=source_thread_id,
             evidence_excerpt=evidence,
             fingerprint=fingerprint,
             first_seen_at=stamp,
             last_confirmed_at=stamp,
             confirm_count=1,
+            revision=1,
             expires_at=expires_at,
             status=STATUS_ACTIVE,
             created_at=stamp,
@@ -1006,7 +1069,12 @@ async def record_fact(
             await session.execute(
                 update(UserFact)
                 .where(UserFact.id.in_(conflicting_ids))
-                .values(status=STATUS_SUPERSEDED, superseded_by=row_id)
+                .values(
+                    status=STATUS_SUPERSEDED,
+                    superseded_by=row_id,
+                    # C3：被替代 = 可见性变化，修订号前进。
+                    revision=UserFact.revision + 1,
+                )
             )
         await session.commit()
     except Exception as exc:
@@ -1543,7 +1611,21 @@ async def _extract_with_session(
         cursor_row_id = int(eligible[-1]["row_id"]) if eligible else max_row_id
         model_input, sender_ids = _build_extract_input(eligible)
         try:
-            raw = await llm.generate(EXTRACT_SYSTEM_PROMPT, model_input)
+            # 记忆提炼是后台作业：绑到它自己的归属，不继承发起人的私聊。
+            # 群 scope（scope_id 是群 id）算群成本，其余落到匿名后台桶。
+            is_group = scope == "group" and int(scope_id) < 0
+            with usage_scope.lenient_scope(
+                kind=(
+                    usage_scope.SCOPE_GROUP
+                    if is_group
+                    else usage_scope.SCOPE_PRIVATE_USER
+                ),
+                group_id=int(scope_id) if is_group else None,
+                user_id=None if is_group else int(scope_id),
+                purpose=usage_scope.PURPOSE_BACKGROUND_OPTIONAL,
+                stage="memory_extract",
+            ):
+                raw = await llm.generate(EXTRACT_SYSTEM_PROMPT, model_input)
         except Exception as exc:
             log.warning(
                 "long-term memory: 提炼调用失败（游标不前移，下一轮重试） | "
@@ -2090,7 +2172,7 @@ async def expire_event_facts(session: Any, *, now: Any | None = None) -> int:
                 UserFact.expires_at.is_not(None),
                 UserFact.expires_at <= stamp,
             )
-            .values(status=STATUS_DELETED)
+            .values(status=STATUS_DELETED, revision=UserFact.revision + 1)
         )
         await session.commit()
     except Exception as exc:
@@ -2106,7 +2188,11 @@ async def prune_user_facts(
     retention_days: int | None = None,
     now: Any | None = None,
 ) -> int:
-    """物理删掉 ``deleted``/``superseded`` 且超过留存期的事实（幂等、不抛异常）。"""
+    """物理删掉 ``deleted``/``superseded`` 且超过留存期的事实（幂等、不抛异常）。
+
+    C3：物理删是**硬删**，行本身消失 —— 人工纠错的 CAS 靠"行不存在"判冲突
+    （absence conflict），所以这里不需要（也无法）推进修订号。
+    """
 
     days = _bounded_int(
         retention_days if retention_days is not None else DELETED_RETENTION_DAYS,
@@ -2173,19 +2259,161 @@ async def run_long_term_memory_maintenance(
         await asyncio.sleep(interval)
 
 
-async def set_optout(
-    session: Any, user_id: int, *, reason: str = "", now: Any | None = None
-) -> int:
-    """``/memory off``：记下这个人的开关，并软删他名下的 active 事实。
+#: ``await session.commit()`` **正常返回**。
+_OUTCOME_COMMITTED = "committed"
+#: commit 的结果没能确认（异常或取消打断）；**不代表持久化一定没发生**。
+_OUTCOME_UNCONFIRMED = "unconfirmed"
+_REASON_COMMIT_UNCONFIRMED = "commit_unconfirmed"
+_REASON_INVALID_USER_ID = "invalid_user_id"
+_REASON_INVALID_FACT_ID = "invalid_fact_id"
 
-    返回被软删的事实条数。读/写失败只记日志（返回 0），绝不抛给命令层。
+
+@dataclass(frozen=True, slots=True)
+class MemoryWriteOutcome:
+    """一次记忆写入尝试的**可判别**结果。
+
+    三个事实彼此独立，不能压成一个数字：
+
+    * ``committed``：只有 ``await session.commit()`` **正常返回**才为 ``True``。
+    * ``switch_changed``：个人开关行（``memory_optouts``）被新建/更新/删除。
+    * ``facts_soft_deleted``：本次被软删的事实条数（``/memory on`` 恒为 0）。
+
+    ``detail`` 是**固定原因码**，只用于日志——不携带异常对象、异常文本或 SQL。
+
+    ``committed is False`` 只表示**未能确认成功**：如果 commit 已经落库、随后才
+    失败（或取消），持久化变化**可能已经发生**，调用方不得据此声明「没有生效」，
+    也不得再发成功回执。
     """
+
+    committed: bool
+    switch_changed: bool
+    facts_soft_deleted: int = 0
+    detail: str = ""
+
+    @property
+    def changed(self) -> bool:
+        """本次是否真的改动了什么（开关行或事实）。"""
+
+        return self.switch_changed or self.facts_soft_deleted > 0
+
+
+class MemorySessionCleanupUnsafeError(RuntimeError):
+    """本服务**无法证明**自己留下的未提交事务已被丢弃。
+
+    这不是「操作失败」，而是「清理失败」：回滚失败，且 ``close()`` 缺失/失败/
+    被取消，残留的 DML 仍然挂在会话上。此时**绝不能**让会话正常返回给
+    ``DbSessionMiddleware``——它会在 handler 返回后补一次 commit，把残留真的写进
+    库（父代理已用真实 session 复现：``commit=2``、``close=2``，fresh 读到开关行
+    与 ``deleted`` 事实）。
+
+    调用方约定：
+
+    * 允许先发出**固定**失败回执（不夹带异常文本、SQL 或个人数据），然后
+      **原样上抛**本异常；
+    * **不得**吞掉它去换一个「正常 return」——那正是残留被补写的那条路径；
+    * :func:`set_optout` / :func:`clear_optout` 这两个兼容包装在无法安全清理时
+      也会抛出本异常。这是刻意保留的边界升级：宁可让外层看到一次异常，也不能让
+      残留被静默补写。
+    """
+
+    def __init__(self) -> None:
+        super().__init__("long-term memory: 会话未能安全清理")
+
+
+async def _discard_pending(session: Any) -> bool:
+    """丢弃**本服务自己**留下的未提交事务，并阻断它被别人的 commit 补写。
+
+    返回是否**已经证明**安全：
+
+    * ``rollback()`` 成功 → ``True``。
+    * 回滚失败、但 ``close()`` 成功 → ``True``（close 把 pending 从 identity map
+      摘掉，后续 commit 变成空操作）。
+    * 回滚失败，且 ``close()`` 缺失或失败 → ``False``：**不能**证明 DML 已回滚。
+      注意 ``execute()`` 已经发过 UPDATE/DELETE，所以「``session.new`` 为空」不是
+      证据；调用方必须改用 :class:`MemorySessionCleanupUnsafeError` 阻断补偿 commit。
+    * 清理期间收到 ``CancelledError`` → 原样上抛（取消优先）。
+
+    只在本服务的异常/取消路径上调用；成功路径不付这个成本。
+    """
+
+    try:
+        await session.rollback()
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning(
+            "long-term memory: 回滚失败，改为关闭会话 | reason=%s", type(exc).__name__
+        )
+    closer = getattr(session, "close", None)
+    if not callable(closer):
+        log.warning("long-term memory: 会话没有 close，无法证明已丢弃事务")
+        return False
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("long-term memory: 关闭会话失败 | reason=%s", type(exc).__name__)
+        return False
+    return True
+
+
+async def _release_correction_session(session: Any, *, suppress_cancel: bool) -> bool:
+    """人工纠错路径专用的**有界**清理：复用 B9 已验收的共享协议。
+
+    vs :func:`_discard_pending`（单次尝试、任一失败即判不安全）：纠错事务一旦在
+    rollback/close 都失败、或首次 close 抛取消之后放弃，就会把事务与 SQLite 全局写锁
+    留在身后（父 B12 边界探针 F3 实测独立 writer 超时）。所以纠错路径走
+    :func:`bot.services.memory._pm_release_session`：rollback / close 各自最多尝试
+    ``_PM_CLEANUP_ATTEMPTS`` 次，第一次 close 失败或抛取消后**仍然真的再关一次**。
+
+    * 有一次 ``close`` 真的返回 → ``True``（事务与写锁都已归还）；
+    * 全部尝试都失败 → ``False``，调用方必须抛
+      :class:`MemorySessionCleanupUnsafeError` 阻断补偿 commit；
+    * ``suppress_cancel=True``（已有原始取消在传播）→ cleanup 期间的新取消只记录不替换；
+    * ``suppress_cancel=False`` 且 cleanup 期间出现**新**取消 → 尽力归还资源后把**那个
+      取消对象原样**抛出，绝不被吞成「未确认」的普通结局。
+
+    仅用于纠错（``correct_fact``）的异常/取消路径；旧 退订/删除/恢复 路径的单次语义
+    （:func:`_discard_pending`）保持不变，其既有回归不得被放宽。
+    """
+
+    from bot.services.memory import _pm_release_session
+
+    try:
+        return await _pm_release_session(
+            session, rollback_first=True, suppress_cancel=suppress_cancel
+        )
+    except asyncio.CancelledError:
+        log.warning("long-term memory: 纠错清理期间收到新的取消，已尽力归还资源后原样上抛")
+        raise
+
+
+async def _discard_pending_quietly(session: Any) -> None:
+    """取消路径上的清理：清理自身的失败**不得遮蔽**原始的 ``CancelledError``。"""
+
+    try:
+        await _discard_pending(session)
+    except BaseException:  # noqa: BLE001 - 故意吞掉，不能遮蔽取消
+        log.warning("long-term memory: 取消后的清理失败（已忽略）")
+
+
+async def set_optout_outcome(
+    session: Any, user_id: int, *, reason: str = "", now: Any | None = None
+) -> MemoryWriteOutcome:
+    """``/memory off`` 的可判别结果版本。见 :class:`MemoryWriteOutcome`。"""
 
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
-        return 0
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_INVALID_USER_ID
+        )
     stamp = now or now_shanghai_naive()
+    switch_changed = False
     try:
         row = await session.get(MemoryOptout, uid)
         if row is None:
@@ -2196,37 +2424,113 @@ async def set_optout(
                     reason=str(reason or "")[:60],
                 )
             )
+            switch_changed = True
         else:
-            row.reason = str(reason or "")[:60]
+            wanted_reason = str(reason or "")[:60]
+            if row.reason != wanted_reason:
+                row.reason = wanted_reason
+                switch_changed = True
         result = await session.execute(
             update(UserFact)
             .where(
                 UserFact.subject_user_id == uid,
                 UserFact.status == STATUS_ACTIVE,
             )
-            .values(status=STATUS_DELETED)
+            .values(status=STATUS_DELETED, revision=UserFact.revision + 1)
         )
+        facts_soft_deleted = _rowcount(result)
         await session.commit()
+    except asyncio.CancelledError:
+        await _discard_pending_quietly(session)
+        raise
     except Exception as exc:
-        await _safe_rollback(session)
-        log.warning("long-term memory: 关闭记忆失败 | user=%s | error=%s", user_id, exc)
-        return 0
-    return _rowcount(result)
+        cleanup_safe = await _discard_pending(session)
+        log.warning(
+            "long-term memory: 关闭记忆未确认 | user=%s | reason=%s | cleanup_safe=%s",
+            uid,
+            type(exc).__name__,
+            cleanup_safe,
+        )
+        if not cleanup_safe:
+            # 清理失败 ⇒ 残留 DML 仍挂在会话上；正常 return 会让中间件补写它。
+            raise MemorySessionCleanupUnsafeError() from None
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_COMMIT_UNCONFIRMED
+        )
+    return MemoryWriteOutcome(
+        committed=True,
+        switch_changed=switch_changed,
+        facts_soft_deleted=facts_soft_deleted,
+    )
+
+
+async def set_optout(
+    session: Any, user_id: int, *, reason: str = "", now: Any | None = None
+) -> int:
+    """``/memory off``：记下这个人的开关，并软删他名下的 active 事实。
+
+    返回**被软删的事实条数**——**不含**开关行本身（0 条事实时返回 0，即便这次
+    真的新建了开关行）。未能确认成功时返回 0。需要区分「成功但零变化」与「未能
+    确认成功」时用 :func:`set_optout_outcome`。
+
+    **唯一的例外边界（B4 返工新加）**：当事务既没能提交、又**无法证明**已被丢弃
+    （回滚失败且 ``close()`` 缺失/失败）时抛出
+    :class:`MemorySessionCleanupUnsafeError`。这条边界是必要的——静默返回 0 会让
+    ``DbSessionMiddleware`` 在 handler 返回后补写残留。见该类 docstring。
+    """
+
+    outcome = await set_optout_outcome(session, user_id, reason=reason, now=now)
+    return outcome.facts_soft_deleted
+
+
+async def clear_optout_outcome(session: Any, user_id: int) -> MemoryWriteOutcome:
+    """``/memory on`` 的可判别结果版本（**不**恢复已经删掉的事实）。"""
+
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_INVALID_USER_ID
+        )
+    switch_changed = False
+    try:
+        result = await session.execute(
+            delete(MemoryOptout).where(MemoryOptout.user_id == uid)
+        )
+        switch_changed = _rowcount(result) > 0
+        await session.commit()
+    except asyncio.CancelledError:
+        await _discard_pending_quietly(session)
+        raise
+    except Exception as exc:
+        cleanup_safe = await _discard_pending(session)
+        log.warning(
+            "long-term memory: 恢复记忆未确认 | user=%s | reason=%s | cleanup_safe=%s",
+            uid,
+            type(exc).__name__,
+            cleanup_safe,
+        )
+        if not cleanup_safe:
+            # 清理失败 ⇒ 残留 DML 仍挂在会话上；正常 return 会让中间件补写它。
+            raise MemorySessionCleanupUnsafeError() from None
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_COMMIT_UNCONFIRMED
+        )
+    return MemoryWriteOutcome(committed=True, switch_changed=switch_changed)
 
 
 async def clear_optout(session: Any, user_id: int) -> bool:
-    """``/memory on``：取消开关（**不**恢复已经删掉的事实）。"""
+    """``/memory on``：取消开关（**不**恢复已经删掉的事实）。
 
-    try:
-        result = await session.execute(
-            delete(MemoryOptout).where(MemoryOptout.user_id == int(user_id))
-        )
-        await session.commit()
-    except Exception as exc:
-        await _safe_rollback(session)
-        log.warning("long-term memory: 恢复记忆失败 | user=%s | error=%s", user_id, exc)
-        return False
-    return _rowcount(result) > 0
+    只在**确认成功且开关行真的被删掉**时返回 ``True``；连不上开关行返回
+    ``False``，未能确认成功同样返回 ``False``。
+
+    **唯一的例外边界（B4 返工新加）**：与 :func:`set_optout` 相同——当事务既没能
+    提交、又无法证明已被丢弃时抛出 :class:`MemorySessionCleanupUnsafeError`。
+    """
+
+    outcome = await clear_optout_outcome(session, user_id)
+    return bool(outcome.committed and outcome.switch_changed)
 
 
 async def is_opted_out(session: Any, user_id: int) -> bool:
@@ -2239,15 +2543,35 @@ async def is_opted_out(session: Any, user_id: int) -> bool:
     return await _is_opted_out(session, uid)
 
 
-async def soft_delete_fact(
+async def soft_delete_fact_outcome(
     session: Any, fact_id: int, *, now: Any | None = None
-) -> bool:
-    """软删一条事实（``/memory forget``）；已经是 deleted 的返回 False。"""
+) -> MemoryWriteOutcome:
+    """``/memory forget <编号>`` 的可判别结果版本。见 :class:`MemoryWriteOutcome`。
+
+    只有 ``await session.commit()`` **正常返回**才 ``committed=True``；此时
+    ``facts_soft_deleted`` 是本次 ``UPDATE`` 真正改变的行数（0 或 1）。
+    单条删除路径上 ``switch_changed`` **恒为 False**（它只对个人开关行有意义）。
+
+    **``committed=True`` 且 ``facts_soft_deleted == 0`` 不足以说「已经删过了」**：
+    零命中有三种互不相同的原因——行已经是 ``deleted``、行根本不存在、行已被并发删除。
+    本函数**不做额外 SELECT** 去区分它们（那会引入新的竞态与额外查询），调用方必须用
+    统一的安全 no-op 文案。
+
+    ``committed=False`` 只表示**未能确认成功**：commit 可能已经落库、随后才抛错或取消，
+    所以调用方不得声明「没有生效」。
+
+    **清理边界（B5）**：普通异常时复用 B4 的 :func:`_discard_pending`；一旦**无法证明**
+    残留事务已被丢弃（回滚失败且 ``close()`` 缺失/失败），抛出
+    :class:`MemorySessionCleanupUnsafeError`，让 ``DbSessionMiddleware`` 不进入补偿
+    commit。取消走 :func:`_discard_pending_quietly` 后**原样传播**。
+    """
 
     try:
         fid = int(fact_id)
     except (TypeError, ValueError):
-        return False
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_INVALID_FACT_ID
+        )
     try:
         result = await session.execute(
             update(UserFact)
@@ -2255,16 +2579,558 @@ async def soft_delete_fact(
                 UserFact.id == fid,
                 UserFact.status != STATUS_DELETED,
             )
-            .values(status=STATUS_DELETED, last_confirmed_at=now or now_shanghai_naive())
+            .values(
+                status=STATUS_DELETED,
+                last_confirmed_at=now or now_shanghai_naive(),
+                # C3：软删也是可见性变化，修订号必须前进。
+                revision=UserFact.revision + 1,
+            )
+        )
+        changed_rows = _rowcount(result)
+        await session.commit()
+    except asyncio.CancelledError:
+        await _discard_pending_quietly(session)
+        raise
+    except Exception as exc:
+        cleanup_safe = await _discard_pending(session)
+        log.warning(
+            "long-term memory: 删除事实未确认 | fact_id=%s | reason=%s | cleanup_safe=%s",
+            fid,
+            type(exc).__name__,
+            cleanup_safe,
+        )
+        if not cleanup_safe:
+            # 清理失败 ⇒ 残留 DML 仍挂在会话上；正常 return 会让中间件补写它。
+            raise MemorySessionCleanupUnsafeError() from None
+        return MemoryWriteOutcome(
+            committed=False, switch_changed=False, detail=_REASON_COMMIT_UNCONFIRMED
+        )
+    return MemoryWriteOutcome(
+        committed=True, switch_changed=False, facts_soft_deleted=changed_rows
+    )
+
+
+async def soft_delete_fact(
+    session: Any, fact_id: int, *, now: Any | None = None
+) -> bool:
+    """软删一条事实（``/memory forget``）；**已确认的零命中**返回 ``False``。
+
+    只在「确认成功**且真的改动了行**」时返回 ``True``：已经删过、行不存在、行已被并发
+    删除都是已确认的零变更，返回 ``False``；未能确认成功同样返回 ``False``。需要区分
+    「已确认的零变更」与「未能确认成功」时用 :func:`soft_delete_fact_outcome`。
+
+    **唯一的例外边界（B5 新加）**：当事务既没能提交、又**无法证明**已被丢弃（回滚失败
+    且 ``close()`` 缺失/失败）时抛出 :class:`MemorySessionCleanupUnsafeError`。这条边界
+    是必要的——静默返回 ``False`` 会让 ``DbSessionMiddleware`` 在 handler 返回后补写残留。
+    见该类 docstring。
+    """
+
+    outcome = await soft_delete_fact_outcome(session, fact_id, now=now)
+    return bool(outcome.committed and outcome.facts_soft_deleted > 0)
+
+
+#: C3 人工纠错：操作者类别（审计里原样保留）
+CORRECTION_OPERATOR_ADMIN = "admin"
+CORRECTION_OPERATOR_SELF = "self"
+CORRECTION_OPERATOR_SUPERADMIN = "superadmin"
+CORRECTION_OPERATORS = (
+    CORRECTION_OPERATOR_ADMIN,
+    CORRECTION_OPERATOR_SELF,
+    CORRECTION_OPERATOR_SUPERADMIN,
+)
+
+#: 结果状态
+CORRECTION_CORRECTED = "corrected"
+CORRECTION_UNCHANGED = "unchanged"
+CORRECTION_CONFLICT = "conflict"
+CORRECTION_INVALID = "invalid"
+CORRECTION_UNCONFIRMED = "unconfirmed"
+#: 冲突/失败原因（固定码，给 API 与回归断言用；不含任何数据）
+CONFLICT_REVISION = "revision"
+CONFLICT_DUPLICATE = "duplicate"
+CONFLICT_TOMBSTONE = "tombstone"
+CONFLICT_GONE = "gone"
+CONFLICT_NOT_VISIBLE = "not_visible"
+CONFLICT_EXPIRED = "expired"
+CONFLICT_OPTOUT = "optout"
+CONFLICT_SCOPE = "scope"
+REASON_EMPTY = "empty"
+REASON_TOO_LONG = "too_long"
+REASON_SENSITIVE = "sensitive"
+REASON_BAD_ARGUMENT = "bad_argument"
+
+#: 人工纠正版的出处片段：**不是**原消息原文，也不冒充正文（C3 红线）。
+CORRECTION_EVIDENCE_MARKER = "人工纠错：本条正文由人工修改，非来源消息原文"
+
+
+@dataclass(frozen=True)
+class FactCorrectionOutcome:
+    """一次人工纠错的可判别结果。
+
+    只有 ``status='corrected'`` 且 ``confirmed=True`` 才是"提交成功且修正版标量
+    已读回确认"；``UNCONFIRMED`` 表示**未能确认**（commit 可能已落库），调用方不
+    得声明"没有生效"；``conflict`` 带固定 ``conflict`` 码；``invalid`` 带固定
+    ``reason`` 码。
+    """
+
+    status: str = CORRECTION_INVALID
+    committed: bool = False
+    confirmed: bool = False
+    conflict: str = ""
+    reason: str = ""
+    fact_id: int = 0
+    revision: int = 0
+    previous_fact_id: int = 0
+    previous_revision: int = 0
+    fact_text: str = ""
+
+
+def _strict_positive_int(value: Any) -> int | None:
+    """严格正整数：``bool``/``float``/字符串/非正数一律 ``None``（不静默截断）。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def redact_sensitive_excerpt(value: Any) -> str:
+    """按**既有**敏感规则保守脱敏一段原文；返回的文本里不得留下敏感值。
+
+    只遮「密码/API key」这类标签会直接把值留在正文里（父 B12 边界探针 F1 实测
+    ``密码是 <值>`` 原样返回），所以这里改成**按行保守隐藏**：整行命中
+    :data:`_SENSITIVE_KEYWORD_RE` 时无法可靠圈出「值」的边界，就把该行整体换成
+    占位符；不含关键词的行只脱敏 11 位及以上长数字串（与
+    :func:`contains_sensitive_fact` 同一判据）。宁可多遮，不可漏值。
+    """
+
+    body = str(value or "")
+    if not body:
+        return ""
+
+    def _mask_digit_run(match: Any) -> str:
+        digits = re.sub(r"\D", "", match.group(0))
+        return SENSITIVE_REDACTION if len(digits) >= 11 else match.group(0)
+
+    lines: list[str] = []
+    for line in body.split("\n"):
+        if _SENSITIVE_KEYWORD_RE.search(line):
+            lines.append(SENSITIVE_REDACTION)
+        else:
+            lines.append(_DIGIT_RUN_RE.sub(_mask_digit_run, line))
+    return "\n".join(lines)
+
+
+def _write_boundary_now() -> datetime:
+    """写锁边界的高精度时刻。
+
+    ``now_shanghai_naive()`` 刻意截断到秒，适合作为落库/展示时间戳；但 TTL 这种
+    "必须精确"的判断若用秒级时间戳，1 秒以内的过期就会在边界被放过。
+    """
+
+    return datetime.now(SHANGHAI_TZ).replace(tzinfo=None)
+
+
+async def _correction_miss_conflict(
+    session: Any,
+    *,
+    scope: str,
+    scope_id: int,
+    subject: int,
+    fact_id: int,
+    revision: int,
+    now: Any,
+) -> tuple[str, str]:
+    """CAS 落空后读回真实状态，给出精确冲突码（读不到就退化成 revision）。
+
+    这里只用来**解释**失败，绝不作为授权判断：真正的写入门槛是同一事务里带
+    TTL/optout 谓词的 ``UPDATE``。
+    """
+
+    try:
+        row = (
+            await session.execute(
+                select(UserFact.status, UserFact.revision, UserFact.expires_at).where(
+                    UserFact.id == fact_id,
+                    UserFact.scope == scope,
+                    UserFact.scope_id == scope_id,
+                    UserFact.subject_user_id == subject,
+                )
+            )
+        ).first()
+        if row is None:
+            return CONFLICT_GONE, ""
+        status_value = str(row[0] or STATUS_ACTIVE)
+        if status_value != STATUS_ACTIVE:
+            return CONFLICT_NOT_VISIBLE, status_value
+        expires_at = row[2]
+        if expires_at is not None and expires_at <= now:
+            return CONFLICT_EXPIRED, ""
+        if subject and await _is_opted_out(session, subject):
+            return CONFLICT_OPTOUT, ""
+    except Exception:  # pragma: no cover - 事务已异常时只能退化
+        return CONFLICT_REVISION, ""
+    if int(row[1] or 1) != revision:
+        return CONFLICT_REVISION, ""
+    # 可见状态与预读一致却仍然落空：只可能是并发写入者已经改过这一行。
+    return CONFLICT_REVISION, ""
+
+
+async def correct_fact(
+    session: Any,
+    *,
+    scope: str,
+    scope_id: Any,
+    subject_user_id: Any,
+    fact_id: Any,
+    expected_revision: Any,
+    new_text: Any,
+    operator_user_id: Any,
+    operator_kind: str,
+    now: Any | None = None,
+) -> FactCorrectionOutcome:
+    """C3 人工纠错：一条原子事务里新建修正版、旧行标 ``superseded`` 并写审计。
+
+    契约（与 B12/C3 合同一一对应）：
+
+    * **CAS**：旧行必须同时满足 ``scope`` / ``scope_id`` / ``stable id`` /
+      ``expected_revision`` / ``status='active'``，并在**写入时的 CAS 谓词里**重新检查
+      ``expires_at`` 与 optout（不是入口时间快照）；预读只用来给精确的冲突码，
+      **不算授权锁**。谓词落空时整笔回滚，绝不留下新行/审计，也不声称成功。
+    * **先校验后 DML**：空/超长/敏感的新正文在动笔之前就被拒（``invalid``）。
+    * **幂等**：归一化后与旧正文完全相同的请求返回 ``unchanged``，不写任何行。
+    * **不复活墓碑**：新正文的 fingerprint 命中 ``deleted``/``superseded`` 行时
+      返回 ``tombstone`` 冲突，既不合并也不复活。
+    * **同一个指纹不许两行 active**：命中别的 active 行返回 ``duplicate``。
+    * **审计**在**同一事务**里写（作用域、新旧 stable id 与修订号、操作者、时间、
+      原因/结果），提交成功才存在。
+    * **清理协议**（父 B12 F3 要求的有界恢复）：纠错路径用
+      :func:`_release_correction_session`（复用 B9 已验收的
+      :func:`bot.services.memory._pm_release_session`，rollback/close 各最多两次，
+      首次 close 抛取消后仍再关一次）；原始取消在传播时保持对象身份，
+      普通异常路径若清理期间出现新取消则原样上抛，全部恢复失败时抛
+      :class:`MemorySessionCleanupUnsafeError`（绝不让中间件补写残留）。
+      旧 退订/删除/恢复 路径的单次清理语义未被改动。
+    * **不碰内部 commit**：不复用 :func:`record_fact`（它自己 commit），本函数是
+      唯一的人工纠错写路径，事务由本函数独占。
+    """
+
+    if operator_kind not in CORRECTION_OPERATORS:
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_BAD_ARGUMENT)
+    normalized_scope = normalize_scope(scope)
+    fact_value = _strict_positive_int(fact_id)
+    revision_value = _strict_positive_int(expected_revision)
+    operator_value = _strict_positive_int(operator_user_id)
+    try:
+        sid = int(scope_id)
+    except (TypeError, ValueError):
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_BAD_ARGUMENT)
+    # ``subject_user_id=None`` 表示「调用方已在本群作用域内授权」，不加 subject 约束
+    # （群管理员面）；传具体值则额外把行锁定到该 subject（本人自助入口严格传本人）。
+    subject_filter: int | None = None
+    if subject_user_id is not None:
+        if isinstance(subject_user_id, bool) or not isinstance(subject_user_id, int):
+            return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_BAD_ARGUMENT)
+        if subject_user_id < 0:
+            return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_BAD_ARGUMENT)
+        subject_filter = int(subject_user_id)
+    if fact_value is None or revision_value is None or operator_value is None:
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_BAD_ARGUMENT)
+
+    raw_text = str(new_text or "").strip()
+    body = normalize_fact_text(raw_text)
+    if not body:
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_EMPTY)
+    if len(_WHITESPACE_RE.sub(" ", raw_text)) > FACT_TEXT_MAX_CHARS:
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_TOO_LONG)
+    if contains_sensitive_fact(body):
+        return FactCorrectionOutcome(status=CORRECTION_INVALID, reason=REASON_SENSITIVE)
+
+    stamp = now or now_shanghai_naive()
+    identity = [
+        UserFact.id == fact_value,
+        UserFact.scope == normalized_scope,
+        UserFact.scope_id == sid,
+    ]
+    if subject_filter is not None:
+        identity.append(UserFact.subject_user_id == subject_filter)
+    try:
+        current = (
+            await session.execute(
+                select(
+                    UserFact.id,
+                    UserFact.status,
+                    UserFact.revision,
+                    UserFact.fact_text,
+                    UserFact.category,
+                    UserFact.confidence,
+                    UserFact.source_kind,
+                    UserFact.source_message_id,
+                    UserFact.source_thread_id,
+                    UserFact.first_seen_at,
+                    UserFact.expires_at,
+                    UserFact.subject_user_id,
+                ).where(*identity)
+            )
+        ).first()
+        if current is None:
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=CONFLICT_GONE,
+                previous_fact_id=fact_value,
+                previous_revision=revision_value,
+            )
+        status_value = str(current[1] or STATUS_ACTIVE)
+        stored_revision = int(current[2] or 1)
+        stored_text = normalize_fact_text(current[3])
+        # 行的真实 subject：scope/subject 都不允许被纠错改写，修正版原样继承。
+        subject = int(current[11] or 0)
+        if status_value != STATUS_ACTIVE:
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=CONFLICT_NOT_VISIBLE,
+                reason=status_value,
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+            )
+        if stored_revision != revision_value:
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=CONFLICT_REVISION,
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+            )
+        expires_at = current[10]
+        if expires_at is not None and expires_at <= stamp:
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=CONFLICT_EXPIRED,
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+            )
+        if subject and await _is_opted_out(session, subject):
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=CONFLICT_OPTOUT,
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+            )
+        if body == stored_text:
+            return FactCorrectionOutcome(
+                status=CORRECTION_UNCHANGED,
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+                fact_text=stored_text,
+            )
+        fingerprint = fact_fingerprint(
+            scope=normalized_scope,
+            scope_id=sid,
+            subject_user_id=subject,
+            fact_text=body,
+        )
+        duplicate = (
+            await session.execute(
+                select(UserFact.id, UserFact.status)
+                .where(
+                    UserFact.scope == normalized_scope,
+                    UserFact.scope_id == sid,
+                    UserFact.subject_user_id == subject,
+                    UserFact.fingerprint == fingerprint,
+                )
+                .order_by(UserFact.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if duplicate is not None:
+            duplicate_status = str(duplicate[1] or STATUS_ACTIVE)
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=(
+                    CONFLICT_TOMBSTONE
+                    if duplicate_status != STATUS_ACTIVE
+                    else CONFLICT_DUPLICATE
+                ),
+                previous_fact_id=fact_value,
+                previous_revision=stored_revision,
+            )
+
+        category_value = normalize_category(current[4])
+        confidence_value = int(current[5]) if current[5] is not None else (
+            DEFAULT_TOOL_CONFIDENCE
+            if normalize_source_kind(current[6]) == SOURCE_TOOL
+            else DEFAULT_PASSIVE_CONFIDENCE
+        )
+        row = UserFact(
+            scope=normalized_scope,
+            scope_id=sid,
+            subject_user_id=subject,
+            fact_text=body,
+            category=category_value,
+            confidence=min(100, max(0, confidence_value)),
+            source_kind=normalize_source_kind(current[6]),
+            source_message_id=current[7],
+            source_thread_id=current[8],
+            evidence_excerpt=CORRECTION_EVIDENCE_MARKER[:EVIDENCE_EXCERPT_MAX_CHARS],
+            fingerprint=fingerprint,
+            first_seen_at=current[9] or stamp,
+            last_confirmed_at=stamp,
+            confirm_count=1,
+            revision=1,
+            corrected_by=operator_value,
+            corrected_at=stamp,
+            expires_at=expires_at,
+            status=STATUS_ACTIVE,
+            created_at=stamp,
+        )
+        session.add(row)
+        await session.flush()
+        new_id = int(row.id)
+        # 写入边界的「当时」：预读时间戳不能代表拿到写锁之后的 TTL/optout 状态。
+        write_stamp = _write_boundary_now()
+        cas_where = [
+            UserFact.id == fact_value,
+            UserFact.scope == normalized_scope,
+            UserFact.scope_id == sid,
+            UserFact.subject_user_id == subject,
+            UserFact.revision == revision_value,
+            UserFact.status == STATUS_ACTIVE,
+            or_(UserFact.expires_at.is_(None), UserFact.expires_at > write_stamp),
+        ]
+        if subject:
+            cas_where.append(
+                ~exists(
+                    select(MemoryOptout.user_id).where(
+                        MemoryOptout.user_id == subject
+                    )
+                )
+            )
+        cas = await session.execute(
+            update(UserFact)
+            .where(*cas_where)
+            .values(
+                status=STATUS_SUPERSEDED,
+                superseded_by=new_id,
+                revision=UserFact.revision + 1,
+            )
+        )
+        if _rowcount(cas) != 1:
+            # CAS 没命中：拿到写锁之后的真实状态与预读不一致（并发纠错/删除/后台
+            # 确认/移到他群/optout/刚过期）。整笔作废，一个字节都不留。
+            conflict, miss_reason = await _correction_miss_conflict(
+                session,
+                scope=normalized_scope,
+                scope_id=sid,
+                subject=subject,
+                fact_id=fact_value,
+                revision=revision_value,
+                now=write_stamp,
+            )
+            cleanup_safe = await _release_correction_session(
+                session, suppress_cancel=False
+            )
+            if not cleanup_safe:
+                raise MemorySessionCleanupUnsafeError() from None
+            return FactCorrectionOutcome(
+                status=CORRECTION_CONFLICT,
+                conflict=conflict,
+                reason=miss_reason,
+                previous_fact_id=fact_value,
+                previous_revision=revision_value,
+            )
+        session.add(
+            UserFactCorrection(
+                scope=normalized_scope,
+                scope_id=sid,
+                subject_user_id=subject,
+                old_fact_id=fact_value,
+                old_revision=revision_value,
+                new_fact_id=new_id,
+                new_revision=1,
+                operator_user_id=operator_value,
+                operator_kind=operator_kind,
+                action="correct",
+                result=CORRECTION_CORRECTED,
+                old_text=str(current[3] or "")[:FACT_TEXT_MAX_CHARS],
+                new_text=body,
+                created_at=stamp,
+            )
         )
         await session.commit()
+    except asyncio.CancelledError:
+        # 原始取消优先：有界清理期间的新取消不得替换它，清理后仍抛原对象。
+        await _release_correction_session(session, suppress_cancel=True)
+        raise
+    except MemorySessionCleanupUnsafeError:
+        raise
     except Exception as exc:
-        await _safe_rollback(session)
-        log.warning(
-            "long-term memory: 删除事实失败 | fact_id=%s | error=%s", fact_id, exc
+        cleanup_safe = await _release_correction_session(
+            session, suppress_cancel=False
         )
-        return False
-    return _rowcount(result) > 0
+        log.warning(
+            "long-term memory: 人工纠错未确认 | fact_id=%s | reason=%s | cleanup_safe=%s",
+            fact_value,
+            type(exc).__name__,
+            cleanup_safe,
+        )
+        if not cleanup_safe:
+            raise MemorySessionCleanupUnsafeError() from None
+        return FactCorrectionOutcome(
+            status=CORRECTION_UNCONFIRMED,
+            conflict="",
+            reason=_REASON_COMMIT_UNCONFIRMED,
+            previous_fact_id=fact_value,
+            previous_revision=revision_value,
+        )
+
+    # 提交已经返回：写是 durable 的。再读回修正版标量，只有读回一致才算 confirmed。
+    confirmed = False
+    read_back_text = ""
+    try:
+        stored = (
+            await session.execute(
+                select(
+                    UserFact.id,
+                    UserFact.revision,
+                    UserFact.status,
+                    UserFact.fact_text,
+                    UserFact.corrected_by,
+                ).where(UserFact.id == new_id)
+            )
+        ).first()
+        if stored is not None:
+            confirmed = (
+                int(stored[0]) == new_id
+                and int(stored[1] or 0) == 1
+                and str(stored[2] or "") == STATUS_ACTIVE
+                and normalize_fact_text(stored[3]) == body
+                and int(stored[4] or 0) == operator_value
+            )
+            read_back_text = str(stored[3] or "")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        confirmed = False
+    return FactCorrectionOutcome(
+        status=CORRECTION_CORRECTED,
+        committed=True,
+        confirmed=confirmed,
+        fact_id=new_id,
+        revision=1,
+        previous_fact_id=fact_value,
+        previous_revision=revision_value,
+        fact_text=read_back_text or body,
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    """保留 ``None`` 的严格整数：``bool``/``float``/字符串一律 ``None``。
+
+    用于可信 thread 这类"要么是真实正整数、要么就是没有"的列——**不做**静默截断，
+    也不把 NULL/旧行编造成 1。
+    """
+
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
 
 
 def _fact_rows_to_records(rows: Iterable[Any]) -> list[dict[str, Any]]:
@@ -2282,6 +3148,16 @@ def _fact_rows_to_records(rows: Iterable[Any]) -> list[dict[str, Any]]:
                 "confirm_count": max(1, int(row[7] or 1)),
                 "first_seen_at": _coerce_dt(row[8]),
                 "last_confirmed_at": _coerce_dt(row[9]),
+                # B2-2：只多带「写入方式」与「来源消息 id」两个元数据列，正文片段
+                # （evidence_excerpt）**刻意不取**，避免原始片段被渲染层顺手带出去。
+                "source_kind": str(row[10] or ""),
+                "source_message_id": int(row[11] or 0),
+                # C3：Topics 深链需要的可信 thread（写入时从一致归档行取，旧行为
+                # None → 退回非 Topics 形状）、纠错 CAS 需要的修订号、以及"是否
+                # 人工纠错过"的标记（正文永不冒充原消息）。
+                "source_thread_id": _optional_int(row[12]),
+                "revision": max(1, int(row[13] or 1)),
+                "corrected": row[14] is not None,
             }
         )
     return records
@@ -2299,6 +3175,11 @@ def _active_fact_columns() -> tuple[Any, ...]:
         UserFact.confirm_count,
         UserFact.first_seen_at,
         UserFact.last_confirmed_at,
+        UserFact.source_kind,
+        UserFact.source_message_id,
+        UserFact.source_thread_id,
+        UserFact.revision,
+        UserFact.corrected_by,
     )
 
 
@@ -2441,18 +3322,44 @@ __all__ = [
     "CATEGORY_SKILL",
     "CATEGORY_TABOO",
     "CONFLICT_CATEGORIES",
+    "CONFLICT_DUPLICATE",
+    "CONFLICT_EXPIRED",
+    "CONFLICT_GONE",
+    "CONFLICT_NOT_VISIBLE",
+    "CONFLICT_OPTOUT",
+    "CONFLICT_REVISION",
+    "CONFLICT_SCOPE",
+    "CONFLICT_TOMBSTONE",
+    "CORRECTION_CONFLICT",
+    "CORRECTION_CORRECTED",
+    "CORRECTION_EVIDENCE_MARKER",
+    "CORRECTION_INVALID",
+    "CORRECTION_OPERATOR_ADMIN",
+    "CORRECTION_OPERATOR_SELF",
+    "CORRECTION_OPERATOR_SUPERADMIN",
+    "CORRECTION_OPERATORS",
+    "CORRECTION_UNCHANGED",
+    "CORRECTION_UNCONFIRMED",
     "DEFAULT_PASSIVE_CONFIDENCE",
     "DEFAULT_TOOL_CONFIDENCE",
     "EVIDENCE_EXCERPT_MAX_CHARS",
     "EXTRACT_SYSTEM_PROMPT",
     "FACT_TEXT_MAX_CHARS",
+    "FactCorrectionOutcome",
     "LONG_TERM_MEMORY_HEADER",
     "LONG_TERM_MEMORY_HEADER_BLOCK",
     "LONG_TERM_MEMORY_NOTE",
     "MEMORY_RECALL_LIMIT",
+    "MemorySessionCleanupUnsafeError",
+    "MemoryWriteOutcome",
+    "REASON_BAD_ARGUMENT",
+    "REASON_EMPTY",
+    "REASON_SENSITIVE",
+    "REASON_TOO_LONG",
     "SCOPES",
     "SCOPE_GROUP",
     "SCOPE_PRIVATE",
+    "SENSITIVE_REDACTION",
     "SOURCE_PASSIVE",
     "SOURCE_TOOL",
     "STATUS_ACTIVE",
@@ -2460,6 +3367,7 @@ __all__ = [
     "STATUS_SUPERSEDED",
     "clear_optout",
     "contains_sensitive_fact",
+    "correct_fact",
     "count_tool_facts_today",
     "expire_event_facts",
     "extract_facts",
@@ -2492,6 +3400,7 @@ __all__ = [
     "parse_fact_items",
     "prune_user_facts",
     "record_fact",
+    "redact_sensitive_excerpt",
     "render_facts_block",
     "reset_extraction_ledger",
     "run_extraction_round",
@@ -2500,4 +3409,5 @@ __all__ = [
     "set_optout",
     "should_extract",
     "soft_delete_fact",
+    "soft_delete_fact_outcome",
 ]

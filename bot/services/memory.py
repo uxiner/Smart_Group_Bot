@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
+from contextlib import asynccontextmanager
 from contextvars import Context
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,50 @@ def _moderation_action_removed_message(action: object) -> bool:
                 stripped = True
                 break
     return base in _ARCHIVE_DISPOSED_ACTION_BASES
+
+
+async def disposed_message_ids(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    telegram_message_ids: Iterable[int],
+) -> set[int]:
+    """精确核对：这批 Telegram 消息 id 里哪些已被审核删除（只读、有界）。
+
+    与 :meth:`MemoryService._removed_message_ids` 同源，区别只是**复用调用方已有的
+    session**，好让命令层（``/find``、``/memory``）不必自己再开一个会话、也不必为了
+    "零新增查询" 而放弃删除保护。
+
+    只有查得到真实处置记录（``violations`` 表里 ``action_taken`` 属于"消息已被删除"
+    的那几个基名）才认定为已删除。**查不到证据不等于可以给链接**：调用方在查询
+    失败时必须按"不可链接"降级。
+    """
+
+    wanted = {int(value) for value in telegram_message_ids if int(value or 0) > 0}
+    if not wanted:
+        return set()
+    rows = (
+        await session.execute(
+            select(
+                Violation.source_message_id,
+                Violation.action_taken,
+            ).where(
+                Violation.group_id == int(group_id),
+                Violation.source_message_id.in_(sorted(wanted)),
+            )
+        )
+    ).all()
+    removed: set[int] = set()
+    for source_message_id, action in rows:
+        if not _moderation_action_removed_message(action):
+            continue
+        try:
+            value = int(source_message_id)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            removed.add(value)
+    return removed
 
 
 def _archive_message_key(group_id: int, telegram_message_id: object) -> str:
@@ -464,6 +509,246 @@ async def _run_bounded_tokenizer_call(call: Callable[[], Any], fallback: Any) ->
         result_future.cancel()
         return fallback
     return result_future.result()
+
+
+# --- 单条群永久备忘删除（B6） --------------------------------------------
+#
+# 按钮 ``lmd:<id>:<page>`` 只携带**稳定 ID**，因此删除必须是
+# ``DELETE ... WHERE group_id = ? AND id = ?`` 的原子单行操作：真实 SQL rowcount 0/1
+# 加上真实 ``commit`` 返回，才分别构成「确认零变更」与「确认已删除」。
+#
+# 绝不把「预读选中了几行」当作删除证据：父代理的独立 probe 已经证明，服务预读一行之后
+# 另一个 session 删掉它并提交，本服务的 DELETE 会命中 0 行而 ``commit`` 仍然正常返回。
+
+PM_DELETE_DELETED = "deleted"
+PM_DELETE_NO_CHANGE = "no_change"
+PM_DELETE_UNCONFIRMED = "unconfirmed"
+
+PM_DELETE_REASON_INVALID_TARGET = "invalid_target"
+PM_DELETE_REASON_EXECUTE_FAILED = "execute_failed"
+PM_DELETE_REASON_COMMIT_FAILED = "commit_failed"
+PM_DELETE_REASON_ROWCOUNT_UNKNOWN = "rowcount_unknown"
+PM_DELETE_REASON_CLEANUP_FAILED = "cleanup_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class PermanentMemoryDeletionOutcome:
+    """单条永久备忘删除的**已确认**结果；不确定一律 ``unconfirmed``。
+
+    ``changed_rows`` 只在 ``deleted`` / ``no_change`` 时有意义（严格整数 1 / 0）；
+    ``unconfirmed`` 表示无法判断，**不得**被读作 0。
+
+    ``resource_released`` 是**另一件事实**：session 的事务与连接是否确认归还。
+    它与持久化真值分开——真实 ``commit`` 已确认的 ``deleted`` / ``no_change``
+    不会因为 cleanup 故障而被改写成「未删除」；反过来，资源没归还也不会把一次
+    未确认的写入变成「已删除」。
+    """
+
+    status: str
+    changed_rows: int = 0
+    detail: str = ""
+    resource_released: bool = True
+
+    @property
+    def confirmed_deleted(self) -> bool:
+        return self.status == PM_DELETE_DELETED
+
+    @property
+    def confirmed_no_change(self) -> bool:
+        return self.status == PM_DELETE_NO_CHANGE
+
+
+# 「修改永久记忆」（自然语言 replace）的终态。这里要修的是同一类空洞：
+# 旧实现先 `session.delete()` 再判断新内容是否有效，于是「目标命中 + 新内容为空」
+# 会真删掉旧记忆，而调用方拿到的是「修改失败」。真实数据丢失 + 失败回执叠加。
+#
+# 因此：**输入无效与目标不存在都必须一行都不碰**；只有真正替换成功才是 updated。
+
+PM_REPLACE_UPDATED = "updated"
+#: 目标在本群不存在/已不存在（含空目标）：旧行未被动过。
+PM_REPLACE_NOT_FOUND = "not_found"
+#: 新内容为空/纯空白：旧行未被动过。
+PM_REPLACE_INVALID_CONTENT = "invalid_new_content"
+#: 写没被确认：commit 没正常返回，或结果不可信。**不承诺**旧行是否还在。
+PM_REPLACE_UNCONFIRMED = "unconfirmed"
+
+PM_REPLACE_REASON_INVALID_CONTENT = "invalid_new_content"
+PM_REPLACE_REASON_LOOKUP_FAILED = "lookup_failed"
+PM_REPLACE_REASON_WRITE_FAILED = "write_failed"
+PM_REPLACE_REASON_COMMIT_FAILED = "commit_failed"
+PM_REPLACE_REASON_CLEANUP_UNRELEASED = "cleanup_unreleased"
+
+
+@dataclass(frozen=True, slots=True)
+class PermanentMemoryReplaceOutcome:
+    """一次「修改永久记忆」的可证明结果。
+
+    与删除口径一致：``not_found`` / ``invalid_new_content`` 明确表示**没有任何行
+    被改动**；``unconfirmed`` 表示无法判断，既不能说「没生效」，也不能据事后查询
+    反推成功。``deleted_count`` / ``memory_id`` / ``content`` 只在 ``updated``
+    时有意义，且都是 commit 之前取好的普通标量。
+    """
+
+    status: str
+    deleted_count: int = 0
+    memory_id: int | None = None
+    content: str = ""
+    created_new: bool = False
+    detail: str = ""
+    #: 与删除口径同义：数据真值确认与资源归还分开上报。
+    resource_released: bool = True
+
+    @property
+    def updated(self) -> bool:
+        return self.status == PM_REPLACE_UPDATED
+
+    @property
+    def not_found(self) -> bool:
+        return self.status == PM_REPLACE_NOT_FOUND
+
+    @property
+    def invalid_new_content(self) -> bool:
+        return self.status == PM_REPLACE_INVALID_CONTENT
+
+    @property
+    def unconfirmed(self) -> bool:
+        return self.status == PM_REPLACE_UNCONFIRMED
+
+
+def _pm_strict_int(value: Any) -> int | None:
+    """只接受真实 ``int``（``bool`` 不算），不做任何转换或截断。
+
+    绝不 ``int(...)``：``True``、``1.5``、``"1"`` 都不得被折叠成稳定 ID，否则按钮
+    回传的非法值会删掉一条完全不同的记忆。负数是合法的群 ID，因此这里不取 ``abs``。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _pm_single_row_change(result: Any) -> int | None:
+    """单行 DELETE 的真实 rowcount；只有整数 0 与 1 可以判定，其余返回 ``None``。
+
+    ``None`` 会让调用方回落到 ``unconfirmed``——不伪造 0，也不把异常值当成一次删除。
+    ``bool`` / 浮点 / 字符串 / ``NaN`` / ``inf`` 一律视为未知，且**不得**在判定过程中
+    抛出转换错误（``int(inf)`` 会抛 ``OverflowError``，这正是要点）。
+    """
+
+    try:
+        raw = getattr(result, "rowcount", None)
+    except Exception:  # pragma: no cover - 驱动异常形状
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    if raw not in (0, 1):
+        return None
+    return raw
+
+
+_PM_CLEANUP_ATTEMPTS = 2
+
+
+def _pm_log_cleanup(phase: str, exc: BaseException) -> None:
+    """cleanup 故障只记录固定阶段码与异常类型名，绝不输出原始异常文本或 SQL。"""
+
+    log.warning(
+        "permanent memory delete cleanup failed | phase=%s | reason=%s",
+        phase,
+        type(exc).__name__,
+    )
+
+
+async def _pm_release_session(
+    session: Any,
+    *,
+    rollback_first: bool,
+    suppress_cancel: bool,
+) -> bool:
+    """尽力把 session 的事务与连接还回去；返回是否**确认**归还。
+
+    失败或取消的路径先 ``rollback``（结束事务、释放 SQLite 全局写锁）再 ``close``；
+    已确认提交之后的路径只 ``close``（此时没有活动事务）。每一步都最多尝试
+    ``_PM_CLEANUP_ATTEMPTS`` 次，而且**每一次都真的走到下一次尝试**：第一次失败就放弃会
+    留下仍持事务与全局写锁的 session（父代理 B6-B1 probe 正是这样让独立 writer 超时的），
+    而 cleanup 阶段的临时取消/临时异常之后，后面那一次 ``close`` 往往仍然能成功。
+
+    ``suppress_cancel`` 为真表示**已经有一个取消正在传播**（调用方马上要 ``raise`` 原取消）：
+    此时 cleanup 里新发生的取消只记录故障，绝不替换它。为假表示**没有原始取消**，cleanup
+    期间出现的取消是**新的**：仍然先尽力归还资源，再把这个新取消原样抛出去，让调用方不能
+    把它吞成普通业务失败去回执。
+
+    任何情况下都**不做无限重试、不留后台任务、不做补偿 commit、不强行 release 全局锁**。
+    """
+
+    cancelled: asyncio.CancelledError | None = None
+
+    if rollback_first:
+        for _ in range(_PM_CLEANUP_ATTEMPTS):
+            try:
+                await session.rollback()
+                break
+            except asyncio.CancelledError as exc:
+                if not suppress_cancel and cancelled is None:
+                    cancelled = exc
+                log.warning("permanent memory delete cleanup cancelled | phase=rollback")
+                continue
+            except Exception as exc:  # pragma: no cover - 需要注入才可达
+                _pm_log_cleanup("rollback", exc)
+
+    released = False
+    for _ in range(_PM_CLEANUP_ATTEMPTS):
+        try:
+            await session.close()
+        except asyncio.CancelledError as exc:
+            if not suppress_cancel and cancelled is None:
+                cancelled = exc
+            log.warning("permanent memory delete cleanup cancelled | phase=close")
+            continue
+        except Exception as exc:  # pragma: no cover - 需要注入才可达
+            _pm_log_cleanup("close", exc)
+            continue
+        # 有一次 ``close`` 真的正常返回就算确认归还——上次失败而这次成功也算。
+        released = True
+        break
+
+    if cancelled is not None:
+        # 新发生的取消必须原样传播（此时资源已尽力归还），绝不被吞成普通结局。
+        raise cancelled
+    return released
+
+
+@asynccontextmanager
+async def _pm_create_session(session_factory: Any):
+    """Create/readback scope using the existing bounded release protocol.
+
+    Do not delegate to AsyncSession.__aexit__: its task/shield boundary can
+    replace the original cancellation. No commit is retried or compensated.
+    Exhausted cleanup is never reported as a successful create/readback.
+    """
+    session = session_factory()
+    failed = False
+    original_cancel: asyncio.CancelledError | None = None
+    try:
+        yield session
+    except asyncio.CancelledError as exc:
+        failed = True
+        original_cancel = exc
+        raise
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        released = await _pm_release_session(
+            session,
+            rollback_first=failed,
+            suppress_cancel=original_cancel is not None,
+        )
+        if not released:
+            log.warning("permanent memory create cleanup unreleased")
+            # Preserve an already propagating exception, especially identity.
+            if not failed:
+                raise RuntimeError("permanent_memory_cleanup_unreleased")
 
 
 class MemoryService:
@@ -2469,32 +2754,12 @@ class MemoryService:
         这里逐个核对，保证已删除内容不会因为提示词上限而漏出去。
         """
 
-        wanted = {int(value) for value in telegram_message_ids if int(value or 0) > 0}
-        if not wanted:
-            return set()
         async with self._session_factory() as session:
-            rows = (
-                await session.execute(
-                    select(
-                        Violation.source_message_id,
-                        Violation.action_taken,
-                    ).where(
-                        Violation.group_id == int(group_id),
-                        Violation.source_message_id.in_(sorted(wanted)),
-                    )
-                )
-            ).all()
-        removed: set[int] = set()
-        for source_message_id, action in rows:
-            if not _moderation_action_removed_message(action):
-                continue
-            try:
-                value = int(source_message_id)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                removed.add(value)
-        return removed
+            return await disposed_message_ids(
+                session,
+                group_id=int(group_id),
+                telegram_message_ids=telegram_message_ids,
+            )
 
     async def recall_archive(
         self,
@@ -3845,7 +4110,7 @@ class MemoryService:
         if not text:
             return None, False
 
-        async with self._session_factory() as session:
+        async with _pm_create_session(self._session_factory) as session:
             stmt = select(GroupPermanentMemory).where(
                 GroupPermanentMemory.group_id == group_id,
                 GroupPermanentMemory.content == text,
@@ -3862,7 +4127,17 @@ class MemoryService:
                 created_by=created_by,
             )
             session.add(row)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                # 并发同内容新建：唯一索引挡下了第二行，读回既有行，仍按幂等形状
+                # 返回 (existing, False)。读不到才是别的完整性错误，原样抛出。
+                await session.rollback()
+                result = await session.execute(stmt)
+                existing = result.scalars().first()
+                if existing is None:
+                    raise
+                return existing, False
             await session.refresh(row)
             return row, True
 
@@ -3905,12 +4180,212 @@ class MemoryService:
             await session.commit()
         return deleted
 
+    async def delete_permanent_memory_outcome(
+        self,
+        group_id: int,
+        memory_id: int,
+    ) -> PermanentMemoryDeletionOutcome:
+        """按**稳定 ID** 原子删除一条群永久备忘，并如实报告确认结果。
+
+        正常最小路径是 **一条 DELETE + 一次 commit**：群边界与稳定 ID 在同一条 DML
+        条件里，因此不需要预读，也不存在「预读之后被别人删掉」的窗口。参数校验不碰 SQL。
+
+        只接受**真实正整数稳定 ID** 与**真实 ``int`` 群 ID**：``bool`` / 浮点 / 字符串一概
+        在碰 SQL 之前就被拒绝（校验不产生任何 SQL，也不删任何行）。
+
+        语义边界：
+
+        * rowcount 为 0 → ``no_change``；为 1 → ``deleted``；其余（未知/负数/越界/bool/
+          浮点/读取异常）→ ``unconfirmed``，**不伪造 0**，也不抛转换错误。
+        * ``commit`` wrapper 尚未返回就抛错（包括内层已落库再抛错）→ ``unconfirmed``：
+          绝不说「失败未生效」，也不重删。
+        * ``commit`` 已正常返回之后 cleanup 失败 → 只记录故障并置
+          ``resource_released=False``，**不推翻**已确认的结果，也不新增补偿 commit。
+        * 取消在 execute / commit / close 任何阶段都原样传播，且不被 cleanup 异常替换。
+        """
+
+        gid = _pm_strict_int(group_id)
+        pid = _pm_strict_int(memory_id)
+        if gid is None or pid is None or pid <= 0:
+            return PermanentMemoryDeletionOutcome(
+                status=PM_DELETE_NO_CHANGE,
+                changed_rows=0,
+                detail=PM_DELETE_REASON_INVALID_TARGET,
+            )
+
+        session = self._session_factory()
+        changed: int | None = None
+        phase = PM_DELETE_REASON_EXECUTE_FAILED
+        try:
+            result = await session.execute(
+                delete(GroupPermanentMemory).where(
+                    GroupPermanentMemory.group_id == gid,
+                    GroupPermanentMemory.id == pid,
+                )
+            )
+            changed = _pm_single_row_change(result)
+            phase = PM_DELETE_REASON_COMMIT_FAILED
+            await session.commit()
+        except asyncio.CancelledError:
+            # 原始取消 A 正在传播：先把事务与连接尽力还回去，再**原样抛出 A**。
+            # cleanup 期间新发生的取消/异常都不能替换 A（suppress_cancel=True）。
+            try:
+                await _pm_release_session(
+                    session, rollback_first=True, suppress_cancel=True
+                )
+            except BaseException:  # pragma: no cover - 绝不替换正在传播的取消
+                log.warning(
+                    "permanent memory delete cleanup aborted | group_id=%s | memory_id=%s",
+                    gid,
+                    pid,
+                )
+            raise
+        except Exception:
+            # 没有原始取消：cleanup 期间若出现**新的**取消，尽力归还后原样抛出，
+            # 绝不能把它吞成普通业务结果（否则 handler 会照常回未确认并结束）。
+            released = await _pm_release_session(
+                session, rollback_first=True, suppress_cancel=False
+            )
+            log.warning(
+                "permanent memory delete unconfirmed | group_id=%s | memory_id=%s | reason=%s",
+                gid,
+                pid,
+                phase,
+            )
+            if not released:
+                log.warning(
+                    "permanent memory delete cleanup fault | group_id=%s | memory_id=%s | reason=%s",
+                    gid,
+                    pid,
+                    PM_DELETE_REASON_CLEANUP_FAILED,
+                )
+            return PermanentMemoryDeletionOutcome(
+                status=PM_DELETE_UNCONFIRMED,
+                detail=phase,
+                resource_released=released,
+            )
+
+        # 已确认提交后的清理：此时没有原始取消，cleanup 里出现的取消是**新的**，
+        # 尽力归还资源后必须原样传播（suppress_cancel=False），不得吞成普通结局。
+        released = await _pm_release_session(
+            session, rollback_first=False, suppress_cancel=False
+        )
+        if not released:
+            log.warning(
+                "permanent memory delete cleanup fault | group_id=%s | memory_id=%s | reason=%s",
+                gid,
+                pid,
+                PM_DELETE_REASON_CLEANUP_FAILED,
+            )
+
+        if changed is None:
+            return PermanentMemoryDeletionOutcome(
+                status=PM_DELETE_UNCONFIRMED,
+                changed_rows=0,
+                detail=PM_DELETE_REASON_ROWCOUNT_UNKNOWN,
+                resource_released=released,
+            )
+        if changed == 1:
+            return PermanentMemoryDeletionOutcome(
+                status=PM_DELETE_DELETED,
+                changed_rows=1,
+                resource_released=released,
+            )
+        return PermanentMemoryDeletionOutcome(
+            status=PM_DELETE_NO_CHANGE,
+            changed_rows=0,
+            resource_released=released,
+        )
+
     async def clear_permanent_memory(self, group_id: int) -> int:
         async with self._session_factory() as session:
             stmt = delete(GroupPermanentMemory).where(GroupPermanentMemory.group_id == group_id)
             result = await session.execute(stmt)
             await session.commit()
             return int(result.rowcount or 0)
+
+    async def _lookup_permanent_memory_targets(
+        self,
+        session: Any,
+        group_id: int,
+        query: str,
+    ) -> list[GroupPermanentMemory]:
+        """按稳定 ID 或正文子串找出本群要改的行（永远限定本群）。"""
+
+        match = re.fullmatch(r"#?(\d+)", query)
+        if match:
+            row = await session.get(GroupPermanentMemory, int(match.group(1)))
+            return [row] if row is not None and row.group_id == group_id else []
+        stmt = (
+            select(GroupPermanentMemory)
+            .where(
+                GroupPermanentMemory.group_id == group_id,
+                GroupPermanentMemory.content.contains(query),
+            )
+            .order_by(GroupPermanentMemory.id.asc())
+        )
+        return list((await session.execute(stmt)).scalars().all())
+
+    async def _replace_permanent_memory_rows(
+        self,
+        session: Any,
+        group_id: int,
+        *,
+        target: str,
+        new_content: str,
+        created_by: int,
+    ) -> tuple[str, list[GroupPermanentMemory], GroupPermanentMemory | None, bool]:
+        """在一个事务里替换永久记忆，只返回「按设计发生了什么」。
+
+        与旧实现的唯一实质差别：**输入无效与目标不存在都在任何 ``session.delete``
+        之前判定**。旧实现先 ``delete`` + ``flush`` 再判断新内容，于是「目标命中 +
+        新内容为空」会真删掉旧行，而调用方拿到的却是「修改失败」——同时发生数据
+        丢失和失实回执。这里两种终态都保证一行未动。
+        """
+
+        query = (target or "").strip()
+        text_value = (new_content or "").strip()
+        if not query:
+            return PM_REPLACE_NOT_FOUND, [], None, False
+        if not text_value:
+            return PM_REPLACE_INVALID_CONTENT, [], None, False
+
+        targets = await self._lookup_permanent_memory_targets(session, group_id, query)
+        if not targets:
+            return PM_REPLACE_NOT_FOUND, [], None, False
+
+        deleted = list(targets)
+        for row in targets:
+            await session.delete(row)
+        # Flush the deletes inside this transaction.  If creating the
+        # replacement fails, rollback restores every original row.
+        await session.flush()
+
+        existing = (
+            await session.execute(
+                select(GroupPermanentMemory).where(
+                    GroupPermanentMemory.group_id == group_id,
+                    GroupPermanentMemory.content == text_value,
+                )
+            )
+        ).scalars().first()
+        created: GroupPermanentMemory
+        created_new = False
+        if existing is not None:
+            created = existing
+        else:
+            await self._ensure_group_row(session, group_id)
+            created = GroupPermanentMemory(
+                group_id=group_id,
+                content=text_value,
+                created_by=created_by,
+            )
+            session.add(created)
+            created_new = True
+        # 让新行的主键与内容在 commit 之前成为普通标量：调用方要在 commit 之前
+        # 把回执字段取好，commit 正常返回后不再碰可能过期的 ORM 属性。
+        await session.flush()
+        return PM_REPLACE_UPDATED, deleted, created, created_new
 
     async def replace_permanent_memory(
         self,
@@ -3920,62 +4395,97 @@ class MemoryService:
         new_content: str,
         created_by: int = 0,
     ) -> tuple[list[GroupPermanentMemory], GroupPermanentMemory | None, bool]:
-        query = (target or "").strip()
-        text_value = (new_content or "").strip()
-        if not query:
-            return [], None, False
+        """既有入口（内部调用方契约）：异常仍向上传播，三元组形状不变。"""
 
         async with self._session_factory() as session:
-            match = re.fullmatch(r"#?(\d+)", query)
-            if match:
-                row = await session.get(GroupPermanentMemory, int(match.group(1)))
-                targets = [row] if row is not None and row.group_id == group_id else []
-            else:
-                stmt = (
-                    select(GroupPermanentMemory)
-                    .where(
-                        GroupPermanentMemory.group_id == group_id,
-                        GroupPermanentMemory.content.contains(query),
-                    )
-                    .order_by(GroupPermanentMemory.id.asc())
-                )
-                targets = list((await session.execute(stmt)).scalars().all())
-
-            if not targets:
+            status, deleted, created, created_new = await self._replace_permanent_memory_rows(
+                session,
+                group_id,
+                target=target,
+                new_content=new_content,
+                created_by=created_by,
+            )
+            if status != PM_REPLACE_UPDATED:
+                # 一行都没碰，也不需要 commit。
                 return [], None, False
-
-            deleted = list(targets)
-            for row in targets:
-                await session.delete(row)
-            # Flush the deletes inside this transaction.  If creating the
-            # replacement fails, rollback restores every original row.
-            await session.flush()
-
-            created: GroupPermanentMemory | None = None
-            created_new = False
-            if text_value:
-                existing = (
-                    await session.execute(
-                        select(GroupPermanentMemory).where(
-                            GroupPermanentMemory.group_id == group_id,
-                            GroupPermanentMemory.content == text_value,
-                        )
-                    )
-                ).scalars().first()
-                if existing is not None:
-                    created = existing
-                else:
-                    await self._ensure_group_row(session, group_id)
-                    created = GroupPermanentMemory(
-                        group_id=group_id,
-                        content=text_value,
-                        created_by=created_by,
-                    )
-                    session.add(created)
-                    created_new = True
-
             await session.commit()
             return deleted, created, created_new
+
+    async def replace_permanent_memory_outcome(
+        self,
+        group_id: int,
+        *,
+        target: str,
+        new_content: str,
+        created_by: int = 0,
+    ) -> PermanentMemoryReplaceOutcome:
+        """能区分终态的「修改永久记忆」。
+
+        - ``not_found`` / ``invalid_new_content``：明确没有改动任何行。
+        - ``updated``：旧行真被替换（复用同内容既有行或新建行）。
+        - ``unconfirmed``：commit 没正常返回或结果不可信。**既不承诺旧行还在，也
+          不承诺新行写入**，更不能靠事后查询反推成成功。
+        """
+
+        session = self._session_factory()
+        status = PM_REPLACE_UNCONFIRMED
+        detail = PM_REPLACE_REASON_LOOKUP_FAILED
+        deleted: list[GroupPermanentMemory] = []
+        created_id: int | None = None
+        created_content = ""
+        created_new = False
+        committed = False
+        original_cancel: asyncio.CancelledError | None = None
+        released = True
+        try:
+            status, deleted, created, created_new = await self._replace_permanent_memory_rows(
+                session,
+                group_id,
+                target=target,
+                new_content=new_content,
+                created_by=created_by,
+            )
+            detail = PM_REPLACE_REASON_COMMIT_FAILED if status == PM_REPLACE_UPDATED else ""
+            if status == PM_REPLACE_UPDATED:
+                # commit 之前把回执要用的标量取好。
+                created_id = _pm_strict_int(getattr(created, "id", None))
+                created_content = str(getattr(created, "content", "") or "")
+                await session.commit()
+                committed = True
+        except asyncio.CancelledError as exc:
+            original_cancel = exc
+            status = PM_REPLACE_UNCONFIRMED
+        except Exception:
+            # 抛错可能发生在 commit 落地之前或之后，SDK 不告诉我们所以不猜：
+            # 一律 unconfirmed，绝不据此断言「没生效」。
+            status = PM_REPLACE_UNCONFIRMED
+        finally:
+            released = await _pm_release_session(
+                session,
+                rollback_first=not committed,
+                suppress_cancel=original_cancel is not None,
+            )
+            if not released:
+                log.warning(
+                    "permanent memory replace cleanup unreleased | reason=%s",
+                    PM_REPLACE_REASON_CLEANUP_UNRELEASED,
+                )
+        if original_cancel is not None:
+            raise original_cancel
+        if status == PM_REPLACE_UPDATED:
+            return PermanentMemoryReplaceOutcome(
+                status=PM_REPLACE_UPDATED,
+                deleted_count=len(deleted),
+                memory_id=created_id,
+                content=created_content,
+                created_new=created_new,
+                resource_released=released,
+            )
+        return PermanentMemoryReplaceOutcome(
+            status=status,
+            detail=detail,
+            resource_released=released,
+        )
 
     async def group_summary_is_behind(
         self,

@@ -22,87 +22,48 @@ import asyncio
 import sys
 
 import logging
-from datetime import datetime
 
 from aiogram import Bot
-from sqlalchemy import delete, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from bot.config import Settings
 from bot.db.engine import init_db
-from bot.db.models import WeeklyReportPost
-from bot.services.activity import render_activity_lines, settle_weekly_activity
+from bot.services.activity import (
+    last_complete_week,
+    render_activity_lines,
+    settle_weekly_activity,
+)
 from bot.services.cost_report import render_cost_digest
 from bot.services.quality_report import authorized_group_ids, render_group_quality
 from bot.utils.timezone import now_shanghai_naive
+from bot.services.weekly_report import (
+    COST_DIGEST_TARGET_ID,
+    REPORT_OUTCOME_ALREADY_DELIVERED,
+    REPORT_OUTCOME_DELIVERED,
+    REPORT_OUTCOME_IN_FLIGHT,
+    claim_report_slot,
+    current_week_key,
+    deliver_group_report,
+    mark_report_sent,
+    previous_iso_week_key,
+    release_report_slot,
+)
 log = logging.getLogger(__name__)
 
 DEFAULT_DAYS = 7
 
-#: 私发超管的成本摘要用的 ``target_id``（0 不是合法群 id，不会和群冲突）。
-COST_DIGEST_TARGET_ID = 0
-
-
-def current_week_key(now: datetime | None = None) -> str:
-    """本次运行所属的 ISO 周（``2026-W41``）——周报幂等键的一半。"""
-
-    stamp = now or now_shanghai_naive()
-    iso = stamp.isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
-
-
-async def claim_report_slot(
-    session,
-    *,
-    target_id: int,
-    week_key: str,
-) -> bool:
-    """为 ``(target_id, week_key)`` 占位；True = 这个目标本周还没收到过。
-
-    占位发生在**发送之前**并由调用方立刻 commit：已有该行时 SQLite 不返回行 →
-    False，于是重叠运行 / 手工重跑都只有一个能发。发失败要调
-    :func:`release_report_slot` 把占位删掉（"没发出去"不能被记成"已发过"）。
-    """
-
-    statement = (
-        sqlite_insert(WeeklyReportPost)
-        .values(
-            target_id=int(target_id),
-            week_key=str(week_key),
-            message_id=0,
-        )
-        .on_conflict_do_nothing(index_elements=["target_id", "week_key"])
-        .returning(WeeklyReportPost.id)
-    )
-    claimed = (await session.execute(statement)).scalar_one_or_none()
-    return claimed is not None
-
-
-async def release_report_slot(session, *, target_id: int, week_key: str) -> None:
-    """发送失败：删掉占位，下一轮还能重发。"""
-
-    await session.execute(
-        delete(WeeklyReportPost).where(
-            WeeklyReportPost.target_id == int(target_id),
-            WeeklyReportPost.week_key == str(week_key),
-        )
-    )
-
-
-async def mark_report_sent(
-    session, *, target_id: int, week_key: str, message_id: int
-) -> None:
-    """发送成功后回填 Telegram message_id（供审计）。"""
-
-    await session.execute(
-        update(WeeklyReportPost)
-        .where(
-            WeeklyReportPost.target_id == int(target_id),
-            WeeklyReportPost.week_key == str(week_key),
-        )
-        .values(message_id=int(message_id))
-    )
-    await session.commit()
+#: 这些名字从 ``bot.services.weekly_report`` 转出：投递链（占位/释放/回填/发送）
+#: 已经抽到共享服务，CLI 与运营任务中心共用同一份实现。这里保留同名再导出，
+#: 既有调用方（含测试）不需要改导入路径。
+__all__ = (
+    "COST_DIGEST_TARGET_ID",
+    "DEFAULT_DAYS",
+    "claim_report_slot",
+    "current_week_key",
+    "mark_report_sent",
+    "release_report_slot",
+    "deliver_group_report",
+    "main",
+)
 
 
 async def _send_reports(days: int, *, dry_run: bool = False) -> int:
@@ -116,7 +77,13 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
     #: 真正**发送失败**的次数。幂等跳过的目标不算失败——否则一次正常的手工重跑
     #: 会因为"什么都没发"而返回 1，把 cron 的告警语义弄脏。
     failed = 0
-    week_key = current_week_key()
+    now = now_shanghai_naive()
+    week_key = current_week_key(now)
+    # R1/R4（返工 v2）：台账键是"发送周"，正文与出站证据都用上一完整业务周。
+    # 手动入口（运营任务中心）传的就是业务周，CLI 这里显式映射到同一个业务周键，
+    # 两个入口互相挡得住，不会同一周发两遍。
+    business_key = previous_iso_week_key(week_key)
+    week_start, week_end = last_complete_week(now)
     try:
         async with session_factory() as session:
             group_ids = await authorized_group_ids(session)
@@ -141,11 +108,27 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
                 # 带着整个循环（以及所有群）一起炸掉，所有群都收不到周报。
                 # 与上面的结算块对齐：单群失败只跳过该群并如实记录。
                 try:
-                    texts[group_id] = await render_group_quality(
+                    main_text = await render_group_quality(
                         session,
                         group_id=group_id,
                         days=days,
                         activity_lines=boards[group_id],
+                        # R4：主统计＝上一完整业务周的精确边界。
+                        week_start=week_start,
+                        week_end=week_end,
+                    )
+                    # 旧 `--days` 滚动口径保留，但降级为**明确注明**的附加段，
+                    # 不允许再冒充"完整周"。
+                    rolling_text = await render_group_quality(
+                        session,
+                        group_id=group_id,
+                        days=days,
+                        activity_lines=None,
+                    )
+                    texts[group_id] = (
+                        f"{main_text}\n\n"
+                        f"<b>附：滚动近 {days} 天口径（仅供参考，不是完整自然周）</b>\n"
+                        f"{rolling_text}"
                     )
                 except Exception:
                     await session.rollback()
@@ -160,7 +143,7 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
             # 只渲染不发送：验证文案/HTML 正确性时用它，别拿真群当试验场
             for group_id in deliverable:
                 print(f"---- dry-run | group={group_id} ----")
-                print(texts[group_id].replace("审核质量 · 近", "群健康周报 · 近", 1))
+                print(texts[group_id].replace("审核质量 ·", "群健康周报 ·", 1))
             for group_id in sorted(failed_groups):
                 print(f"---- dry-run | group={group_id} ----")
                 print("（本群渲染失败，已跳过；详见日志）")
@@ -170,79 +153,61 @@ async def _send_reports(days: int, *, dry_run: bool = False) -> int:
         bot = Bot(token)
         try:
             for group_id in deliverable:
-                text = texts[group_id].replace(
-                    "审核质量 · 近", "群健康周报 · 近", 1
-                )
                 # B-26：先占位再发。重叠运行 / 手工重跑都不会让同一个群在同一周
-                # 收到两条周报。
-                async with session_factory() as claim_session:
-                    claimed = await claim_report_slot(
-                        claim_session, target_id=int(group_id), week_key=week_key
-                    )
-                    if claimed:
-                        await claim_session.commit()
-                if not claimed:
+                # 收到两条周报。投递链与运营任务中心共用 deliver_group_report。
+                outcome = await deliver_group_report(
+                    session_factory,
+                    bot,
+                    target_id=int(group_id),
+                    week_key=week_key,
+                    business_key=business_key,
+                    text=texts[group_id],
+                    wrap=lambda body: body.replace("审核质量 ·", "群健康周报 ·", 1),
+                )
+                if outcome.status in (
+                    REPORT_OUTCOME_ALREADY_DELIVERED,
+                    REPORT_OUTCOME_IN_FLIGHT,
+                ):
                     print(f"本周已发过，跳过 | group={group_id} | week={week_key}")
                     continue
-                try:
-                    message = await bot.send_message(group_id, text, parse_mode="HTML")
+                if outcome.status == REPORT_OUTCOME_DELIVERED:
                     sent += 1
                     print(f"已发送周报 | group={group_id}")
-                except Exception as exc:  # 单个群失败不影响其它群
-                    failed += 1
-                    log.warning("weekly report send failed | group=%s | %s", group_id, exc)
-                    print(f"发送失败 | group={group_id} | {exc}")
-                    # 发失败就撤掉占位，"没发出去"不能被记成"已发过"。
-                    async with session_factory() as release_session:
-                        await release_report_slot(
-                            release_session,
-                            target_id=int(group_id),
-                            week_key=week_key,
-                        )
-                        await release_session.commit()
                     continue
-                async with session_factory() as mark_session:
-                    await mark_report_sent(
-                        mark_session,
-                        target_id=int(group_id),
-                        week_key=week_key,
-                        message_id=int(getattr(message, "message_id", 0) or 0),
-                    )
+                failed += 1
+                log.warning(
+                    "weekly report send failed | group=%s | %s",
+                    group_id,
+                    outcome.error,
+                )
+                print(f"发送失败 | group={group_id} | {outcome.error}")
             admin_id = int(getattr(settings, "super_admin_id", 0) or 0)
             if admin_id > 0:
                 # 成本摘要同样幂等（B-26：以前是无条件私发）。
-                async with session_factory() as claim_session:
-                    claimed = await claim_report_slot(
-                        claim_session,
-                        target_id=COST_DIGEST_TARGET_ID,
-                        week_key=week_key,
-                    )
-                    if claimed:
-                        await claim_session.commit()
-                if claimed:
-                    try:
-                        message = await bot.send_message(admin_id, cost_text)
-                        print(f"已私发成本摘要 | admin={admin_id}")
-                        async with session_factory() as mark_session:
-                            await mark_report_sent(
-                                mark_session,
-                                target_id=COST_DIGEST_TARGET_ID,
-                                week_key=week_key,
-                                message_id=int(getattr(message, "message_id", 0) or 0),
-                            )
-                    except Exception as exc:
-                        failed += 1
-                        log.warning("weekly cost digest failed | admin=%s | %s", admin_id, exc)
-                        print(f"成本摘要私发失败 | {exc}")
-                        async with session_factory() as release_session:
-                            await release_report_slot(
-                                release_session,
-                                target_id=COST_DIGEST_TARGET_ID,
-                                week_key=week_key,
-                            )
-                            await release_session.commit()
-                else:
+                digest = await deliver_group_report(
+                    session_factory,
+                    bot,
+                    target_id=COST_DIGEST_TARGET_ID,
+                    week_key=week_key,
+                    business_key=business_key,
+                    chat_id=admin_id,
+                    text=cost_text,
+                )
+                if digest.status == REPORT_OUTCOME_DELIVERED:
+                    print(f"已私发成本摘要 | admin={admin_id}")
+                elif digest.status in (
+                    REPORT_OUTCOME_ALREADY_DELIVERED,
+                    REPORT_OUTCOME_IN_FLIGHT,
+                ):
                     print(f"本周已私发过成本摘要，跳过 | week={week_key}")
+                else:
+                    failed += 1
+                    log.warning(
+                        "weekly cost digest failed | admin=%s | %s",
+                        admin_id,
+                        digest.error,
+                    )
+                    print(f"成本摘要私发失败 | {digest.error}")
             else:
                 print("未配置最高管理员，跳过成本摘要")
         finally:

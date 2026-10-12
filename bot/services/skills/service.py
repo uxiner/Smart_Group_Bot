@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -1010,6 +1011,67 @@ class SkillService:
             text=text,
         )
 
+    #: 走功能操作额度的技能 -> operation_limits 里的 feature 名。
+    #: 只接这两个中央入口；其它直接 TTS / 媒体入口下一轮另做 inventory。
+    _OPERATION_FEATURES: dict[str, str] = {
+        "websearch": "search",
+        "doubao_tts": "tts",
+    }
+
+    async def _operation_budget_denial(
+        self, name: str, context: Any
+    ) -> tuple[SkillRunResult | None, tuple[int, str] | None]:
+        """按群扣一次功能操作额度；超额时返回明确拒绝（不调用外部技能）。
+
+        * 群归属取自现有 usage_scope —— 私聊/系统**不套**群额度，也不把私聊的
+          正 chat_id 硬当群；
+        * 用启动时装配的**进程级共享** service，不自己 new、也不与 HTTP 侧缓存
+          各干一份（否则热更新 0→2→0 不会在入口生效）；
+        * 预算存储真出故障时 optional **fail-closed**，但绝不影响安全功能 ——
+          未映射的技能（vote_ban 等）根本不走这里。
+        """
+
+        feature = self._OPERATION_FEATURES.get(name)
+        if feature is None:
+            return None, None
+        group_id = _group_id_from_context(context)
+        if group_id is None:
+            return None, None
+
+        from bot.services import group_budget as budget_module
+
+        try:
+            service = budget_module.shared_service()
+            result = await service.consume_operation(
+                group_id=group_id, feature=feature
+            )
+        except Exception:  # noqa: BLE001 - 存储故障时 optional fail-closed
+            log.warning(
+                "技能操作额度判定失败，拒绝本次可选功能 | skill=%s feature=%s",
+                name, feature, exc_info=True,
+            )
+            return (
+                SkillRunResult(
+                    ok=False, skill=name,
+                    summary="功能额度暂时不可用，请稍后重试。",
+                    error="operation_budget_unavailable",
+                ),
+                None,
+            )
+        if not result.admitted:
+            return (
+                SkillRunResult(
+                    ok=False, skill=name,
+                    summary="本群今日的该功能次数已用完。",
+                    error="operation_budget_denied",
+                ),
+                None,
+            )
+        # 中央已经扣过一次：给这次技能调用留下**单次可用**的凭证，底层真实
+        # TTS sender 领走它就不再扣。凭证领走即失效 —— 同一技能调用里第二次
+        # 发送照常扣费，不会两次免费。
+        return None, (group_id, feature)
+
     async def _run_tool(
         self,
         *,
@@ -1050,29 +1112,39 @@ class SkillService:
                     current_task = asyncio.current_task()
                     if current_task is not None and current_task.cancelling():
                         raise asyncio.CancelledError
-                    if tool_context.session is not None or tool_context.session_factory is None:
-                        return await skill.run(arguments, tool_context)
+                    # 功能操作额度：排在闸门与许可**之后**、真正调用外部技能
+                    # **之前**。排队/取消发生在准入之前，不计费；一旦真的准入，
+                    # 后面外部调用失败也算这一次（未知结果的调用退款等于送免费）。
+                    denial, credit = await self._operation_budget_denial(
+                        name, tool_context
+                    )
+                    if denial is not None:
+                        return denial
+                    # 只在这一个技能调用期间有效；finally 严格还原。
+                    with _credit_scope(credit):
+                        if tool_context.session is not None or tool_context.session_factory is None:
+                            return await skill.run(arguments, tool_context)
 
-                    # A reply batch must not retain one database connection throughout
-                    # all model rounds.  Give a DB-backed tool a short-lived session
-                    # only for the duration of that tool call.
-                    async with tool_context.session_factory() as tool_session:
-                        tool_context.session = tool_session
-                        try:
-                            result = await skill.run(arguments, tool_context)
-                            current_task = asyncio.current_task()
-                            if current_task is not None and current_task.cancelling():
-                                raise asyncio.CancelledError
-                            if result.ok:
-                                await tool_session.commit()
-                            else:
+                        # A reply batch must not retain one database connection throughout
+                        # all model rounds.  Give a DB-backed tool a short-lived session
+                        # only for the duration of that tool call.
+                        async with tool_context.session_factory() as tool_session:
+                            tool_context.session = tool_session
+                            try:
+                                result = await skill.run(arguments, tool_context)
+                                current_task = asyncio.current_task()
+                                if current_task is not None and current_task.cancelling():
+                                    raise asyncio.CancelledError
+                                if result.ok:
+                                    await tool_session.commit()
+                                else:
+                                    await tool_session.rollback()
+                                return result
+                            except BaseException:
                                 await tool_session.rollback()
-                            return result
-                        except BaseException:
-                            await tool_session.rollback()
-                            raise
-                        finally:
-                            tool_context.session = None
+                                raise
+                            finally:
+                                tool_context.session = None
 
         task = asyncio.create_task(_invoke(), name=f"skill:{name}")
         try:
@@ -3026,3 +3098,31 @@ class SkillService:
                 default_text=last_tool_summary or last_success_summary,
             )
         )
+
+
+def _credit_scope(credit: tuple[int, str] | None):
+    """把中央准入留下的凭证限定在一个技能调用期间。"""
+
+    if credit is None:
+        return contextlib.nullcontext()
+    from bot.services import operation_budget
+
+    return operation_budget.admitted(*credit)
+
+
+def _group_id_from_context(context: Any) -> int | None:
+    """从现有 usage_scope 取群 id；私聊/系统返回 None（不套群额度）。"""
+
+    try:
+        from bot.services import usage_scope as scopes
+
+        scope = scopes.current_usage_scope()
+    except Exception:  # pragma: no cover - 取不到就按"不套额度"处理
+        return None
+    if str(getattr(scope, "kind", "")) != scopes.SCOPE_GROUP:
+        return None
+    try:
+        group_id = int(getattr(scope, "group_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return group_id if group_id < 0 else None
