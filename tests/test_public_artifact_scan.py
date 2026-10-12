@@ -22,6 +22,51 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: 私有主机名的**词法形态**。字号规则只负责"长得像主机名"；它是不是真的部署绑定，
+#: 由 :func:`is_lan_host_reference` 按**上下文**判定（见那里的说明）。
+#:
+#: 排除本仓约定的**合成**占位：``*.test.internal``（RFC 6761 保留域风格的测试域）、
+#: ``example.invalid``（RFC 2606）、``docker.internal``（Docker Desktop 自带）与
+#: ``toml.local``（语言服务）。这些不是部署绑定。
+LAN_HOST_PATTERN = (
+    r"(?<![\w.])"
+    r"(?!(?:docker|toml|example|gw|llm|nas|redis|test)\.)"
+    r"[a-z0-9-]+\.(?:internal|home\.arpa)\b"
+)
+
+#: 命中词素**左侧紧邻**的"网络位置"证据：URL scheme、``//`` 权威段、userinfo ``@``、
+#: 字符串字面量定界引号。
+_LAN_HOST_LEFT = re.compile(r"(?:[a-z][a-z0-9+.\-]*://|//|@|[\"'])$", re.IGNORECASE)
+
+#: 命中词素**右侧紧邻**的"网络位置"证据：端口（``:8080``）、路径/查询/片段分隔符、
+#: 字符串字面量定界引号。
+_LAN_HOST_RIGHT = re.compile(r"^(?::\d{1,5}(?!\d)|[/\\?#]|[\"'])")
+
+
+def is_lan_host_reference(line: str, match: "re.Match[str]") -> bool:
+    """``*.internal`` / ``*.home.arpa`` 命中是不是**网络字面量里的主机名**。
+
+    ``scope = plan.internal if plan.policy_groups else None``、``list(values.internal)``
+    这类是 **Python 属性表达式**：属性链两侧没有任何网络证据（左边是空白或 ``(``，
+    右边是空白、``)``、``,``），根本不是部署绑定。把它们报出来，维护者只能去
+    ``ALLOW`` 整个产品文件——那条路一旦走上去，真正的私有主机名也会跟着被豁免。
+
+    所以这里做**精确的词法上下文校验**：只有命中紧邻下列任一"主机名位置"才算数——
+
+    * 左侧：``http://`` 等 scheme、``//`` 权威段、userinfo ``@``、字符串定界引号；
+    * 右侧：端口 ``:8080``、路径 ``/``、查询 ``?``、片段 ``#``、字符串定界引号。
+
+    判定只看命中**两侧的紧邻字符**，不做"同一行里出现过 http 就算"这种模糊判断，
+    也不是"放行所有 ``.internal``"：没有网络上下文的裸属性链按源码示例处理，而
+    ``http://myserver.internal:8080/v1``、``"myserver.internal"``、
+    ``myserver.internal:6379`` 这些仍然照报。
+    """
+
+    return bool(_LAN_HOST_LEFT.search(line[: match.start()])) or bool(
+        _LAN_HOST_RIGHT.match(line[match.end() :])
+    )
+
+
 #: 判定为"私人部署绑定"的形态。值一律是**合成**的，只用来验证规则本身。
 DEPLOYMENT_PATTERNS: tuple[tuple[str, str], ...] = (
     # 形如 -100… 的 13 位负数（Telegram 频道/超级群 chat id）。
@@ -30,15 +75,8 @@ DEPLOYMENT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("home_path", r"/Users/(?!someone/|example/)[A-Za-z][A-Za-z0-9_.-]*/"),
     # 隧道 / 动态 DNS
     ("tunnel_host", r"\b[a-z0-9-]+\.(?:ngrok[a-z-]*|trycloudflare\.com|duckdns\.org)\b"),
-    # 私有主机名。排除本仓约定的**合成**占位：``*.test.internal``（RFC 6761 保留域
-    # 风格的测试域）、``example.invalid``（RFC 2606）、``docker.internal``（Docker
-    # Desktop 自带）与 ``toml.local``（语言服务）。这些不是部署绑定。
-    (
-        "lan_host",
-        r"(?<![\w.])"
-        r"(?!(?:docker|toml|example|gw|llm|nas|redis|test)\.)"
-        r"[a-z0-9-]+\.(?:internal|home\.arpa)\b",
-    ),
+    # 私有主机名：字号规则 + :func:`is_lan_host_reference` 上下文判定。
+    ("lan_host", LAN_HOST_PATTERN),
 )
 
 #: **身份上下文**：只有出现在这些名字旁边的裸数字，才可能是"某个人的 Telegram id"。
@@ -54,7 +92,7 @@ IDENTITY_CONTEXT = re.compile(
 def _is_obvious_placeholder(value: str) -> bool:
     """一眼假的数字：重复位、连续递增/递减位、或者内含日期戳。
 
-    这一层是"降噪"而不是"判定安全"：它只负责让规则不��对明显的样例数据开火，
+    这一层是"降噪"而不是"判定安全"：它只负责让规则不对明显的样例数据开火，
     真正需要人看的情况仍然会被报出来。
     """
 
@@ -103,6 +141,15 @@ SYNTHETIC_IDS = frozenset(
         # 按群成本 / 预算护栏用例里的两个合成群（用量归属与预留争用各一）。
         "-100900000001",
         "-100900000002",
+        # 长期事实 / 运营任务 / `/find` 回归用例里的合成群。三处都是**测试源码里
+        # 现写的假值**：事实读取的「未知群」、商店到期迁移用例里的「历史群」、
+        # 以及公开群回链用例里的合成公开群。它们必须继续当假值用，**不能**换成
+        # 任何真实群 id。
+        "-100111222333",
+        "-1009999999001",
+        "-1009999999002",
+        "-1009999999003",
+        "-1001234567999",
         # 反例测试里用来断言"非法值被拒"的那两个形状。
         "-100000000000",
         "-10000000000000",
@@ -120,6 +167,40 @@ SYNTHETIC_IDS = frozenset(
         "1005550001",
     }
 )
+
+
+def scan_text(relative: str, text: str) -> list[str]:
+    """对一段文本跑全部规则，返回 ``["path:line [rule] 前缀…", …]``。
+
+    扫描真棵树和自测**共用这一条路径**：自测里的正例必须真的产出 finding、负例
+    必须一条都不产出。否则"规则改成什么样"就没人验证过——只测正则字面量的自测
+    会在上下文校验被改坏时静默通过。
+    """
+
+    findings: list[str] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        for name, pattern in DEPLOYMENT_PATTERNS:
+            for match in re.finditer(pattern, line):
+                if name == "lan_host" and not is_lan_host_reference(line, match):
+                    # 没有网络上下文的 `.internal` 是属性表达式/源码示例，不是
+                    # 部署绑定；真正的私有主机名照旧报出来。
+                    continue
+                if match.group(0) in SYNTHETIC_IDS:
+                    continue
+                findings.append(
+                    f"{relative}:{line_number} [{name}] {match.group(0)[:6]}…"
+                )
+        # 身份 id：必须落在身份上下文里，且不是一眼假的占位。
+        if not IDENTITY_CONTEXT.search(line):
+            continue
+        for match in re.finditer(r"(?<![\w.])\d{8,11}(?![\w.])", line):
+            value = match.group(0)
+            if value in SYNTHETIC_IDS or _is_obvious_placeholder(value):
+                continue
+            if int(value) <= 1_000_000:          # 小 id：Telegram 测试账号量级
+                continue
+            findings.append(f"{relative}:{line_number} [telegram_user_id] {value[:2]}…")
+    return findings
 
 
 def _tracked_files() -> list[str]:
@@ -190,6 +271,91 @@ class ScannerSelfTest(unittest.TestCase):
             self.assertIsNone(re.search(pattern, host), f"{host} 不该被当成私有主机")
         self.assertIsNotNone(re.search(pattern, "myserver.internal"))
 
+    def test_lan_host_rule_needs_network_context(self) -> None:
+        """``.internal`` 只有在**网络字面量位置**才算部署绑定。
+
+        正例（必须报）：URL、裸主机 + 端口、字符串字面量里的主机。
+        负例（必须静默）：Python 属性表达式、源码示例、既有合成测试域。这些一旦
+        开火，维护者只能去 ``ALLOW`` 整个产品文件——那条路走上去，真正的私有
+        主机名也会被一起豁免，所以这里不允许"放行所有 ``.internal``"。
+        """
+
+        positives = (
+            "http://myserver.internal:8080/v1",
+            "https://box.internal/healthz",
+            'host = "myserver.internal"',
+            "LAN_HOST = myserver.internal:6379",
+            "url = 'http://vault.home.arpa/x'",
+        )
+        negatives = (
+            "scope = plan.internal if plan.policy_groups else None",
+            "total = len(plan.internal)",
+            "rows = sorted(values.internal)",
+            "return list(values.internal)",
+            "return (values.internal)",
+            'host.endswith((".localhost", ".local", ".internal"))',
+            "users = values.internal_users",
+        )
+        for line in positives:
+            with self.subTest(line=line, expected="reported"):
+                matches = list(re.finditer(LAN_HOST_PATTERN, line))
+                self.assertTrue(matches, f"正例没被字号规则命中：{line}")
+                self.assertTrue(
+                    any(is_lan_host_reference(line, item) for item in matches),
+                    f"正例没被上下文校验认可：{line}",
+                )
+        for line in negatives:
+            with self.subTest(line=line, expected="quiet"):
+                self.assertFalse(
+                    any(
+                        is_lan_host_reference(line, item)
+                        for item in re.finditer(LAN_HOST_PATTERN, line)
+                    ),
+                    f"负例被误报成私有主机：{line}",
+                )
+
+    def test_scan_reports_positives_and_stays_quiet_on_negatives(self) -> None:
+        """端到端控制：**真的走一遍扫描路径**，正例必须报、负例必须一条不报。"""
+
+        positive_lines = (
+            "SUPER_ADMIN = 601238417",                      # 身份上下文 + 非占位
+            "MODERATION_CHANNEL = -100777000111",          # 私人群 id 形状
+            "HOME = /Users/jdoe/Desktop/repo",             # 个人家目录
+            "HOOK = https://myservice.duckdns.org/hook",   # 隧道 / 动态 DNS
+            "LAN_HOST = myserver.internal:6379",           # 裸主机 + 端口
+            'PRIVATE_HOST = "vault.home.arpa"',            # 字面量里的私有主机
+        )
+        negative_lines = (
+            "scope = plan.internal if plan.policy_groups else None",
+            "total = len(plan.internal)",
+            "rows = sorted(values.internal)",
+            "HOST = gw.test.internal",
+            "DOCKER = host.docker.internal",
+            "PLACEHOLDER_GROUP = -1009999999999",          # 合成占位 id
+            "USER_ID = 20261001",                          # 日期戳，不是身份
+            "PAYLOAD = 601238417",                         # 没有身份上下文
+            "ADMIN_ID = 111111111",                        # 一眼假的占位
+        )
+        reported: set[str] = set()
+        for line in positive_lines:
+            found = scan_text("fixture.txt", line)
+            self.assertTrue(found, f"正例没被报出来：{line}")
+            reported.update(item.split("[", 1)[1].split("]", 1)[0] for item in found)
+        for line in negative_lines:
+            with self.subTest(line=line, expected="quiet"):
+                self.assertEqual(scan_text("fixture.txt", line), [], f"负例被误报：{line}")
+        # 五条规则都要被自己的正例真的走到——少一条就说明有一条规则已经失效。
+        self.assertEqual(
+            reported,
+            {
+                "telegram_user_id",
+                "telegram_channel_id",
+                "home_path",
+                "tunnel_host",
+                "lan_host",
+            },
+        )
+
     def test_known_synthetic_fixtures_do_not_trip_the_identity_rule(self) -> None:
         """测试套件里既有的合成 fixture 不该被当成真人 id。
 
@@ -235,26 +401,7 @@ class PublicTreeScanTests(unittest.TestCase):
                 text = target.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue  # 二进制资源（PNG 字体等）不参与文本扫描
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                for name, pattern in DEPLOYMENT_PATTERNS:
-                    for match in re.finditer(pattern, line):
-                        if match.group(0) in SYNTHETIC_IDS:
-                            continue
-                        findings.append(
-                            f"{relative}:{line_number} [{name}] {match.group(0)[:6]}…"
-                        )
-                # 身份 id：必须落在身份上下文里，且不是一眼假的占位。
-                if not IDENTITY_CONTEXT.search(line):
-                    continue
-                for match in re.finditer(r"(?<![\w.])\d{8,11}(?![\w.])", line):
-                    value = match.group(0)
-                    if value in SYNTHETIC_IDS or _is_obvious_placeholder(value):
-                        continue
-                    if int(value) <= 1_000_000:      # 小 id：Telegram 测试账号量级
-                        continue
-                    findings.append(
-                        f"{relative}:{line_number} [telegram_user_id] {value[:2]}…"
-                    )
+            findings.extend(scan_text(relative, text))
         self.assertEqual(
             findings,
             [],
