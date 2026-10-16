@@ -8,13 +8,22 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.llm import LLMService
-from bot.services.sticker_library import sticker_library
+from bot.services.sticker_library import (
+    is_serious_context,
+    normalize_media_type,
+    parse_profile,
+    query_has_semantic_evidence,
+    sticker_library,
+)
 from bot.utils.prompts import get_prompt
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
 _REPLIES_PER_STICKER = 5
 _RATIO_BASELINE: dict[int, tuple[int, int]] = {}
+# A long, information-dense answer reads as a report; a sticker after it feels
+# like noise, so the service refuses before spending an LLM call.
+_MAX_STICKER_DRAFT_CHARS = 128
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -147,17 +156,28 @@ class StickerDecisionService:
         for row in candidates[:30]:
             if not isinstance(row, dict):
                 continue
-            normalized.append(
-                {
-                    "file_id": clean_text(str(row.get("file_id", "")), max_len=255),
-                    "emoji": clean_text(str(row.get("emoji", "")), max_len=16),
-                    "set_name": clean_text(str(row.get("set_name", "")), max_len=80),
-                    "description": clean_text(str(row.get("description", "")), max_len=120),
-                    "seen_count": int(row.get("seen_count", 0) or 0),
-                    "sent_count": int(row.get("sent_count", 0) or 0),
-                    "source": clean_text(str(row.get("source", "")), max_len=32),
-                }
-            )
+            description = clean_text(str(row.get("description", "")), max_len=160)
+            profile = parse_profile(description)
+            structured: dict[str, object] = {}
+            if profile.emotion:
+                structured["emotion"] = profile.emotion
+            if profile.scenes:
+                structured["scenes"] = list(profile.scenes)
+            if profile.meme:
+                structured["meme"] = profile.meme
+            entry = {
+                "file_id": clean_text(str(row.get("file_id", "")), max_len=255),
+                "media_type": normalize_media_type(row.get("media_type")),
+                "emoji": clean_text(str(row.get("emoji", "")), max_len=16),
+                "set_name": clean_text(str(row.get("set_name", "")), max_len=80),
+                "description": description,
+                "seen_count": int(row.get("seen_count", 0) or 0),
+                "sent_count": int(row.get("sent_count", 0) or 0),
+                "source": clean_text(str(row.get("source", "")), max_len=32),
+            }
+            if structured:
+                entry["structured"] = structured
+            normalized.append(entry)
         return json.dumps(normalized, ensure_ascii=False)
 
     async def decide(
@@ -176,6 +196,12 @@ class StickerDecisionService:
         default_sticker_file_ids: list[str] | None = None,
     ) -> StickerDecisionResult:
         normalized_action = (action or "").strip().lower()
+        if normalized_action == "skip":
+            # No reply is produced for this message, so a sticker would arrive
+            # out of nowhere.
+            log.info("[%s] sticker skipped | action_skip", group_id)
+            return StickerDecisionResult(send=False, reason="action_skip")
+
         can_have_reply = normalized_action != "skip" and bool((assistant_reply or "").strip())
         total_replies = max(0, int(assistant_reply_count or 0)) + (1 if can_have_reply else 0)
         total_sent = await sticker_library.total_sent_count(session, group_id)
@@ -207,6 +233,18 @@ class StickerDecisionService:
             fallback_pool=default_sticker_file_ids or [],
         )
         candidate_ids = {str(x.get("file_id", "")).strip() for x in candidates if str(x.get("file_id", "")).strip()}
+
+        if not candidate_ids:
+            log.info("[%s] sticker skipped | no_candidates", group_id)
+            return StickerDecisionResult(send=False, reason="no_candidates")
+
+        if is_serious_context(user_text=user_text, assistant_reply=assistant_reply):
+            log.info("[%s] sticker skipped | serious_context", group_id)
+            return StickerDecisionResult(send=False, reason="serious_context")
+
+        if len(clean_text(assistant_reply, max_len=2000).strip()) > _MAX_STICKER_DRAFT_CHARS:
+            log.info("[%s] sticker skipped | long_reply", group_id)
+            return StickerDecisionResult(send=False, reason="long_reply")
 
         mention_tag = "yes" if is_mentioned else "no"
         reply_bot_tag = "yes" if is_reply_to_bot else "no"
@@ -246,6 +284,13 @@ class StickerDecisionService:
         reason = clean_text(str(data.get("reason", "")), max_len=60)
 
         if sticker_file_id and sticker_file_id in candidate_ids:
+            if query and not query_has_semantic_evidence(query):
+                # The model wants to send but cannot justify it with an honest
+                # emotion/scene/alias query: refuse instead of sending blind.
+                log.info("[%s] sticker skipped | unjustified_file_id", group_id)
+                return StickerDecisionResult(
+                    send=False, query=query, reason="no_semantic_match", raw=raw or ""
+                )
             return StickerDecisionResult(
                 send=True,
                 sticker_file_id=sticker_file_id,
@@ -274,4 +319,9 @@ class StickerDecisionService:
                 raw=raw or "",
             )
 
-        return StickerDecisionResult(send=False, query=query, reason=reason or "no_sticker", raw=raw or "")
+        return StickerDecisionResult(
+            send=False,
+            query=query,
+            reason="no_semantic_match" if picked.source == "no_semantic_match" else (reason or "no_sticker"),
+            raw=raw or "",
+        )

@@ -964,6 +964,51 @@ async def reply_sticker_with_auto_delete(
     return sent
 
 
+async def send_material_with_auto_delete(
+    message: Message,
+    *,
+    file_id: str,
+    media_type: str,
+    delivery_mode: str = "reply",
+    caption: str = "",
+    auto_delete_seconds: int = 0,
+    on_delivery: Callable[[], None] | None = None,
+    **kwargs: object,
+) -> Message:
+    """Send one library material with the Telegram call matching its type.
+
+    ``media_type`` is never guessed here: an unrecognised value raises
+    :class:`ValueError` instead of silently falling back to a sticker, because
+    sending the wrong media type is worse than sending nothing.
+    """
+
+    fid = (file_id or "").strip()
+    if not fid:
+        raise ValueError("media_file_id_required")
+    kind = (media_type or "").strip().lower()
+    as_message = (delivery_mode or "").strip().lower() == "message"
+    if kind == "sticker":
+        if as_message:
+            sent = await message.answer_sticker(sticker=fid, **kwargs)
+        else:
+            sent = await message.reply_sticker(sticker=fid, **kwargs)
+    elif kind == "photo":
+        if as_message:
+            sent = await message.answer_photo(photo=fid, caption=caption or None, **kwargs)
+        else:
+            sent = await message.reply_photo(photo=fid, caption=caption or None, **kwargs)
+    elif kind == "animation":
+        if as_message:
+            sent = await message.answer_animation(animation=fid, caption=caption or None, **kwargs)
+        else:
+            sent = await message.reply_animation(animation=fid, caption=caption or None, **kwargs)
+    else:
+        raise ValueError("media_type_unsupported")
+    confirm_telegram_delivery(on_delivery)
+    await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
+    return sent
+
+
 async def send_sticker_with_auto_delete(
     message: Message,
     *,

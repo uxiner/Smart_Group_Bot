@@ -1279,11 +1279,65 @@ class StickerLibraryRecord(Base):
     seen_count: Mapped[int] = mapped_column(Integer, default=0)
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(64), default="group_message")
+    #: sticker / photo / animation. Old rows and any unknown value read as
+    #: ``sticker``, which is exactly what pre-phase-2 data was.
+    media_type: Mapped[str] = mapped_column(String(16), default="sticker", server_default="sticker")
+    #: Sending metadata. All optional: they are hints for the sender and for
+    #: the candidate prompt, never a correctness requirement.
+    mime_type: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    width: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    height: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    #: Telegram ``file_unique_id`` of the ingested material. Stable across bots
+    #: and re-uploads, so it is the idempotency key for background ingestion.
+    file_unique_id: Mapped[str] = mapped_column(String(255), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (Index("ix_sticker_group_file", "group_id", "file_id", unique=True),)
+
+
+class MediaIngestLog(Base):
+    """异步素材识图入库的幂等账本。
+
+    一行 = 「这个群里这张图（``file_unique_id``）已经处理过了」。 ``file_unique_id``
+    在同一个 bot 下跨群、跨重新上传都稳定，所以 ``(group_id, file_unique_id)`` 是
+    天然的幂等键：后台 worker 重复收到同一条消息、Telegram 重投 update、或者
+    并发跑两个 worker，都只会留下这一行。
+
+    ``telegram_message_id`` 只用于审计（"哪条消息带来的这张图"），不参与判定。
+    ``status`` 见 :mod:`bot.services.media_ingestion`：``ok`` 表示确实写进了素材库；
+    ``skipped`` / ``invalid`` / ``failed`` 表示这次没写库，且有可审计原因。
+    """
+
+    __tablename__ = "media_ingest_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    file_unique_id: Mapped[str] = mapped_column(String(255))
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    telegram_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    reason: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_media_ingest_group_unique",
+            "group_id",
+            "file_unique_id",
+            unique=True,
+        ),
+        Index(
+            "ix_media_ingest_message_unique",
+            "group_id",
+            "telegram_message_id",
+            unique=True,
+            sqlite_where=text("telegram_message_id > 0"),
+        ),
+    )
+
 
 class MemberCheckin(Base):
     """每日签到：一行 = 一个成员在一个本地自然日的一次签到。

@@ -73,6 +73,7 @@ from bot.services.long_term_memory import (
     run_long_term_memory_extraction,
     run_long_term_memory_maintenance,
 )
+from bot.services.media_worker import flush_media_ingest_tasks
 from bot.services.runtime_config import (
     RuntimeConfig,
     RuntimeConfigManager,
@@ -1488,6 +1489,11 @@ async def main() -> None:
         await _await_cleanup_bounded(
             flush_telegram_background_tasks(),
             label="Telegram delayed cleanup tasks",
+        )
+        # 素材识图入库 worker 要用 LLM 客户端，必须排在关闭客户端之前。
+        await _await_cleanup_bounded(
+            flush_media_ingest_tasks(),
+            label="media ingest tasks",
         )
         # 告警消费者**先停**：它还在用这个 bot 发消息，而 bot HTTP 马上要关、
         # engine 马上要 dispose —— 顺序反了就是对着已关的连接发消息。

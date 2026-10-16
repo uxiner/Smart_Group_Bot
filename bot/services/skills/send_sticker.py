@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.services.sticker_library import sticker_library
+from bot.services.sticker_library import (
+    MEDIA_TYPE_STICKER,
+    query_has_semantic_evidence,
+    sticker_library,
+)
 from bot.utils.security import clean_text
 from bot.utils.telegram import send_sticker_with_auto_delete
 
@@ -63,15 +67,20 @@ class SendStickerSkill:
         picked_source = "explicit"
         picked_description = ""
         if not sticker_file_id:
-            picked = await sticker_library.pick_sticker(
-                session,
-                group_id,
-                query=query or context.current_user_text,
-                fallback_pool=context.default_sticker_file_ids,
-            )
-            sticker_file_id = (picked.file_id or "").strip()
-            picked_source = picked.source or "none"
-            picked_description = clean_text(picked.description or "", max_len=120)
+            pick_query = query or context.current_user_text
+            # Tool-level guard: text that cannot honestly justify a semantic
+            # lookup is never turned into a sticker pick.
+            if query_has_semantic_evidence(pick_query):
+                picked = await sticker_library.pick_sticker(
+                    session,
+                    group_id,
+                    query=pick_query,
+                    fallback_pool=context.default_sticker_file_ids,
+                    media_types=(MEDIA_TYPE_STICKER,),
+                )
+                sticker_file_id = (picked.file_id or "").strip()
+                picked_source = getattr(picked, "source", "") or "none"
+                picked_description = clean_text(getattr(picked, "description", "") or "", max_len=120)
 
         if not sticker_file_id:
             return SkillRunResult(

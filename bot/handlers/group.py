@@ -161,6 +161,8 @@ from bot.services.long_term_memory import (
     memory_recall_limit,
     render_facts_block,
 )
+from bot.services.media_ingestion import message_file_unique_id
+from bot.services.media_worker import submit_media_ingest
 from bot.services.skills import SkillService
 from bot.services.skills.vote_ban import is_explicit_vote_ban_request
 from bot.services.sticker_library import sticker_library
@@ -240,6 +242,20 @@ _MODERATION_USER_LOCKS: weakref.WeakValueDictionary[
 _MAX_VISION_IMAGE_BYTES = 5 * 1024 * 1024
 _VISION_DOWNLOAD_TIMEOUT_SEC = 20.0
 _VISION_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+# 第 3 期：会进入「后台识图入库」的消息类型。贴纸也走后台任务，与
+# photo/animation 使用同一条幂等入库路径（同一 file_unique_id 只入一次）。
+_MEDIA_INGEST_MESSAGE_TYPES = frozenset(
+    {
+        "sticker",
+        "photo",
+        "photo_caption",
+        "document",
+        "document_caption",
+        "animation",
+        "animation_caption",
+    }
+)
 
 
 class _LimitedBytesIO(io.BytesIO):
@@ -9445,25 +9461,23 @@ async def on_group_message(
                 sender_is_tg_admin=sender_is_tg_admin,
             ),
         )
-    if msg_type == "sticker":
+    # 第 3 期：群内图片/动图/贴纸素材的识图入库是**后台任务**，绝不能挡在
+    # 审核、文字生成和回复前面。这里只负责「调度」，不 await 识图；调度本身
+    # 是同步的（create_task），任何异常都只能降级记日志，不能影响文字链路。
+    if msg_type in _MEDIA_INGEST_MESSAGE_TYPES:
         try:
-            learned = await sticker_library.learn_from_message(
-                session,
-                group_id,
-                message,
-                vision_description=vision_body,
+            submit_media_ingest(
+                session_factory=session_factory,
+                group_id=group_id,
+                message=message,
+                llm=llm,
+                file_unique_id=message_file_unique_id(message),
+                # 素材库依赖显式注入：worker 不再自己去取全局单例，调用方拥有依赖。
+                library=sticker_library,
             )
-            if learned:
-                log.info(
-                    "[%s] sticker learned: file_id=%s desc=%s seen=%s",
-                    group_id,
-                    str(learned.get("file_id", ""))[:32],
-                    str(learned.get("description", ""))[:80],
-                    learned.get("seen_count", 1),
-                )
         except Exception:
-            await session.rollback()
-            log.exception("[%s] sticker learning failed", group_id)
+            # 素材入库只是增强能力：调度失败静默降级，文字回复照旧。
+            log.exception("[%s] media ingest scheduling failed", group_id)
 
 
     log.info("[%s]【流程】审核 | 开始", group_id)

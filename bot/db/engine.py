@@ -2493,6 +2493,57 @@ async def init_db(
                 "bot_present",
                 "bot_present BOOLEAN NOT NULL DEFAULT 1",
             )
+            # 第 2 期：贴纸库扩成通用素材库（sticker/photo/animation）。
+            # 全部走 ``_sqlite_ensure_column``：老库（只有贴纸列）与重复启动都幂等，
+            # 不加回填脚本，旧行靠列默认值读成 "sticker"。
+            await _sqlite_ensure_column(
+                conn,
+                "sticker_library",
+                "media_type",
+                "media_type VARCHAR(16) NOT NULL DEFAULT 'sticker'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "sticker_library",
+                "mime_type",
+                "mime_type VARCHAR(64) NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "sticker_library",
+                "width",
+                "width INTEGER NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "sticker_library",
+                "height",
+                "height INTEGER NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "sticker_library",
+                "file_unique_id",
+                "file_unique_id VARCHAR(255) NOT NULL DEFAULT ''",
+            )
+            # 第 3 期：异步识图入库的幂等账本。唯一索引在 ``create_all`` 里建，
+            # 这里只为"表已存在但索引缺失"的中间态兜一次底。
+            if await _sqlite_table_exists(conn, "media_ingest_log"):
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "ix_media_ingest_group_unique "
+                        "ON media_ingest_log (group_id, file_unique_id)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "ix_media_ingest_message_unique "
+                        "ON media_ingest_log (group_id, telegram_message_id) "
+                        "WHERE telegram_message_id > 0"
+                    )
+                )
             await conn.execute(
                 text(
                     "UPDATE authorized_groups SET bot_present = 1 "

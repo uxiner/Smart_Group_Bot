@@ -34,6 +34,7 @@ from bot.services.skills.music_search import MusicSearchSkill
 from bot.services.skills.remember import RememberSkill
 from bot.services.skills.routeros_doc import RouterOSDocSkill
 from bot.services.skills.rule_manage import RuleManageSkill
+from bot.services.skills.send_meme import SendMemeSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
@@ -306,6 +307,7 @@ class SkillService:
         self._register(RememberSkill(settings))
         self._register(RuleManageSkill())
         self._register(SendStickerSkill())
+        self._register(SendMemeSkill())
         self._register(MusicSearchSkill(settings))
         self._register(WebSearchSkill(settings))
         self._register(WebFetchSkill(settings))
