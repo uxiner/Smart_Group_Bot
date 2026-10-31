@@ -22,6 +22,7 @@ from bot.services.reply_progress import ProgressCallback, ProgressReference, Pro
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.search_memory import SCOPE_GROUP, record_search_for_result
+from bot.services.tool_observability import observe_tool
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.api_model_query import ApiModelQuerySkill
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
@@ -1074,6 +1075,7 @@ class SkillService:
         # 发送照常扣费，不会两次免费。
         return None, (group_id, feature)
 
+    @observe_tool("group_skill")
     async def _run_tool(
         self,
         *,

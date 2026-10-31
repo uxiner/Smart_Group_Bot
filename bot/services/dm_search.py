@@ -26,6 +26,9 @@ from bot.services import policy_runtime, usage_scope
 from bot.services.search_memory import SCOPE_PRIVATE, record_search_for_result
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.websearch import WebSearchSkill
+from bot.services.tool_observability import observe_tool
+from bot.utils.runtime_context import build_current_time_context
+from bot.utils.timezone import now_shanghai
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +189,7 @@ def _firecrawl_key_present(settings: Any) -> bool:
     return bool(str(getattr(settings, "firecrawl_api_key", "") or "").strip())
 
 
+@observe_tool("private_search", "websearch")
 async def run_search(
     query: str, *, settings: Any = None, max_results: int = 5
 ) -> SkillRunResult:

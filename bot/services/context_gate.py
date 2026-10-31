@@ -14,9 +14,9 @@
 
 设计取舍：
 
-* **纯函数**：只依赖 :func:`bot.utils.tokens.estimate_text_tokens`，不碰数据库、不碰
-  全局状态，所以单测可以直接喂构造好的 layers 断言裁剪结果；并发/多群互不影响
-  （没有共享可变状态）。
+* 装配算法只依赖 :func:`bot.utils.tokens.estimate_text_tokens`，不碰数据库；对同一输入
+  仍返回确定的消息/layers。完成后另有 best-effort 的进程内数值观察副作用，不参与裁剪，
+  且普通异常不改变装配结果；取消/进程退出异常继续传播。观察是全局汇总，不按群或用户隔离。
 * **裁剪是「按条丢 + 单条超长截断」**：每一层都从**最旧**的一端开始整条丢；只剩最后
   一条还装不下时，截断它的正文（补一句「已截断」），而不是把这一层清空——与第 1/2 期
   历史装配的「最新那条一定留下」同口径。
@@ -35,6 +35,20 @@ from bot.utils.budget import (
     BUSINESS_CONTEXT_TOKENS_MIN,
 )
 from bot.utils.tokens import estimate_text_tokens
+
+
+# Internal numeric observation is deliberately isolated after assembly. Ordinary
+# telemetry exceptions are ignored; cancellation and process-exit BaseException
+# values propagate unchanged, just like exceptions from the original assembler.
+def _observe_completed_assembly(assembly: ContextAssembly) -> None:
+    from bot.services.context_observability import record_context_assembly
+
+    record_context_assembly(
+        used_tokens=assembly.used_tokens,
+        budget_tokens=assembly.budget_tokens,
+        over_budget=assembly.over_budget,
+        trims=assembly.trims,
+    )
 
 #: 统一闸门的默认预算：272K = 278528（全项目统一用这个精确数字）。
 #: **2026-10-04 之后**：``auto`` 模式下这是"查不到模型元数据"时的保守降级值；
@@ -305,7 +319,7 @@ def assemble_context_within_budget(
         *[item for item in kept["history"]],
         *kept["current_turn"],
     ]
-    return ContextAssembly(
+    assembly = ContextAssembly(
         messages=merged,
         layers=kept,
         used_tokens=used,
@@ -313,3 +327,8 @@ def assemble_context_within_budget(
         over_budget=over_budget,
         trims=tuple(trims),
     )
+    try:
+        _observe_completed_assembly(assembly)
+    except Exception:
+        pass
+    return assembly
