@@ -88,6 +88,7 @@ from sqlalchemy import select
 
 from bot.db.models import PrivateChatMessage
 from bot.services import policy_runtime
+from bot.services.tool_observability import observe_tool
 from bot.utils.telegram import schedule_message_auto_delete_durable
 
 log = logging.getLogger(__name__)
@@ -972,6 +973,7 @@ async def _synthesize_segment(service: Any, text: str, *, uid: str, want_audio: 
         )
 
 
+@observe_tool("private_tts", "deliver_private_reply")
 async def deliver_private_reply(
     message: Any,
     *,
