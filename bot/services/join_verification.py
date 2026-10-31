@@ -542,6 +542,11 @@ class _TelegramRecoveryResult:
     operator_action_required: bool = False
     final_banned: bool | None = None
     final_restricted: bool | None = None
+    # Telegram answered "that user is not in this chat at all" (member not
+    # found / user not found / PARTICIPANT_ID_INVALID). An unban cleanup has
+    # nothing left to release in that case, so it must finish instead of
+    # retrying the same rejected mutation forever.
+    target_absent: bool = False
 
     @property
     def retryable(self) -> bool:
@@ -609,6 +614,32 @@ _UNBANNABLE_TARGET_ERROR_MARKERS = (
     "user is an administrator of the chat",
     "user admin invalid",
 )
+# Telegram answers these when the *user* is not in the chat at all — the group
+# itself is perfectly reachable. Repeating the mutation can never succeed, and
+# for an unban cleanup there is nothing left to release, so the caller must
+# treat the target as already handled instead of retrying every 15 minutes.
+_TARGET_ABSENT_ERROR_MARKERS = (
+    "member not found",
+    "user not found",
+    "participant not found",
+    "participant id invalid",
+    "user not participant",
+    "user is not a participant",
+)
+
+
+def telegram_target_is_absent_error(exc: BaseException) -> bool:
+    """Return whether Telegram says the target user is not in the chat.
+
+    Only deterministic Bot API rejections qualify; transport failures and
+    flood waits must keep their retryable meaning. Underscore normalization
+    also covers descriptions such as ``PARTICIPANT_ID_INVALID``.
+    """
+
+    if not isinstance(exc, _DETERMINISTIC_GROUP_API_ERRORS):
+        return False
+    detail = " ".join(str(exc).replace("_", " ").lower().split())
+    return any(marker in detail for marker in _TARGET_ABSENT_ERROR_MARKERS)
 
 
 def telegram_ban_failure_is_deterministic(exc: BaseException) -> bool:
@@ -678,6 +709,7 @@ def _telegram_ban_failure_result(exc: Exception) -> _TelegramRecoveryResult:
         error=exc,
         group_unreachable=group_unreachable,
         operator_action_required=operator_action_required,
+        target_absent=telegram_target_is_absent_error(exc),
     )
 
 
@@ -2915,6 +2947,17 @@ async def _restore_member_permissions_result(
         except Exception as exc:
             last_error = exc
             failure = _telegram_ban_failure_result(exc)
+            if failure.target_absent and not failure.group_unreachable:
+                # The user is not in the chat at all, so there are no
+                # permissions left to restore. This is a finished cleanup, not
+                # a failure that should be retried on a 15-minute timer.
+                log.info(
+                    "join verification restore skipped | reason=target_not_in_chat "
+                    "chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return _TelegramRecoveryResult(ok=True)
             log.warning(
                 "join verification restore request failed | chat=%s user=%s "
                 "attempt=%s/3 unreachable=%s operator_action=%s error=%s",
@@ -2949,6 +2992,14 @@ async def _restore_member_permissions_result(
                 return _TelegramRecoveryResult(ok=True)
         except Exception as exc:
             probe_failure = _telegram_ban_failure_result(exc)
+            if probe_failure.target_absent and not probe_failure.group_unreachable:
+                log.info(
+                    "join verification restore skipped | reason=target_not_in_chat "
+                    "chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return _TelegramRecoveryResult(ok=True)
             if probe_failure.group_unreachable:
                 return probe_failure
             if probe_failure.operator_action_required:
@@ -3151,6 +3202,19 @@ async def _ensure_kick_unbanned_result(
             raise
         except Exception as exc:
             failure = _telegram_ban_failure_result(exc)
+            if failure.target_absent and not failure.group_unreachable:
+                # "member not found" / "user not found" / PARTICIPANT_ID_INVALID
+                # means the account is not in this chat at all: there is no
+                # temporary kick left to lift, so this cleanup is finished.
+                # Retrying would only repeat the same rejection forever.
+                log.info(
+                    "kick unban target not in chat; treating unban as finished | "
+                    "chat=%s user=%s attempt=%s",
+                    chat_id,
+                    user_id,
+                    attempt,
+                )
+                return await finish_confirmed_unban()
             log.warning(
                 "join verification unban cleanup failed | chat=%s user=%s "
                 "attempt=%s/3 unreachable=%s operator_action=%s error=%s",
@@ -3182,6 +3246,17 @@ async def _ensure_kick_unbanned_result(
                 return await finish_confirmed_unban()
         except Exception as exc:
             probe_failure = _telegram_ban_failure_result(exc)
+            if probe_failure.target_absent and not probe_failure.group_unreachable:
+                # The membership probe itself says the user is not in the chat,
+                # which is the released state an unban cleanup wants anyway.
+                log.info(
+                    "kick unban target not in chat; treating unban as finished | "
+                    "chat=%s user=%s attempt=%s",
+                    chat_id,
+                    user_id,
+                    attempt,
+                )
+                return await finish_confirmed_unban()
             if probe_failure.group_unreachable:
                 return probe_failure
             if probe_failure.operator_action_required:
