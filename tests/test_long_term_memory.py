@@ -111,9 +111,13 @@ class _DbTestCase(unittest.IsolatedAsyncioTestCase):
             f"sqlite+aiosqlite:///{self._db_path}"
         )
         ltm.reset_extraction_ledger()
+        ltm._EXTRACTION_PARSE_FAILURES.clear()
+        ltm._EXTRACTION_PARSE_DIAGNOSTICS.clear()
 
     async def asyncTearDown(self) -> None:
         ltm.reset_extraction_ledger()
+        ltm._EXTRACTION_PARSE_FAILURES.clear()
+        ltm._EXTRACTION_PARSE_DIAGNOSTICS.clear()
         await self.engine.dispose()
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -338,7 +342,7 @@ class PureFunctionTests(unittest.TestCase):
 
     def test_parse_fact_items(self) -> None:
         self.assertIsNone(ltm.parse_fact_items("这不是 JSON"))
-        self.assertIsNone(ltm.parse_fact_items(""))
+        self.assertEqual(ltm.parse_fact_items(""), [])
         self.assertEqual(ltm.parse_fact_items("[]"), [])
         self.assertEqual(
             ltm.parse_fact_items('```json\n[{"fact": "x"}]\n```'), [{"fact": "x"}]
@@ -375,32 +379,62 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(salvaged[0]["fact"], "写代码时会用到 {config}")
 
     def test_parse_fact_items_returns_none_for_unusable_output(self) -> None:
-        """既没有完整数组、也抢不出**像事实的对象** → None（游标不前移的信号）。
-
-        ``抱歉…{}`` / ``{"facts": []}`` 这类「带花括号的解释文本或包了一层的外壳」绝不能
-        算解析成功——否则游标前移、这批消息被静默跳过（实测回归过）。
-        """
+        """没有完整事实且不是明确的空结果 → None（先重试，达到阈值后才跳过）。"""
 
         for bad in (
             "抱歉，我无法完成。",
             "抱歉，我无法输出 JSON。{}",
             '{"note": "这批没有什么可记的"}',
-            "",
+            None,
             "```json\n[{半截",
             "[{半截",
             "没有数组也没有对象",
+            "无需记录，但他喜欢咖啡，fact: 喜欢咖啡",
+            '无需记录。{"fact": "未闭合',
+            "无稳定事实以外的内容：喜欢茶",
+            "无" + "。" * 40,
+            "这不是空批 [] fact: 喜欢猫",
+            '```json\n[]\n```\n但 fact: 喜欢猫',
+            "说明```json\n\n```尾部内容",
+            '{"facts": []}',
+            "[1, 2, 3]",
         ):
             with self.subTest(raw=bad):
                 self.assertIsNone(ltm.parse_fact_items(bad))
 
-    def test_parse_fact_items_accepts_an_empty_array(self) -> None:
-        """空数组 / 数组里没有对象 = 这批没有可记的事实（与「解析失败」区分开）。"""
+    def test_parse_fact_items_accepts_explicit_empty_responses(self) -> None:
+        for raw in (
+            "", " \n\t", "[]", "[ \n ]", "```json\n[]\n```", "```json\n\n```",
+            "```\n无\n```", "无", " 无稳定事实。 ", "无需记录",
+            "没有可提炼", "没有可提炼的事实", "没有可提炼的稳定事实", "没有可记录的事实",
+            "本批没有需要记录的稳定事实。",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(ltm.parse_fact_items(raw), [])
 
-        self.assertEqual(ltm.parse_fact_items("[]"), [])
-        self.assertEqual(ltm.parse_fact_items("```json\n[]\n```"), [])
-        self.assertEqual(ltm.parse_fact_items("[1, 2, 3]"), [])
-        # 包了一层外壳的「空批」（`{"facts": []}`）取到内层空数组 → 同样是「没有可记的」
-        self.assertEqual(ltm.parse_fact_items('{"facts": []}'), [])
+    def test_parse_failure_counts_are_bounded_and_isolated(self) -> None:
+        with patch.dict(ltm._EXTRACTION_PARSE_FAILURES, clear=True):
+            self.assertEqual(ltm._note_extraction_parse_failure("group", 1), 1)
+            self.assertEqual(ltm._note_extraction_parse_failure("group", 1), 2)
+            self.assertEqual(ltm._note_extraction_parse_failure("private", 1), 1)
+            for scope_id in range(2, ltm.EXTRACT_PARSE_FAILURE_MAX_KEYS + 2):
+                ltm._note_extraction_parse_failure("group", scope_id)
+            self.assertEqual(
+                len(ltm._EXTRACTION_PARSE_FAILURES), ltm.EXTRACT_PARSE_FAILURE_MAX_KEYS
+            )
+            self.assertNotIn(("group", 1), ltm._EXTRACTION_PARSE_FAILURES)
+            self.assertNotIn(("private", 1), ltm._EXTRACTION_PARSE_FAILURES)
+
+    def test_parse_failure_diagnostics_ring_is_bounded(self) -> None:
+        diagnostics = ltm._EXTRACTION_PARSE_DIAGNOSTICS
+        self.assertEqual(diagnostics.maxlen, ltm.EXTRACT_PARSE_DIAGNOSTIC_LIMIT)
+        try:
+            for index in range(ltm.EXTRACT_PARSE_DIAGNOSTIC_LIMIT + 1):
+                diagnostics.append({"cursor_row_id": index})
+            self.assertEqual(len(diagnostics), ltm.EXTRACT_PARSE_DIAGNOSTIC_LIMIT)
+            self.assertEqual(diagnostics[0]["cursor_row_id"], 1)
+        finally:
+            diagnostics.clear()
 
     def test_config_getters_default_and_clamp(self) -> None:
         empty = _settings(
@@ -803,6 +837,9 @@ class ExtractionTests(_DbTestCase):
         )
         self.assertEqual(written, 0)
         self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), 0)
+        self.assertEqual(ltm._EXTRACTION_PARSE_FAILURES[(ltm.SCOPE_GROUP, GROUP_ID)], 1)
+        self.assertEqual(await self._facts(), [])
+        self.assertEqual(list(ltm._EXTRACTION_PARSE_DIAGNOSTICS), [])
         good = _StubLLM(self._response(SENDER_ID, "喜欢喝咖啡", "我很喜欢喝咖啡"))
         written = await ltm.extract_facts(
             scope=ltm.SCOPE_GROUP,
@@ -812,6 +849,128 @@ class ExtractionTests(_DbTestCase):
             session_factory=self.session_factory,
         )
         self.assertEqual(written, 1, "游标没前移，下一轮必须重试同一批")
+        self.assertNotIn((ltm.SCOPE_GROUP, GROUP_ID), ltm._EXTRACTION_PARSE_FAILURES)
+        await self._archive("新的消息", message_id=2)
+        await ltm.extract_facts(
+            scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=broken,
+            settings=_settings(), session_factory=self.session_factory,
+        )
+        self.assertEqual(ltm._EXTRACTION_PARSE_FAILURES[(ltm.SCOPE_GROUP, GROUP_ID)], 1)
+        self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), 1)
+
+    async def test_explicit_empty_response_advances_without_writing_facts(self) -> None:
+        for index, raw in enumerate(("", " \n", "```json\n\n```", "[]", "无稳定事实。"), 1):
+            with self.subTest(raw=raw):
+                row_id = await self._archive("普通闲聊", message_id=index)
+                # 空结果也是成功，必须清除之前的失败计数。
+                ltm._note_extraction_parse_failure(ltm.SCOPE_GROUP, GROUP_ID)
+                written = await ltm.extract_facts(
+                    scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=_StubLLM(raw),
+                    settings=_settings(), session_factory=self.session_factory,
+                )
+                self.assertEqual(written, 0)
+                self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), row_id)
+                self.assertEqual(await self._facts(), [])
+                self.assertNotIn((ltm.SCOPE_GROUP, GROUP_ID), ltm._EXTRACTION_PARSE_FAILURES)
+        self.assertEqual(list(ltm._EXTRACTION_PARSE_DIAGNOSTICS), [])
+
+    async def test_third_parse_failure_skips_batch_and_records_redacted_diagnostic(self) -> None:
+        row_id = await self._archive("普通闲聊", message_id=1)
+        await self._archive("机器人回复不算提炼输入", message_id=2, role="assistant")
+        raw = "模型输出格式错误\n密码是\nhunter2\ntoken: sk-test-secret\n13812345678"
+        llm = _StubLLM(raw)
+        captured_logs: list[str] = []
+        for attempt in range(1, 4):
+            with self.assertLogs("bot.services.long_term_memory", level="WARNING") as logs:
+                written = await ltm.extract_facts(
+                    scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=llm,
+                    settings=_settings(), session_factory=self.session_factory,
+                )
+            captured_logs = logs.output
+            self.assertEqual(written, 0)
+            self.assertEqual(await self._facts(), [])
+            self.assertEqual(
+                await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), row_id if attempt == 3 else 0
+            )
+            if attempt < 3:
+                self.assertEqual(ltm._EXTRACTION_PARSE_FAILURES[(ltm.SCOPE_GROUP, GROUP_ID)], attempt)
+                self.assertEqual(list(ltm._EXTRACTION_PARSE_DIAGNOSTICS), [])
+        self.assertEqual(len(llm.calls), 3)
+        self.assertNotIn((ltm.SCOPE_GROUP, GROUP_ID), ltm._EXTRACTION_PARSE_FAILURES)
+        self.assertTrue(any(line.startswith("ERROR:") for line in captured_logs))
+        diagnostic = ltm._EXTRACTION_PARSE_DIAGNOSTICS[-1]
+        self.assertEqual(diagnostic["scope"], ltm.SCOPE_GROUP)
+        self.assertEqual(diagnostic["scope_id"], GROUP_ID)
+        self.assertEqual(diagnostic["cursor_before"], 0)
+        self.assertEqual(diagnostic["cursor_row_id"], row_id)
+        self.assertEqual(diagnostic["failures"], 3)
+        self.assertEqual(diagnostic["raw_chars"], len(raw))
+        self.assertEqual(diagnostic["raw_excerpt"], ltm.SENSITIVE_REDACTION)
+        for secret in ("hunter2", "sk-test-secret", "13812345678"):
+            self.assertNotIn(secret, str(diagnostic))
+            self.assertNotIn(secret, "\n".join(captured_logs))
+        # 解除堵塞后，后续消息确实可以正常提炼。
+        next_row_id = await self._archive("我很喜欢喝咖啡", message_id=3)
+        good = _StubLLM(self._response(SENDER_ID, "喜欢喝咖啡", "我很喜欢喝咖啡"))
+        written = await ltm.extract_facts(
+            scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=good,
+            settings=_settings(), session_factory=self.session_factory,
+        )
+        self.assertEqual(written, 1)
+        self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), next_row_id)
+        self.assertEqual(len(await self._facts()), 1)
+        self.assertNotIn("普通闲聊", good.calls[0][1])
+
+    async def test_skip_cursor_write_failure_keeps_count_until_cursor_advances(self) -> None:
+        row_id = await self._archive("普通闲聊", message_id=1)
+        ltm._note_extraction_parse_failure(ltm.SCOPE_GROUP, GROUP_ID)
+        ltm._note_extraction_parse_failure(ltm.SCOPE_GROUP, GROUP_ID)
+        with patch.object(ltm, "_update_cursor", side_effect=RuntimeError("cursor write failed")):
+            await ltm.extract_facts(
+                scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=_StubLLM("格式错误"),
+                settings=_settings(), session_factory=self.session_factory,
+            )
+        self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), 0)
+        self.assertEqual(ltm._EXTRACTION_PARSE_FAILURES[(ltm.SCOPE_GROUP, GROUP_ID)], 3)
+        await ltm.extract_facts(
+            scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=_StubLLM("格式错误"),
+            settings=_settings(), session_factory=self.session_factory,
+        )
+        self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), row_id)
+        self.assertNotIn((ltm.SCOPE_GROUP, GROUP_ID), ltm._EXTRACTION_PARSE_FAILURES)
+        self.assertEqual(await self._facts(), [])
+
+    async def test_parse_failure_diagnostic_truncates_after_redaction(self) -> None:
+        for index, raw in enumerate(("格式错误" * 200, "hunter2\n" + "错" * 600 + "密码是"), 1):
+            with self.subTest(index=index):
+                row_id = await self._archive("普通闲聊", message_id=index)
+                for _ in range(3):
+                    await ltm.extract_facts(
+                        scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=_StubLLM(raw),
+                        settings=_settings(), session_factory=self.session_factory,
+                    )
+                excerpt = ltm._EXTRACTION_PARSE_DIAGNOSTICS[-1]["raw_excerpt"]
+                self.assertLessEqual(len(excerpt), 500)
+                self.assertEqual(excerpt, raw[:500] if index == 1 else ltm.SENSITIVE_REDACTION)
+                self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), row_id)
+                self.assertEqual(await self._facts(), [])
+
+    async def test_recovery_does_not_relax_evidence_subject_or_sensitive_guards(self) -> None:
+        await self._archive("我很喜欢喝咖啡", message_id=1)
+        invalid_items = [
+            json.loads(self._response(SENDER_ID, "喜欢喝咖啡", "我很喜欢 喝咖啡"))[0],
+            json.loads(self._response(999, "喜欢喝咖啡", "我很喜欢喝咖啡"))[0],
+            json.loads(self._response(SENDER_ID, "密码是 hunter2", "我很喜欢喝咖啡"))[0],
+        ]
+        for raw in ("无需记录，但 fact: 喜欢咖啡", json.dumps(invalid_items, ensure_ascii=False)):
+            written = await ltm.extract_facts(
+                scope=ltm.SCOPE_GROUP, scope_id=GROUP_ID, llm=_StubLLM(raw),
+                settings=_settings(), session_factory=self.session_factory,
+            )
+            self.assertEqual(written, 0)
+            self.assertEqual(await self._facts(), [])
+        self.assertEqual(await self._cursor(ltm.SCOPE_GROUP, GROUP_ID), 1)
+        self.assertNotIn((ltm.SCOPE_GROUP, GROUP_ID), ltm._EXTRACTION_PARSE_FAILURES)
 
     async def test_model_error_keeps_the_cursor(self) -> None:
         await self._archive("我很喜欢喝咖啡", message_id=1)

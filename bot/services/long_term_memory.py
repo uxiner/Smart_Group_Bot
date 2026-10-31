@@ -38,6 +38,7 @@ import inspect
 import json
 import logging
 import re
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable
@@ -121,6 +122,20 @@ CONFIRMED_CONFIDENCE_BUMP = 5
 #: 实测 10 条 + 每条 200 字证据会把 JSON 截断（`raw_chars=534` 断在 evidence 中间），
 #: 解析失败则整批丢弃。6 条 × 约 150 token ≈ 900 token，留足余量。
 MAX_FACTS_PER_EXTRACTION = 6
+#: 解析失败重试有界；状态仅进程内保留，最久未失败的作用域先淘汰。
+EXTRACT_PARSE_FAILURE_LIMIT = 3
+EXTRACT_PARSE_FAILURE_MAX_KEYS = 256
+EXTRACT_PARSE_DIAGNOSTIC_LIMIT = 32
+EXTRACT_PARSE_EXCERPT_MAX_CHARS = 500
+_EXTRACTION_PARSE_FAILURES: OrderedDict[tuple[str, int], int] = OrderedDict()
+_EXTRACTION_PARSE_DIAGNOSTICS: deque[dict[str, Any]] = deque(
+    maxlen=EXTRACT_PARSE_DIAGNOSTIC_LIMIT
+)
+#: 仅整段精确匹配，不用子串猜测「没有事实」；带其它内容仍按 JSON / 抢救路径处理。
+_EMPTY_FACT_RESPONSES = frozenset({
+    "无", "没有可提炼", "没有可提炼的事实", "没有可提炼的稳定事实", "无需记录",
+    "无稳定事实", "没有可记录的事实", "本批没有需要记录的稳定事实",
+})
 #: 单次送进模型的输入上限（token，用 ``estimate_text_tokens`` 估算；超了从最旧端截）
 EXTRACT_INPUT_TOKEN_LIMIT = 12000
 #: 每轮最多遍历多少个作用域（群 + 私聊各自上限）
@@ -212,7 +227,7 @@ EXTRACT_SYSTEM_PROMPT = (
     '{"subject_user_id": 123, "fact": "…", "category": "preference", '
     '"confidence": 70, "evidence": "…"}；'
     "subject_user_id 只能取输入里出现过的发送者 id；关于本群整体的公共事实用 0。"
-    "不要输出任何解释、前后缀或代码块。"
+    "没有可记录的事实时只输出 []。不要输出任何解释、前后缀或代码块。"
 )
 
 #: 维护巡检间隔（秒）：一天几次足够
@@ -1454,18 +1469,20 @@ def _salvage_fact_objects(text: str) -> list[dict[str, Any]]:
 
 
 def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
-    """解析模型返回的 JSON 数组；解析不出来返回 ``None``（游标不前移的信号）。
+    """解析 JSON / 抢救完整事实；明确空结果返回 []，其余不可解析输出返回 None。
 
-    先按严格路径取「第一个 ``[`` 到最后一个 ``]``」；不成（含**被截断**的情形）
-    就退回 :func:`_salvage_fact_objects` 抢救完整对象。两条路都拿不到东西才返回 ``None``。
+    空结果只接受整段空白、完整围栏、空数组或短白名单，不从解释文字里截取 []。
+    非空事实保留既有的数组提取和截断对象抢救路径。
     """
 
-    body = str(raw or "").strip()
-    if not body:
+    if not isinstance(raw, str):
         return None
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", body, re.S)
+    body = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)```", body, re.S)
     if fenced:
         body = fenced.group(1).strip()
+    if not body or (len(body) <= 32 and body.rstrip("。.!！") in _EMPTY_FACT_RESPONSES):
+        return []
     start = body.find("[")
     end = body.rfind("]")
     if start >= 0 and end > start:
@@ -1474,7 +1491,11 @@ def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
         except Exception:
             parsed = None
         if isinstance(parsed, list):
-            return [item for item in parsed if isinstance(item, dict)]
+            if not parsed and start == 0 and end == len(body) - 1:
+                return []
+            items = [item for item in parsed if isinstance(item, dict)]
+            if items:
+                return items
     # 抢救出来的对象必须**真的像一条事实**（带非空 fact 字符串）：否则「模型回了一段
     # 带花括号的解释文本」（例如 `抱歉，我无法输出 JSON。{}`）会被当成解析成功，
     # 于是游标前移、整批静默跳过——那正是最该避免的方向。
@@ -1484,6 +1505,17 @@ def parse_fact_items(raw: Any) -> list[dict[str, Any]] | None:
         if isinstance(item.get("fact"), str) and item["fact"].strip()
     ]
     return salvaged or None
+
+
+def _note_extraction_parse_failure(scope: str, scope_id: int) -> int:
+    key = (scope, scope_id)
+    count = min(
+        _EXTRACTION_PARSE_FAILURES.pop(key, 0) + 1, EXTRACT_PARSE_FAILURE_LIMIT
+    )
+    _EXTRACTION_PARSE_FAILURES[key] = count
+    if len(_EXTRACTION_PARSE_FAILURES) > EXTRACT_PARSE_FAILURE_MAX_KEYS:
+        _EXTRACTION_PARSE_FAILURES.popitem(last=False)
+    return count
 
 
 def _evidence_is_grounded(evidence: str, source_text: str) -> bool:
@@ -1512,8 +1544,8 @@ async def extract_facts(
       只取 ``id > 游标`` 的（最多 ``memory_extract_batch_max`` 条，按 id 升序）。
     * 只喂 ``role='user'`` 的文本消息，跳过机器人自己的消息、空正文与已关闭记忆
       的发送者；总输入超过 12000 token 时从最旧端截掉。
-    * 模型返回解析失败 / 调用报错 → 只记日志，**游标不前移**（下一轮重试同一批），
-      绝不在一次调用里 while 重试。
+    * 模型返回解析失败 → 不前移、下一轮重试；同作用域连续 3 次则留脱敏诊断并跳过
+      本批，避免永久堵塞。调用报错仍不前移，绝不在一次调用里 while 重试。
     * 写入逐条独立提交（:func:`record_fact` 自己吞异常），一条失败不影响其余。
     * 传了 ``session`` 就用它，否则用 ``session_factory`` 开一个自己的短会话。
     """
@@ -1587,6 +1619,7 @@ async def _extract_with_session(
             # 取到的行里没有可提炼的内容（全是机器人消息/非文本/已关闭记忆的人）：
             # 游标照常前移，否则这些行会被每一轮反复统计，作用域永远「有新消息」。
             await _update_cursor(session, scope, scope_id, max_row_id, now=now)
+            _EXTRACTION_PARSE_FAILURES.pop((scope, scope_id), None)
             return 0
 
         eligible_before_trim = len(eligible)
@@ -1637,15 +1670,38 @@ async def _extract_with_session(
             return 0
         items = parse_fact_items(raw)
         if items is None:
+            failures = _note_extraction_parse_failure(scope, scope_id)
+            if failures >= EXTRACT_PARSE_FAILURE_LIMIT:
+                # 先对完整输出脱敏，再截断；敏感标签可能在第 500 字之后或另起一行。
+                raw_text = str(raw or "")
+                excerpt = (
+                    SENSITIVE_REDACTION if contains_sensitive_fact(raw_text)
+                    else redact_sensitive_excerpt(raw_text)
+                )[:EXTRACT_PARSE_EXCERPT_MAX_CHARS]
+                diagnostic = {
+                    "scope": scope, "scope_id": scope_id, "cursor_before": cursor,
+                    "cursor_row_id": cursor_row_id, "failures": failures,
+                    "raw_chars": len(raw_text), "raw_excerpt": excerpt,
+                }
+                _EXTRACTION_PARSE_DIAGNOSTICS.append(diagnostic)
+                log.error(
+                    "long-term memory: 提炼结果连续解析失败，达到阈值，将跳过本批推进游标 | "
+                    "diagnostic=%r", diagnostic,
+                )
+                await _update_cursor(session, scope, scope_id, cursor_row_id, now=now)
+                _EXTRACTION_PARSE_FAILURES.pop((scope, scope_id), None)
+                return 0
             log.warning(
                 "long-term memory: 提炼结果解析失败（游标不前移，下一轮重试） | "
-                "scope=%s | scope_id=%s | raw_chars=%d",
+                "scope=%s | scope_id=%s | raw_chars=%d | failures=%d",
                 scope,
                 scope_id,
                 len(str(raw or "")),
+                failures,
             )
             return 0
 
+        _EXTRACTION_PARSE_FAILURES.pop((scope, scope_id), None)
         allowed_subjects = set(sender_ids) | {0}
         source_message_id = eligible[-1].get("telegram_message_id")
         for item in items[:MAX_FACTS_PER_EXTRACTION]:
