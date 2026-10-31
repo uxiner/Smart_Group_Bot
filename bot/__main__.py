@@ -16,7 +16,14 @@ from bot.config import (
     validate_bootstrap_settings,
 )
 from bot.db.engine import init_db
-from bot.handlers import admin, commands, group, membership, private_chat
+from bot.handlers import (
+    admin,
+    commands,
+    group,
+    membership,
+    private_chat,
+    self_check,
+)
 from bot.loader import create_bot, dp
 from bot.middlewares.command_cleanup import ManagementCommandCleanupMiddleware
 from bot.middlewares.db import DbSessionMiddleware
@@ -949,6 +956,9 @@ async def main() -> None:
 
         _register_update_middlewares(dp, session_factory)
 
+        # /selfcheck 用精确命令，必须排在 commands / private_chat / group 之前：
+        # 后者对私聊用宽泛 F.chat.type == PRIVATE，排在前面才不会被当成闲聊送去模型。
+        dp.include_router(self_check.router)
         dp.include_router(commands.router)
         dp.include_router(admin.router)
         dp.include_router(membership.router)
